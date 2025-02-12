@@ -1,0 +1,120 @@
+---
+weight: 10
+---
+
+# Prometheus 监控数据备份与恢复
+
+## 功能简介
+
+Prometheus 监控数据以 TSDB（时序数据库）格式存储，支持数据备份和恢复功能。监控数据存储在 Prometheus 容器的指定路径下（由配置 `storage.tsdb.path` 指定，默认为 `/prometheus`）。
+
+```yaml
+template:
+    spec:
+      containers:
+        - args:
+            - '--storage.tsdb.path=/prometheus'     # Prometheus 容器存储监控数据的目录
+```
+
+## 使用场景
+
+- 系统迁移时需要保留历史监控数据
+- 防止意外情况导致监控数据丢失
+- 需要将监控数据迁移到新的 Prometheus 实例
+
+## 前置条件
+
+- 已部署 Prometheus 监控组件（计算组件名称为 `prometheus-kube-prometheus-0`，类型为 `StatefulSet`）
+- 具有集群的管理员权限
+- 确保目标存储位置有足够的存储空间
+
+## 操作步骤
+
+### 备份数据
+
+在开始备份之前，请注意：Prometheus 存储监控数据时，会将采集到的数据先放入缓存，然后定期写入存储目录。以下备份方式均是以存储目录作为数据源，因此不包括备份时刻缓存中的数据。
+
+#### 方式一：备份存储目录（推荐）
+
+1. 使用 kubectl cp 命令备份：
+```bash
+kubectl cp -n cpaas-system prometheus-kube-prometheus-0-0:/prometheus -c prometheus <目标存储路径>
+```
+
+2. 从存储后端备份（根据部署时选择的存储类型）：
+- **LocalVolume**：从 `/cpaas/monitoring/prometheus` 目录拷贝
+- **PV**：从 PV 挂载目录拷贝（建议将 PV 的 **persistentVolumeReclaimPolicy** 设置为 `Retain`）
+- **StorageClass**：从 PV 挂载目录拷贝
+
+#### 方式二：快照备份
+
+1. 启用 Admin API：
+```bash
+kubectl edit -n cpaas-system prometheus kube-prometheus-0
+```
+添加配置：
+```yaml
+spec: 
+  enableAdminAPI: true
+```
+**说明**：更新并保存配置后，Prometheus 的 Pod（Pod 名称：prometheus-kube-prometheus-0-0）会重启，等待 Pod 都处于 Running 状态后执行后续操作。
+
+2. 创建快照：
+```bash
+curl -XPOST <Prometheus Pod IP>:9090/api/v1/admin/tsdb/snapshot
+```
+
+### 恢复数据
+
+1. 将备份数据拷贝到 Prometheus 容器：
+```bash
+kubectl cp ./prometheus-backup cpaas-system/prometheus-kube-prometheus-0-0:/prometheus/
+```
+
+2. 移动数据到指定目录：
+```bash
+kubectl exec -it -n cpaas-system prometheus-kube-prometheus-0-0 -c prometheus sh
+mv /prometheus/prometheus-backup/* /prometheus/
+```
+**快捷方式**：当插件部署时的存储类型为 **LocalVolume** 时，直接将备份数据拷贝至部署插件的节点的 `/cpaas/monitoring/prometheus/prometheus-db/` 目录下即可。
+
+## 操作结果
+
+- 备份完成后，可在目标存储路径下看到完整的 TSDB 格式监控数据
+- 恢复完成后，Prometheus 会自动加载历史监控数据
+
+## 了解更多
+
+### TSDB 数据格式说明
+
+TSDB 格式数据结构示例：
+```
+├── 01FXP317QBANGAX1XQAXCJK9DB
+│   ├── chunks
+│   │   └── 000001
+│   ├── index
+│   ├── meta.json
+│   └── tombstones
+├── chunks_head
+│   ├── 000022
+│   └── 000023
+├── queries.active
+└── wal
+    ├── 00000020
+    ├── 00000021
+    ├── 00000022
+    ├── 00000023
+    └── checkpoint.00000019
+        └── 00000000
+```
+
+### 数据备份注意事项
+- 备份数据不包含备份时刻的缓存数据
+- 建议定期进行数据备份
+- 使用 PV 存储时，建议将 **persistentVolumeReclaimPolicy** 设置为 `Retain`
+
+## 后续操作
+
+- 验证监控数据是否正确恢复
+- 定期进行数据备份计划
+- 如使用快照备份方式，可选择关闭 Admin API
