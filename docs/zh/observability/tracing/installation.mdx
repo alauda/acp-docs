@@ -5,6 +5,8 @@ i18n:
     en: Installation
 ---
 
+# 部署
+
 :::warning
 
 **该部署文档仅适用对接容器平台调用链的场景。**
@@ -13,15 +15,13 @@ i18n:
 
 :::
 
-# 部署调用链
-
 本指南为集群管理员提供了在 Alauda Container Platform 集群上安装调用链的过程。
 
 先决条件:
 
 * 您可以使用具有 `platform-admin-system` 权限的帐户访问 Alauda Container Platform 集群。
 * 您已安装 `kubectl` CLI。
-* 存储调用链数据的 `Elasticsearch` 组件，包括访问地址和 `basic auth` 信息。
+* 存储调用链数据的 `Elasticsearch` 组件，包括访问地址和 `Basic Auth` 信息。
 
 ## 安装 Jaeger Operator
 
@@ -47,21 +47,350 @@ i18n:
 * 验证 Jaeger Operator 的所有组件是否已成功安装。在终端上登录集群，并运行以下命令：
 
   ```bash
-  $ kubectl -n jaeger-operator get csv
+  kubectl -n jaeger-operator get csv
   ```
 
   **示例输出**
 
   ```bash
   NAME                     DISPLAY           VERSION   REPLACES   PHASE
-  jaeger-operator.v4.0.0   Jaeger Operator   4.0.0                Succeeded
+  jaeger-operator.vx.x.0   Jaeger Operator   x.x.0                Succeedex
   ```
 
   如果 `PHASE` 内容为 `Succeeded`，则表示 Operator 及其组件已成功安装。
 
 ## 部署 Jaeger 实例
 
-TODO：
+Jaeger 实例和相关资源，通过如下的 `install-jaeger.sh` 脚本安装，该脚本有三个参数：
+
+- `--es-url`：Elasticsearch 的访问地址。
+- `--es-user-base64`：Elasticsearch 的 `Basic Auth` 用户名，使用 base64 编码。
+- `--es-pass-base64`：Elasticsearch 的 `Basic Auth` 密码，使用 base64 编码。
+
+复制 **DETAILS** 中的安装脚本，登录要安装的集群中，保存为 `install-jaeger.sh`，添加执行权限后执行：
+
+:::details
+```bash
+#!/bin/bash
+
+set -euo pipefail
+
+# get arg
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --es-url=*)
+            ES_URL="${1#*=}"
+            ;;
+        --es-user-base64=*)
+            ES_USER_BASE64="${1#*=}"
+            ;;
+        --es-pass-base64=*)
+            ES_PASS_BASE64="${1#*=}"
+            ;;
+        *)
+            echo "unkonw argument: $1"
+            exit 1
+            ;;
+    esac
+    shift
+done
+
+# print arg
+echo "ES_URL: $ES_URL"
+echo "ES_USER_BASE64: $ES_USER_BASE64"
+echo "ES_PASS_BASE64: $ES_PASS_BASE64"
+
+# get global-info from ConfigMap
+CLUSTER_NAME=$(kubectl get configmap global-info -n kube-public -o jsonpath='{.data.clusterName}')
+echo "CLUSTER_NAME: ${CLUSTER_NAME}"
+ISSUER_URL=$(kubectl get configmap global-info -n kube-public -o jsonpath='{.data.oidcIssuer}')
+CLIENT_ID=$(kubectl get configmap global-info -n kube-public -o jsonpath='{.data.oidcClientID}')
+CLIENT_SECRET=$(kubectl get configmap global-info -n kube-public -o jsonpath='{.data.oidcClientSecret}')
+CLIENT_SECRET_BASE64=$(echo -n "${CLIENT_SECRET}" | base64 -w0)
+PLATFORM_URL=$(kubectl get configmap global-info -n kube-public -o jsonpath='{.data.platformURL}')
+echo "PLATFORM_URL: ${PLATFORM_URL}"
+
+# get oauth2-proxy image
+INSTALLED_CSV=$(kubectl get subscription jaeger-operator -n jaeger-operator -o jsonpath='{.status.installedCSV}')
+echo "INSTALLED_CSV: ${INSTALLED_CSV}"
+OAUTH2_PROXY_IMAGE=$(kubectl get csv "${INSTALLED_CSV}" -n jaeger-operator -o jsonpath='{.spec.relatedImages[?(@.name=="component.3rdparty-oauth2-proxy")].image}')
+echo "OAUTH2_PROXY_IMAGE: ${OAUTH2_PROXY_IMAGE}"
+
+TARGET_NAMESPACE="cpaas-system"
+JAEGER_BASEPATH="clusters/$CLUSTER_NAME/acp/jaeger"
+
+_apply_resource() {
+  if [ -z "$1" ]; then
+    echo "Usage: _apply_resource <yaml_content>"
+    return 1
+  fi
+
+  local yaml_content="$1"
+  echo "$yaml_content" | kubectl apply -f -
+}
+
+_install_configmap() {
+  local yaml_content=$(cat <<EOF
+apiVersion: v1
+data:
+  OAUTH2_PROXY_CLIENT_ID: $CLIENT_ID
+  OAUTH2_PROXY_COOKIE_SECURE: "false"
+  OAUTH2_PROXY_EMAIL_DOMAINS: "*"
+  OAUTH2_PROXY_HTTP_ADDRESS: 0.0.0.0:4180
+  OAUTH2_PROXY_INSECURE_OIDC_ALLOW_UNVERIFIED_EMAIL: "true"
+  OAUTH2_PROXY_OIDC_ISSUER_URL: $ISSUER_URL
+  OAUTH2_PROXY_PROVIDER: oidc
+  OAUTH2_PROXY_PROXY_PREFIX: /$JAEGER_BASEPATH/oauth2
+  OAUTH2_PROXY_REDIRECT_URL: $PLATFORM_URL/$JAEGER_BASEPATH/oauth2/callback
+  OAUTH2_PROXY_SCOPE: openid profile email groups ext
+  OAUTH2_PROXY_SKIP_JWT_BEARER_TOKENS: "true"
+  OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
+  OAUTH2_PROXY_SSL_INSECURE_SKIP_VERIFY: "true"
+  OAUTH2_PROXY_UPSTREAMS: http://127.0.0.1:16686
+kind: ConfigMap
+metadata:
+  name: jaeger-oauth2-proxy
+  namespace: $TARGET_NAMESPACE
+EOF
+)
+  _apply_resource "$yaml_content"
+}
+
+_install_secret() {
+  local yaml_content=$(cat <<EOF
+apiVersion: v1
+data:
+  OAUTH2_PROXY_CLIENT_SECRET: $CLIENT_SECRET_BASE64
+  OAUTH2_PROXY_COOKIE_SECRET: $CLIENT_SECRET_BASE64
+kind: Secret
+metadata:
+  name: jaeger-oauth2-proxy
+  namespace: $TARGET_NAMESPACE
+type: Opaque
+---
+apiVersion: v1
+data:
+  ES_PASSWORD: $ES_PASS_BASE64
+  ES_USERNAME: $ES_USER_BASE64
+kind: Secret
+metadata:
+  name: jaeger-elasticsearch-basic-auth
+  namespace: $TARGET_NAMESPACE
+type: Opaque
+EOF
+)
+  _apply_resource "$yaml_content"
+}
+
+_install_jaeger() {
+  local yaml_content=$(cat <<EOF
+apiVersion: jaegertracing.io/v1
+kind: Jaeger
+metadata:
+  name: jaeger-prod
+  namespace: $TARGET_NAMESPACE
+spec:
+  collector:
+    affinity:
+      podAntiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: jaeger-prod-collector
+            topologyKey: kubernetes.io/hostname
+    replicas: 1
+    resources:
+      limits:
+        cpu: "2"
+        memory: 512Mi
+      requests:
+        cpu: 250m
+        memory: 256Mi
+  imagePullSecrets:
+    - name: global-registry-auth
+  ingress:
+    enabled: false
+  labels:
+    service_name: jaeger
+  query:
+    affinity:
+      podAntiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: jaeger-prod-query
+            topologyKey: kubernetes.io/hostname
+    annotations:
+      oauth2-proxy.github.io/image: $OAUTH2_PROXY_IMAGE
+      oauth2-proxy.github.io/inject: "true"
+      oauth2-proxy.github.io/oidc-configmap: jaeger-oauth2-proxy
+      oauth2-proxy.github.io/oidc-secret: jaeger-oauth2-proxy
+      oauth2-proxy.github.io/proxyCPULimit: 100m
+      oauth2-proxy.github.io/proxyMemoryLimit: 128Mi
+    options:
+      query:
+        base-path: /$JAEGER_BASEPATH
+    replicas: 1
+    resources:
+      limits:
+        cpu: "1"
+        memory: 512Mi
+      requests:
+        cpu: 250m
+        memory: 256Mi
+  resources:
+    limits:
+      cpu: 100m
+      memory: 300Mi
+    requests:
+      cpu: 100m
+      memory: 300Mi
+  sampling:
+    options: {}
+  storage:
+    dependencies:
+      enabled: false
+      resources: {}
+      schedule: 55 23 * * *
+    elasticsearch:
+      name: elasticsearch
+      nodeCount: 3
+      redundancyPolicy: SingleRedundancy
+    esIndexCleaner:
+      enabled: true
+      numberOfDays: 7
+      resources: {}
+      schedule: 55 23 * * *
+    esRollover:
+      resources: {}
+      schedule: 0 0 * * *
+    options:
+      es.index-prefix: acp-tracing-$CLUSTER_NAME
+      es.max-span-age: 168h0m0s
+      es.server-urls: $ES_URL
+      es.tls.enabled: true
+      es.tls.skip-host-verify: true
+    secretName: jaeger-elasticsearch-basic-auth
+    type: elasticsearch
+  strategy: production
+  tolerations:
+    - effect: NoSchedule
+      key: node-role.kubernetes.io/control-plane
+      operator: Exists
+    - effect: NoSchedule
+      key: node-role.kubernetes.io/master
+      operator: Exists
+  ui:
+    options:
+      dependencies:
+        menuEnabled: false
+EOF
+)
+  _apply_resource "$yaml_content"
+}
+
+_install_pod_monitor() {
+  local yaml_content=$(cat <<EOF
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  labels:
+    monitoring: pods
+    prometheus: kube-prometheus
+  name: jaeger-monitor
+  namespace: $TARGET_NAMESPACE
+spec:
+  jobLabel: app.kubernetes.io/name
+  namespaceSelector:
+    matchNames:
+      - $TARGET_NAMESPACE
+  podMetricsEndpoints:
+    - interval: 60s
+      path: /metrics
+      port: admin-http
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: jaeger-prod
+EOF
+)
+  _apply_resource "$yaml_content"
+}
+
+_install_ingress() {
+  local alb_annotation=""
+  if [[ "$CLUSTER_NAME" == "global" ]]; then
+  alb_annotation=$(cat <<EOF
+    alb.ingress.cpaas.io/rewrite-request: |
+      {"headers_var":{"Authorization":"cookie_cpaas_id_token"}}
+EOF
+  )
+  fi
+  local ingress_class=""
+  if [[ "$CLUSTER_NAME" != "global" ]]; then
+    ingress_class="  ingressClassName: cpaas-system"
+  fi
+
+  local yaml_content=$(cat <<EOF
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: jaeger-query
+  namespace: $TARGET_NAMESPACE
+  annotations:
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+$alb_annotation
+spec:
+$ingress_class
+  rules:
+    - http:
+        paths:
+          - path: /$JAEGER_BASEPATH
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: jaeger-prod-query
+                port:
+                  number: 4180
+EOF
+)
+  _apply_resource "$yaml_content"
+}
+
+# final install
+_install_configmap
+_install_secret
+_install_jaeger
+_install_pod_monitor
+_install_ingress
+
+echo "Jaeger installation completed"
+```
+:::
+
+**脚本执行示例**：
+
+```bash
+./install-jaeger.sh --es-url='https://xxx' --es-user-base64='xxx' --es-pass-base64='xxx'
+```
+
+**脚本输出示例**：
+
+```bash
+ES_URL: https://xxx
+ES_USER_BASE64: xxx
+ES_PASS_BASE64: xxx
+CLUSTER_NAME: cluster-xxx
+PLATFORM_URL: https://xxx
+INSTALLED_CSV: jaeger-operator.vx.x.x
+OAUTH2_PROXY_IMAGE: build-harbor.alauda.cn/3rdparty/oauth2-proxy/oauth2-proxy:vx.x.x
+configmap/jaeger-oauth2-proxy created
+secret/jaeger-oauth2-proxy created
+secret/jaeger-elasticsearch-basic-auth created
+jaeger.jaegertracing.io/jaeger-prod created
+podmonitor.monitoring.coreos.com/jaeger-monitor created
+ingress.networking.k8s.io/jaeger-query created
+Jaeger installation completed
+```
 
 ## 安装 OpenTelemetry Operator
 
@@ -87,21 +416,288 @@ TODO：
 * 验证 OpenTelemetry Operator 的所有组件是否已成功安装。在终端上登录集群，并运行以下命令：
 
   ```bash
-  $ kubectl -n opentelemetry-operator get csv
+  kubectl -n opentelemetry-operator get csv
   ```
 
   **示例输出**
 
   ```bash
   NAME                            DISPLAY                  VERSION   REPLACES   PHASE
-  openTelemetry-operator.v4.0.0   OpenTelemetry Operator   4.0.0                Succeeded
+  openTelemetry-operator.vx.x.0   OpenTelemetry Operator   x.x.0                Succeedex
   ```
 
   如果 `PHASE` 内容为 `Succeeded`，则表示 Operator 及其组件已成功安装。
 
 ## 部署 OpenTelemetry 实例
 
-TODO：
+OpenTelemetry 实例和相关资源，通过如下的 `install-otel.sh` 脚本安装。
+
+复制 **DETAILS** 中的安装脚本，登录要安装的集群中，保存为 `install-otel.sh`，添加执行权限后执行：
+
+:::details
+```bash
+#!/bin/bash
+
+set -euo pipefail
+
+TARGET_NAMESPACE="cpaas-system"
+
+_apply_resource() {
+  if [ -z "$1" ]; then
+    echo "Usage: _apply_resource <yaml_content>"
+    return 1
+  fi
+
+  local yaml_content="$1"
+  echo "$yaml_content" | kubectl apply -f -
+}
+
+_install_rbac() {
+  local yaml_content=$(cat <<EOF
+apiVersion: v1
+imagePullSecrets:
+  - name: global-registry-auth
+kind: ServiceAccount
+metadata:
+  name: otel-collector
+  namespace: $TARGET_NAMESPACE
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: otel-collector:cpaas-system:cluster-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: otel-collector
+    namespace: $TARGET_NAMESPACE
+EOF
+)
+  _apply_resource "$yaml_content"
+}
+
+_install_otel_collector() {
+  local yaml_content=$(cat <<EOF
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: otel
+  namespace: $TARGET_NAMESPACE
+spec:
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app: otel-collector
+          topologyKey: kubernetes.io/hostname
+  config:
+    exporters:
+      debug: {}
+      otlp:
+        balancer_name: round_robin
+        endpoint: dns:///jaeger-prod-collector-headless.$TARGET_NAMESPACE:4317
+        tls:
+          insecure: true
+      prometheus:
+        endpoint: 0.0.0.0:8889
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+    processors:
+      batch: {}
+      filter/metric_apis:
+        metrics:
+          datapoint:
+            - attributes["http.route"] == "/actuator/health" or attributes["uri"] == "/actuator/health"
+            - attributes["http.route"] == "/actuator/prometheus" or attributes["uri"] == "/actuator/prometheus"
+      transform:
+        metric_statements:
+          - context: datapoint
+            statements:
+              - delete_key(attributes, "inner.client.ms.name")
+              - delete_key(attributes, "inner.client.ms.namespace")
+              - delete_key(attributes, "inner.client.cluster.name")
+              - delete_key(attributes, "inner.client.env.type")
+              - set(attributes["namespace"], resource.attributes["k8s.namespace.name"])
+              - set(attributes["container"], resource.attributes["k8s.container.name"])
+              - set(attributes["service_name"], resource.attributes["service.name"])
+              - set(attributes["pod"], resource.attributes["k8s.pod.name"])
+      memory_limiter:
+        check_interval: 5s
+        limit_percentage: 85
+        spike_limit_percentage: 25
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+    service:
+      extensions:
+        - health_check
+      pipelines:
+        metrics:
+          exporters:
+            - debug
+            - prometheus
+          processors:
+            - memory_limiter
+            - filter/metric_apis
+            - transform
+            - batch
+          receivers:
+            - otlp
+        traces:
+          exporters:
+            - debug
+            - otlp
+          processors:
+            - memory_limiter
+            - batch
+          receivers:
+            - otlp
+      telemetry:
+        logs:
+          level: info
+        metrics:
+          address: 0.0.0.0:8888
+          level: detailed
+  managementState: managed
+  mode: deployment
+  replicas: 1
+  resources:
+    limits:
+      cpu: "2"
+      memory: 1Gi
+    requests:
+      cpu: 250m
+      memory: 512Mi
+  securityContext:
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+  serviceAccount: otel-collector
+  tolerations:
+    - effect: NoSchedule
+      key: node-role.kubernetes.io/control-plane
+      operator: Exists
+    - effect: NoSchedule
+      key: node-role.kubernetes.io/master
+      operator: Exists
+  upgradeStrategy: automatic
+EOF
+)
+  _apply_resource "$yaml_content"
+}
+
+_install_instrumentation() {
+  local yaml_content=$(cat <<EOF
+apiVersion: opentelemetry.io/v1alpha1
+kind: Instrumentation
+metadata:
+  name: acp-common-java
+  namespace: $TARGET_NAMESPACE
+spec:
+  env:
+    - name: OTEL_TRACES_EXPORTER
+      value: otlp
+    - name: OTEL_METRICS_EXPORTER
+      value: otlp
+    - name: OTEL_EXPORTER_OTLP_ENDPOINT
+      value: http://otel-collector.$TARGET_NAMESPACE:4317
+    - name: OTEL_SERVICE_NAME
+      value: \$(SERVICE_NAME).\$(SERVICE_NAMESPACE)
+    - name: OTEL_RESOURCE_ATTRIBUTES
+      value: service.namespace=\$(SERVICE_NAMESPACE)
+  sampler:
+    type: parentbased_traceidratio
+    argument: "1"
+EOF
+)
+  _apply_resource "$yaml_content"
+}
+
+_install_service_monitor() {
+  local yaml_content=$(cat <<EOF
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  labels:
+    monitoring: services
+    prometheus: kube-prometheus
+  name: otel-collector-monitoring
+  namespace: $TARGET_NAMESPACE
+spec:
+  endpoints:
+    - interval: 60s
+      path: /metrics
+      port: monitoring
+  jobLabel: app.kubernetes.io/name
+  namespaceSelector:
+    matchNames:
+      - $TARGET_NAMESPACE
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: $TARGET_NAMESPACE.otel
+      operator.opentelemetry.io/collector-service-type: monitoring
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  labels:
+    monitoring: services
+    prometheus: kube-prometheus
+  name: otel-collector
+  namespace: $TARGET_NAMESPACE
+spec:
+  endpoints:
+    - honorLabels: true
+      interval: 60s
+      path: /metrics
+      port: prometheus
+  jobLabel: app.kubernetes.io/name
+  namespaceSelector:
+    matchNames:
+      - $TARGET_NAMESPACE
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: $TARGET_NAMESPACE.otel
+      operator.opentelemetry.io/collector-service-type: base
+EOF
+)
+  _apply_resource "$yaml_content"
+}
+
+_install_rbac
+_install_otel_collector
+_install_instrumentation
+_install_service_monitor
+
+echo "OpenTelemetry installation completed"
+```
+:::
+
+**脚本执行示例**：
+
+```bash
+./install-otel.sh
+```
+
+**脚本输出示例**：
+
+```bash
+serviceaccount/otel-collector created
+clusterrolebinding.rbac.authorization.k8s.io/otel-collector:cpaas-system:cluster-admin created
+opentelemetrycollector.opentelemetry.io/otel created
+instrumentation.opentelemetry.io/acp-common-java created
+servicemonitor.monitoring.coreos.com/otel-collector-monitoring created
+servicemonitor.monitoring.coreos.com/otel-collector created
+OpenTelemetry installation completed
+```
 
 ## 打开功能开关
 
@@ -114,3 +710,19 @@ TODO：
 TODO：
 
 介绍卸载组件的流程步骤。一般需要先删除组件的实例，然后删除组件的 Operator，最后删除组件的 CRD。
+
+```bash
+kubectl -n cpaas-system delete ingress jaeger-query
+kubectl -n cpaas-system delete podmonitor jaeger-monitor
+kubectl -n cpaas-system delete jaeger jaeger-prod
+kubectl -n cpaas-system delete secret jaeger-oauth2-proxy
+kubectl -n cpaas-system delete secret jaeger-elasticsearch-basic-auth
+kubectl -n cpaas-system delete configmap jaeger-oauth2-proxy
+#
+kubectl -n cpaas-system delete servicemonitor otel-collector-monitoring
+kubectl -n cpaas-system delete servicemonitor otel-collector
+kubectl -n cpaas-system delete instrumentation acp-common-java
+kubectl -n cpaas-system delete opentelemetrycollector otel
+kubectl delete clusterrolebinding otel-collector:cpaas-system:cluster-admin
+kubectl -n cpaas-system delete serviceAccount otel-collector
+```
