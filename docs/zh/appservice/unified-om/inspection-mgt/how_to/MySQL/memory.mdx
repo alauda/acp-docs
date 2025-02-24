@@ -1,0 +1,85 @@
+---
+weight: 20
+---
+
+# MySQL 内存使用优化
+
+MySQL 的关键指标之一是实例内存使用率和 buffer pool 命中率。内存使用率过高会增加 OOM 风险，而低 buffer pool 命中率则意味着大量数据页未命中 buffer pool 中缓存的数据页，需要从存储读取数据，从而增加 IO 吞吐和延迟。
+
+## 查看内存使用情况
+
+### 查看总内存使用情况
+
+```
+select * from sys.memory_global_total;
+```
+
+**注意**：受限于数据更新频率、缓存和内核等相关使用（此部分未统计），该语句可以反馈内存使用的大致情况。
+
+### 查看内存占用前 20 的事件
+
+```
+select event_name,CURRENT_NUMBER_OF_BYTES_USED/1024/1024
+from performance_schema.memory_summary_global_by_event_name
+order by CURRENT_NUMBER_OF_BYTES_USED desc LIMIT 20;
+```
+
+### 查看内存占用前 20 的线程
+
+```
+select thread_id,event_name,CURRENT_NUMBER_OF_BYTES_USED/1024/1024
+from performance_schema.memory_summary_by_thread_by_event_name
+order by CURRENT_NUMBER_OF_BYTES_USED desc limit 20;
+```
+
+### 查看当前分配内存
+
+```
+select substring_index(event_name,'/',2) as code_area, format_bytes(sum(current_alloc)) as current_alloc
+from sys.x$memory_global_by_current_bytes
+group by substring_index(event_name,'/',2)
+order by sum(current_alloc) DESC;
+```
+
+## 内存使用优化建议
+
+### 多语句（multiple statements）
+
+MySQL 支持使用半角分号 `;` 将多个 SQL 语句分隔开，一起发送给 MySQL，并逐条处理。但某些内存需要等待所有 SQL 执行结束才能释放。
+
+如果一次性发送的 SQL 非常多，比如达到数百兆，那么在 SQL 执行过程中，各种对象的分配和累积消耗的内存非常大，可能会导致 MySQL 进程内存耗尽。
+
+此外，使用多语句方式发送 SQL 会导致网络流量突增，可以通过网络流量监控和 SQL 洞察来判断是否存在这种情况。因此，在业务实现中，建议尽量避免使用多语句的 SQL 发送方式。
+
+### 缓冲池（buffer pool）问题
+
+所有表的数据页都存放在缓冲池中，查询执行的时如果需要的数据页直接命中缓冲池，就不会发生物理 I/O，SQL 执行的效率较高，缓冲池采用 LRU 算法管理数据页，所有的脏页放到 Flush List 链表中。
+
+在拥有大量内存的系统上，InnoDB Buffer Pool 的内存在实例内存中通常是最大的。可以通过修改 innodb_buffer_pool_instances参数将缓冲池划分为多个缓冲池实例，提高并发性能。
+
+Buffer pool 相关的常见问题及优化建议如下表所示。
+
+| 问题现象 | 原因或建议 |
+| --- | --- |
+| **数据页预热不足导致查询延迟较高** | 通常发生在实例重启、冷数据读取或缓冲池命中率较低的场景。建议采用升级实例规格或提前预热数据的方式来解决。 |
+| **脏页累积过多** | 当未刷新脏页过多时，会触发后台线程同步刷新脏页，导致实例性能严重下降。解决方法包括均衡写入负载、避免写入吞吐过高、调整刷新脏页参数或升级实例规格等。 |
+| **全表扫描污染 buffer pool** | 尽量避免全表扫描，例如避免使用 `select * from 大表` 的语句，以减少对 buffer pool 的污染。|
+
+### 临时表
+
+MySQL 中使用内存临时表时，其大小受到 tmp_table_size 和 max_heap_table_size 参数的限制。内存临时表的超出了参数限制，将被转化为磁盘临时表。如果在短时间内有大量连接创建大量内存临时表，可能会导致内存使用量急剧增加。
+
+MySQL 8.0 引入了新的 temptable engine。这个引擎要求所有线程分配的内存临时表大小之和必须小于参数 temptable_max_ram，而 temptable_max_ram 的默认值为 1GB。内存临时表超出这个限制后，将会被转换为磁盘临时表。
+
+### 集群通信缓存
+
+当使用 MGR (MySQL Group Replication) 组成集群时，还需要考虑 XCom Cache 通信缓存的消耗。默认情况下，该缓存大小为 1GB。在网络质量较好的环境下，可以使用较低的 group_replication_message_cachesize 参数来创建集群，从而减少内存的使用。
+
+### 其他
+
+当实例内的表数量特别多或者查询频率非常高时，Table Cache 也会消耗大量内存。建议在实例中避免创建过多的表，或者将参数table_open_cache 设置为适当的大小。
+
+AHI（自适应哈希索引）默认占用 Buffer Pool 的 1/64 的内存。如果查询或写入大量的 blob 大字段，将会动态分配内存，从而增加内存使用量。禁用 AHI 可以更有效和合理地利用服务器的内存资源，为业务系统释放更多可用内存，从而提高整体性能。但是，需要注意的是，AHI 还具有加速特定查询的功能，因此禁用时需要权衡查询性能收益与内存优化之间的平衡。
+
+如果 MySQL 实例的内存使用率异常增加或者内存耗尽，建议查阅 [MySQL 5.7 官方文档](https://dev.mysql.com/doc/refman/5.7/en/optimizing-innodb-diskio.html) 或 [MySQL 8.0 官方文档](https://dev.mysql.com/doc/refman/8.0/en/optimizing-innodb-diskio.html) ，以排查导致内存增加的原因。
+
