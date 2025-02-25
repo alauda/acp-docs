@@ -14,3 +14,5 @@ $ yarn install
 * `yarn dev`: 启动本地开发服务器，文件修改将实时更新。(**注意：** 左导航栏相关修改需要重启服务)
 * `yarn build`: 构建生产环境代码，构建完成后会在 `dist` 目录生成静态文件
 * `yarn serve`: 本地预览构建后的静态文件
+* `yarn info @alauda/doom`: 查看 doom 版本
+* `yarn up @alauda/doom`: 升级 doom 版本
