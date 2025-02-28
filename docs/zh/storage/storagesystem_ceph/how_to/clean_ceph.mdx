@@ -1,0 +1,230 @@
+---
+weight: 10
+---
+
+
+# 分布式存储服务资源清理
+
+
+
+如果需要删除 rook-ceph 集群，重新部署一个新的集群，需要按照本文依次清理分布式存储服务相关资源。
+
+## 注意事项
+
+在清理 rook-ceph 之前，请保证所有使用 Ceph 存储的 PVC、PV 资源已被删除。
+
+## 删除快照类
+
+1. 删除快照类。
+
+    ```
+    kubectl delete VolumeSnapshotClass csi-cephfs-snapshotclass csi-rbd-snapshotclass
+    ```
+    
+2. 验证快照类清理是否完毕。
+
+    ```
+    kubectl get VolumeSnapshotClass |grep csi-cephfs-snapshotclass
+    kubectl get VolumeSnapshotClass |grep csi-rbd-snapshotclass
+    ```
+    当该命令没有任何输出时，表示清理完毕。
+    
+
+## 删除存储类
+
+1. 进入 **平台管理**。
+
+1. 在左侧导航栏中，单击 **存储管理** > **存储类**。
+
+2. 单击 ⋮ > **删除**，删除所有使用 Ceph 存储方案的存储类。
+
+## 删除存储池
+
+此步骤要在上个步骤清理完毕之后执行。
+
+1. 进入 **平台管理**。
+
+1. 在左侧导航栏中，单击 **存储管理** > **分布式存储**。
+
+2. 在 **存储池区域**，单击 ⋮ > **删除**，逐个删除所有存储池。当存储池区域显示 **无存储池** 时，说明存储池删除成功。
+
+
+3. （可选）若集群模式为 **延伸**，还需在集群的 Master 节点上执行下述命令删除创建的内置存储池。
+
+    ```
+    kubectl -n rook-ceph delete cephblockpool -l cpaas.io/builtin=true
+    ```
+    
+    回显信息：
+    
+    ```
+    cephblockpool.ceph.rook.io "builtin-mgr" deleted
+    ```
+
+## 删除 ceph-cluster
+
+此步骤要在上个步骤清理完毕之后执行。
+
+1. 更新 ceph-cluster，开启清理策略。
+
+    ```
+    kubectl -n rook-ceph patch cephcluster ceph-cluster --type merge -p '{"spec":{"cleanupPolicy":{"confirmation":"yes-really-destroy-data"}}}'
+    ```
+
+1. 删除 ceph-cluster。
+
+
+    ```
+    kubectl delete cephcluster ceph-cluster -n rook-ceph
+    ```
+
+2. 删除执行清理工作的 Job。
+    
+    ```
+    kubectl delete jobs --all -n rook-ceph
+    ```
+
+2. 验证 ceph-cluster 清理是否完毕。
+
+
+    ``` 
+    kubectl get cephcluster  -n rook-ceph | grep ceph-cluster
+    ```
+
+    当该命令没有任何输出时，表示清理完毕。
+
+## 删除 rook-operator
+
+此步骤要在上个步骤清理完毕之后执行。
+
+1. 删除 rook-operator。
+
+    ```
+    kubectl -n rook-ceph delete subscriptions.operators.coreos.com rook-operator
+    ```
+
+2. 验证 rook-operator 清理是否完毕。
+    
+    ```
+    kubectl get subscriptions.operators.coreos.com -n rook-ceph | grep rook-operator
+    ```
+    
+    当该命令没有任何输出时，表示清理完毕。
+    
+2. 验证 ConfigMap 是否清理完毕。
+
+    ```
+    kubectl get configmap -n rook-ceph
+    ```
+    当该命令没有任何输出时，表示清理完毕，若有输出结果，请执行如下命令清理，请使用实际输出结果替换 `<configmap>`。
+    
+    ```
+    kubectl -n rook-ceph patch configmap <configmap> --type merge -p '{"metadata":{"finalizers": []}}'
+    ```
+
+3. 验证 Secret 是否清理完毕。
+
+    ```
+    kubectl get secret -n rook-ceph
+    ```
+    当该命令没有任何输出时，表示清理完毕，若有输出结果，请执行如下命令清理，请使用实际输出结果替换 `<secret>`。
+    
+    ```
+    kubectl -n rook-ceph patch secrets <secret> --type merge -p '{"metadata":{"finalizers": []}}'
+    ```
+ 
+
+3. 验证 rook-ceph 清理是否完毕。
+
+    ```
+    kubectl get all -n rook-ceph
+    ```
+    当该命令没有任何输出时，表示清理完毕。
+   
+
+## 执行清理脚本
+
+上述步骤都完成后，代表 kubernetes 和 ceph 相关的资源已经清空，接下来需清空 rook-ceph 在宿主机里的残留。
+
+### 清理脚本
+
+清理脚本 clean-rook.sh 的内容如下：
+
+```shell
+#!/bin/bash
+
+DISK="$1"
+
+if [ ! -n "$DISK" ]
+then
+   echo "you must input block dev"
+   exit
+else
+   echo "are you sure to clean device: $DISK ? yes/no"
+   read ANSWER
+   case $ANSWER in
+     [Yy]*)
+     echo " you input is y or Y !"
+     ;;
+     [Nn]*)
+     echo " you input a "$ANSWER
+     exit
+     ;;
+   esac
+fi
+
+echo "clean /var/lib/rook"
+rm -rf /var/lib/rook
+
+
+echo "clean block dev"
+
+# fdisk 重建分区表并添加分区，中间空行不可删除
+echo "g
+n
+
+
+
+w" |sudo fdisk $DISK
+
+
+# Zap the disk to a fresh, usable state (zap-all is important, b/c MBR has to be clean)
+# You will have to run this step for all disks.
+sgdisk --zap-all $DISK
+
+# Clean hdds with dd
+dd if=/dev/zero of="$DISK" bs=1M count=100 oflag=direct,dsync
+
+
+# Clean disks such as ssd with blkdiscard instead of dd
+blkdiscard $DISK
+
+# These steps only have to be run once on each node
+# If rook sets up osds using ceph-volume, teardown leaves some devices mapped that lock the disks.
+ls /dev/mapper/ceph-* | xargs -I% -- dmsetup remove %
+
+# ceph-volume setup can leave ceph-<UUID> directories in /dev (unnecessary clutter)
+rm -rf /dev/ceph-*
+```
+
+### 注意事项
+
+清理脚本依赖 sgdisk 命令，执行清理脚本前，请务必确认已安装 sgdisk。
+
+* Ubuntu 安装命令：`sudo apt install gdisk`
+* RedHat 或 CentOS 安装命令：`sudo yum install gdisk`
+
+### 操作步骤
+
+1. 在部署分布式存储的业务集群的每一台机器上执行清理脚本 clean-rook.sh。
+
+    ```
+    sh clean-rook.sh /dev/[设备名称]
+    ```
+
+    示例：`sh clean-rook.sh /dev/vdb`
+
+    执行时将提示是否真正清空该设备，确认无误后，输入 yes 即可开始清理。
+    
+2. 使用 `lsblk -f` 命令检查分区信息，当该命令的输出中 `FSTYPE` 列为空时，表示清理完毕。
+

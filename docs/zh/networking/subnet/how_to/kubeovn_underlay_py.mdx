@@ -1,0 +1,115 @@
+---
+weight: 10
+---
+
+# 准备 Kube-OVN Underlay 物理网络
+
+Kube-OVN Underlay 传输方式下容器网络需要依赖物理网络支持，在部署 Kube-OVN Underlay 网络前，请事先和网络管理员共同规划并完成物理网络的相关配置，确保网络连通性。
+
+## 使用说明
+
+Kube-OVN Underlay 需要多网卡部署，且 Underlay 子网必须独占一张网卡。该网卡上不能有其他类型的流量，例如 SSH 等需要使用其他网卡。
+
+使用前请确保节点服务器至少为 **双网卡** 环境，网卡速率推荐使用 **至少 10 Gbps 及以上**（例如：10 Gbps、25 Gbps、40 Gbps）。
+
+* 网卡一：默认路由所在的网卡，配置 IP 地址，与外部交换机接口互联，且交换机接口的配置为 Access 模式。
+
+* 网卡二：非默认路由所在的网卡，并且没有配置 IP 地址，与外部交换机接口互联，且交换机接口的配置为 Trunk 模式。Underlay 子网独占网卡二。
+
+<img src="../assets/ovnunderlay.png" width="700" />
+
+## 名词解释
+
+VLAN（Virtual Local Area Network，虚拟局域网）是一种将局域网从逻辑上划分成一个个网段（或者说是更小的局域网 LAN），从而实现虚拟工作组的数据交换技术。
+
+VLAN 技术的出现，使得管理员可以根据实际应用需求，把同一物理局域网内的不同用户逻辑地划分成不同的广播域，每一个 VLAN 都包含一组有着相同需求的计算机工作站，与物理上形成的 LAN 有着相同的属性。由于它是从逻辑上划分，而不是从物理上划分，所以同一个 VLAN 内的各个工作站无需限制在同一个物理范围中，即这些工作站可以在不同物理 LAN 网段。
+
+VLAN 的主要优点：
+
+* 端口的分隔。即便在同一个交换机上，处于不同 VLAN 的端口也不能相互通信。一个物理的交换机可以当作多个逻辑的交换机使用。常用于控制网络中不同部门、不同站点之间的互相访问。
+
+* 网络的安全。不同 VLAN 不能直接通信，杜绝了广播信息的不安全性。一个 VLAN 内部的广播和单播流量均不会转发到其他 VLAN 中，从而有助于控制流量、减少设备投资、简化网络管理、提高网络的安全性。
+
+* 灵活的管理。更改用户所属的网络时无需更换端口和连线，只需更改软件配置即可。
+
+## 环境要求
+
+在 Underlay 模式下，Kube-OVN 会桥接一块物理网卡到 OVS 内，并将数据包直接通过该物理网卡对外发送，L2/L3 层面的转发能力需要依赖底层网络设备。需要预先在底层网络设备配置对应的网关、VLAN 和安全策略等配置。
+
+* **网络配置要求**
+
+    * Kube-OVN 启动容器时会通过 ICMP 协议检查网关的连通性，底层网关需要能够响应 ICMP 请求。
+
+    * 对于 Service 访问流量，Pod 会将数据包首先发送至网关，网关需要有能将数据包转发回本网段的能力。
+
+    * 当交换机或网桥开启了 Hairpin 功能时，需要 **关闭 Hairpin**。若使用 VMWare 虚拟机环境，则可直接将 VMWare 主机的 **Net.ReversePathFwdCheckPromisc** 置为 **1**，无需关闭 Hairpin。
+
+    * 桥接网卡 **不能** 为 **Linux Bridge**。
+
+    * 网卡绑定模式支持 Mode 0（balance-rr）、Mode 1（active-backup）、Mode 4（802.3ad）、Mode 6（balance-alb），推荐使用 0 或 1。其它绑定模式未经测试，请谨慎使用。
+
+* **IaaS（虚拟化）层配置要求**
+
+    * 对于 OpenStack 的 VM 环境，需要将对应网络端口的 **PortSecurity** 关闭。
+
+    * 对于 VMware 的 vSwitch 网络，需要将 **MAC 地址更改**（MAC Address Changes)、 **伪传输**（Forged Transmits） 和 **混杂模式**（Promiscuous Mode Operation）均设置为 **接受**。
+
+    * 对于公有云，例如 AWS、GCE、阿里云等由于不支持用户自定义 MAC 无法支持 Underlay 模式网络。
+
+## 配置示例
+
+本例中的节点服务器为双网卡物理机。其中网卡一为默认路由所在的网卡；网卡二非默认路由所在的网卡，且没有配置 IP 地址，供 Underlay 子网独占使用。网卡二与外部交换机的接口互联。
+
+
+
+* 交换机侧需要将连接网卡二的接口配置为 Trunk 模式，并允许对应的 VLAN 通过。
+
+* 在对应 vlan-interface 接口上配置集群子网的网关地址。如需双栈，可同时配置 IPv6 的网关地址。
+
+* 如果网关在防火墙上，需要放开 node 节点到 cluster-cidr 网络的访问。
+
+* 服务器网卡无需做任何配置。
+
+### 交换机配置
+
+配置 VLAN Interface 接口：
+
+```
+#
+interface Vlan-interface74
+  ip address 192.168.74.254 255.255.255.0   //IPv4 网关地址
+  ipv6 address 2074::192:168:74:254/64  //IPv6 网关地址
+#
+```
+
+配置与网卡二互联的接口：
+
+```
+#
+interface Ten-GigabitEthernet1/0/19
+  port link mode bridge
+  port link-type trunk  //配置接口为 Trunk 模式
+  undo port trunk permit vlan 1
+  port trunk permit vlan 74  //配置允许对应的 VLAN 通过
+#
+```
+### 检查网络连通性
+
+测试网卡二到网关地址是否可以正常通信：
+
+```
+ip link add ens224.74 link ens224 type vlan id 74  //网卡名称为 ens224，VLAN ID为 74
+ip link set ens224.74 up
+ip addr add 192.168.74.200/24 dev ens224.74  //在 Underlay 网段内选择一个测试地址，本例中为 192.168.74.200/24
+ping 192.168.74.254  //如果可以 Ping 通网关即证明物理环境满足部署要求
+ip addr del 192.168.74.200/24 dev ens224.74  //测试完成后需删除测试地址
+ip link del ens224.74  //测试完成后需删除子接口
+```
+
+### 平台配置
+
+在左侧导航栏中，单击 **集群管理 > 集群**，单击 **创建集群**，具体配置步骤请参考 [创建集群]() 文档，其中容器网络的配置如下图所示。
+
+**说明**：Join 子网在 Underlay 环境中无实际意义，主要用于后续创建 Overlay 子网，提供节点与容器组之间通信所需的 IP 地址段。
+
+<img src="../assets/ovnunderlayexample.png" width="700" />
