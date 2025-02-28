@@ -1,0 +1,309 @@
+---
+weight: 50
+---
+
+# 连接数据库实例
+
+本文档将指导您如何连接到 MySQL-MGR 数据库实例，包括集群内部和外部的访问方式。正确的连接方式对于应用程序与数据库的交互至关重要，本文将详细介绍各种连接方法及其适用场景。
+
+## 连接方式概述
+
+MySQL-MGR 提供了多种连接方式，以满足不同场景的需求：
+
+1. **集群内部连接**：适用于部署在同一 Kubernetes 集群内的应用程序。
+2. **集群外部连接**：适用于需要从集群外部访问数据库的场景。
+3. **读写分离连接**：通过不同的连接地址分别访问主节点和从节点。
+4. **直接 Pod 连接**：用于特定的运维和调试场景。
+
+## 集群内部连接
+
+### 使用服务名称连接
+
+在同一 Kubernetes 集群内的应用可以使用服务名称直接连接到 MySQL-MGR 实例：
+
+```
+<实例名称>-mysql.<命名空间>.svc.cluster.local
+```
+
+例如，对于名为 `my-mgr-instance` 的实例，部署在 `default` 命名空间，连接字符串为：
+
+```
+my-mgr-instance-mysql.default.svc.cluster.local:3306
+```
+
+### 使用环境变量连接
+
+Kubernetes 会为每个服务创建环境变量，应用程序可以使用这些环境变量连接到数据库：
+
+```
+${MYSQL_MGR_INSTANCE_MYSQL_SERVICE_HOST}:${MYSQL_MGR_INSTANCE_MYSQL_SERVICE_PORT}
+```
+
+### 示例代码
+
+以下是在 Java 应用中使用 JDBC 连接到 MySQL-MGR 的示例：
+
+```java
+String url = "jdbc:mysql://my-mgr-instance-mysql.default.svc.cluster.local:3306/mydb";
+String username = "root";
+String password = "yourpassword";
+
+try (Connection conn = DriverManager.getConnection(url, username, password)) {
+    // 执行数据库操作
+}
+```
+
+## 集群外部连接
+
+### 使用 NodePort 服务
+
+如果您配置了 NodePort 类型的服务，可以通过集群节点的 IP 和分配的端口访问数据库：
+
+```
+<节点IP>:<NodePort>
+```
+
+查看分配的 NodePort：
+
+```bash
+kubectl get svc my-mgr-instance-mysql -n default
+```
+
+### 使用 LoadBalancer 服务
+
+如果您配置了 LoadBalancer 类型的服务，可以通过负载均衡器的 IP 或域名访问数据库：
+
+```
+<LoadBalancer IP/域名>:3306
+```
+
+查看负载均衡器的 IP：
+
+```bash
+kubectl get svc my-mgr-instance-mysql-external -n default
+```
+
+### 使用 Ingress 控制器
+
+对于 HTTP/HTTPS 服务，可以使用 Ingress 控制器提供访问。但由于 MySQL 使用 TCP 协议，通常需要配置 TCP 代理：
+
+```bash
+# 配置 TCP 代理的 ConfigMap
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+meta
+  name: tcp-services
+  namespace: ingress-nginx
+data:
+  3306: "default/my-mgr-instance-mysql:3306"
+EOF
+```
+
+然后通过 Ingress 控制器的 IP 或域名访问：
+
+```
+<Ingress IP/域名>:3306
+```
+
+## 读写分离连接
+
+MySQL-MGR 支持读写分离，可以通过不同的连接地址分别访问主节点和从节点：
+
+### 写操作连接（主节点）
+
+使用主服务连接地址进行写操作：
+
+```
+my-mgr-instance-mysql-primary.default.svc.cluster.local:3306
+```
+
+### 读操作连接（从节点）
+
+使用只读服务连接地址进行读操作：
+
+```
+my-mgr-instance-mysql-secondary.default.svc.cluster.local:3306
+```
+
+### 配置应用程序实现读写分离
+
+以下是使用 Spring Boot 配置读写分离的示例：
+
+```yaml
+spring:
+  datasource:
+    primary:
+      url: jdbc:mysql://my-mgr-instance-mysql-primary.default.svc.cluster.local:3306/mydb
+      username: root
+      password: yourpassword
+    secondary:
+      url: jdbc:mysql://my-mgr-instance-mysql-secondary.default.svc.cluster.local:3306/mydb
+      username: root
+      password: yourpassword
+```
+
+## 直接 Pod 连接
+
+在某些运维和调试场景下，可能需要直接连接到特定的数据库 Pod：
+
+```bash
+kubectl exec -it my-mgr-instance-mysql-0 -n default -- mysql -u root -p
+```
+
+或者使用端口转发：
+
+```bash
+kubectl port-forward my-mgr-instance-mysql-0 3307:3306 -n default
+```
+
+然后在本地连接：
+
+```bash
+mysql -h 127.0.0.1 -P 3307 -u root -p
+```
+
+## 连接安全性配置
+
+### 启用 SSL 连接
+
+为了保障数据传输安全，建议启用 SSL 连接：
+
+1. 检查 SSL 是否已启用：
+
+```
+SHOW VARIABLES LIKE '%ssl%';
+```
+
+2. 在连接字符串中启用 SSL：
+
+```
+jdbc:mysql://my-mgr-instance-mysql.default.svc.cluster.local:3306/mydb?useSSL=true&requireSSL=true
+```
+
+### 配置网络策略
+
+使用 Kubernetes 网络策略限制数据库访问：
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+meta
+  name: mysql-mgr-network-policy
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: my-mgr-instance
+      app.kubernetes.io/name: mysql
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: my-application
+    ports:
+    - protocol: TCP
+      port: 3306
+```
+
+## 连接故障排查
+
+### 连接超时
+
+如果遇到连接超时问题，可以检查：
+
+1. 服务是否正常运行：
+
+```bash
+kubectl get svc my-mgr-instance-mysql -n default
+```
+
+2. Pod 是否正常运行：
+
+```bash
+kubectl get pods -l app.kubernetes.io/instance=my-mgr-instance -n default
+```
+
+3. 网络策略是否限制了连接：
+
+```bash
+kubectl get networkpolicy -n default
+```
+
+### 认证失败
+
+如果遇到认证失败问题，可以检查：
+
+1. 用户名和密码是否正确
+2. 用户是否有权限从当前主机连接
+
+可以通过以下命令查看用户权限：
+
+```
+SELECT user, host FROM mysql.user WHERE user = 'your_user';
+```
+
+### 连接数限制
+
+如果遇到"Too many connections"错误，可以检查和调整最大连接数：
+
+```
+SHOW VARIABLES LIKE 'max_connections';
+```
+
+## 连接池配置
+
+为了提高连接效率和管理连接资源，建议在应用程序中使用连接池：
+
+### HikariCP (Java)
+
+```java
+HikariConfig config = new HikariConfig();
+config.setJdbcUrl("jdbc:mysql://my-mgr-instance-mysql.default.svc.cluster.local:3306/mydb");
+config.setUsername("root");
+config.setPassword("yourpassword");
+config.setMaximumPoolSize(10);
+config.setMinimumIdle(5);
+config.setIdleTimeout(30000);
+config.setConnectionTimeout(10000);
+
+HikariDataSource dataSource = new HikariDataSource(config);
+```
+
+### 连接池最佳实践
+
+1. **合理设置池大小**：通常设置为 `核心数 * 2 + 有效磁盘数`
+2. **设置连接超时**：避免长时间等待无法获取的连接
+3. **设置最大生命周期**：定期刷新连接，避免使用过期连接
+4. **启用连接测试**：在使用前测试连接是否有效
+
+## 多应用共享数据库
+
+当多个应用需要共享同一个 MySQL-MGR 实例时，建议采用以下最佳实践：
+
+1. **为每个应用创建独立的数据库**：
+
+```
+CREATE DATABASE app1_db;
+CREATE DATABASE app2_db;
+```
+
+2. **为每个应用创建独立的用户并限制权限**：
+
+```
+CREATE USER 'app1_user'@'%' IDENTIFIED BY 'password1';
+GRANT ALL PRIVILEGES ON app1_db.* TO 'app1_user'@'%';
+
+CREATE USER 'app2_user'@'%' IDENTIFIED BY 'password2';
+GRANT ALL PRIVILEGES ON app2_db.* TO 'app2_user'@'%';
+```
+
+3. **在应用配置中使用各自的连接信息**
+
+## 后续步骤
+
+成功连接到 MySQL-MGR 实例后，您可以进一步：
+
+- [参数配置](./parameter_config.mdx)：优化数据库参数配置
+- [管理数据库对象](../manage-database/intro.mdx)：创建和管理数据库、表和用户
+- [监控数据库](../manage-database/intro.mdx)：监控数据库性能和健康状态

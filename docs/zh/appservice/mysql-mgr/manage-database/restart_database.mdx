@@ -1,0 +1,228 @@
+---
+weight: 40
+---
+
+# 重启数据库实例
+
+本文档将指导您如何通过命令行界面（CLI）重启 MySQL-MGR 数据库实例。重启操作可以解决某些临时性问题，应用配置更改，或作为常规维护的一部分。
+
+## 功能简介
+
+重启数据库实例是一种常见的管理操作，它会暂时中断数据库服务，然后重新启动服务，使其恢复可用状态。与完全停止再启动相比，重启通常更快速，且能保持实例的配置和连接信息不变。
+
+重启功能在以下场景中特别有用：
+- 应用某些配置更改，如需要重启才能生效的参数修改
+- 解决临时性的性能问题或连接问题
+- 清理系统资源，如内存碎片或临时文件
+- 作为故障排除的一部分，重置数据库服务状态
+
+## 主要功能
+
+- **重启单个实例**：重启指定的 MySQL-MGR 实例
+- **滚动重启**：逐个重启集群中的节点，最小化服务中断
+- **强制重启**：在常规重启失败时，强制重启实例
+- **监控重启进度**：跟踪重启过程的状态和进度
+
+## 功能优势
+
+- **快速恢复**：比完全停止再启动更快速地恢复服务
+- **保留配置**：保持实例的配置和连接信息不变
+- **解决临时问题**：有效解决某些临时性的性能或连接问题
+- **应用配置更改**：使需要重启才能生效的配置更改生效
+
+## 重启数据库实例
+
+### 查看实例状态
+
+在重启实例前，先检查实例的当前状态：
+
+```bash
+kubectl get cluster mysql-mgr-instance -n default
+```
+
+确保实例处于 `Running` 状态。
+
+### 重启单个实例
+
+使用以下命令重启指定的 MySQL-MGR 实例：
+
+```bash
+kubectl rollout restart statefulset mysql-mgr-instance-mysql -n default
+```
+
+参数说明：
+
+| 参数 | 描述 |
+|------|------|
+| `mysql-mgr-instance-mysql` | 要重启的实例 StatefulSet 名称 |
+| `default` | 实例所在的命名空间 |
+
+### 监控重启进度
+
+重启命令发出后，您可以监控重启进度：
+
+```bash
+kubectl rollout status statefulset mysql-mgr-instance-mysql -n default
+```
+
+您还可以查看 Pod 的状态变化：
+
+```bash
+kubectl get pods -l app.kubernetes.io/instance=mysql-mgr-instance -n default -w
+```
+
+### 验证实例已重启
+
+使用以下命令验证实例是否已成功重启：
+
+```bash
+kubectl get pods -l app.kubernetes.io/instance=mysql-mgr-instance -n default
+```
+
+所有 Pod 应显示为 `Running` 状态，并且 `AGE` 列应显示较短的时间，表明 Pod 是新创建的。
+
+您还可以检查数据库的启动时间：
+
+```bash
+kubectl exec -it mysql-mgr-instance-mysql-0 -n default -- mysql -u root -p -e "SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME='UPTIME'"
+```
+
+### 滚动重启集群
+
+对于 MySQL-MGR 集群，建议使用滚动重启方式，逐个重启节点，以最小化服务中断：
+
+```bash
+for i in $(seq 0 2); do
+  echo "Restarting node $i..."
+  kubectl delete pod mysql-mgr-instance-mysql-$i -n default
+  kubectl wait --for=condition=Ready pod/mysql-mgr-instance-mysql-$i -n default --timeout=300s
+  echo "Node $i restarted successfully."
+  # 等待一段时间，确保节点完全恢复并同步
+  sleep 60
+done
+```
+
+这个脚本会逐个删除 Pod，Kubernetes 会自动创建新的 Pod 来替代被删除的 Pod。脚本会等待每个 Pod 恢复到 Ready 状态，然后再继续下一个 Pod。
+
+### 强制重启
+
+如果常规重启方法失败，您可以尝试强制重启：
+
+```bash
+kubectl delete pods -l app.kubernetes.io/instance=mysql-mgr-instance -n default --force --grace-period=0
+```
+
+**警告**：强制重启可能导致数据不一致或损坏。仅在常规方法失败且已备份数据的情况下使用。
+
+## 重启特定节点
+
+在某些情况下，您可能只需要重启集群中的特定节点：
+
+### 重启主节点
+
+1. 首先，确定当前的主节点：
+
+```bash
+kubectl exec -it mysql-mgr-instance-mysql-0 -n default -- mysql -u root -p -e "SELECT MEMBER_HOST FROM performance_schema.replication_group_members WHERE MEMBER_ROLE='PRIMARY'"
+```
+
+2. 重启主节点（假设主节点是 mysql-mgr-instance-mysql-0）：
+
+```bash
+kubectl delete pod mysql-mgr-instance-mysql-0 -n default
+```
+
+**注意**：重启主节点会触发主节点切换，可能导致短暂的写入服务中断。
+
+### 重启从节点
+
+重启从节点通常对服务影响较小：
+
+```bash
+kubectl delete pod mysql-mgr-instance-mysql-1 -n default
+```
+
+## 使用限制与注意事项
+
+在使用重启功能时，请注意以下限制和注意事项：
+
+### 重启的影响
+
+- **服务中断**：重启实例会导致短暂的服务中断，所有连接到该实例的应用将暂时无法访问数据库。
+- **连接处理**：重启操作会关闭所有现有连接，正在执行的查询可能会失败。
+- **主节点切换**：在 MySQL-MGR 集群中，重启主节点可能触发主节点切换。
+- **数据一致性**：在极少数情况下，不正常的重启可能导致数据不一致，需要进行恢复操作。
+
+### 最佳实践
+
+- **计划维护窗口**：在业务低峰期执行重启操作。
+- **提前通知**：在执行操作前通知相关团队，以便他们做好准备。
+- **验证备份**：在重启重要实例前，确保有最新的备份可用。
+- **使用滚动重启**：对于多节点集群，使用滚动重启方式，逐个重启节点，以最小化服务中断。
+- **监控重启过程**：重启实例后，监控数据库日志以确保正常启动。
+- **测试应用连接**：实例重启后，测试应用程序是否能够正常连接和操作。
+
+## 常见问题处理
+
+### 实例重启后无法启动
+
+如果实例重启后无法正常启动，可能的原因和解决方法：
+
+1. **配置错误**：
+   ```bash
+   kubectl logs mysql-mgr-instance-mysql-0 -n default
+   ```
+   检查数据库日志，查找可能的配置错误。
+
+2. **资源不足**：
+   ```bash
+   kubectl describe nodes
+   ```
+   检查集群资源是否充足。
+
+3. **数据损坏**：
+   ```bash
+   kubectl exec -it mysql-mgr-instance-mysql-0 -n default -- mysqlcheck -u root -p --all-databases
+   ```
+   检查数据库表是否损坏，必要时进行修复。
+
+### 重启后主从复制中断
+
+如果重启后发现主从复制中断，可能的原因和解决方法：
+
+1. **检查复制状态**：
+   ```bash
+   kubectl exec -it mysql-mgr-instance-mysql-0 -n default -- mysql -u root -p -e "SELECT * FROM performance_schema.replication_group_members"
+   ```
+   检查所有节点的复制状态。
+
+2. **重新加入节点**：
+   如果某个节点未正确加入复制组，可能需要手动重新加入：
+   ```bash
+   kubectl exec -it mysql-mgr-instance-mysql-1 -n default -- mysql -u root -p -e "STOP GROUP_REPLICATION; START GROUP_REPLICATION"
+   ```
+
+### 应用程序连接问题
+
+如果重启后应用程序无法连接到数据库，可能的原因和解决方法：
+
+1. **服务未就绪**：
+   ```bash
+   kubectl get svc mysql-mgr-instance-mysql -n default
+   ```
+   检查服务是否正常运行。
+
+2. **连接池未刷新**：
+   应用程序可能需要重新初始化连接池。
+
+3. **网络问题**：
+   ```bash
+   kubectl run mysql-client --rm -it --image=mysql:8.0 -- mysql -h mysql-mgr-instance-mysql -u root -p
+   ```
+   测试从集群内部连接数据库。
+
+## 后续步骤
+
+成功重启 MySQL-MGR 实例后，您可以进一步：
+
+- [参数配置](../config-database/parameter_config.mdx)：调整数据库参数配置
