@@ -1,0 +1,159 @@
+---
+weight: 50
+---
+
+# 虚拟机克隆
+
+虚拟机克隆是指创建一个虚拟机当前时间点的副本，克隆的虚拟机包含原始虚拟机的所有配置、操作系统、应用程序和数据。
+
+## 前提条件
+
+* 若需使用虚拟机克隆功能，其磁盘必须使用支持快照功能的存储类。虚拟机快照中保存了虚拟机当下的状态，一旦发生意外故障，可用于将虚拟机恢复到该时间点的状态。
+
+* 在需要执行脚本的节点上安装 jq 包。其中，jq 是一个轻量级的命令行 JSON 处理工具，用于解析和处理 JSON 数据。
+
+## 操作步骤
+
+**注意**：下述所有操作需在虚拟机所在集群的 master 节点上执行。
+
+1. 打开 CLI 工具。
+
+2. 执行下述命令创建并打开 vm-clone.sh 文件。
+
+    ```
+    vi vm-clone.sh
+    ```
+    
+3. 键入 `i`，将如下内容复制到 vm-clone.sh 文件中。
+
+    ```
+    #!/bin/bash
+     
+    vm_clone() {
+      NAMESPACE=$1
+      VM_NAME=$2
+      VM_CLONE_NAME=$3
+     
+      cat <<EOF | kubectl create -f -
+    kind: VirtualMachineClone
+    apiVersion: clone.kubevirt.io/v1alpha1
+    metadata:
+      name: clone-$VM_NAME
+      namespace: $NAMESPACE
+    spec:
+      source:
+        apiGroup: kubevirt.io
+        kind: VirtualMachine
+        name: $VM_NAME
+      target:
+        apiGroup: kubevirt.io
+        kind: VirtualMachine
+        name: $VM_CLONE_NAME
+      labelFilters:
+        - "*"
+        - "!ovn.kubernetes.io/*"
+      annotationFilters:
+        - "*"
+        - "!ovn.kubernetes.io/*"
+      template:
+        labelFilters:
+          - "*"
+          - "!ovn.kubernetes.io/*"
+        annotationFilters:
+          - "*"
+          - "!ovn.kubernetes.io/*"
+    EOF
+     
+      if [ $? -eq 0 ]; then
+        echo "Create vmclone resource Succeeded"
+      else
+        echo "Create vmclone resource failed"
+        exit 1
+      fi
+     
+      echo "Waiting for vm clone completion"
+      while true; do
+        phase=$(kubectl -n $NAMESPACE get vmclone clone-$VM_NAME -o jsonpath='{.status.phase}')
+        if [ "$phase" == "Succeeded" ]; then
+          break
+        elif [ "$phase" == "Failed" ]; then
+          echo "VirtualMachineClone resource pahse is Failed"
+          exit 1
+        fi
+        sleep 5
+      done
+      echo "vm clone completion"
+     
+      dvList=$(kubectl -n $NAMESPACE get vm $VM_CLONE_NAME -o jsonpath='{.spec.template.spec.volumes}' | jq . | grep restore- | grep name | awk '{print $2}')
+     
+      for dv in $dvList; do
+        kubectl -n $NAMESPACE label --overwrite dv $(echo $dv | sed 's/"//g') vm.cpaas.io/used-by=$VM_CLONE_NAME
+        if [ $? -ne 0 ]; then
+          echo "update DV label failed"
+          exit 1
+        fi
+      done
+     
+      pvcList=$(kubectl -n $NAMESPACE get vm $VM_CLONE_NAME -o jsonpath='{.spec.template.spec.volumes}' | jq . | grep restore- | grep claimName | awk '{print $2}')
+     
+      for pvc in $pvcList; do
+        kubectl -n $NAMESPACE label --overwrite pvc $(echo $pvc | sed 's/"//g') vm.cpaas.io/used-by=$VM_CLONE_NAME
+        if [ $? -ne 0 ]; then
+          echo "update PVC label failed"
+          exit 1
+        fi
+      done
+    }
+     
+    if [ $# -ne 3 ]; then
+      echo "error: parameters error"
+      echo "Usage: ./vm-clone.sh NAMESPACE VM_NAME VM_CLONE_NAME"
+      exit 1
+    fi
+     
+    # exec vm clone
+    vm_clone "$1" "$2" "$3"
+    ```
+
+3. 键入 `shift+:wq`，保存文件。
+
+4. 执行下述命令为 vm-clone.sh 文件增加执行权限。
+
+    ```
+    chmod +x vm-clone.sh
+    ```
+
+5. 执行下述命令，运行脚本文件。\{#clone}
+
+    ```
+    ./vm-clone.sh <NAMESPACE> <VM_NAME> <VM_CLONE_NAME>
+    ```
+    参数说明：
+    * **NAMESPACE**：填写需要克隆的虚拟机所在的命名空间，使用此命名空间替换 \<NAMESPACE> 部分。
+    * **VM_NAME**：填写需要克隆的虚拟机的名称，使用此名称替换 \<VM_NAME> 部分。
+    * **VM_CLONE_NAME**：填写克隆后的虚拟机名称，使用此名称替换 \<VM_CLONE_NAME> 部分。
+    
+6. 当出现类似下述回显信息则表示已经克隆完成。
+
+    ```
+    virtualmachineclone.clone.kubevirt.io/clone-k1 created
+    Create vmclone resource Succeeded
+    Waiting for vm clone completion
+    vm clone completion
+    datavolume.cdi.kubevirt.io/restore-e8ff0e7b-dc7e-4140-aec7-8556cfcf4533-rootfs labeled
+    datavolume.cdi.kubevirt.io/restore-e8ff0e7b-dc7e-4140-aec7-8556cfcf4533-1 labeled
+    ```
+
+## 相关操作
+
+### 查看并启动克隆的虚拟机
+
+1. 进入 **平台管理**。
+
+1. 在左侧导航栏中，单击 **虚拟化管理** > **虚拟机镜像**。
+
+4. 可以看到在 [运行脚本](#clone) 步骤中指定名称的克隆虚拟机，克隆后的虚拟机默认状态为 **停止**。
+
+5. 单击此虚拟机名称，页面跳转至 Container Platform 的虚拟机详情页面。
+
+5. 单击 **启动**，虚拟机启动成功。
