@@ -1,0 +1,132 @@
+---
+weight: 10
+sourceSHA: 3d791c547ee8bff0e3592416035cefeed5ee2724f1f110bea063d072f76dd378
+---
+
+# Pod Migration and Recovery from Abnormal Shutdown of Virtual Machine Nodes
+
+## Problem Description
+
+Whether the node is **gracefully shut down** or experiences an **abnormal crash**, the virtual machine Pods running on that node will not automatically migrate to other healthy nodes.
+
+## Cause Analysis
+
+The platform implements a virtual machine solution based on the open-source component KubeVirt. However, from the perspective of KubeVirt, it cannot differentiate between an actual virtual machine crash and a connection failure caused by network or other issues. If virtual machines are migrated to other nodes indiscriminately, it may lead to multiple instances of the same virtual machine existing concurrently.
+
+## Solutions
+
+When maintaining virtual machine nodes, manual actions are required according to this document. For both **graceful shutdown** and **abnormal crash** situations, virtual machine Pods must be manually evicted or forcibly deleted.
+
+**Note**: The following commands must be executed on the Master node of the corresponding cluster.
+
+### Migration of Virtual Machine Pods during Graceful Shutdown
+
+1. In the CLI tool, execute the following command to obtain node information. The `NAME` field in the returned information is the `Node-Name`.
+
+   ```
+   kubectl get nodes
+   ```
+
+   Output:
+
+   ```
+   NAME             STATUS   ROLES                  AGE   VERSION
+   1.1.1.211   Ready    control-plane,master   99d   v1.28.8
+   ```
+
+2. (Optional) Execute the following command to view the virtual machine instances under the node.
+
+   ```
+   kubectl get vmis --all-namespaces -o wide | grep <Node-Name>  # Replace <Node-Name> in the command with the Node-Name obtained in step 1
+   ```
+
+   Output:
+
+   ```
+   test-test         vm-t-export-clone   13d     Running      1.1.1.1   1.1.1.211   True    False   
+   ```
+
+3. Before the graceful shutdown, execute the following command to evict all virtual machine Pods on the node to be shut down. If the output appears as follows, it indicates that the eviction was successful.
+
+   ```
+   kubectl drain <Node-Name> --delete-local-data --ignore-daemonsets=true --force --pod-selector=kubevirt.io=virt-launcher   # Replace <Node-Name> in the command with the Node-Name of the node to be shut down
+   ```
+
+   Output:
+
+   ```
+   Flag --delete-local-data has been deprecated, This option is deprecated and will be deleted. Use --delete-emptydir-data.
+   node/1.1.1.211 cordoned
+   evicting pod test-test/virt-launcher-vm-t-export-clone-hmnkk
+   pod/virt-launcher-vm-t-export-clone-hmnkk evicted
+   node/1.1.1.211 drained
+   ```
+
+4. After all virtual machines are started on other nodes, shut down the node.
+
+5. After the node is shut down and rebooted, execute the following command to mark the node as schedulable.
+
+   ```
+   kubectl uncordon <Node-Name> # Replace <Node-Name> in the command with the Node-Name of the shut down and rebooted node
+   ```
+
+   Output:
+
+   ```
+   node/1.1.1.211 uncordoned
+   ```
+
+6. At this point, the original virtual machine instances on that node have been migrated to other healthy nodes, and this node is now available for new Pod scheduling after rebooting.
+
+### Recovery from Abnormal Shutdown
+
+1. In the CLI tool, execute the following command to obtain node information. The `NAME` field in the returned information is the `Node-Name`.
+
+   ```
+   kubectl get nodes
+   ```
+
+   Output:
+
+   ```
+   NAME             STATUS   ROLES                  AGE   VERSION
+   1.1.1.211   Ready    control-plane,master   99d   v1.28.8
+   ```
+
+2. Execute the following command to forcibly delete all virtual machine Pods on the node.
+
+   ```
+   kubectl get po -A -l kubevirt.io=virt-launcher -o wide | grep <Node-Name> | awk '{print "kubectl delete pod --force -n " $1, $2}'  | bash  # Replace <Node-Name> in the command with the Node-Name of the node that crashed abnormally.
+   ```
+
+3. Execute the following command to delete the volume attachments on that node.
+
+   ```
+   kubectl get volumeattachments.storage.k8s.io | grep <Node-Name> | awk '{print $1}' | xargs kubectl delete volumeattachments.storage.k8s.io  # Replace <Node-Name> in the command with the Node-Name of the node that crashed abnormally.
+   ```
+
+4. Execute the following command to query if there are Pods with the label kubevirt.io=virt-api on the node that crashed abnormally.
+
+   ```
+   kubectl -n kubevirt get po -l kubevirt.io=virt-api -o wide | grep <Node-Name> # Replace <Node-Name> in the command with the Node-Name of the node that crashed abnormally.
+   ```
+
+   If they exist, execute the following command to delete the Pods.
+
+   ```
+   kubectl -n kubevirt get po -l kubevirt.io=virt-api -o name | xargs kubectl -n kubevirt delete --force --grace-period=0
+   ```
+
+5. Execute the following command to query if there are Pods with the label kubevirt.io=virt-controller on the node that crashed abnormally.
+
+   ```
+   kubectl -n kubevirt get po -l kubevirt.io=virt-controller -o wide | grep <Node-Name> # Replace <Node-Name> in the command with the Node-Name of the node that crashed abnormally.
+   ```
+
+   If they exist, execute the following command to delete the Pods.
+
+   ```
+   kubectl -n kubevirt get po -l kubevirt.io=virt-controller -o name | xargs kubectl -n kubevirt delete --force --grace-period=0
+   ```
+
+6. At this point, the virtual machine instances will be migrated to other healthy nodes after the node experiences an abnormal shutdown.

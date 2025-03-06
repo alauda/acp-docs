@@ -1,0 +1,510 @@
+---
+weight: 30
+sourceSHA: 5fec7a638619db92429801041595b819d5d35770e044cd7907c307ec52932cb1
+---
+
+# Configuring SR-IOV
+
+By configuring the physical server nodes to support the creation of virtual machines with SR-IOV (Single Root I/O Virtualization) network cards, lower latency for virtual machines is achieved, along with support for standalone IPv6 as well as dual-stack IPv4/IPv6 functionality.
+
+## Terminology
+
+| Term         | Definition                                                              |
+| ------------ | ----------------------------------------------------------------------- |
+| Multus CNI   | Acts as middleware for other CNI plugins to enable Kubernetes to support multiple network interfaces for Pods. |
+| SR-IOV      | Allows virtualization of the physical NIC on a node, splitting it into multiple VFs for use by Pods or virtual machines, providing superior network performance. |
+| VF           | A virtual device created from a physical PCI device; VFs can be allocated directly to virtual machines or containers, resembling independent physical PCI devices, significantly improving I/O performance. |
+
+## Constraints and Limitations
+
+The SR-IOV feature relies on glibc and only supports glibc versions 2.34 and above. However, both Kylin V10 and CentOS 7.x operating systems do not support this version, and thus, SR-IOV functionality cannot be used on these two operating systems.
+
+## Prerequisites
+
+Obtain the following charts and images and upload them to the image repository. This document uses the repository address `build-harbor.example.cn` as an example. For specific methods to obtain the charts and images, please contact the relevant personnel.
+
+### Chart
+
+- build-harbor.example.cn/example/chart-sriov-network-operator:v3.15.0
+
+### Images
+
+- build-harbor.example.cn/3rdparty/sriov/sriov-network-operator:4.13
+- build-harbor.example.cn/3rdparty/sriov/sriov-network-operator-config-daemon:4.13
+- build-harbor.example.cn/3rdparty/sriov/sriov-cni:4.13
+- build-harbor.example.cn/3rdparty/sriov/ib-sriov-cni:4.13
+- build-harbor.example.cn/3rdparty/sriov/sriov-network-device-plugin:4.13
+- build-harbor.example.cn/3rdparty/sriov/network-resources-injector:4.13
+- build-harbor.example.cn/3rdparty/sriov/sriov-network-operator-webhook:4.13
+- build-harbor.example.cn/3rdparty/kubectl:v3.15.1
+
+## Steps
+
+**Note**: All commands mentioned below are executed in the terminal.
+
+### Enabling SR-IOV in the Physical Machine's BIOS
+
+Before configuration, use the following command to check the motherboard information.
+
+```
+$ dmidecode -t 1
+# dmidecode 3.3
+Getting SMBIOS data from sysfs.
+SMBIOS 2.7 present.
+
+Handle 0x0100, DMI type 1, 27 bytes
+System Information
+    Product Name: PowerEdge R620
+    Version: Not Specified
+    Serial Number: 7SJNF62
+    UUID: 4c4c4544-0053-4a10-804e-b7c04f463632
+    Wake-up Type: Power Switch
+    SKU Number: SKU=NotProvided;ModelName=PowerEdge R620
+    Family: Not Specified
+```
+
+The operation to enable SR-IOV in the BIOS varies among server manufacturers. Please refer to the corresponding manufacturer's documentation. Generally, the steps are as follows:
+
+1. Reboot the server.
+
+2. When the brand logo is displayed on the screen during BIOS POST, press the F2 key to enter the system setup.
+
+3. Click **Processor Settings** > **Virtualization Technology**, and change **Virtualization Technology** setting to `Enabled`.
+
+4. Click **Settings** > **Integrated devices**, and change **SR-IOV Global Enable** setting to `Enabled`.
+
+5. Save the configuration and reboot the server.
+
+### Enabling IOMMU
+
+The operation to enable IOMMU may vary across different operating systems. Please refer to the corresponding operating system documentation. This document uses CentOS as an example.
+
+1. Edit the `/etc/default/grub` file and add `intel_iommu=on iommu=pt` to the `GRUB_CMDLINE_LINUX` configuration item.
+
+   ```
+   GRUB_CMDLINE_LINUX="crashkernel=auto rd.lvm.lv=centos/root rhgb quiet intel_iommu=on iommu=pt"
+   ```
+
+2. Execute the following command to generate the `grub.cfg` file.
+
+   ```
+   grub2-mkconfig -o /boot/grub2/grub.cfg
+   ```
+
+3. Reboot the server.
+
+4. Execute the following command, and if the output shows `IOMMU enabled`, it indicates that the enabling is successful.
+
+   ```
+   dmesg | grep -i iommu
+   ```
+
+### Loading the VFIO Module in the System Kernel
+
+1. Execute the following command to load the vfio-pci module.
+
+   ```
+   $ modprobe vfio-pci
+   ```
+
+2. Once loaded, execute the following command. If the configuration information can be displayed normally, then the VFIO kernel module has been loaded successfully.
+
+   ```
+   $ # For CentOS, execute the following command to check the VFIO loading status
+   $ lsmod | grep vfio
+   vfio_pci               41993  0
+   vfio_iommu_type1       22440  0
+   vfio                   32657  2 vfio_iommu_type1, vfio_pci
+   irqbypass              13503  2 kvm, vfio_pc
+   $
+   $
+   $ # For Ubuntu, execute the following command to check the VFIO loading status
+   $ cat /lib/modules/$(uname -r)/modules.builtin | grep vfio
+   kernel/drivers/vfio/vfio.ko
+   kernel/drivers/vfio/vfio_virqfd.ko
+   kernel/drivers/vfio/vfio_iommu_type1.ko
+   kernel/drivers/vfio/pci/vfio-pci-core.ko
+   kernel/drivers/vfio/pci/vfio-pci.ko
+   ```
+
+### Creating VF Devices
+
+1. Execute the following command to see the currently supported VF devices.
+
+   ```
+   $ find /sys -name *vfs*
+
+   /sys/devices/pci0000:00/0000:00:03.0/0000:05:00.1/sriov_totalvfs
+   /sys/devices/pci0000:00/0000:00:03.0/0000:05:00.1/sriov_numvfs
+   /sys/devices/pci0000:00/0000:00:03.0/0000:05:00.0/sriov_totalvfs
+   /sys/devices/pci0000:00/0000:00:03.0/0000:05:00.0/sriov_numvfs
+   ```
+
+   The output information indicates as follows:
+
+   - **0000:05:00.1**: The PCI address of the SR-IOV physical NIC enp5s0f1.
+
+   - **0000:05:00.0**: The PCI address of the SR-IOV physical NIC enp5s0f0.
+
+   - **sriov_totalvfs**: Number of supported VFs.
+
+   - **sriov_numvfs**: Current number of VFs.
+
+2. Execute the following command to get information on the physical machine's NIC.
+
+   ```
+   $ ifconfig
+
+   enp5s0f0: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500
+           inet 192.168.66.213  netmask 255.255.255.0  broadcast 192.168.66.255
+           inet6 1066::192:168:66:213  prefixlen 112  scopeid 0x0<global>
+           inet6 fe80::a236:9fff:fe29:6c00  prefixlen 64  scopeid 0x20<link>
+           ether a0:36:9f:29:6c:00  txqueuelen 1000  (Ethernet)
+           RX packets 13889  bytes 1075801 (1.0 MB)
+           RX errors 0  dropped 1603  overruns 0  frame 0
+           TX packets 5057  bytes 440807 (440.8 KB)
+           TX errors 0  dropped 0 overruns 0  carrier 0  collisions 0
+    
+   enp5s0f1: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500
+           inet6 fe80::a236:9fff:fe29:6c02  prefixlen 64  scopeid 0x20<link>
+           ether a0:36:9f:29:6c:02  txqueuelen 1000  (Ethernet)
+           RX packets 1714  bytes 227506 (227.5 KB)
+           RX errors 0  dropped 1604  overruns 0  frame 0
+           TX packets 70  bytes 19241 (19.2 KB)
+           TX errors 0  dropped 0 overruns 0  carrier 0  collisions 0
+   ```
+
+3. Execute the command `ethtool -i <NIC name>` to obtain the corresponding physical NIC's PCI address, as shown below.
+
+   ```
+   $ ethtool -i enp5s0f0
+   driver: ixgbe
+   version: 5.15.0-76-generic
+   firmware-version: 0x8000030d, 14.5.8
+   expansion-rom-version:
+   bus-info: 0000:05:00.0     ## The PCI address of the enp5s0f0 NIC
+   supports-statistics: yes
+   supports-test: yes
+   supports-eeprom-access: yes
+   supports-register-dump: yes
+   supports-priv-flags: yes
+   $
+   $
+   $ ethtool -i enp5s0f1
+   driver: ixgbe
+   version: 5.15.0-76-generic
+   firmware-version: 0x8000030d, 14.5.8
+   expansion-rom-version:
+   bus-info: 0000:05:00.1    ## The PCI address of the enp5s0f1 NIC
+   supports-statistics: yes
+   supports-test: yes
+   supports-eeprom-access: yes
+   supports-register-dump: yes
+   supports-priv-flags: yes
+   ```
+
+4. Execute the following command to create a VF. This document takes configuring the enp5s0f1 NIC as an example. If multiple NICs need to be virtualized, all of them need to be configured.
+
+   ```
+   $ cat /sys/devices/pci0000:00/0000:00:03.0/0000:05:00.1/sriov_totalvfs   ## Check the number of supported VFs
+   63
+   $
+   $ echo 8 > /sys/devices/pci0000:00/0000:00:03.0/0000:05:00.1/sriov_numvfs  ## Set the current number of VFs
+   $
+   $ cat /sys/devices/pci0000:00/0000:00:03.0/0000:05:00.1/sriov_numvfs   ## Check the current number of VFs
+   8
+   ```
+
+5. Execute the following command to check if the VFs were created successfully.
+
+   **Note**: You can see the configured 8 VF addresses, such as `05:10.1`. These VF addresses need to be supplemented with the **Domain Identifier**, resulting in the final format: `0000:05:10.1`.
+
+   ```
+   $ lspci | grep Virtual
+   00:11.0 PCI bridge: Intel Corporation C600/X79 series chipset PCI Express Virtual Root Port (rev 05)
+   05:10.1 Ethernet controller: Intel Corporation 82599 Ethernet Controller Virtual Function (rev 01)
+   05:10.3 Ethernet controller: Intel Corporation 82599 Ethernet Controller Virtual Function (rev 01)
+   05:10.5 Ethernet controller: Intel Corporation 82599 Ethernet Controller Virtual Function (rev 01)
+   05:10.7 Ethernet controller: Intel Corporation 82599 Ethernet Controller Virtual Function (rev 01)
+   05:11.1 Ethernet controller: Intel Corporation 82599 Ethernet Controller Virtual Function (rev 01)
+   05:11.3 Ethernet controller: Intel Corporation 82599 Ethernet Controller Virtual Function (rev 01)
+   05:11.5 Ethernet controller: Intel Corporation 82599 Ethernet Controller Virtual Function (rev 01)
+   05:11.7 Ethernet controller: Intel Corporation 82599 Ethernet Controller Virtual Function (rev 01)
+   ```
+
+### Binding the VFIO Driver
+
+1. Download the <a href="/scripts/dpdk-devbind.py" download="dpdk-devbind.py">binding script</a>, and execute the `$ python3 dpdk-devbind.py -b vfio-pci <VF address with domain identifier>` command to bind the 8 VFs of the enp5s0f1 NIC to the vfio-pci driver, as shown below.
+
+   ```
+   $ python3 dpdk-devbind.py -b vfio-pci 0000:05:10.1
+   $ python3 dpdk-devbind.py -b vfio-pci 0000:05:10.3
+   $ python3 dpdk-devbind.py -b vfio-pci 0000:05:10.5
+   $ python3 dpdk-devbind.py -b vfio-pci 0000:05:10.7
+   $ python3 dpdk-devbind.py -b vfio-pci 0000:05:11.1
+   $ python3 dpdk-devbind.py -b vfio-pci 0000:05:11.3
+   $ python3 dpdk-devbind.py -b vfio-pci 0000:05:11.5
+   $ python3 dpdk-devbind.py -b vfio-pci 0000:05:11.7
+   ```
+
+2. After binding successfully, execute the following command to check the binding results. Look for the already bound VFs in the **Network devices using DPDK-compatible driver** area in the output result. Among them, the VF device ID is `10ed`.\{#VF_ID}
+
+   ```
+   $ python3 dpdk-devbind.py --status
+   
+   Network devices using DPDK-compatible driver
+   ============================================
+   0000:05:10.1 '82599 Ethernet Controller Virtual Function 10ed' drv=vfio-pci unused=ixgbevf
+   0000:05:10.3 '82599 Ethernet Controller Virtual Function 10ed' drv=vfio-pci unused=ixgbevf
+   0000:05:10.5 '82599 Ethernet Controller Virtual Function 10ed' drv=vfio-pci unused=ixgbevf
+   0000:05:10.7 '82599 Ethernet Controller Virtual Function 10ed' drv=vfio-pci unused=ixgbevf
+   0000:05:11.1 '82599 Ethernet Controller Virtual Function 10ed' drv=vfio-pci unused=ixgbevf
+   0000:05:11.3 '82599 Ethernet Controller Virtual Function 10ed' drv=vfio-pci unused=ixgbevf
+   0000:05:11.5 '82599 Ethernet Controller Virtual Function 10ed' drv=vfio-pci unused=ixgbevf
+   0000:05:11.7 '82599 Ethernet Controller Virtual Function 10ed' drv=vfio-pci unused=ixgbevf
+
+   Network devices using kernel driver
+   ===================================
+   0000:01:00.0 'NetXtreme BCM5720 Gigabit Ethernet PCIe 165f' if=eno1 drv=tg3 unused=vfio-pci
+   0000:01:00.1 'NetXtreme BCM5720 Gigabit Ethernet PCIe 165f' if=eno2 drv=tg3 unused=vfio-pci
+   0000:02:00.0 'NetXtreme BCM5720 Gigabit Ethernet PCIe 165f' if=eno3 drv=tg3 unused=vfio-pci
+   0000:02:00.1 'NetXtreme BCM5720 Gigabit Ethernet PCIe 165f' if=eno4 drv=tg3 unused=vfio-pci
+   0000:05:00.0 'Ethernet 10G 2P X520 Adapter 154d' if=enp5s0f0 drv=ixgbe unused=vfio-pci *Active*
+   0000:05:00.1 'Ethernet 10G 2P X520 Adapter 154d' if=enp5s0f1 drv=ixgbe unused=vfio-pci
+
+   No 'Baseband' devices detected
+   ==============================
+
+   No 'Crypto' devices detected
+   ============================
+
+   No 'DMA' devices detected
+   =========================
+
+   No 'Eventdev' devices detected
+   ==============================
+
+   No 'Mempool' devices detected
+   =============================
+
+   No 'Compress' devices detected
+   ==============================
+
+   No 'Misc (rawdev)' devices detected
+   ===================================
+
+   No 'Regex' devices detected
+   ===========================
+   ```
+
+### Deploying the Multus CNI Plugin\{#deploy_plugins}
+
+1. Go to **Platform Management**.
+
+2. In the left navigation bar, click **Cluster Management** > **Clusters**.
+
+3. Click the name of the virtual machine cluster and switch to the **Plugins** tab.
+
+   - Deploy the **Multus CNI** plugin.
+
+### Deploying the sriov-network-operator
+
+Execute the following command to deploy the sriov-network-operator.
+
+```
+REGISTRY=<$registry>  # Replace the <$registry> part with the repository address where the sriov-network-operator image is located, for example: REGISTRY=build-harbor.example.cn
+NICSELECTOR=["<nics>"] # Replace the <nics> part with the NIC names, for example: NICSELECTOR=["ens802f1","ens802f2"], separate multiple with commas
+NUMVFS=<numVfs> # Replace the <numVfs> part with the number of VFs, for example: NUMVFS=8
+  
+cat <<EOF | kubectl create -f -
+apiVersion: operator.alauda.io/v1alpha1
+kind: AppRelease
+metadata:
+  annotations:
+    auto-recycle: "true"
+    interval-sync: "true"
+  name: sriov-network-operator
+  namespace: cpaas-system
+spec:
+  destination:
+    cluster: ""
+    namespace: "kube-system"
+  source:
+    charts:
+    - name: <chartName> # Replace <chartName> with the actual chart path, for example: name = example/chart-sriov-network-operator
+      releaseName: sriov-network-operator
+      targetRevision: v3.15.0
+    repoURL: $REGISTRY
+  timeout: 120
+  values:
+    global:
+      registry:
+        address: $REGISTRY
+    networkNodePolicy:
+      nicSelector: $NICSELECTOR
+      numVfs: $NUMVFS
+EOF
+```
+
+### Setting Node Role Identifier Labels for Physical Nodes
+
+**Note**: Before performing this operation, ensure that the Pod of the `sriov-network-operator` is running normally.
+
+1. Go to **Platform Management**.
+
+2. In the left navigation bar, click **Cluster Management** > **Clusters**.
+
+3. Click the cluster name and switch to the **Nodes** tab.
+
+4. Click the physical node that supports SR-IOV ⋮ > **Update Node Labels**.
+
+5. Set the node label as follows:
+   - `node-role.kubernetes.io/worker: ""`
+
+6. Click **Update**.
+
+### Checking if the Resources are Created Successfully\{#checkpod}
+
+In the CLI tool, execute the command `kubectl -n cpaas-system get sriovnetworknodestates` to check if the `sriovnetworknodestates` resource has been created successfully. If you see similar output below, it indicates that creation was successful. If the resource creation fails, check if the Multus CNI plugin and sriov-network-operator have been deployed successfully.
+
+```
+$  kubectl -n cpaas-system get sriovnetworknodestates
+NAME                      SYNC STATUS           AGE
+192.168.254.88            Succeeded             5d22h
+```
+
+### Setting SR-IOV Node Feature Labels for Physical Nodes
+
+**Note**: Before performing this operation, ensure that the `sriovnetworknodestates` resource has been successfully created.
+
+1. Go to **Platform Management**.
+
+2. In the left navigation bar, click **Cluster Management** > **Clusters**.
+
+3. Click the cluster name and switch to the **Nodes** tab.
+
+4. Click the physical node that supports SR-IOV ⋮ > **Update Node Labels**.
+
+5. Set the node label as follows:
+   - `feature.node.kubernetes.io/network-sriov.capable: "true"`
+
+### Checking NIC Device Support
+
+1. Execute the command `lspci -n -s <VF address with domain identifier>` to obtain the current NIC device's vendor ID and device ID, as shown below.
+
+   ```
+   $ lspci -n -s 0000:05:00.1
+   05:00.1 0200: 8086:154d (rev 01)
+   ```
+
+   The output indicates:
+   - **8086**: Vendor ID.
+   - **154d**: Device ID.
+
+2. Execute the command `lspci -s <VF address with domain identifier> -vvv | grep Ethernet` to obtain the current NIC name, as shown below.
+
+   ```
+   $ lspci -s 0000:05:00.1 -vvv | grep Ethernet
+   05:00.1 Ethernet controller: Intel Corporation Ethernet 10G 2P X520 Adapter (rev 01)
+   ```
+
+3. In the cpaas-system namespace, locate the configuration file named `supported-nic-ids` with type ConfigMap, and check if the current NIC's configuration information is in the support list within its data section.
+
+   **Note**: If the current NIC is not in the support list, you need to refer to [Step 4](#configmap1) to add the NIC to the configuration file. If the current NIC is already in the support list, skip [Step 4](#configmap1).
+
+   ```
+   kind: ConfigMap
+   apiVersion: v1
+   metadata:
+     name: supported-nic-ids
+     namespace: cpaas-system
+   data:
+     Broadcom_bnxt_BCM57414_2x25G: 14e4 16d7 16dc
+     Broadcom_bnxt_BCM75508_2x100G: 14e4 1750 1806
+     Intel_i40e_10G_X710_SFP: 8086 1572 154c
+     Intel_i40e_25G_SFP28: 8086 158b 154c
+     Intel_i40e_40G_XL710_QSFP: 8086 1583 154c
+     Intel_i40e_X710_X557_AT_10G: 8086 1589 154c
+     Intel_i40e_XXV710: 8086 158a 154c
+     Intel_i40e_XXV710_N3000: 8086 0d58 154c
+     Intel_ice_Columbiaville_E810: 8086 1591 1889
+     Intel_ice_Columbiaville_E810-CQDA2_2CQDA2: 8086 1592 1889
+     Intel_ice_Columbiaville_E810-XXVDA2: 8086 159b 1889
+     Intel_ice_Columbiaville_E810-XXVDA4: 8086 1593 1889
+   ```
+
+4. Add the current NIC to the data section of the support list in the format `**<NIC Name>: <Vendor ID> <Device ID> <VF Device ID>**`, as shown below.\{#configmap1}
+
+   ```
+   kind: ConfigMap
+   apiVersion: v1
+   metadata:
+     name: supported-nic-ids
+     namespace: cpaas-system
+   data:
+     Broadcom_bnxt_BCM57414_2x25G: 14e4 16d7 16dc
+     Broadcom_bnxt_BCM75508_2x100G: 14e4 1750 1806
+     
+     Intel_Corporation_X520: 8086 154d 10ed            ## Add new NIC information
+     
+     Intel_i40e_10G_X710_SFP: 8086 1572 154c
+     Intel_i40e_25G_SFP28: 8086 158b 154c
+     Intel_i40e_40G_XL710_QSFP: 8086 1583 154c
+     Intel_i40e_X710_X557_AT_10G: 8086 1589 154c
+     Intel_i40e_XXV710: 8086 158a 154c
+     Intel_i40e_XXV710_N3000: 8086 0d58 154c
+     Intel_ice_Columbiaville_E810: 8086 1591 1889
+     Intel_ice_Columbiaville_E810-CQDA2_2CQDA2: 8086 1592 1889
+     Intel_ice_Columbiaville_E810-XXVDA2: 8086 159b 1889
+     Intel_ice_Columbiaville_E810-XXVDA4: 8086 1593 1889
+   ```
+
+   Parameter configuration explanation:
+   - **Intel_Corporation_X520**: The name of the NIC, which can be customized.
+   - **8086**: Vendor ID.
+   - **154d**: Device ID.
+   - **10ed**: VF Device ID, which can be found in the [binding results](#VF_ID).
+
+### Configuring IP Address
+
+Log in to the switch to configure DHCP (Dynamic Host Configuration Protocol).
+
+**Note**: If it is not possible to use DHCP, please manually configure the IP address in the virtual machine.
+
+## Result Verification
+
+1. Go to **Container Platform**.
+
+2. In the left navigation bar, click **Virtualization** > **Virtual Machines**.
+
+3. Click **Create Virtual Machine**, and when adding an auxiliary network card, select **SR-IOV** as the **Network Type**.
+
+4. Complete the creation of the virtual machine.
+
+5. Access the virtual machine through VNC, you should see that eth1 has successfully obtained an IP address, indicating that the configuration has been successful.
+   <img src="./assets/showeth1.png" width="700" />
+
+## Related Notes
+
+### Kernel Parameter Configuration for CentOS Virtual Machines
+
+After the CentOS virtual machine uses the SR-IOV NIC, it is necessary to modify the kernel parameters for the corresponding NIC. The specific steps are as follows.
+
+1. Open a terminal and execute the following command to modify the kernel parameters for the corresponding NIC. Replace the `<NIC Name>` part of the command with the actual NIC name.
+
+   ```
+   sysctl -w net.ipv4.conf.<NIC Name>.rp_filter=2
+   echo "net.ipv4.conf.<NIC Name>.rp_filter=2" >> /etc/sysctl.conf
+   ```
+
+2. Execute the following command to load and apply all kernel parameter commands from the /etc/sysctl.conf file, so that the kernel configuration takes effect. When the value in the output information is 2, it indicates that the modification was successful.
+
+   ```
+   sysctl -p
+   ```
+
+   Output information:
+
+   ```
+   net.ipv4.conf.<NIC Name>.rp_filter = 2
+   ```

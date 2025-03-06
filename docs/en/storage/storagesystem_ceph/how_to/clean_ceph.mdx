@@ -1,0 +1,225 @@
+---
+weight: 10
+sourceSHA: 7ee36bb2f744ad11269fde958b77aef9337a1346e1b2929c70dec7eddedebf4c
+---
+
+# Resource Cleanup for Distributed Storage Service
+
+If you need to delete a rook-ceph cluster and redeploy a new one, you should follow this document to sequentially clean the distributed storage service related resources.
+
+## Precautions
+
+Before cleaning up rook-ceph, ensure that all PVC and PV resources using Ceph storage have been deleted.
+
+## Deleting VolumeSnapshotClasses
+
+1. Delete the VolumeSnapshotClasses.
+
+   ```
+   kubectl delete VolumeSnapshotClass csi-cephfs-snapshotclass csi-rbd-snapshotclass
+   ```
+
+2. Verify that the VolumeSnapshotClasses have been cleaned up.
+
+   ```
+   kubectl get VolumeSnapshotClass | grep csi-cephfs-snapshotclass
+   kubectl get VolumeSnapshotClass | grep csi-rbd-snapshotclass
+   ```
+
+   When there is no output from these commands, it indicates that the cleanup is complete.
+
+## Deleting StorageClasses
+
+1. Go to **Platform Management**.
+
+2. In the left navigation bar, click **Storage Management** > **Storage Classes**.
+
+3. Click ⋮ > **Delete**, and delete all StorageClasses that use Ceph storage solutions.
+
+## Deleting Storage Pools
+
+This step should be performed after the previous step has been completed.
+
+1. Go to **Platform Management**.
+
+2. In the left navigation bar, click **Storage Management** > **Distributed Storage**.
+
+3. In the **Storage Pool Area**, click ⋮ > **Delete**, and delete all storage pools one by one. When the storage pool area shows **No Storage Pools**, it indicates successful deletion of the storage pools.
+
+4. (Optional) If the cluster mode is **Extended**, you also need to execute the following command on the Master node of the cluster to delete the created built-in storage pools.
+
+   ```
+   kubectl -n rook-ceph delete cephblockpool -l cpaas.io/builtin=true
+   ```
+
+   Response:
+
+   ```
+   cephblockpool.ceph.rook.io "builtin-mgr" deleted
+   ```
+
+## Deleting ceph-cluster
+
+This step should be performed after the previous step has been completed.
+
+1. Update the ceph-cluster and enable the cleanup policy.
+
+   ```
+   kubectl -n rook-ceph patch cephcluster ceph-cluster --type merge -p '{"spec":{"cleanupPolicy":{"confirmation":"yes-really-destroy-data"}}}'
+   ```
+
+2. Delete the ceph-cluster.
+
+   ```
+   kubectl delete cephcluster ceph-cluster -n rook-ceph
+   ```
+
+3. Delete the jobs that perform the cleanup.
+
+   ```
+   kubectl delete jobs --all -n rook-ceph
+   ```
+
+4. Verify that the ceph-cluster cleanup is complete.
+
+   ```
+   kubectl get cephcluster  -n rook-ceph | grep ceph-cluster
+   ```
+
+   When this command has no output, it indicates that the cleanup is complete.
+
+## Deleting rook-operator
+
+This step should be performed after the previous step has been completed.
+
+1. Delete the rook-operator.
+
+   ```
+   kubectl -n rook-ceph delete subscriptions.operators.coreos.com rook-operator
+   ```
+
+2. Verify that the rook-operator cleanup is complete.
+
+   ```
+   kubectl get subscriptions.operators.coreos.com -n rook-ceph | grep rook-operator
+   ```
+
+   When this command has no output, it indicates that the cleanup is complete.
+
+3. Verify that all ConfigMaps have been cleaned up.
+
+   ```
+   kubectl get configmap -n rook-ceph
+   ```
+
+   When this command has no output, it indicates that cleanup is complete. If there are output results, execute the following command to clean up, replacing `<configmap>` with the actual output.
+
+   ```
+   kubectl -n rook-ceph patch configmap <configmap> --type merge -p '{"metadata":{"finalizers": []}}'
+   ```
+
+4. Verify that all Secrets have been cleaned up.
+
+   ```
+   kubectl get secret -n rook-ceph
+   ```
+
+   When this command has no output, it indicates that cleanup is complete. If there are output results, execute the following command to clean up, replacing `<secret>` with the actual output.
+
+   ```
+   kubectl -n rook-ceph patch secrets <secret> --type merge -p '{"metadata":{"finalizers": []}}'
+   ```
+
+5. Verify that the rook-ceph cleanup is complete.
+
+   ```
+   kubectl get all -n rook-ceph
+   ```
+
+   When this command has no output, it indicates that cleanup is complete.
+
+## Execute Cleanup Script
+
+Once the above steps are completed, it indicates that Kubernetes and Ceph related resources have been cleared. Next, you need to clean up any residuals of rook-ceph on the host.
+
+### Cleanup Script
+
+The contents of the cleanup script clean-rook.sh are as follows:
+
+```shell
+#!/bin/bash
+
+DISK="$1"
+
+if [ ! -n "$DISK" ]
+then
+   echo "you must input block dev"
+   exit
+else
+   echo "are you sure to clean device: $DISK ? yes/no"
+   read ANSWER
+   case $ANSWER in
+     [Yy]*)
+     echo " you input is y or Y !"
+     ;;
+     [Nn]*)
+     echo " you input a "$ANSWER
+     exit
+     ;;
+   esac
+fi
+
+echo "clean /var/lib/rook"
+rm -rf /var/lib/rook
+
+
+echo "clean block dev"
+
+# Recreate partition table and add partition using fdisk, do not delete the empty lines in between
+echo "g
+n
+
+
+
+w" | sudo fdisk $DISK
+
+
+# Zap the disk to a fresh, usable state (zap-all is important, because MBR has to be clean)
+# You will have to run this step for all disks.
+sgdisk --zap-all $DISK
+
+# Clean HDDs with dd
+dd if=/dev/zero of="$DISK" bs=1M count=100 oflag=direct,dsync
+
+
+# Clean disks such as SSDs with blkdiscard instead of dd
+blkdiscard $DISK
+
+# These steps only have to be run once on each node
+# If rook sets up OSDs using ceph-volume, teardown leaves some devices mapped that lock the disks.
+ls /dev/mapper/ceph-* | xargs -I% -- dmsetup remove %
+
+# ceph-volume setup can leave ceph-<UUID> directories in /dev (unnecessary clutter)
+rm -rf /dev/ceph-*
+```
+
+### Precautions
+
+The cleanup script depends on the sgdisk command, so please make sure to have it installed before executing the cleanup script.
+
+- Installation command for Ubuntu: `sudo apt install gdisk`
+- Installation command for RedHat or CentOS: `sudo yum install gdisk`
+
+### Operation Steps
+
+1. Execute the cleanup script clean-rook.sh on each machine in the business cluster where distributed storage is deployed.
+
+   ```
+   sh clean-rook.sh /dev/[device_name]
+   ```
+
+   Example: `sh clean-rook.sh /dev/vdb`
+
+   When executed, you will be prompted to confirm whether to really clear the device. If confirmed, enter yes to begin cleaning.
+
+2. Use the `lsblk -f` command to check the partition information. When the `FSTYPE` column in the output of this command is empty, it indicates that the cleanup is complete.
