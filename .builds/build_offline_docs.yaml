@@ -1,0 +1,190 @@
+apiVersion: builds.katanomi.dev/v1alpha1
+kind: Build
+spec:
+  workspaces:
+    - description: >
+        This workspace is shared among all the pipeline tasks to read/write
+        common resources
+      name: source
+  tasks:
+    - name: aggregate-offline-docs
+      workspaces:
+        - name: source
+          workspace: source
+      params:
+        - name: branch
+          value: $(build.git.branch.name)
+      taskSpec:
+        results:
+          - description: Determine whether to push to the remote warehouse
+            name: modified-flag
+            type: string
+        steps:
+          - image: build-harbor.alauda.cn/idp/docs-ops:main
+            name: aggregate-offline-docs
+            imagePullPolicy: Always
+            workingDir: $(workspaces.source.path)
+            command:
+            - xonsh
+            - /apps/aggregate_offline_docs.xsh
+            args:
+            - --branch=$(params.branch)
+            - --result-file=$(results.modified-flag.path)
+            env:
+              - name: MINIO_URL
+                valueFrom:
+                  secretKeyRef:
+                    name: product-docs-minio-credentials
+                    key: url
+              - name: MINIO_ACCESS_KEY
+                valueFrom:
+                  secretKeyRef:
+                    name: product-docs-minio-credentials
+                    key: access-key
+              - name: MINIO_SECRET_KEY
+                valueFrom:
+                  secretKeyRef:
+                    name: product-docs-minio-credentials
+                    key: secret-key
+              - name: MINIO_BUCKET
+                valueFrom:
+                  secretKeyRef:
+                    name: product-docs-minio-credentials
+                    key: bucket
+              - name: GH_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: product-docs-github-credentials
+                    key: token
+              - name: GITLAB_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: product-docs-gitlab-credentials
+                    key: token
+    - name: build-image
+      runAfter:
+        - aggregate-offline-docs
+      timeout: 30m
+      retries: 2
+      taskRef:
+        kind: ClusterTask
+        name: build-image-buildkit
+      workspaces:
+        - name: source
+          workspace: source
+      when:
+        - input: "$(tasks.aggregate-offline-docs.results.modified-flag)"
+          operator: in
+          values:
+            - "true"
+      params:
+        - name: "cache-major-branches"
+          value: "false"
+        - name: "reuse-image"
+          value: "false"
+        - name: container-images
+          value:
+          - build-harbor.alauda.cn/alauda/product-docs-offline:$(build.git.version.short)$(build.triggeredBy.triggeredTimestamp.yyyyMMddmmss)
+        - name: dockerfile
+          value: ./Dockerfile
+        - name: labels
+          value:
+            - branch=$(build.git.branch.name)
+            - commit=$(build.git.lastCommit.id)
+    - name: update-module-plugin
+      runAfter:
+        - build-image
+      workspaces:
+        - name: source
+          workspace: source
+      when:
+        - input: "$(tasks.aggregate-offline-docs.results.modified-flag)"
+          operator: in
+          values:
+            - "true"
+      params:
+        - name: build_tag
+          value: $(build.git.version.short)$(build.triggeredBy.triggeredTimestamp.yyyyMMddmmss)
+      taskSpec:
+        description: |
+          set the version
+        workspaces:
+          - name: source
+            workspace: source
+        params:
+          - name: build_tag
+            type: string
+        steps:
+          - name: set-version
+            image: build-harbor.alauda.cn/ops/alpine:latest
+            imagePullPolicy: IfNotPresent
+            workingDir: $(workspaces.source.path)
+            script: |
+              #!/bin/sh
+              sed -i "s|version: .*|version: $(params.build_tag)|g" ./chart/module-plugin.yaml
+              cat ./chart/module-plugin.yaml
+            resources:
+              requests:
+                cpu: 100m
+                memory: 100Mi
+    - name: chart-build
+      runAfter:
+        - update-module-plugin
+      timeout: 30m
+      retries: 0
+      taskRef:
+        kind: ClusterTask
+        name: chart-build
+      workspaces:
+        - name: source
+          workspace: source
+      when:
+        - input: "$(tasks.aggregate-offline-docs.results.modified-flag)"
+          operator: in
+          values:
+            - "true"
+      params:
+        - name: helm-images
+          value:
+            - build-harbor.alauda.cn/alauda/chart-product-docs-offline:$(build.git.version.short)$(build.triggeredBy.triggeredTimestamp.yyyyMMddmmss)
+        - name: dir
+          value: ./chart
+        - name: media-type
+          value: application/vnd.cncf.helm.chart.content.v1.tar+gzip
+        - name: version
+          value:
+            - chart-version=$(build.git.version.short)$(build.triggeredBy.triggeredTimestamp.yyyyMMddmmss)
+        - name: values
+          value:
+            - global.images.productDocs.repository=alauda/product-docs-offline
+            - global.images.productDocs.tag=$(build.git.version.short)$(build.triggeredBy.triggeredTimestamp.yyyyMMddmmss)
+            - deployMode=offline
+        - name: annotations
+          value:
+            - branch=$(build.git.branch.name)
+            - commit=$(build.git.lastCommit.id)
+  finally:
+    - name: release-tag
+      timeout: 30m
+      retries: 0
+      taskRef:
+        kind: ClusterTask
+        name: alauda-release-tag
+      workspaces:
+        - name: source
+          workspace: source
+      when:
+        - input: $(build.git.versionPhase)
+          operator: in
+          values:
+            - custom
+            - ga
+        - input: $(tasks.status)
+          operator: in
+          values:
+            - Succeeded
+            - Completed
+      params:
+        - name: version
+          value: $(build.git.version.short)$(build.triggeredBy.triggeredTimestamp.yyyyMMddmmss)
+
