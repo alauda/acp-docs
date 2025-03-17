@@ -1,0 +1,233 @@
+---
+weight: 30
+---
+
+# Kube-OVN Overlay 网络支持 IPsec 加密
+
+
+本文档提供了 Kube-OVN Overlay 网络中开启和关闭 IPsec 加密隧道流量的详细指南，由于 OVN 隧道流量通过物理路由器和交换机传输，这些设备可能位于不受信任的公共网络中或存在被攻击的风险，因此启用 IPsec 加密可以有效防止流量数据被监控和篡改。
+
+## 名词解释
+
+|名词|解释|
+|---|---|
+|**IPsec**|一种用于保护和验证在互联网上传输数据的协议和技术。它在 IP 层提供安全通信，主要用于创建虚拟专用网络（VPN）和保护 IP 数据包的传输，IPsec 主要通过下述方式确保数据的安全性：<ul><li>**数据加密**：通过加密技术 IPsec可以确保数据在传输过程中不被窃取或篡改，常用的加密算法包括 AES、3DES 等。</li><li>**数据校验**：IPsec 使用哈希函数（如 SHA-1、SHA-256）来验证数据的完整性，确保数据在传输过程中没有被修改。</li><li>**身份验证**：IPsec 可以通过多种方式（如预共享密钥、数字证书）验证通信双方的身份，以防止未经授权的访问。</li><li>**密钥管理**：IPsec 使用 Internet 密钥交换（IKE）协议来协商和管理加密密钥。</li></ul>|
+
+## 注意事项
+
+* 启用 IPsec 功能可能会导致数秒钟的网络中断。
+
+* 如果内核版本为 3.10.0-1160.el7.x86_64，启用 Kube-OVN 的 IPsec 功能可能会遇到兼容性问题。
+
+
+
+## 前提条件
+
+请执行下述命令检查当前操作系统内核是否支持 IPsec 相关模块，若回显信息中 XFRM 相关内容模块均为为 `y` 或 `m`，则表示支持 IPsec。
+
+```
+cat /boot/config-$(uname -r) | grep CONFIG_XFRM
+```
+
+回显信息：
+
+```
+CONFIG_XFRM_ALGO=y
+CONFIG_XFRM_USER=y
+CONFIG_XFRM_SUB_POLICY=y
+CONFIG_XFRM_MIGRATE=y
+CONFIG_XFRM_STATISTICS=y
+CONFIG_XFRM_IPCOMP=m
+```
+
+## 操作步骤
+
+**注意**：若没有特殊说明，下述命令均需在集群 Master 节点的 CLI 工具中执行。
+
+### 开启 IPsec
+
+1. 修改 kube-ovn-controller 的配置文件。
+
+    1. 执行下述命令编辑 kube-ovn-controller 的 YAML 配置文件。
+    
+        ```
+        kubectl edit deploy kube-ovn-controller -n kube-system
+        ```
+        
+    2. 根据下述说明修改指定字段信息。
+    
+        
+        ```yaml
+        spec:
+          template：
+            spec：
+              containers:
+                - args:
+                  - --enable-ovn-ipsec=true  # 增加该字段
+                  securityContext:
+                    runAsUser: 0  # 值修改为 0
+        ```
+
+        
+        字段说明：
+        
+        * **spec.template.spec.containers[0].args**：在该字段下增加 `- --enable-ovn-ipsec=true`。
+        * **spec.template.spec.containers[0].securityContext.runAsUse**：把该字段的值修改为 0。
+    
+    3. 保存修改。
+
+
+2. 修改 kube-ovn-cni 配置文件。
+
+    1. 执行下述命令编辑 kube-ovn-cni 的 YAML 配置文件。
+    
+        ```
+        kubectl edit ds kube-ovn-cni -n kube-system
+        ```
+    2. 根据下述说明修改指定字段信息。
+    
+        
+        ```yaml
+        spec:
+          template:
+            spec:
+              containers:
+              - args:
+                - --enable-ovn-ipsec=true  # 增加该字段
+                volumeMounts:  # 添加挂载路径，将名称为 ovs-ipsec-keys 的卷挂载至容器中
+                  - mountPath: /etc/ovs_ipsec_keys
+                    name: ovs-ipsec-keys
+              volumes:  # 添加名称为 ovs-ipsec-keys、类型为 hostPath 的卷
+                - name: ovs-ipsec-keys
+                  hostPath:
+                    path: /etc/origin/ovs_ipsec_keys
+        ```
+        
+        字段说明：
+        
+        * **spec.template.spec.containers[0].args**：在该字段下增加 `- --enable-ovn-ipsec=true`。
+        * **spec.template.spec.containers[0].volumeMounts**：在该字段下添加挂载路径，将名称为 ovs-ipsec-keys 的卷挂载至容器中。
+        * **spec.template.spec.volumes**：在该字段下添加名称为 ovs-ipsec-keys、类型为 hostPath 的卷。
+    
+    3. 保存修改。
+
+3. 验证功能是否开启成功。
+
+    1. 执行下述命令进入 kube-ovn-cni 的 Pod。
+    
+        ```
+        kubectl exec -it -n kube-system $(kubectl get pods -n kube-system -l app=kube-ovn-cni -o=jsonpath='{.items[0].metadata.name}') -- /bin/bash
+        ```
+        
+    2. 执行下述命令查看 Security Associations 的连接数，若有 (节点数 - 1) 个 up，则表示开启成功。
+    
+        ```
+        ipsec status | grep "Security"
+        ``` 
+        
+        回显信息：
+        
+        ```
+        Security Associations (2 up, 0 connecting):  # 该集群下有 3 个节点，所以可以看到连接数为 2 up
+        ```
+
+### 关闭 IPsec
+
+
+1. 修改 kube-ovn-controller 的配置文件。
+
+    1. 执行下述命令编辑 kube-ovn-controller 的 YAML 配置文件。
+    
+        ```
+        kubectl edit deploy kube-ovn-controller -n kube-system
+        ```
+        
+    2. 根据下述说明修改指定字段信息。
+    
+        
+        ```yaml
+        spec:
+          template：
+            spec：
+              containers:
+                - args:
+                  - --enable-ovn-ipsec=false  # 修改为 false
+                  securityContext:
+                    runAsUser: 65534  # 值修改为 65534
+        ```
+        
+        字段说明：
+        
+        * **spec.template.spec.containers[0].args**：将该字段 `enable-ovn-ipsec` 的值修改为 false。
+        * **spec.template.spec.containers[0].securityContext.runAsUse**：将该字段的值修改为 65534。
+    
+    3. 保存修改。
+
+
+2. 修改 kube-ovn-cni 配置文件。
+
+    1. 执行下述命令编辑 kube-ovn-cni 的 YAML 配置文件。
+    
+        ```
+        kubectl edit ds kube-ovn-cni -n kube-system
+        ```
+    
+    2. 根据下述说明修改指定字段信息。
+    
+        * 修改前的配置
+        
+            
+            ```yaml
+            spec:
+              template:
+                spec:
+                  containers:
+                  - args:
+                    - --enable-ovn-ipsec=true # 修改为 false
+                    volumeMounts: # 删除名称为 ovs-ipsec-keys 的挂载路径
+                      - mountPath: /etc/ovs_ipsec_keys
+                        name: ovs-ipsec-keys
+                  volumes: # 删除名称为 ovs-ipsec-keys、类型为 hostPath 的卷
+                    - name: ovs-ipsec-keys
+                      hostPath:
+                        path: /etc/origin/ovs_ipsec_keys
+            ```
+            
+            字段说明：
+            
+            * **spec.template.spec.containers[0].args**：将该字段 `enable-ovn-ipsec` 的值修改为 false。
+            * **spec.template.spec.containers[0].volumeMounts**：删除该字段下名称为 ovs-ipsec-keys 的挂载路径。
+            * **spec.template.spec.volumes**：删除该字段下名称为 ovs-ipsec-keys、类型为 hostPath 的卷。
+        
+        * 修改后的配置
+
+            
+            ```yaml
+            spec:
+              template:
+                spec:
+                  containers:
+                  - args:
+                    - --enable-ovn-ipsec=false
+                    volumeMounts:
+                  volumes:
+            ```
+    
+    
+    3. 保存修改。
+
+4. 验证功能是否关闭成功。
+
+    1. 执行下述命令进入 kube-ovn-cni 的 Pod。
+        
+        ```
+        kubectl exec -it -n kube-system $(kubectl get pods -n kube-system -l app=kube-ovn-cni -o=jsonpath='{.items[0].metadata.name}') -- /bin/bash
+        ```
+    
+    2. 执行下述命令查看连接状态，若没有任何输出结果，则表示关闭成功。
+    
+        ```
+        ipsec status
+        ``` 
+
+

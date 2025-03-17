@@ -1,0 +1,180 @@
+---
+weight: 20
+sourceSHA: 9e057271e6d953cfee4be02a7e17f3d927b910fad5ba478938717b9b5d4f0d8a
+---
+
+# Common Questions About Argo CD
+
+## What should I do if I deleted/damaged the code repository and cannot delete the application?
+
+When Argo CD cannot generate manifest files, it will not be able to delete the application. You need to:
+
+1. Restore/fix your code repository
+2. Delete the application using the `--cascade=false` parameter and then manually delete the related resources
+
+## Why does the application status remain `OutOfSync` after a successful sync?
+
+Please refer to the [Diffing Documentation](https://argo-cd.readthedocs.io/en/stable/user-guide/diff-strategies/) to understand the reasons why resources may be in an OutOfSync state, and how to configure Argo CD to ignore specific fields when discrepancies are expected.
+
+## Why does the application remain in the `Progressing` state?
+
+Argo CD provides health checks for several standard Kubernetes types. The `Ingress`, `StatefulSet`, and `SealedSecret` types have known issues which may cause the health checks to return a `Progressing` state instead of a `Healthy` state:
+
+- `Ingress`: It is only considered healthy when the `status.loadBalancer.ingress` list is non-empty and contains at least one `hostname` or `IP` value. Some Ingress controllers (e.g., contour, traefik) do not update the `status.loadBalancer.ingress` field, which can result in the `Ingress` remaining in a `Progressing` state indefinitely.
+- `StatefulSet`: It is only considered healthy when the value of the `status.updatedReplicas` field matches the value of the `spec.replicas` field.
+- Your `StatefulSet` or `DaemonSet` uses the `OnDelete` strategy instead of the `RollingUpdate` strategy.
+
+As a solution, Argo CD allows providing a custom health check configuration to override default behavior.
+
+If you are using Traefik as your Ingress, you can publish the loadBalancer IP by updating the Traefik configuration:
+
+```yaml
+providers:
+  kubernetesIngress:
+    publishedService:
+      enabled: true
+```
+
+## How to reset the admin password if forgotten?
+
+For Argo CD v1.8 and earlier, the initial password is set to the name of the server pod. For Argo CD v1.9 and later, the initial password can be obtained from a secret named `argocd-initial-admin-secret`.
+
+To change the password, edit the `argocd-secret` key and update the `admin.password` field with the new bcrypt hash.
+
+Generate a bcrypt hash:
+
+```bash
+argocd account bcrypt --password <your new password>
+```
+
+Apply the new password hash:
+
+```bash
+# bcrypt(password)=$2a$10$rRyBsGSHK6.uc8fntPwVIuLVHgsAhAX7TcdrqW/RADU0uh7CaChLa
+kubectl -n argocd patch secret argocd-secret \
+  -p '{"stringData": {
+    "admin.password": "$2a$10$rRyBsGSHK6.uc8fntPwVIuLVHgsAhAX7TcdrqW/RADU0uh7CaChLa",
+    "admin.passwordMtime": "'$(date +%FT%T%Z)'"
+  }}'
+```
+
+## How to disable the admin user?
+
+Add `admin.enabled: "false"` in the `argocd-cm` ConfigMap.
+
+## How to resolve the issue of Argo CD being unable to deploy Helm Chart-based applications when it cannot access the internet?
+
+When a chart has dependencies located in external repositories, Argo CD may be unable to generate Helm Chart manifests. To resolve this issue, you need to ensure that `requirements.yaml` only uses internally available Helm repositories. Even if the chart uses dependencies solely from internal repositories, Helm may decide to refresh the `stable` repository. As a solution, you can override the `stable` repository URL in the `argocd-cm` configuration map:
+
+```yaml
+data:
+  repositories: |
+    - type: helm
+      url: http://<internal-helm-repo-host>:8080
+      name: stable
+```
+
+## Why can't I see the deployed Helm application using Helm commands like `helm ls` after deploying with Argo CD?
+
+When deploying Helm applications, Argo CD only uses Helm as a templating mechanism. It runs `helm template` and then deploys the generated manifests to the cluster, rather than executing `helm install`. This means you cannot use any Helm commands to view/verify the application. It is fully managed by Argo CD. Note that Argo CD natively supports some features you may want to use in Helm (like history and rollback commands).
+
+## The configured cluster secret is not visible in the CLI/Argo CD Dashboard, how can I fix this?
+
+Check if the cluster secret has the label `argocd.argoproj.io/secret-type: cluster`. If the secret has the label but the cluster is still not visible, it may be a permission issue. Try listing the clusters using the `admin` user (e.g.: `argocd login --username admin && argocd cluster list`).
+
+## How to terminate a sync operation?
+
+To terminate a sync, click "Sync" and then click "Terminate".
+
+## Why does the application still show an `Out Of Sync` state after synchronization?
+
+In some cases, the tools you are using may conflict with Argo CD by adding the `app.kubernetes.io/instance` label, for example, when using Kustomize's common label feature.
+
+Argo CD automatically sets the `app.kubernetes.io/instance` label and uses it to determine which resources make up the application. If the tool does this as well, it can lead to confusion. You can change this label by setting the `application.instanceLabelKey` value in `argocd-cm`. We recommend using `argocd.argoproj.io/instance`.
+
+:::warning
+Note: When making this change, your application will be in an out-of-sync state and will need to be resynchronized.
+:::
+
+## How often does Argo CD check for changes in Git or Helm repositories?
+
+The default polling interval is 3 minutes (180 seconds) and can be configured. You can change the settings by updating the `timeout.reconciliation` value and `timeout.reconciliation.jitter` in the argocd-cm configuration map. If there are any Git changes, Argo CD will only update the applications that have automatic sync settings enabled. If set to `0`, Argo CD will stop automatically polling the Git repository, and you will only be able to deploy applications using other methods (such as webhooks and/or manual sync).
+
+## How to fix the `invalid cookie, longer than max length 4093` error?
+
+Argo CD uses JWT as the authentication token. You may belong to many groups, exceeding the 4KB limit set for cookies. You can obtain the list of groups by opening "Developer Tools -> Network":
+
+1. Log in to the Argo CD Dashboard \[How to get the Argo CD Dashboard login address]
+2. Locate the call to `<argocd_instance>/auth/callback?code=<random_string>`
+
+Decode the token at [https://jwt.io/](https://jwt.io/). This will provide you with a list of teams you can log out from.
+
+## Why do I receive the `rpc error: code = Unavailable desc = transport is closing` error when using the CLI?
+
+Perhaps you are behind a proxy that does not support HTTP/2? Try using the `--grpc-web` flag:
+
+```bash
+argocd ... --grpc-web
+```
+
+## Why do I receive the `x509: certificate signed by unknown authority` error when using the CLI?
+
+The certificate created by Argo CD by default is not automatically recognized by the Argo CD CLI. To create a secure system, you must follow the instructions to install the certificate and configure the client operating system to trust that certificate.
+
+If you are not running on a production system (e.g., you are testing Argo CD), try using the `--insecure` flag:
+
+```bash
+argocd ... --insecure
+```
+
+Warning: Do not use `--insecure` in production environments.
+
+## How to rotate Redis keys?
+
+1. Delete the `argocd-redis` secret in the Argo CD installation namespace:
+
+```bash
+kubectl delete secret argocd-redis -n <argocd namespace>
+```
+
+2. If you are running Redis in HA mode, restart HA Redis:
+
+```bash
+kubectl rollout restart deployment argocd-redis-ha-haproxy
+kubectl rollout restart statefulset argocd-redis-ha-server
+```
+
+3. If you are running Redis in non-HA mode, restart Redis:
+
+```bash
+kubectl rollout restart deployment argocd-redis
+```
+
+4. Restart other components:
+
+```bash
+kubectl rollout restart deployment argocd-server argocd-repo-server
+kubectl rollout restart statefulset argocd-application-controller
+```
+
+## How to fix the `Manifest generation error (cached)` error?
+
+`Manifest generation error (cached)` indicates that there was an error generating the manifest, and that error message has been cached to prevent infinite retries.
+
+Performing a hard refresh (ignoring cached errors) may solve temporary issues. However, if there are persistent reasons for the manifest generation to fail, a hard refresh will not resolve the issue.
+
+Instead, try searching the repo-server logs for the application name to identify the errors that caused the manifest generation to fail.
+
+## How to fix the `field not declared in schema` error?
+
+For certain features, Argo CD relies on a static (hardcoded) schema set of built-in Kubernetes resource types.
+
+If your manifest uses fields that do not exist in the hardcoded schema, you may receive an error like `field not declared in schema`.
+
+The schema version is based on the version of the Kubernetes libraries on which Argo CD was built. To resolve this issue, you can:
+
+1. Upgrade to an Argo CD version that contains a static schema supporting the required fields.
+2. Avoid using features that rely on the static schema:
+   - Disable `ignoreDifferences` with `managedFieldsManagers`
+   - Disable server-side application
+   - Disable changes webhook when using server-side differences

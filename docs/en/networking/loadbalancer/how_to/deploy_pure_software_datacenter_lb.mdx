@@ -1,0 +1,266 @@
+---
+weight: 10
+sourceSHA: 22e17c86f270a59220ad0d72b8ed89b3fca468191974c6aa425730fc95768d35
+---
+
+# Soft Data Center LB Solution (Alpha)
+
+Deploy a pure software data center load balancer (LB) by creating a highly available load balancer outside the cluster, providing load balancing capabilities for multiple ALBs to ensure stable business operations. It supports configuration for IPv4 only, IPv6 only, or both IPv4 and IPv6 dual stack.
+
+## Prerequisites
+
+1. Prepare two or more host nodes as LB. It is recommended to install Ubuntu 22.04 operating system on LB nodes to reduce the time for LB to forward traffic to abnormal backend nodes.
+
+2. Pre-install the following software on all host nodes of the external LB (this chapter takes two external LB host nodes as an example):
+
+   - `ipvsadm`
+
+   - `Docker (20.10.7)`
+
+3. Ensure that the Docker service starts on boot for each host using the following command: `sudo systemctl enable docker.service`.
+
+4. Ensure that the clock of each host node is synchronized.
+
+5. Prepare the image for Keepalived, used to start the external LB service; the platform already contains this image. The image address is in the following format: `<image repository address>/tkestack/keepalived:<version suffix>`. The version suffix may vary slightly among different versions. You can obtain the image repository address and version suffix as follows. This document uses `build-harbor.alauda.cn/tkestack/keepalived:v3.16.0-beta.3.g598ce923` as an example.
+
+   - In the global cluster, execute `kubectl get prdb base -o json | jq .spec.registry.address` to get the **image repository address** parameter.
+
+   - In the directory where the installation package is extracted, execute `cat ./installer/res/artifacts.json |grep keepalived -C 2|grep tag|awk '{print $2}'|awk -F '"' '{print $2}'` to get the **version suffix**.
+
+## Steps
+
+**Note**: The following operations must be executed once on each external LB host node, and the `hostname` of the host nodes must not be duplicated.
+
+1. Add the following configuration information to the file `/etc/modules-load.d/alive.kmod.conf`.
+
+   ```
+   ip_vs
+   ip_vs_rr
+   ip_vs_wrr
+   ip_vs_sh
+   nf_conntrack_ipv4
+   nf_conntrack
+   ip6t_MASQUERADE
+   nf_nat_masquerade_ipv6
+   ip6table_nat
+   nf_conntrack_ipv6
+   nf_defrag_ipv6
+   nf_nat_ipv6
+   ip6_tables
+   ```
+
+2. Add the following configuration information to the file `/etc/sysctl.d/alive.sysctl.conf`.
+
+   ```
+   net.ipv4.ip_forward = 1
+   net.ipv4.conf.all.arp_accept = 1
+   net.ipv4.vs.conntrack = 1
+   net.ipv4.vs.conn_reuse_mode = 0
+   net.ipv4.vs.expire_nodest_conn = 1
+   net.ipv4.vs.expire_quiescent_template = 1
+   net.ipv6.conf.all.forwarding=1
+   ```
+
+3. Restart using the `reboot` command.
+
+4. Create a folder for the Keepalived configuration file.
+
+   ```
+   mkdir -p /etc/keepalived
+   mkdir -p /etc/keepalived/kubecfg
+   ```
+
+5. Modify the configuration items according to the comments in the following file and save them in the `/etc/keepalived/` folder, naming the file `alive.yaml`.
+
+   ```
+   instances:
+     - vip: # Multiple VIPs can be configured
+         vip: 192.168.128.118 # VIPs must be different
+         id: 20 # Each VIP's ID must be unique, optional
+         interface: "eth0"
+         check_interval: 1 # optional, default 1: interval to execute check script
+         check_timeout: 3  # optional, default 3: check script timeout period
+         name: "vip-1" # Identifier for this instance, can only contain alphanumeric characters and hyphens, cannot start with a hyphen
+         peer: [ "192.168.128.116", "192.168.128.75" ] # Keepalived node IP, actual generated keepalived.conf will remove all IPs on the interface https://github.com/osixia/docker-keepalived/issues/33
+         kube_lock:
+           kubecfgs: # The kube-config list used by kube-lock will sequentially attempt these kubecfgs for leader election in Keepalived
+             - "/live/cfg/kubecfg/kubecfg01.conf"
+             - "/live/cfg/kubecfg/kubecfg02.conf"
+             - "/live/cfg/kubecfg/kubecfg03.conf"
+       ipvs: # Configuration for option IPVS
+         ips: [ "192.168.143.192", "192.168.138.100","192.168.129.100" ] # IPVS backend, change k8s master node IP to ALB node's node IP
+         ports: # Configure health check logic for each port on the VIP
+           - port: 80 # The port on the virtual server must match the real server's port
+             virtual_server_config: |
+               delay_loop 10  # Interval for performing health checks on the real server
+               lb_algo rr
+               lb_kind NAT
+               protocol TCP
+             raw_check: |
+               TCP_CHECK {
+                   connect_timeout 10
+                   connect_port 1936
+               }
+     - vip:
+         vip: 2004::192:168:128:118
+         id: 102
+         interface: "eth0"
+         peer: [ "2004::192:168:128:75","2004::192:168:128:116" ]
+         kube_lock:
+           kubecfgs: # The kube-config list used by kube-lock will sequentially attempt these kubecfgs for leader election in Keepalived
+             - "/live/cfg/kubecfg/kubecfg01.conf"
+             - "/live/cfg/kubecfg/kubecfg02.conf"
+             - "/live/cfg/kubecfg/kubecfg03.conf"
+       ipvs:
+         ips: [ "2004::192:168:143:192","2004::192:168:138:100","2004::192:168:129:100" ]
+         ports:
+           - port: 80
+             virtual_server_config: |
+               delay_loop 10
+               lb_algo rr
+               lb_kind NAT
+               protocol TCP
+             raw_check: |
+               TCP_CHECK {
+                   connect_timeout 1
+                   connect_port 1936
+               }
+   ```
+
+6. Execute the following command in the business cluster to check the certificate expiration date in the configuration file, ensuring that the certificate is still valid. The LB functionality will become unavailable after the certificate expires, requiring contact with the platform administrator for a certificate update.
+
+   ```
+   openssl x509 -in <(cat /etc/kubernetes/admin.conf | grep client-certificate-data | awk '{print $NF}' | base64 -d ) -noout -dates
+   ```
+
+7. Copy the `/etc/kubernetes/admin.conf` file from the three Master nodes in the Kubernetes cluster to the `/etc/keepalived/kubecfg` folder on the external LB nodes, naming them with an index, e.g., `kubecfg01.conf`, and modify the `apiserver` node addresses in these three files to the actual node addresses of the Kubernetes cluster.
+
+   **Note**: After the platform certificate is updated, this step needs to be executed again, overwriting the original files.
+
+8. Check the validity of the certificates.
+
+   1. Copy `/usr/bin/kubectl` from the Master node of the business cluster to the LB node.
+
+   2. Execute `chmod +x /usr/bin/kubectl` to grant execution permissions.
+
+   3. Execute the following commands to confirm certificate validity.
+
+      ```
+      kubectl --kubeconfig=/etc/keepalived/kubecfg/kubecfg01.conf get node
+      kubectl --kubeconfig=/etc/keepalived/kubecfg/kubecfg02.conf get node
+      kubectl --kubeconfig=/etc/keepalived/kubecfg/kubecfg03.conf get node
+      ```
+
+      If the following results are returned, the certificate is valid.
+
+      ```
+      kubectl --kubeconfig=/etc/keepalived/kubecfg/kubecfg01.conf get node
+      ## Output
+      NAME              STATUS   ROLES                  AGE     VERSION
+      192.168.129.100   Ready    <none>                 7d22h   v1.25.6
+      192.168.134.167   Ready    control-plane,master   7d22h   v1.25.6
+      192.168.138.100   Ready    <none>                 7d22h   v1.25.6
+      192.168.143.116   Ready    control-plane,master   7d22h   v1.25.6
+      192.168.143.192   Ready    <none>                 7d22h   v1.25.6
+      192.168.143.79    Ready    control-plane,master   7d22h   v1.25.6
+
+      kubectl --kubeconfig=/etc/keepalived/kubecfg/kubecfg02.conf get node
+      ## Output
+      NAME              STATUS   ROLES                  AGE     VERSION
+      192.168.129.100   Ready    <none>                 7d22h   v1.25.6
+      192.168.134.167   Ready    control-plane,master   7d22h   v1.25.6
+      192.168.138.100   Ready    <none>                 7d22h   v1.25.6
+      192.168.143.116   Ready    control-plane,master   7d22h   v1.25.6
+      192.168.143.192   Ready    <none>                 7d22h   v1.25.6
+      192.168.143.79    Ready    control-plane,master   7d22h   v1.25.6
+
+      kubectl --kubeconfig=/etc/keepalived/kubecfg/kubecfg03.conf get node
+      ## Output
+      NAME              STATUS   ROLES                  AGE     VERSION
+      192.168.129.100   Ready    <none>                 7d22h   v1.25.6
+      192.168.134.167   Ready    control-plane,master   7d22h   v1.25.6
+      192.168.138.100   Ready    <none>                 7d22h   v1.25.6
+      192.168.143.116   Ready    control-plane,master   7d22h   v1.25.6
+      192.168.143.192   Ready    <none>                 7d22h   v1.25.6
+      192.168.143.79    Ready    control-plane,master   7d22h   v1.25.6
+      ```
+
+9. Upload the Keepalived image to the external LB node and run Keepalived using Docker.
+
+   ```
+   docker run -dt --restart=always --privileged --network=host -v /etc/keepalived:/live/cfg build-harbor.alauda.cn/tkestack/keepalived:v3.16.0-beta.3.g598ce923
+   ```
+
+10. Run the following command on the node accessing `keepalived`: `sysctl -w net.ipv4.conf.all.arp_accept=1`.
+
+## Verification
+
+1. Run the command `ipvsadm -ln` to view the IPVS rules, and you will see IPv4 and IPv6 rules applicable to the business cluster ALBs.
+
+   ```
+   IP Virtual Server version 1.2.1 (size=4096)
+   Prot LocalAddress:Port Scheduler Flags
+     -> RemoteAddress:Port           Forward Weight        ActiveConn InActConn
+   TCP  192.168.128.118:80 rr
+     -> 192.168.129.100:80           Masq    1      0          0        
+     -> 192.168.138.100:80           Masq    1      0          0        
+     -> 192.168.143.192:80           Masq    1      0          0        
+   TCP  [2004::192:168:128:118]:80 rr
+     -> [2004::192:168:129:100]:80   Masq    1      0          0        
+     -> [2004::192:168:138:100]:80   Masq    1      0          0        
+     -> [2004::192:168:143:192]:80   Masq    1      0          0
+   ```
+
+2. Shut down the LB node where the VIP is located and test whether the VIP of both IPv4 and IPv6 can successfully migrate to another node, typically within 20 seconds.
+
+3. Use the `curl` command on a non-LB node to test if communication with the VIP is normal.
+
+   ```
+   curl 192.168.128.118
+
+   <!DOCTYPE html>
+   <html>
+   <head>
+   <title>Welcome to nginx!</title>
+   <style>
+   html { color-scheme: light dark; }
+   body { width: 35em; margin: 0 auto;
+   font-family: Tahoma, Verdana, Arial, sans-serif; }
+   </style>
+   </head>
+   <body>
+   <h1>Welcome to nginx!</h1>
+   <p>If you see this page, the nginx web server is successfully installed and working. Further configuration is required.</p>
+
+   <p>For online documentation and support please refer to <a href="http://nginx.org/">nginx.org</a>.<br/>
+   Commercial support is available at <a href="http://nginx.com/">nginx.com</a>.</p>
+
+   <p><em>Thank you for using nginx.</em></p>
+   </body>
+   </html>
+   ```
+
+   ```
+   curl -6 [2004::192:168:128:118]:80 -g
+
+   <!DOCTYPE html>
+   <html>
+   <head>
+   <title>Welcome to nginx!</title>
+   <style>
+   html { color-scheme: light dark; }
+   body { width: 35em; margin: 0 auto;
+   font-family: Tahoma, Verdana, Arial, sans-serif; }
+   </style>
+   </head>
+   <body>
+   <h1>Welcome to nginx!</h1>
+   <p>If you see this page, the nginx web server is successfully installed and working. Further configuration is required.</p>
+
+   <p>For online documentation and support please refer to <a href="http://nginx.org/">nginx.org</a>.<br/>
+   Commercial support is available at<a href="http://nginx.com/">nginx.com</a>.</p>
+
+   <p><em>Thank you for using nginx.</em></p>
+   </body>
+   </html>
+   ```

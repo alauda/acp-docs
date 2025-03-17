@@ -1,0 +1,333 @@
+---
+weight: 50
+sourceSHA: f2eb3c0a77c8124f6c5cf1632c57a36d1a9847bd5c26af096da402d6b32cefbd
+---
+
+# Physical GPU Passthrough Environment Preparation
+
+Physical GPU passthrough in virtual machines refers to the process of directly allocating the actual Graphics Processing Unit (GPU) to a virtual machine within a virtualization environment. This allows the virtual machine to access and utilize the physical GPU directly, achieving graphics performance equivalent to that of running directly on a physical machine. It avoids performance bottlenecks caused by virtual graphics adapters, thus enhancing overall performance.
+
+## Constraints and Limitations
+
+The physical GPU passthrough functionality requires the use of the kubevirt-gpu-device-plugin; however, there is currently no ARM64 image available for the kubevirt-gpu-device-plugin, which means this functionality cannot be used in an operating system with an ARM64 CPU architecture.
+
+## Prerequisites
+
+### Chart and Image Preparation
+
+Obtain the following Chart and images and upload them to an image repository. This document uses `build-harbor.example.cn` as an example repository address. For the specific method of obtaining the Chart and images, please contact the relevant personnel.
+
+**Chart**
+
+- build-harbor.example.cn/example/chart-gpu-operator:v23.9.1
+
+**Images**
+
+- build-harbor.example.cn/3rdparty/nvidia/gpu-operator:v23.9.0
+- build-harbor.example.cn/3rdparty/nvidia/cloud-native/gpu-operator-validator:v23.9.0
+- build-harbor.example.cn/3rdparty/nvidia/cuda:12.3.1-base-ubi8
+- build-harbor.example.cn/3rdparty/nvidia/kubevirt-gpu-device-plugin:v1.2.4
+- build-harbor.example.cn/3rdparty/nvidia/nfd/node-feature-discovery:v0.14.2
+
+### Enabling IOMMU
+
+The procedure for enabling IOMMU varies across different operating systems. Please refer to the documentation of the corresponding operating system. This document uses CentOS as an example, and all commands should be executed in the terminal.
+
+1. Edit the `/etc/default/grub` file and add `intel_iommu=on iommu=pt` to the `GRUB_CMDLINE_LINUX` configuration option.
+
+   ```
+   GRUB_CMDLINE_LINUX="crashkernel=auto rd.lvm.lv=centos/root rhgb quiet intel_iommu=on iommu=pt"
+   ```
+
+2. Execute the following command to generate the `grub.cfg` file.
+
+   ```
+   grub2-mkconfig -o /boot/grub2/grub.cfg
+   ```
+
+3. Restart the server.
+
+4. Run the following command to confirm if IOMMU has been successfully enabled. If the output contains `IOMMU enabled`, then it indicates that it has been successfully enabled.
+
+   ```
+   dmesg | grep -i iommu
+   ```
+
+## Operating Steps
+
+**Note**: All commands below should be executed in the CLI tool on the corresponding cluster Master node unless otherwise specified.
+
+### Create Namespace
+
+Execute the following command to create a namespace named `gpu-system`. If the output displays `namespace/gpu-system created`, it indicates that the creation was successful.
+
+```
+kubectl create ns gpu-system
+```
+
+### Deploy gpu-operator
+
+1. Execute the following command to deploy the gpu-operator.
+
+   ```
+   export REGISTRY=<registry> # Replace <registry> with the repository address where the gpu-operator image is located, e.g.: export REGISTRY=build-harbor.example.cn
+     
+   cat <<EOF | kubectl create -f -
+   apiVersion: operator.alauda.io/v1alpha1
+   kind: AppRelease
+   metadata:
+     annotations:
+       auto-recycle: "true"
+       interval-sync: "true"
+     name: gpu-operator
+     namespace: gpu-system
+   spec:
+     destination:
+       cluster: ""
+       namespace: "gpu-operator"
+     source:
+       charts:
+       - name: <chartName> # Replace <chartName> with the actual chart path, e.g.: name = example/chart-gpu-operator
+         releaseName: gpu-operator
+         targetRevision: v23.9.1
+       repoURL: $REGISTRY
+     timeout: 120
+     values:
+       global:
+         registry:
+           address: $REGISTRY
+       nfd:
+         enabled: true
+       sandboxWorkloads:
+         enabled: true
+         defaultWorkload: "vm-passthrough"
+   EOF
+   ```
+
+2. Execute the following command to check if the gpu-operator has synchronized. If `SYNC` shows as `Synced`, it indicates that it has synchronized successfully.
+
+   ```
+   kubectl -n gpu-system get apprelease gpu-operator
+   ```
+
+   Output information:
+
+   ```
+   NAME           SYNC           HEALTH        MESSAGE        UPDATE   AGE
+   gpu-operator   Synced         Ready         chart synced   28s      32s
+   ```
+
+3. Execute the following command to retrieve the names of all nodes and find the GPU node name.
+
+   ```
+   kubectl get nodes -o wide
+   ```
+
+4. Execute the following command to check if the GPU node has any pass-through capable GPU. If the output contains GPU information similar to `nvidia.com/GK210GL_TESLA_K80`, it indicates that there are pass-through capable GPUs.
+
+   ```
+   kubectl get node <gpu-node-name> -o jsonpath='{.status.allocatable}' # Replace <gpu-node-name> with the GPU node name obtained from Step 3
+   ```
+
+   Output information:
+
+   ```
+   {"cpu":"39","devices.kubevirt.io/kvm":"1k","devices.kubevirt.io/tun":"1k","devices.kubevirt.io/vhost-net":"1k","ephemeral-storage":"426562784165","hugepages-1Gi":"0","hugepages-2Mi":"0","memory":"122915848Ki","nvidia.com/GK210GL_TESLA_K80":"8","pods":"256"}
+   ```
+
+5. At this point, the gpu-operator has been successfully deployed.
+
+### Configure Kubevirt
+
+1. Execute the following command to enable the DisableMDEVConfiguration feature. If a message similar to `hyperconverged.hco.kubevirt.io/kubevirt-hyperconverged patched` is returned, it indicates successful enabling.
+
+   ```
+   kubectl patch hco kubevirt-hyperconverged -n kubevirt --type='json' -p='[{"op": "add", "path": "/spec/featureGates/disableMDevConfiguration", "value": true }]'
+   ```
+
+2. In the terminal of the GPU node, execute the following command to obtain the pciDeviceSelector. The `10de:102d` part in the output is the value of pciDeviceSelector. \{#pciDeviceSelector}
+
+   ```
+   lspci -nn | grep -i nvidia
+   ```
+
+   Output information:
+
+   ```
+   04:00.0 3D controller [0302]: NVIDIA Corporation GK210GL [Tesla K80] [10de:102d] (rev a1)
+   05:00.0 3D controller [0302]: NVIDIA Corporation GK210GL [Tesla K80] [10de:102d] (rev a1)
+   08:00.0 3D controller [0302]: NVIDIA Corporation GK210GL [Tesla K80] [10de:102d] (rev a1)
+   09:00.0 3D controller [0302]: NVIDIA Corporation GK210GL [Tesla K80] [10de:102d] (rev a1)
+   85:00.0 3D controller [0302]: NVIDIA Corporation GK210GL [Tesla K80] [10de:102d] (rev a1)
+   86:00.0 3D controller [0302]: NVIDIA Corporation GK210GL [Tesla K80] [10de:102d] (rev a1)
+   89:00.0 3D controller [0302]: NVIDIA Corporation GK210GL [Tesla K80] [10de:102d] (rev a1)
+   8a:00.0 3D controller [0302]: NVIDIA Corporation GK210GL [Tesla K80] [10de:102d] (rev a1)
+   ```
+
+3. Execute the following command to retrieve the names of all nodes and find the GPU node name.
+
+   ```
+   kubectl get nodes -o wide
+   ```
+
+4. Execute the following command to obtain the resourceName. The `nvidia.com/GK210GL_TESLA_K80` part in the output is the value of resourceName.
+
+   ```
+   kubectl get node <gpu-node-name> -o jsonpath='{.status.allocatable}' # Replace <gpu-node-name> with the GPU node name obtained from Step 3
+   ```
+
+   Output information:
+
+   ```
+   {"cpu":"39","devices.kubevirt.io/kvm":"1k","devices.kubevirt.io/tun":"1k","devices.kubevirt.io/vhost-net":"1k","ephemeral-storage":"426562784165","hugepages-1Gi":"0","hugepages-2Mi":"0","memory":"122915848Ki","nvidia.com/GK210GL_TESLA_K80":"8","pods":"256"}
+   ```
+
+5. Execute the following command to add the passthrough GPU.
+
+   **Note**: When replacing the \<pci-devices-id> part in the command below with the pciDeviceSelector value obtained in [Step 2](#pciDeviceSelector), **all letters in the pciDeviceSelector must be converted to uppercase**. For example, if the pciDeviceSelector value obtained is `10de:102d`, it should be replaced with `export DEVICE=10DE:102D`.
+
+   - Adding a single GPU card
+
+     ```
+     export DEVICE=<pci-devices-id> # Replace <pci-devices-id> with the pciDeviceSelector obtained in Step 2, e.g.: export DEVICE=10DE:102D
+     export RESOURCE=<resource-name> # Replace <resource-name> with the resourceName obtained in Step 4, e.g.: export RESOURCE=nvidia.com/GK210GL_TESLA_K80
+      
+     kubectl patch hco kubevirt-hyperconverged -n kubevirt --type='json' -p='
+     [
+       {
+         "op": "add",
+         "path": "/spec/permittedHostDevices",
+         "value": {
+           "pciHostDevices": [
+             {
+               "externalResourceProvider": true,
+               "pciDeviceSelector": "'"$DEVICE"'",
+               "resourceName": "'"$RESOURCE"'"
+             }
+           ]
+         }
+       }
+     ]'
+     ```
+
+   - Adding multiple GPU cards
+
+     **Note**: When adding multiple GPU cards, each pciDeviceSelector value used to replace \<pci-devices-id> must be unique.
+
+     ```
+     export DEVICE1=<pci-devices-id1> # Replace <pci-devices-id1> with the pciDeviceSelector obtained in Step 2
+     export RESOURCE1=<resource-name1> # Replace <resource-name1> with the resourceName obtained in Step 4
+     export DEVICE2=<pci-devices-id2> # Replace <pci-devices-id2> with the pciDeviceSelector obtained in Step 2
+     export RESOURCE2=<resource-name2> # Replace <resource-name2> with the resourceName obtained in Step 4
+      
+     kubectl patch hco kubevirt-hyperconverged -n kubevirt --type='json' -p='
+     [
+       {
+         "op": "add",
+         "path": "/spec/permittedHostDevices",
+         "value": {
+           "pciHostDevices": [
+             {
+               "externalResourceProvider": true,
+               "pciDeviceSelector": "'"$DEVICE"'",
+               "resourceName": "'"$RESOURCE"'"
+             },
+             {
+               "externalResourceProvider": true,
+               "pciDeviceSelector": "'"$DEVICE2"'",
+               "resourceName": "'"$RESOURCE2"'"
+             }
+           ]
+         }
+       }
+     ]'
+     ```
+
+   - Adding new GPU cards after already adding GPU cards
+
+     ```
+     export DEVICE=<pci-devices-id> # Replace <pci-devices-id> with the pciDeviceSelector obtained in Step 2
+     export RESOURCE=<resource-name> # Replace <resource-name> with the resourceName obtained in Step 4
+     export INDEX=<index> # index is a zero-based array index, use the number to replace <index>, for example: if one GPU card has already been added, and now you want to add another one, index should be 1, i.e., export INDEX=1
+       
+     kubectl patch hco kubevirt-hyperconverged -n kubevirt --type='json' -p='
+     [
+       {
+         "op": "add",
+         "path": "/spec/permittedHostDevices/pciHostDevices/'"${INDEX}"'",
+         "value": {
+           "externalResourceProvider": true,
+           "pciDeviceSelector": "'"$DEVICE"'",
+           "resourceName": "'"$RESOURCE"'"
+         }
+       }
+     ]'
+     ```
+
+## Result Verification{#result}
+
+After completing the above configuration steps, if the corresponding physical GPU can be selected when creating the virtual machine, it indicates that the physical GPU passthrough environment has been successfully prepared.
+
+**Note**: If physical GPU passthrough needs to be configured, please enable the relevant features in advance.
+
+1. Go to **Container Platform**.
+
+2. In the left navigation bar, click **Virtualization** > **Virtual Machines**.
+
+3. Click **Create Virtual Machine**.
+
+4. Configure the **Physical GPU (Alpha)** parameter for the virtual machine.
+
+   | Parameter            | Description                               |
+   | -------------------- | ----------------------------------------- |
+   | **Physical GPU (Alpha)** | Select the model of the configured physical GPU. Only one physical GPU can be assigned to each virtual machine. |
+
+5. At this point, the physical GPU passthrough environment has been successfully prepared.
+
+## Related Operations
+
+### Delete the Virtual Machine with Passthrough GPU
+
+1. Go to **Container Platform**.
+
+2. In the left navigation bar, click **Virtualization** > **Virtual Machines**.
+
+3. In the list page, click the ⋮ on the right side of the virtual machine to be deleted > **Delete**, or click the name of the virtual machine to be deleted to enter its detail information page, and click **Actions** > **Delete**.
+
+4. Input the confirmation information to delete the virtual machine with passthrough GPU.
+
+### Remove GPU-related Configuration from KubeVirt
+
+1. On the corresponding cluster Master node for the GPU, use the CLI tool to execute the following command to remove the GPU-related configuration from KubeVirt.
+
+   ```
+   kubectl patch hco kubevirt-hyperconverged -n kubevirt --type='json' -p='[{"op": "remove", "path": "/spec/permittedHostDevices"}]'
+   ```
+
+2. After deletion, if it is not possible to choose the corresponding physical GPU model when creating a virtual machine through **Container Platform**, it indicates that the deletion was successful. Please refer to [Select Physical GPU Model](#result) for the specific steps to create a virtual machine.
+
+### Uninstall gpu-operator
+
+1. Use the CLI tool on the corresponding cluster Master node for the GPU to execute the following command to uninstall the gpu-operator.
+
+   ```
+   kubectl -n gpu-system delete apprelease gpu-operator
+   ```
+
+   Output information:
+
+   ```
+   apprelease.operator.alauda.io "gpu-operator" deleted
+   ```
+
+2. Execute the command, and if you receive a response similar to the one below, it indicates that the gpu-operator has been successfully uninstalled.
+
+   ```
+   kubectl -n gpu-system get apprelease gpu-operator
+   ```
+
+   Output information:
+
+   ```
+   Error from server (NotFound): appreleases.operator.alauda.io "gpu-operator" not found
+   ```
