@@ -1,0 +1,260 @@
+apiVersion: builds.katanomi.dev/v1alpha1
+kind: Build
+spec:
+  runTemplate:
+    spec:
+      timeouts:
+        pipeline: 1h
+      workspaces:
+        - name: source
+          volumeClaimTemplate:
+            spec:
+              storageClassName: topolvm
+              accessModes:
+                - ReadWriteOnce
+              resources:
+                requests:
+                  storage: 20Gi
+        - name: dockerconfig
+          secret:
+            secretName: build-harbor.kauto.docfj
+  workspaces:
+    - description: >
+        This workspace is shared among all the pipeline tasks to read/write
+        common resources
+      name: source
+    - name: dockerconfig
+  tasks:
+    - name: aggregate-online-docs
+      workspaces:
+        - name: source
+          workspace: source
+      params:
+        - name: branch
+          value: $(build.git.branch.name)
+      taskSpec:
+        results:
+          - description: Determine whether to push to the remote warehouse
+            name: modified-flag
+            type: string
+        steps:
+          - image: build-harbor.alauda.cn/idp/docs-ops:main
+            name: aggregate-online-docs
+            imagePullPolicy: Always
+            workingDir: $(workspaces.source.path)
+            command:
+            - xonsh
+            - /apps/aggregate_online_docs.xsh
+            args:
+            - --mode=prod
+            - --result-file=$(results.modified-flag.path)
+            env:
+              - name: MAIN_REPO_URL
+                value: "https://gitlab-ce.alauda.cn/alauda/product-docs"
+              - name: MAIN_REPO_NAME
+                value: "product-docs"
+              - name: MAIN_REPO_BASE
+                value: "container_platform"
+              - name: MINIO_URL
+                valueFrom:
+                  secretKeyRef:
+                    name: product-docs-minio-credentials
+                    key: url
+              - name: MINIO_ACCESS_KEY
+                valueFrom:
+                  secretKeyRef:
+                    name: product-docs-minio-credentials
+                    key: access-key
+              - name: MINIO_SECRET_KEY
+                valueFrom:
+                  secretKeyRef:
+                    name: product-docs-minio-credentials
+                    key: secret-key
+              - name: MINIO_BUCKET
+                valueFrom:
+                  secretKeyRef:
+                    name: product-docs-minio-credentials
+                    key: bucket
+              - name: GH_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: product-docs-github-credentials
+                    key: token
+              - name: GITLAB_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: product-docs-gitlab-credentials
+                    key: token
+    - name: build-image
+      runAfter:
+        - aggregate-online-docs
+      timeout: 30m
+      retries: 2
+      taskRef:
+        resolver: hub
+        params:
+          - name: catalog
+            value: extras
+          - name: kind
+            value: task
+          - name: name
+            value: buildx
+          - name: version
+            value: "0.1"
+      workspaces:
+        - name: source
+          workspace: source
+        - name: dockerconfig
+          workspace: dockerconfig
+      when:
+        - input: "$(tasks.aggregate-online-docs.results.modified-flag)"
+          operator: in
+          values:
+            - "true"
+      params:
+        - name: context
+          value: "."
+        - name: dockerfile
+          value: ./Dockerfile
+        - name: image-url
+          value: build-harbor.alauda.cn/alauda/product-docs-online
+        - name: image-tags
+          value:
+          - $(build.git.version.short)$(build.triggeredBy.triggeredTimestamp.yyyyMMddmmss)
+        - name: labels
+          value:
+            - branch=$(build.git.branch.name)
+            - commit=$(build.git.lastCommit.id)
+        - name: platform
+          value:
+            - linux/amd64
+            - linux/arm64
+    - name: chart-build
+      runAfter:
+        - build-image
+      timeout: 30m
+      retries: 0
+      taskRef:
+        kind: ClusterTask
+        name: chart-build
+      workspaces:
+        - name: source
+          workspace: source
+      when:
+        - input: "$(tasks.aggregate-online-docs.results.modified-flag)"
+          operator: in
+          values:
+            - "true"
+      params:
+        - name: helm-images
+          value:
+            - build-harbor.alauda.cn/alauda/chart-product-docs-online:$(build.git.version.short)$(build.triggeredBy.triggeredTimestamp.yyyyMMddmmss)
+        - name: dir
+          value: ./chart
+        - name: media-type
+          value: application/vnd.cncf.helm.chart.content.v1.tar+gzip
+        - name: version
+          value:
+            - chart-version=$(build.git.version.short)$(build.triggeredBy.triggeredTimestamp.yyyyMMddmmss)
+        - name: values
+          value:
+            - global.images.productDocs.repository=alauda/product-docs-online
+            - global.images.productDocs.tag=$(build.git.version.short)$(build.triggeredBy.triggeredTimestamp.yyyyMMddmmss)
+            - deployMode=online
+        - name: annotations
+          value:
+            - branch=$(build.git.branch.name)
+            - commit=$(build.git.lastCommit.id)
+    - name: clone-env-repo
+      runAfter:
+        - chart-build
+      timeout: 5m
+      retries: 3
+      taskRef:
+        name: git-clone
+        kind: ClusterTask
+      params:
+        - name: git-url
+          value: https://gitlab-ce.alauda.cn/ops/docs-env
+        - name: git-revision
+          value: $(build.git.branch.name)
+      workspaces:
+        - name: source
+          workspace: source
+      when:
+        - input: "$(tasks.aggregate-online-docs.results.modified-flag)"
+          operator: in
+          values:
+            - "true"
+    - name: update-chart-version
+      runAfter:
+        - clone-env-repo
+      timeout: 2m
+      retries: 0
+      taskRef:
+        name: yaml-update
+        kind: ClusterTask
+      params:
+        - name: path
+          value: ./gitops-apps/values.versions.yaml
+        - name: set
+          value:
+            - .apps.product_docs_online_staging.version="$(build.git.version.short)"
+            - .apps.product_docs_online_staging.branch="$(build.git.branch.name)"
+            - .apps.product_docs_online_staging.commit="$(build.git.lastCommit)"
+            - .apps.product_docs_online_staging.message="$(build.git.lastCommit.message)"
+            - .apps.product_docs_online_staging.author="$(build.git.lastCommit.authorEmail)"
+      workspaces:
+        - name: source
+          workspace: source
+      when:
+        - input: "$(tasks.aggregate-online-docs.results.modified-flag)"
+          operator: in
+          values:
+            - "true"
+    - name: publish
+      runAfter:
+        - update-chart-version
+      timeout: 5m
+      retries: 0
+      taskRef:
+        name: alauda-git-commit-push
+        kind: ClusterTask
+      when:
+        - input: "$(tasks.update-chart-version.results.push-flag)"
+          operator: in
+          values:
+            - "true"
+      params:
+        - name: branch
+          value: $(build.git.branch.name)
+        - name: git-message
+          value: "update product-docs version to $(build.git.version.short)$(build.triggeredBy.triggeredTimestamp.yyyyMMddmmss)"
+      workspaces:
+        - name: source
+          workspace: source
+  finally:
+    - name: release-tag
+      timeout: 30m
+      retries: 0
+      taskRef:
+        kind: ClusterTask
+        name: alauda-release-tag
+      workspaces:
+        - name: source
+          workspace: source
+      when:
+        - input: $(build.git.versionPhase)
+          operator: in
+          values:
+            - custom
+            - ga
+        - input: $(tasks.status)
+          operator: in
+          values:
+            - Succeeded
+            - Completed
+      params:
+        - name: version
+          value: $(build.git.version.short)$(build.triggeredBy.triggeredTimestamp.yyyyMMddmmss)
+
