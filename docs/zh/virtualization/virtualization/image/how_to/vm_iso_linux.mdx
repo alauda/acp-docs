@@ -1,0 +1,340 @@
+---
+weight: 30
+---
+
+# KubeVirt 基于 ISO 制作 Linux 镜像
+
+平台基于开源组件 KubeVirt 实现的虚拟机方案，本文档使用 KubeVirt 虚拟化技术，通过 ISO 镜像文件来创建一个 Linux 操作系统的镜像。
+
+## 前提条件
+
+* 集群中各组件运行正常。
+
+* 请提前准备 Linux 镜像，本文档以 [Ubuntu 操作系统](https://mirrors.tuna.tsinghua.edu.cn/ubuntu-releases/) 为例进行介绍。
+
+* 请提前准备镜像存放仓库。本文档以 build-harbor.example.cn 仓库为例进行介绍，请根据实际环境进行替换。
+
+## 约束与限制
+
+
+* 在启动 KubeVirt 时，自定义镜像的文件系统大小会影响镜像写入 PVC 中磁盘的速度。如果文件系统过大，可能会导致创建时间过长。
+
+* 建议将 Linux 根分区保持在 100G 以下，以减小初始大小。配置好 cloud-init 后，创建虚拟机时为根分区分配更大的存储容量，系统会自动进行扩容。
+
+## 操作步骤
+
+### 将 Linux 的 ISO 镜像制作为 Docker 镜像
+
+1. 进入 ISO 镜像存放目录，在终端中执行下述命令将 ISO 镜像名称重命名为 ubuntu.iso。
+
+    ```
+    mv <ISO 镜像名称> ubuntu.iso # 需使用实际镜像名称替换 <ISO 镜像名称> 部分，例如：mv ubuntu-24.04-live-server-amd64.iso ubuntu.iso
+    ```
+2. 执行下述命令创建 Dockerfile 文件。
+
+    ```
+    touch Dockerfile
+    ```
+3. 编辑 Dockerfile 文件，添加下述内容后并保存。
+
+    ```
+    FROM scratch
+    ADD --chown=107:107 ubuntu.iso /disk/
+    ```
+4. 执行下述命令构建 Docker 镜像。
+
+    ```
+    docker build -t build-harbor.example.cn/3rdparty/vmdisks/ubuntu-iso:24.04 . # 请根据实际环境替换仓库
+    ```
+    
+5. 执行下述命令将镜像推送至仓库中。
+
+    
+    ```
+    docker push  build-harbor.example.cn/3rdparty/vmdisks/ubuntu-iso:24.04 # 请根据实际环境替换仓库
+    ```
+
+### 创建虚拟机
+
+1. 进入 **Container Platform**。
+
+1. 在左侧导航栏中，单击 **虚拟化** > **虚拟机**。
+
+2. 单击 **创建虚拟机**。
+
+3. 在表单页面填写下述参数，具体参数及配置请参考 [创建虚拟机](/virtualization/virtualization/virtual_machine/functions/create_virtual_machine.mdx)。
+
+    |参数|说明|
+    |---|---|
+    |**选择镜像**|选择虚拟机的模板镜像。|
+    |**IP 地址**|保持默认，默认通过 **DHCP** 获取。|
+    |**网络模式**|使用 **NAT** 模式，此处请勿使用 **桥接** 模式。|
+
+4. 切换至 YAML。
+
+4. 将 spec.template.spec.domain.devices.disks 字段下的配置替换为下述内容。
+
+    ```
+          domain:
+            devices:
+              disks:
+                - bootOrder: 1
+                  cdrom:
+                    bus: sata
+                  name: containerdisk
+                - disk:
+                    bus: virtio
+                  name: cloudinitdisk
+                - disk:
+                    bus: virtio
+                  name: rootfs
+                  bootOrder: 10
+    ```
+    
+5. 在 spec.template.spec.volumes 字段下添加下述内容。
+    
+    ```
+            - containerDisk:
+                image: registry.example.cn:60070/3rdparty/vmdisks/ubuntu-iso:24.04 # 请根据实际环境替换镜像
+              name: containerdisk
+    ```
+
+6. 检查 YAML 文件，配置完成后的完整 YAML 如下。
+
+    ```
+    apiVersion: kubevirt.io/v1alpha3
+    kind: VirtualMachine
+    metadata:
+      annotations:
+        kubevirt.io/latest-observed-api-version: v1
+        kubevirt.io/storage-observed-api-version: v1
+      labels:
+        virtualization.cpaas.io/image-name: debian-2120-x86
+        virtualization.cpaas.io/image-os-arch: amd64
+        virtualization.cpaas.io/image-os-type: debian
+        virtualization.cpaas.io/image-supply-by: public
+        vm.cpaas.io/name: aa
+      name: aa
+    spec:
+      dataVolumeTemplates:
+        - metadata:
+            creationTimestamp: null
+            labels:
+              vm.cpaas.io/reclaim-policy: Delete
+              vm.cpaas.io/used-by: aa
+            name: aa-rootfs
+          spec:
+            pvc:
+              accessModes:
+                - ReadWriteOnce
+              resources:
+                requests:
+                  storage: 100Gi
+              storageClassName: vm-cephrbd
+              volumeMode: Block
+            source:
+              http:
+                url: http://192.168.254.12/kube-debian-12.2.0-x86-out.qcow2
+      running: true
+      template:
+        metadata:
+          annotations:
+            cpaas.io/creator: test@example.io
+            cpaas.io/display-name: ""
+            cpaas.io/updated-at: 2024-09-09T03:49:08Z
+            kubevirt.io/latest-observed-api-version: v1
+            kubevirt.io/storage-observed-api-version: v1
+          creationTimestamp: null
+          labels:
+            virtualization.cpaas.io/image-name: debian-2120-x86
+            virtualization.cpaas.io/image-os-arch: amd64
+            virtualization.cpaas.io/image-os-type: debian
+            virtualization.cpaas.io/image-supply-by: public
+            vm.cpaas.io/name: aa
+        spec:
+          accessCredentials:
+            - sshPublicKey:
+                propagationMethod:
+                  qemuGuestAgent:
+                    users:
+                      - root
+                source:
+                  secret:
+                    secretName: test-xeon
+          affinity:
+            nodeAffinity: {}
+          architecture: amd64
+          domain:
+            devices:
+              disks:
+                - bootOrder: 1
+                  cdrom:
+                    bus: sata
+                  name: containerdisk
+                - disk:
+                    bus: virtio
+                  name: cloudinitdisk
+                - disk:
+                    bus: virtio
+                  name: rootfs
+                  bootOrder: 10
+               interfaces:
+                - bridge: {}
+                  name: default
+            machine:
+              type: q35
+            resources:
+              limits:
+                cpu: "1"
+                memory: 2Gi
+              requests:
+                cpu: "1"
+                memory: 2Gi
+          networks:
+            - name: default
+              pod: {}
+          nodeSelector:
+            kubernetes.io/arch: amd64
+            vm.cpaas.io/baremetal: "true"
+          volumes:
+            - containerDisk:
+                image: registry.example.cn:60070/3rdparty/vmdisks/ubuntu-iso:24.04 # 请根据实际环境替换镜像
+              name: containerdisk
+            - cloudInitConfigDrive:
+                userData: |-
+                  #cloud-config
+                  disable_root: false
+                  ssh_pwauth: false
+                  users:
+                    - default
+                    - name: root
+                      lock_passwd: false
+                      hashed_passwd: ""
+              name: cloudinitdisk
+            - dataVolume:
+                name: aa-rootfs
+              name: rootfs
+    ```
+
+7. 单击 **创建**。
+8. 单击 **操作** > **VNC 登录**。
+9. 当出现 **press any key boot from CD or DVD** 提示信息后，键入任意键，进入 Windows 安装程序；若没有看到提示信息，则单击页面左上角 **发送远程命令**，在弹出的下拉菜单中，单击 **Ctrl-Alt-Delete**，重启服务器。
+
+    **注意**：在虚拟机详情信息页面上方出现 **当前虚拟机有配置变更，需执行重启以使配置生效，请重启** 提示信息时，请忽略此信息，无需重启。
+    
+### 安装 Linux 操作系统
+
+1. 进入安装页面后，根据安装指引进行安装即可。本文档以安装 Ubuntu 操作系统为例进行介绍，不同的操作系统安装过程中的配置项基本相同，此处不再赘述，部分配置项说明如下。
+
+    |配置|说明|
+    |---|---|
+    |**安装类型**|推荐使用最小化安装，可以使得镜像体积最小。|
+    |**存储配置**|选择自定义存储。将磁盘格式化为 ext4 或 xfs 格式，并挂载到根分区 (/) 上。<br/>**注意**：磁盘分区不要使用 LVM（Create volume group (LVM)。|
+    |**SSH 配置**|选择安装 OpenSSH 工具以进行 SSH 连接。|
+
+2. 等待安装完成。
+
+### 修改 YAML 文件
+
+1. 进入 **Container Platform**。
+
+1. 在左侧导航栏中，单击 **虚拟化** > **虚拟机**。
+
+2. 单击列表中 **虚拟机名称** 进入详情信息页面。
+3. 单击 **停止**。
+4. 单击右上角 **操作** > **更新**。
+5. 切换至 YAML。
+6. 确认 spec.template.spec.domain.devices.disks 字段下名称为 **rootfs** 的盘，其 bootOrder 为 1，若不为 1 则修改为 1。
+6. 删除 spec.template.spec.domain.devices.disks 字段下名称为 **containerdisk** 的相关内容，具体删除内容如下。
+    
+    ```
+                - bootOrder: 1
+                  cdrom:
+                    bus: sata
+                  name: containerdisk
+    ```
+7. 删除 spec.template.spec.volumes 字段下名称为 **containerdisk** 的相关内容，具体删除内容如下。
+
+    ```
+            - containerDisk:
+                image: registry.example.cn:60070/3rdparty/vmdisks/ubuntu-iso:24.04
+              name: containerdisk
+    ```
+8. 单击 **更新**。
+
+9. 单击 **启动**。
+
+### 安装必要软件包及修改配置
+
+**注意**：不同操作系统中下述命令及配置文件的位置可能略有不同，请根据实际环境进行替换。
+
+1. 输入用户名及密码，登录操作系统。
+
+2. 切换至 root 用户权限。
+
+3. 安装软件包。
+    
+    * CentOS 系列执行的命令：
+    
+        ```
+        yum install cloud-utils cloud-init qemu-guest-agent  vim
+        ```
+    
+    * Debian 系列执行的命令：
+            
+        ```
+        apt install cloud-init cloud-guest-utils qemu-guest-agent vim
+        ```
+
+4. 编辑 SSHD 配置文件。
+
+
+    1. 执行下述命令编辑 sshd_config 文件。
+    
+        ```
+        vim /etc/ssh/sshd_config
+        ```
+    5. 增加下述配置文件。
+    
+        ```
+        PermitRootLogin yes  # 允许 root 用户使用密码登录
+        PubkeyAuthentication yes  # 允许使用密钥登录
+        ```
+    6. 保存修改的配置。
+
+5. 执行下述命令删除 root 用户默认密码。
+    
+    ```
+    passwd -d root
+    ```
+
+6. 修改源地址文件。
+
+    1. 执行下述命令修改系统的源地址文件，将其中的地址修改为合适的镜像站地址。
+    
+        ```
+        vim /etc/apt/sources.list.d/ubuntu.sources
+        ```
+    9. 修改完成后保存配置。
+
+10. 修改 cloud-init 配置，自动扩容根目录。
+
+    1. 执行下述命令编辑 cloud.cfg 配置文件。
+    
+        ```
+        vim /etc/cloud/cloud.cfg
+        ```
+    2. 增加下述配置内容。
+    
+        ```
+        runcmd:
+          - [growpart, /dev/vda, 1]  # growpart 命令用于扩展磁盘上的分区，即会扩展 /dev/vda1 分区。
+          - [xfs_growfs, /dev/vda1]  # xfs_growfs命令用于扩展 XFS 文件系统来使用分区上的所有可用空间，/dev/vda1 是要扩展的文件系统所在的分区，在扩展分区后，使用 xfs_growfs 可以确保文件系统本身也扩展到新的分区大小。
+        ```
+    3. 修改完成后保存配置。
+
+11. 配置完成后，关闭操作系统。
+
+### 导出并使用自定义 Linux 镜像
+
+具体操作请参考 [导出虚拟机镜像](./vm_image_export.mdx)。

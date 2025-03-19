@@ -15,11 +15,15 @@ spec:
               resources:
                 requests:
                   storage: 20Gi
+        - name: dockerconfig
+          secret:
+            secretName: build-harbor.kauto.docfj
   workspaces:
     - description: >
         This workspace is shared among all the pipeline tasks to read/write
         common resources
       name: source
+    - name: dockerconfig
   tasks:
     - name: aggregate-offline-docs
       workspaces:
@@ -87,30 +91,44 @@ spec:
       timeout: 30m
       retries: 2
       taskRef:
-        kind: ClusterTask
-        name: build-image-buildkit
+        resolver: hub
+        params:
+          - name: catalog
+            value: extras
+          - name: kind
+            value: task
+          - name: name
+            value: buildx
+          - name: version
+            value: "0.1"
       workspaces:
         - name: source
           workspace: source
+        - name: dockerconfig
+          workspace: dockerconfig
       when:
         - input: "$(tasks.aggregate-offline-docs.results.modified-flag)"
           operator: in
           values:
             - "true"
       params:
-        - name: "cache-major-branches"
-          value: "false"
-        - name: "reuse-image"
-          value: "false"
-        - name: container-images
-          value:
-          - build-harbor.alauda.cn/alauda/product-docs-offline:$(build.git.version.short)$(build.triggeredBy.triggeredTimestamp.yyyyMMddmmss)
+        - name: context
+          value: "."
         - name: dockerfile
           value: ./Dockerfile
+        - name: image-url
+          value: build-harbor.alauda.cn/alauda/product-docs-offline
+        - name: image-tags
+          value:
+          - $(build.git.version.short)$(build.triggeredBy.triggeredTimestamp.yyyyMMddmmss)
         - name: labels
           value:
             - branch=$(build.git.branch.name)
             - commit=$(build.git.lastCommit.id)
+        - name: platform
+          value:
+            - linux/amd64
+            - linux/arm64
     - name: update-module-plugin
       runAfter:
         - build-image
@@ -183,6 +201,70 @@ spec:
           value:
             - branch=$(build.git.branch.name)
             - commit=$(build.git.lastCommit.id)
+    - name: clone-artifacts-repo
+      runAfter:
+        - chart-build
+      timeout: 5m
+      retries: 3
+      taskRef:
+        name: git-clone
+        kind: ClusterTask
+      params:
+        - name: git-url
+          value: https://gitlab-ce.alauda.cn/alauda/artifacts
+        - name: git-revision
+          value: $(build.git.branch.name)
+      workspaces:
+        - name: source
+          workspace: source
+      when:
+        - input: "$(tasks.aggregate-offline-docs.results.modified-flag)"
+          operator: in
+          values:
+            - "true"
+    - name: update-chart-version
+      runAfter:
+        - clone-artifacts-repo
+      timeout: 2m
+      retries: 0
+      taskRef:
+        name: yaml-update
+        kind: ClusterTask
+      params:
+        - name: path
+          value: ./product-docs/versions.yaml
+        - name: set
+          value:
+            - .default="$(build.git.version.short)$(build.triggeredBy.triggeredTimestamp.yyyyMMddmmss)"
+      workspaces:
+        - name: source
+          workspace: source
+      when:
+        - input: "$(tasks.aggregate-offline-docs.results.modified-flag)"
+          operator: in
+          values:
+            - "true"
+    - name: publish-to-artifacts
+      runAfter:
+        - update-chart-version
+      timeout: 5m
+      retries: 0
+      taskRef:
+        name: alauda-git-commit-push
+        kind: ClusterTask
+      when:
+        - input: "$(tasks.update-chart-version.results.push-flag)"
+          operator: in
+          values:
+            - "true"
+      params:
+        - name: branch
+          value: $(build.git.branch.name)
+        - name: git-message
+          value: "update product-docs version to $(build.git.version.short)$(build.triggeredBy.triggeredTimestamp.yyyyMMddmmss)"
+      workspaces:
+        - name: source
+          workspace: source
   finally:
     - name: release-tag
       timeout: 30m
