@@ -1,0 +1,66 @@
+---
+weight: 10
+sourceSHA: 9aec1fea857d02671f68fd5712c7fb2e3019c99a4780ddd82440052561f1d6a3
+---
+
+# MySQL IO Load Optimization
+
+## Introduction to InnoDB IO System
+
+The IO performance of MySQL is influenced by multiple factors, including the type of hardware storage media, the DB kernel architecture at the software layer, as well as the amount of data read or modified by specific SQL statements.
+
+InnoDB utilizes the asynchronous IO interface provided by the operating system to implement an IO subsystem for asynchronously reading and writing data pages, logs, and undo logs. When the data page requested by an SQL query is not in the buffer pool, physical IO operations are needed to read or write data from the underlying storage.
+
+- For reading data pages, the InnoDB IO system uses synchronous IO. Synchronous IO calls the underlying read interface to read data. For writing data pages, the InnoDB IO system uses asynchronous IO; for example, a background thread flushes dirty pages asynchronously to storage.
+
+- In addition to reading and writing IO operations for normal data files, operations such as writing redo/undo logs, writing binlog logs, sorting temporary tables, and DDL rebuilding of tablespaces also generate a significant amount of IO.
+
+To optimize disk IO, one can generally increase the buffer pool size, adjust the flushing method, configure the operating system's flushing threshold, and use fdatasync provided by MySQL 8.0 as a replacement for fsync. For specific optimization methods, refer to the optimization sections in the [MySQL 5.7 Official Documentation](https://dev.mysql.com/doc/refman/5.7/en/optimizing-innodb-diskio.html) or [MySQL 8.0 Official Documentation](https://dev.mysql.com/doc/refman/8.0/en/optimizing-innodb-diskio.html).
+
+## Optimization Suggestions for High IO Load
+
+### High Throughput Writing
+
+It is recommended to use solid-state drives that are suitable for high IOPS (Input/Output Operations Per Second), which can effectively mitigate high IO issues.
+
+The `innodb_log_file_size` controls the size of the InnoDB redo log files. If the parameter value is too small, it will lead to frequent log file cycling and flushing, increasing the number of IO operations and impairing write performance. Appropriately increasing this parameter can reduce the frequency of log file cycling, merging multiple log buffer flushes into a single disk IO operation to enhance write performance.
+
+Additionally, it is advisable to lower the read/write frequency or optimize parameters related to dirty page flushing to resolve high IO issues. The parameters related to dirty page flushing are shown in the table below.
+
+| Parameter Name                                   | Description                                                                                                                                                                                            |
+| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **innodb\_max\_dirty\_pages\_pct**      | Controls the maximum proportion of dirty pages in InnoDB. The larger the value, the more dirty pages are allowed in InnoDB, but it will also increase the frequency and time of flushing dirty data.                                     |
+| **innodb\_max\_dirty\_pages\_pct\_lwm** | Controls when to start flushing dirty data after the maximum proportion of dirty pages is reached in InnoDB. The smaller the value, the sooner InnoDB starts flushing dirty data, but it will also increase the frequency and time of flushing. |
+| **innodb\_io\_capacity**                | Controls the I/O throughput that InnoDB can handle on the disk. The larger the value, the higher the pressure on the disk for InnoDB, but it can also increase the speed of flushing dirty data.                                     |
+| **innodb\_io\_capacity\_max**           | Controls the maximum I/O throughput that InnoDB can handle on the disk, determining the upper limit on the speed of flushing dirty data.                                                              |
+| **innodb\_lru\_scan\_depth**            | Controls the depth of the buffer pool scanned by InnoDB when flushing dirty pages, thus affecting the amount of IO load under high throughput writing environments. If too large, each flushing cycle requires scanning more pages, leading to more ineffective IO reads, increasing overall IO load and affecting performance. If too small, it may only allow InnoDB to scan and clean very few dirty pages, which could lead to unlimited accumulation of dirty pages and serious IO competition, aggravating IO load. |
+
+### Large IO from Temporary Tables
+
+After entering the MySQL container, you can use the following command to check the size of the temporary file directory.
+
+```
+ls -lh /var/lib/mysql/#innodb_temp
+```
+
+If the temporary directory is large, it could be due to slow SQL sorting or deduplication, leading to the creation of large temporary tables. In this case, it is necessary to optimize slow SQL queries to reduce the usage of temporary tables, thereby avoiding increased IO from temporary table writes.
+
+### Large IO from Reading Cold Data
+
+You can query the buffer hit rate with the following SQL command.
+
+```
+select hit_rate from information_schema.INNODB_BUFFER_POOL_STATS;
+```
+
+When the data queried or modified by SQL is not in the buffer pool in memory, it must be read from the disk. If the amount of data to be read is very large, it may lead to very high disk read/write throughput. To avoid this, full table scans should be minimized, such as avoiding statements like `select * from large_table`, to reduce pollution of the buffer pool.
+
+For specific business scenarios, consider redesigning caching strategies or upgrading instance specifications to enhance system performance.
+
+### IO Burden from DDL Statements
+
+When executing DDL statements, operations such as rebuilding tablespaces, scanning full table data, and creating index sorts may occur. The dirty pages generated by new tables need to be flushed, resulting in a significant amount of IO throughput. Additionally, when needing to delete large tables, a drop table operation may cause IO fluctuations. To avoid impacting business operations, these operations should be scheduled during low business periods.
+
+### Large Transactions Writing Binlogs Generate Heavy IO
+
+It is advisable to split large transactions into smaller transactions to avoid writing large amounts of binlog files, thereby reducing IO throughput. For instance, if a delete SQL statement needs to delete a large number of rows, it can be split into multiple smaller delete statements for execution. This can lower the size of binlog files generated by each transaction and reduce the frequency of disk flushing, improving performance. Furthermore, optimizing business logic could help prevent the occurrence of large transactions.
