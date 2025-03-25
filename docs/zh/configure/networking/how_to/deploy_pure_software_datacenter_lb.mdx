@@ -1,0 +1,266 @@
+---
+weight: 10
+sourceSHA: 2890f2a0251271d8bc73e0d8cc456d5c8e8e18d2505d86f136bab38647ce8bf9
+---
+
+# 软件数据中心负载均衡方案（Alpha）
+
+通过创建一个高度可用的负载均衡器在集群外部部署纯软件数据中心负载均衡器（LB），为多个 ALB 提供负载均衡能力，以确保业务操作的稳定。它支持 IPv4 仅、IPv6 仅或 IPv4 和 IPv6 双栈的配置。
+
+## 先决条件
+
+1. 准备两个或更多主机节点作为 LB。建议在 LB 节点上安装 Ubuntu 22.04 操作系统，以减少 LB 将流量转发到异常后端节点的时间。
+
+2. 在所有外部 LB 主机节点上预安装以下软件（本章以两个外部 LB 主机节点为例）：
+
+   - `ipvsadm`
+
+   - `Docker (20.10.7)`
+
+3. 确保每个主机的 Docker 服务在启动时启用，可以使用以下命令：`sudo systemctl enable docker.service`。
+
+4. 确保每个主机节点的时钟已同步。
+
+5. 准备 Keepalived 的镜像，用于启动外部 LB 服务；该平台已经包含此镜像。镜像地址格式为：`<image repository address>/tkestack/keepalived:<version suffix>`。版本后缀可能在不同版本间略有不同。您可以通过以下方式获取镜像仓库地址和版本后缀。本文档以 `build-harbor.alauda.cn/tkestack/keepalived:v3.16.0-beta.3.g598ce923` 为例。
+
+   - 在 global 集群中执行 `kubectl get prdb base -o json | jq .spec.registry.address` 获取 **镜像仓库地址** 参数。
+   
+   - 在安装包解压目录中执行 `cat ./installer/res/artifacts.json |grep keepalived -C 2|grep tag|awk '{print $2}'|awk -F '"' '{print $2}'` 获取 **版本后缀**。
+
+## 步骤
+
+**注意**：以下操作必须在每个外部 LB 主机节点上执行一次，并且主机节点的 `hostname` 不能重复。
+
+1. 将以下配置信息添加到文件 `/etc/modules-load.d/alive.kmod.conf`。
+
+   ```
+   ip_vs
+   ip_vs_rr
+   ip_vs_wrr
+   ip_vs_sh
+   nf_conntrack_ipv4
+   nf_conntrack
+   ip6t_MASQUERADE
+   nf_nat_masquerade_ipv6
+   ip6table_nat
+   nf_conntrack_ipv6
+   nf_defrag_ipv6
+   nf_nat_ipv6
+   ip6_tables
+   ```
+
+2. 将以下配置信息添加到文件 `/etc/sysctl.d/alive.sysctl.conf`。
+
+   ```
+   net.ipv4.ip_forward = 1
+   net.ipv4.conf.all.arp_accept = 1
+   net.ipv4.vs.conntrack = 1
+   net.ipv4.vs.conn_reuse_mode = 0
+   net.ipv4.vs.expire_nodest_conn = 1
+   net.ipv4.vs.expire_quiescent_template = 1
+   net.ipv6.conf.all.forwarding=1
+   ```
+
+3. 使用 `reboot` 命令重启。
+
+4. 创建 Keepalived 配置文件的文件夹。
+
+   ```
+   mkdir -p /etc/keepalived
+   mkdir -p /etc/keepalived/kubecfg
+   ```
+
+5. 根据以下文件中的注释修改配置项，并将其保存在 `/etc/keepalived/` 文件夹中，文件命名为 `alive.yaml`。
+
+   ```
+   instances:
+     - vip: # 可以配置多个 VIP
+         vip: 192.168.128.118 # VIP 必须不同
+         id: 20 # 每个 VIP 的 ID 必须唯一，选填
+         interface: "eth0"
+         check_interval: 1 # 选填，默认 1：执行检查脚本的间隔
+         check_timeout: 3  # 选填，默认 3：检查脚本的超时时间
+         name: "vip-1" # 此实例的标识符，仅能包含字母数字字符和连字符，不能以连字符开头
+         peer: [ "192.168.128.116", "192.168.128.75" ] # Keepalived 节点 IP，实际生成的 keepalived.conf 会删除接口上的所有 IP https://github.com/osixia/docker-keepalived/issues/33
+         kube_lock:
+           kubecfgs: # kube-lock 使用的 kube-config 列表，Keepalived 中将按顺序尝试这些 kubecfgs 进行领导者选举
+             - "/live/cfg/kubecfg/kubecfg01.conf"
+             - "/live/cfg/kubecfg/kubecfg02.conf"
+             - "/live/cfg/kubecfg/kubecfg03.conf"
+       ipvs: # 选项 IPVS 的配置
+         ips: [ "192.168.143.192", "192.168.138.100","192.168.129.100" ] # IPVS 后端，将 k8s 主节点 IP 改为 ALB 节点的节点 IP
+         ports: # 为 VIP 上的每个端口配置健康检查逻辑
+           - port: 80 # 虚拟服务器上的端口必须与真实服务器的端口匹配
+             virtual_server_config: |
+               delay_loop 10  # 对真实服务器执行健康检查的间隔
+               lb_algo rr
+               lb_kind NAT
+               protocol TCP
+             raw_check: |
+               TCP_CHECK {
+                   connect_timeout 10
+                   connect_port 1936
+               }
+     - vip:
+         vip: 2004::192:168:128:118
+         id: 102
+         interface: "eth0"
+         peer: [ "2004::192:168:128:75","2004::192:168:128:116" ]
+         kube_lock:
+           kubecfgs: # kube-lock 使用的 kube-config 列表，Keepalived 中将按顺序尝试这些 kubecfgs 进行领导者选举
+             - "/live/cfg/kubecfg/kubecfg01.conf"
+             - "/live/cfg/kubecfg/kubecfg02.conf"
+             - "/live/cfg/kubecfg/kubecfg03.conf"
+       ipvs:
+         ips: [ "2004::192:168:143:192","2004::192:168:138:100","2004::192:168:129:100" ]
+         ports:
+           - port: 80
+             virtual_server_config: |
+               delay_loop 10
+               lb_algo rr
+               lb_kind NAT
+               protocol TCP
+             raw_check: |
+               TCP_CHECK {
+                   connect_timeout 1
+                   connect_port 1936
+               }
+   ```
+
+6. 在业务集群中执行以下命令检查配置文件中的证书到期日期，确保证书仍然有效。证书过期后，LB 功能将变得不可用，需联系平台管理员进行证书更新。
+
+   ```
+   openssl x509 -in <(cat /etc/kubernetes/admin.conf | grep client-certificate-data | awk '{print $NF}' | base64 -d ) -noout -dates
+   ```
+
+7. 从 Kubernetes 集群中的三个主节点复制 `/etc/kubernetes/admin.conf` 文件到外部 LB 节点的 `/etc/keepalived/kubecfg` 文件夹中，以索引命名，例如 `kubecfg01.conf`，并在这三个文件中将 `apiserver` 节点地址修改为 Kubernetes 集群的实际节点地址。
+
+   **注意**：平台证书更新后，此步骤需重新执行，覆盖原始文件。
+
+8. 检查证书的有效性。
+
+   1. 从业务集群的主节点复制 `/usr/bin/kubectl` 到 LB 节点。
+
+   2. 执行 `chmod +x /usr/bin/kubectl` 授予执行权限。
+
+   3. 执行以下命令确认证书的有效性。
+
+      ```
+      kubectl --kubeconfig=/etc/keepalived/kubecfg/kubecfg01.conf get node
+      kubectl --kubeconfig=/etc/keepalived/kubecfg/kubecfg02.conf get node
+      kubectl --kubeconfig=/etc/keepalived/kubecfg/kubecfg03.conf get node
+      ```
+
+      如果返回以下结果，则证书有效。
+
+      ```
+      kubectl --kubeconfig=/etc/keepalived/kubecfg/kubecfg01.conf get node
+      ## 输出
+      NAME              STATUS   ROLES                  AGE     VERSION
+      192.168.129.100   Ready    <none>                 7d22h   v1.25.6
+      192.168.134.167   Ready    control-plane,master   7d22h   v1.25.6
+      192.168.138.100   Ready    <none>                 7d22h   v1.25.6
+      192.168.143.116   Ready    control-plane,master   7d22h   v1.25.6
+      192.168.143.192   Ready    <none>                 7d22h   v1.25.6
+      192.168.143.79    Ready    control-plane,master   7d22h   v1.25.6
+
+      kubectl --kubeconfig=/etc/keepalived/kubecfg/kubecfg02.conf get node
+      ## 输出
+      NAME              STATUS   ROLES                  AGE     VERSION
+      192.168.129.100   Ready    <none>                 7d22h   v1.25.6
+      192.168.134.167   Ready    control-plane,master   7d22h   v1.25.6
+      192.168.138.100   Ready    <none>                 7d22h   v1.25.6
+      192.168.143.116   Ready    control-plane,master   7d22h   v1.25.6
+      192.168.143.192   Ready    <none>                 7d22h   v1.25.6
+      192.168.143.79    Ready    control-plane,master   7d22h   v1.25.6
+
+      kubectl --kubeconfig=/etc/keepalived/kubecfg/kubecfg03.conf get node
+      ## 输出
+      NAME              STATUS   ROLES                  AGE     VERSION
+      192.168.129.100   Ready    <none>                 7d22h   v1.25.6
+      192.168.134.167   Ready    control-plane,master   7d22h   v1.25.6
+      192.168.138.100   Ready    <none>                 7d22h   v1.25.6
+      192.168.143.116   Ready    control-plane,master   7d22h   v1.25.6
+      192.168.143.192   Ready    <none>                 7d22h   v1.25.6
+      192.168.143.79    Ready    control-plane,master   7d22h   v1.25.6
+      ```
+
+9. 将 Keepalived 镜像上传到外部 LB 节点，并使用 Docker 运行 Keepalived。
+
+   ```
+   docker run -dt --restart=always --privileged --network=host -v /etc/keepalived:/live/cfg build-harbor.alauda.cn/tkestack/keepalived:v3.16.0-beta.3.g598ce923
+   ```
+
+10. 在访问 `keepalived` 的节点上运行以下命令：`sysctl -w net.ipv4.conf.all.arp_accept=1`。
+
+## 验证
+
+1. 运行命令 `ipvsadm -ln` 查看 IPVS 规则，您将会看到适用于业务集群 ALB 的 IPv4 和 IPv6 规则。
+
+   ```
+   IP Virtual Server version 1.2.1 (size=4096)
+   Prot LocalAddress:Port Scheduler Flags
+     -> RemoteAddress:Port           Forward Weight        ActiveConn InActConn
+   TCP  192.168.128.118:80 rr
+     -> 192.168.129.100:80           Masq    1      0          0        
+     -> 192.168.138.100:80           Masq    1      0          0        
+     -> 192.168.143.192:80           Masq    1      0          0        
+   TCP  [2004::192:168:128:118]:80 rr
+     -> [2004::192:168:129:100]:80   Masq    1      0          0        
+     -> [2004::192:168:138:100]:80   Masq    1      0          0        
+     -> [2004::192:168:143:192]:80   Masq    1      0          0
+   ```
+
+2. 关闭 VIP 所在的 LB 节点，测试 IPv4 和 IPv6 的 VIP 能否成功迁移到另一个节点，通常在 20 秒内。
+
+3. 在非 LB 节点上使用 `curl` 命令测试与 VIP 的通信是否正常。
+
+   ```
+   curl 192.168.128.118
+
+   <!DOCTYPE html>
+   <html>
+   <head>
+   <title>Welcome to nginx!</title>
+   <style>
+   html { color-scheme: light dark; }
+   body { width: 35em; margin: 0 auto;
+   font-family: Tahoma, Verdana, Arial, sans-serif; }
+   </style>
+   </head>
+   <body>
+   <h1>Welcome to nginx!</h1>
+   <p>If you see this page, the nginx web server is successfully installed and working. Further configuration is required.</p>
+
+   <p>For online documentation and support please refer to <a href="http://nginx.org/">nginx.org</a>.<br/>
+   Commercial support is available at <a href="http://nginx.com/">nginx.com</a>.</p>
+
+   <p><em>Thank you for using nginx.</em></p>
+   </body>
+   </html>
+   ```
+
+   ```
+   curl -6 [2004::192:168:128:118]:80 -g
+
+   <!DOCTYPE html>
+   <html>
+   <head>
+   <title>Welcome to nginx!</title>
+   <style>
+   html { color-scheme: light dark; }
+   body { width: 35em; margin: 0 auto;
+   font-family: Tahoma, Verdana, Arial, sans-serif; }
+   </style>
+   </head>
+   <body>
+   <h1>Welcome to nginx!</h1>
+   <p>If you see this page, the nginx web server is successfully installed and working. Further configuration is required.</p>
+
+   <p>For online documentation and support please refer to <a href="http://nginx.org/">nginx.org</a>.<br/>
+   Commercial support is available at<a href="http://nginx.com/">nginx.com</a>.</p>
+
+   <p><em>Thank you for using nginx.</em></p>
+   </body>
+   </html>
+   ```

@@ -1,0 +1,180 @@
+---
+weight: 10
+sourceSHA: 616ca737537273c9a6caaf40fef857e060bf2a300e1eee152b65f98d82869525
+---
+
+# 在 ALB 中使用 OAuth 代理
+
+## 概述
+
+本文档演示了如何在 ALB 中使用 OAuth 代理来实现外部身份验证。
+
+## 步骤
+
+按照以下步骤使用该功能：
+
+1. 部署 kind
+
+```bash
+kind create cluster --name alb-auth --image=kindest/node:v1.28.0
+kind get kubeconfig --name=alb-auth > ~/.kube/config
+```
+
+2. 部署 alb
+
+```bash
+helm repo add alb https://alauda.github.io/alb/;helm repo update;helm search repo|grep alb
+helm install alb-operator alb/alauda-alb2
+alb_ip=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' alb-auth-control-plane)
+echo $alb_ip
+cat <<EOF | kubectl apply -f -
+apiVersion: crd.alauda.io/v2
+kind: ALB2
+metadata:
+    name: alb-auth
+spec:
+    address: "$alb_ip"
+    type: "nginx" 
+    config:
+        networkMode: host
+        loadbalancerName: alb-demo
+        projects:
+        - ALL_ALL
+        replicas: 1
+EOF
+```
+
+3. 部署测试应用
+
+- 创建 [github oauth 应用](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app)
+  - 注意在此步骤中将获得 `$GITHUB_CLIENT_ID` 和 `$GITHUB_CLIENT_SECRET`，需要将其设置为环境变量
+- 配置 DNS
+  - 此处我们使用 echo.com 作为应用域名，auth.alb.echo.com 和 alb.echo.com
+- 部署 oauth-proxy
+
+> oauth2-proxy 需要访问 github，这可能需要设置 HTTPS\_PROXY 环境变量
+
+```bash
+COOKIE_SECRET=$(python -c 'import os,base64; print(base64.urlsafe_b64encode(os.urandom(32)).decode())')
+OAUTH2_PROXY_IMAGE="quay.io/oauth2-proxy/oauth2-proxy:v7.7.1"
+kind load docker-image $OAUTH2_PROXY_IMAGE --name alb-auth
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    k8s-app: oauth2-proxy
+  name: oauth2-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      k8s-app: oauth2-proxy
+  template:
+    metadata:
+      labels:
+        k8s-app: oauth2-proxy
+    spec:
+      containers:
+        - args:
+            - --http-address=0.0.0.0:4180
+            - --redirect-url=http://auth.alb.echo.com/oauth2/callback
+            - --provider=github
+            - --whitelist-domain=.alb.echo.com
+            - --email-domain=*
+            - --upstream=file:///dev/null
+            - --cookie-domain=.alb.echo.com
+            - --cookie-secure=false
+            - --reverse-proxy=true
+          env:
+            - name: OAUTH2_PROXY_CLIENT_ID
+              value: $GITHUB_CLIENT_ID
+            - name: OAUTH2_PROXY_CLIENT_SECRET
+              value: $GITHUB_CLIENT_SECRET
+            - name: OAUTH2_PROXY_COOKIE_SECRET
+              value: $COOKIE_SECRET
+          image: $OAUTH2_PROXY_IMAGE
+          imagePullPolicy: IfNotPresent
+          name: oauth2-proxy
+          ports:
+          - containerPort: 4180
+            name: http
+            protocol: TCP
+          - containerPort: 44180
+            name: metrics
+            protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    k8s-app: oauth2-proxy
+  name: oauth2-proxy
+spec:
+ ports:
+ - appProtocol: http
+   name: http
+   port: 80
+   protocol: TCP
+   targetPort: http
+ - appProtocol: http
+   name: metrics
+   port: 44180
+   protocol: TCP
+   targetPort: metrics
+ selector:
+   k8s-app: oauth2-proxy
+EOF
+```
+
+4. 配置 Ingress
+
+- 我们将配置两个 Ingress，auth.alb.echo.com 和 alb.echo.com
+
+```bash
+cat <<EOF | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/auth-url: "https://auth.alb.echo.com/oauth2/auth"
+    nginx.ingress.kubernetes.io/auth-signin: "https://auth.alb.echo.com/oauth2/start?rd=http://\$host\$request_uri"
+  name: echo-resty
+spec:
+  ingressClassName: alb-auth
+  rules:
+    - host: alb.echo.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-resty
+                port:
+                  number: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: oauth2-proxy
+spec:
+  ingressClassName: alb-auth
+  rules:
+    - host: auth.alb.echo.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: oauth2-proxy 
+                port:
+                  number: 80
+EOF
+```
+
+## 结果
+
+- 操作完成后，将部署一个 alb、oauth-proxy 和测试应用。
+- 访问 alb.echo.com 后，您将被重定向到 github 身份验证页面，经过验证后可以看到应用的输出。
