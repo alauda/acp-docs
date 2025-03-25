@@ -1,0 +1,440 @@
+---
+weight: 65
+---
+
+# 块储数据容灾
+
+RBD Mirror 是 Ceph 块存储（RBD）的一个特性，用于在不同 Ceph 集群之间实现异步数据复制，从而提供跨集群的灾难恢复（Disaster Recovery, DR）。其核心作用是通过主备模式同步数据，确保在主集群故障时，备集群能快速接管服务。
+
+:::warning
+- RBD Mirror 基于快照进行增量同步，默认快照间隔为每小时一次（可配置）。​主备集群的差异数据通常为一个快照周期内的写入量。
+- RBD Mirror 仅提供底层存储数据的备份，并不能处理 Kubernetes 资源的备份，请配合平台 **备份恢复** 功能备份 PVC 和 PV 资源。
+:::
+
+## 名词解释
+
+|名词|解释|
+|:---|:---|
+|**Primary 集群**|主集群，当前运行业务的集群。|
+|**Secondary 集群**| 备集群，用于备份的集群。|
+
+## 备份配置
+
+### 前提条件
+
+- 请提前准备两个可用于部署 Alauda Container Platform (ACP) Storage with Ceph 的集群，即 Primary 集群和 Secondary 集群，且集群间网络互通。
+- 两个集群使用的平台版本（v3.12 及以上版本）必须保持一致。
+- 在 Primary 集群和 Secondary 集群中[创建分布式存储服务](../../installation/create_service_stand.mdx)。
+- 在 Primary 和 Secondary 集群中创建**名称相同**的块存储存储池。
+- 请确保已将下述三个镜像上传至平台私有镜像仓库中：
+    - `quay.io/csiaddons/k8s-controller:v0.5.0`
+    - `quay.io/csiaddons/k8s-sidecar:v0.8.0`
+    - `quay.io/brancz/kube-rbac-proxy:v0.8.0`
+
+### 操作步骤
+
+<Steps>
+  ### 开启 Primary 集群块存储池的 Mirror 功能
+
+    在 Primary 集群的 Control 节点上执行下述命令：
+
+    <Tabs>
+    <Tab label="命令">
+    ```bash
+    kubectl -n rook-ceph patch cephblockpool <block-pool-name> \
+    --type merge -p '{"spec":{"mirroring":{"enabled":true,"mode":"image"}}}'
+    ```
+    </Tab>
+    <Tab label="回显">
+    ```bash
+    cephblockpool.ceph.rook.io/<block-pool-name> patched
+    ```
+    </Tab>
+    </Tabs>
+
+    **参数说明**：
+    - `<block-pool-name>`：块存储池名称
+
+  ### <a id="blocktoken"></a>获取 Peer Token
+  
+    该 token 是两个集群建立镜像连接的关键凭证
+
+    在 Primary 集群的 Control 节点上执行下述命令：
+
+    <Tabs>
+    <Tab label="命令">
+    ```bash
+    kubectl get secret -n rook-ceph \
+    $(kubectl get cephblockpool.ceph.rook.io <block-pool-name> -n rook-ceph -o jsonpath='{.status.info.rbdMirrorBootstrapPeerSecretName}') \
+    -o jsonpath='{.data.token}' | base64 -d
+    ```
+    </Tab>
+    <Tab label="回显">
+    ```bash
+    # 由于涉及敏感信息该回显信息已做截断处理
+    eyJmc2lkIjoiMjc2N2I3ZmEtY2YwYi00N...
+    ```
+    </Tab>
+    </Tabs>
+
+    **参数说明**：
+    - `<block-pool-name>`：块存储池名称
+
+  ### 在 Secondary 集群中创建 peer token secret
+
+    在 Secondary 集群的 Control 节点上执行下述命令：
+
+    <Tabs>
+    <Tab label="命令">
+    ```bash
+    kubectl -n rook-ceph create secret generic rbd-primary-site-secret \
+    --from-literal=token=<token> \
+    --from-literal=pool=<block-pool-name>
+    ```
+    </Tab>
+    <Tab label="回显">
+    ```
+    secret/rbd-primary-site-secret created
+    ```
+    </Tab>
+    </Tabs>
+
+    **参数说明**：
+    - `<token>`：[步骤 2](#blocktoken) 中的获取的 token。
+    - `<block-pool-name>`：块存储池名称。
+
+  ### 为 Secondary 集群的块存储池开启 Mirror 功能
+
+    在 Secondary 集群的 Control 节点上执行下述命令：
+
+    <Tabs>
+    <Tab label="命令">
+    ```bash
+    kubectl -n rook-ceph patch cephblockpool <block-pool-name> --type merge -p \
+    '{
+      "spec": {
+        "mirroring": {
+          "enabled": true, 
+          "mode": "image", 
+          "peers": {
+            "secretNames": [
+              "rbd-primary-site-secret"
+            ]
+          }
+        }
+      }
+    }'
+    ```
+    </Tab>
+    <Tab label="回显">
+    ```
+    cephblockpool.ceph.rook.io/<block-pool-name> patched
+    ```
+    </Tab>
+    </Tabs>
+
+    参数说明：
+    - `<block-pool-name>`：块存储池名称
+
+  ### 在 Seconday 集群中部署 mirror daemon
+
+    该 daemon 负责监控和管理 RBD 镜像同步过程，进行数据同步、错误处理等。
+
+    在 Secondary 集群的 Control 节点上执行下述命令：
+
+    <Tabs>
+    <Tab label="命令">
+    ```yaml
+    cat << EOF | kubectl apply -f -
+    apiVersion: ceph.rook.io/v1
+    kind: CephRBDMirror
+    metadata:
+      name: rbd-mirror
+      namespace: rook-ceph
+    spec:
+      count: 1
+    EOF
+    ```
+    </Tab>
+    <Tab label="回显">
+    ```
+    cephrbdmirror.ceph.rook.io/rbd-mirror created
+    ```
+    </Tab>
+    </Tabs>
+
+  ### 检查 Mirror 的状态
+
+    在 Secondary 集群的 Control 节点上执行下述命令：
+
+    <Tabs>
+    <Tab label="命令">
+    ```bash
+    kubectl get cephblockpools.ceph.rook.io <block-pool-name> -n rook-ceph -o jsonpath='{.status.mirroringStatus.summary}'
+    ```
+    </Tab>
+    <Tab label="回显">
+    ```bash
+    # 若回显信息中所有状态均为 `OK`，则表示状态正常。
+    {"daemon_health":"OK","health":"OK","image_health":"OK","states":{}}
+    ```
+    </Tab>
+    </Tabs>
+
+    参数说明：
+    - `<block-pool-name>`：块存储池名称
+
+  ### 开启 Replication Sidecar
+
+    此功能可以在用户不干扰主应用运行的情况下，实现数据的高效复制和同步，增强系统的可靠性和可用性。
+
+    1. 部署 csiaddons-controller
+
+      在 Primary 和 Secondary 集群的 Control 节点上执行下述命令：
+
+      <details> 
+      <summary>点击查看</summary>
+        ```yaml
+        kubectl create -f https://raw.githubusercontent.com/csi-addons/kubernetes-csi-addons/v0.5.0/deploy/controller/crds.yaml
+        kubectl create -f https://raw.githubusercontent.com/csi-addons/kubernetes-csi-addons/v0.5.0/deploy/controller/rbac.yaml
+         
+        cat << EOF | kubectl apply -f -
+        apiVersion: v1
+        data:
+          controller_manager_config.yaml: |
+            apiVersion: controller-runtime.sigs.k8s.io/v1alpha1
+            kind: ControllerManagerConfig
+            health:
+              healthProbeBindAddress: :8081
+            metrics:
+              bindAddress: 127.0.0.1:8080
+            webhook:
+              port: 9443
+            leaderElection:
+              leaderElect: true
+              resourceName: e8cd140a.openshift.io
+        kind: ConfigMap
+        metadata:
+          name: csi-addons-manager-config
+          namespace: csi-addons-system
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          labels:
+            app.kubernetes.io/name: csi-addons
+          name: csi-addons-controller-manager
+          namespace: csi-addons-system
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app.kubernetes.io/name: csi-addons
+          template:
+            metadata:
+              annotations:
+                kubectl.kubernetes.io/default-container: manager
+              labels:
+                app.kubernetes.io/name: csi-addons
+            spec:
+              containers:
+              - args:
+                - --secure-listen-address=0.0.0.0:8443
+                - --upstream=http://127.0.0.1:8080/
+                - --logtostderr=true
+                - --v=10
+                image: <registry>/brancz/kube-rbac-proxy:v0.8.0 # 需使用实际的镜像仓库地址替换 <registry>
+                name: kube-rbac-proxy
+                ports:
+                - containerPort: 8443
+                  name: https
+                  protocol: TCP
+                resources:
+                  limits:
+                    cpu: 500m
+                    memory: 128Mi
+                  requests:
+                    cpu: 10m
+                    memory: 64Mi
+              - args:
+                - --health-probe-bind-address=:8081
+                - --metrics-bind-address=127.0.0.1:8080
+                - --leader-elect
+                command:
+                - /manager
+                image: <registry>/csiaddons/k8s-controller:v0.5.0 # 需使用实际的镜像仓库地址替换 <registry>
+                livenessProbe:
+                  httpGet:
+                    path: /healthz
+                    port: 8081
+                  initialDelaySeconds: 15
+                  periodSeconds: 20
+                name: manager
+                readinessProbe:
+                  httpGet:
+                    path: /readyz
+                    port: 8081
+                  initialDelaySeconds: 5
+                  periodSeconds: 10
+                resources:
+                  limits:
+                    cpu: 500m
+                    memory: 128Mi
+                  requests:
+                    cpu: 10m
+                    memory: 64Mi
+                securityContext:
+                  allowPrivilegeEscalation: false
+              securityContext:
+                runAsNonRoot: true
+              serviceAccountName: csi-addons-controller-manager
+              terminationGracePeriodSeconds: 10
+        EOF
+        ```
+      </details>
+    
+      字段说明：
+      - **spec.template.spec.containers.args[0].image**：需使用实际仓库地址替换 \<registry>。
+      - **spec.template.spec.containers.args[1].image**：需使用实际仓库地址替换 \<registry>。
+
+
+    2. 开启 csi sidecar
+
+      在 Primary 和 Secondary 集群的 Control 节点上执行下述命令：
+
+      ```bash
+      kubectl patch cm rook-ceph-operator-config -n rook-ceph --type json --patch \
+      '[
+        {
+          "op": "add", 
+          "path": "/data/CSI_ENABLE_OMAP_GENERATOR", 
+          "value": "true"
+        }, 
+        {
+          "op": "add", 
+          "path": "/data/CSI_ENABLE_CSIADDONS", 
+          "value": "true"
+        }
+      ]'
+      ```
+
+  ### 创建 VolumeReplicationClass。
+  
+    在 Primary 和 Secondary 集群的 Control 节点上执行下述命令：
+  
+    <Tabs>
+    <Tab label="命令">
+    ```yaml
+    cat << EOF | kubectl apply -f -
+    apiVersion: replication.storage.openshift.io/v1alpha1
+    kind: VolumeReplicationClass
+    metadata:
+      name: rbd-volumereplicationclass
+    spec:
+      provisioner: rook-ceph.rbd.csi.ceph.com
+      parameters:
+        mirroringMode: snapshot
+        schedulingInterval: "<scheduling-interval>" # [!code callout]
+        replication.storage.openshift.io/replication-secret-name: rook-csi-rbd-provisioner
+        replication.storage.openshift.io/replication-secret-namespace: rook-ceph
+    EOF
+    ```
+    </Tab>
+    <Tab label="回显">
+    ```bash
+    volumereplicationclass.replication.storage.openshift.io/rbd-volumereplicationclass created
+    ```
+    </Tab>
+    </Tabs>
+
+    <Callouts>
+
+    1. `<scheduling-interval>`: 执行周期，（例如：`schedulingInterval: "1h"`，表示每 1 小时执行一次。）
+
+    </Callouts>
+
+  ### 为 PVC 开启 Mirror 同步
+
+    在 Primary 集群的 Control 节点上执行下述命令
+
+    <Tabs>
+    <Tab label="命令">  
+    ```yaml
+    cat << EOF | kubectl apply -f -
+    apiVersion: replication.storage.openshift.io/v1alpha1
+    kind: VolumeReplication
+    metadata:
+      name: <vr-name> # [!code callout]
+      namespace: <namespace> # [!code callout]
+    spec:
+      autoResync: false
+      volumeReplicationClass: rbd-volumereplicationclass
+      replicationState: primary
+      dataSource:
+        apiGroup: ""
+        kind: PersistentVolumeClaim
+        name: <pvc-name> # [!code callout]
+    EOF
+    ```
+    </Tab>
+    <Tab label="回显">
+    ```bash
+    volumereplication.replication.storage.openshift.io/<mirror-pvc-name> created
+    ``` 
+    </Tab>
+    </Tabs>
+
+    <Callouts>
+    1. `<vr-name>`： VolumeReplication 对象名称，建议与 PVC 名称相同
+    2. `<namespace>`：VolumeReplication 所属命名空间，需与 PVC 命名空间相同
+    3. `<pvc-name>`：需要开启 Mirror 的 PVC 名称
+    </Callouts>
+
+    **说明**
+    开启之后 Secondary 集群中的 RBD image 是只读的。
+
+</Steps> 
+
+## 故障切换
+  
+在 Primary 集群故障时，需要切换 RBD image 的主备关系。
+
+### 前提条件
+
+- Primary 集群 Kubernetes 资源已经备份，并恢复至 Secondary 集群，比如 PVC、PV、业务的 Workload 等。
+
+### 操作步骤
+
+<Steps>
+
+  #### 创建 VolumeReplication
+    
+    在 Secondary 集群的 Control 节点执行：
+    ```yaml
+    cat << EOF | kubectl apply -f -
+    apiVersion: replication.storage.openshift.io/v1alpha1
+    kind: VolumeReplication
+    metadata:
+      name: <vr-name> # [!code callout]
+      namespace: <namespace> # [!code callout]
+    spec:
+      autoResync: false
+      dataSource:
+        apiGroup: ""
+        kind: PersistentVolumeClaim
+        name: <mirror-pvc-name> # [!code callout]
+      replicationHandle: ""
+      replicationState: primary
+      volumeReplicationClass: rbd-volumereplicationclass
+    EOF
+    ```
+    <Callouts>
+    1. `<vr-name>`： VolumeReplication 对象名称
+    2. `<namespace>`：PVC 所属命名空间
+    3. `<mirror-pvc-name>`：要开启 Mirror 同步的 PVC 名称
+    </Callouts>
+
+    **说明**
+    创建完成之后 Secondary 集群上的 RBD image 变为 primary，可以读写。
+
+</Steps>

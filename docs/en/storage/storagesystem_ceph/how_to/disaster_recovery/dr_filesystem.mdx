@@ -1,0 +1,228 @@
+---
+weight: 64
+---
+
+# File Storage Disaster Recovery
+
+CephFS Mirror is a feature of the Ceph file system designed to enable asynchronous data replication between different Ceph clusters, thereby providing cross-cluster disaster recovery. Its core functionality is to synchronize data in a primary-backup mode, ensuring that the backup cluster can rapidly take over services if the primary cluster experiences a failure.
+
+:::warning
+- CephFS Mirror performs incremental synchronization based on snapshots, with the default snapshot interval set to once per hour (configurable). The differential data between the primary and backup clusters typically consists of the amount of data written within one snapshot cycle.
+- CephFS Mirror solely provides the backup of underlying storage data and is incapable of handling the backup of Kubernetes resources. Please utilize the platform's **Backup and Restore** feature to back up PVC and PV resources in conjunction.
+:::
+
+## Terminology
+
+|Term|Explanation|
+|:---|:---|
+|**Primary Cluster**|The cluster currently providing storage services.|
+|**Secondary Cluster**|Cluster for backup.|
+
+## Backup Configuration
+
+### Prerequisites
+
+- Prepare two clusters suitable for deploying Alauda Container Platform (ACP) Storage with Ceph, namely the Primary cluster and the Secondary cluster, ensuring that the networks between the clusters are interconnected.
+- The platform versions used by both clusters (v3.12 and above) must be consistent.
+- [Create a distributed storage service](../../installation/create_service_stand.mdx) in both the Primary and Secondary clusters
+- Create file storage pools with the **same name** in both the Primary and Secondary clusters.
+
+### Procedure
+
+<Steps>
+
+  ### Enable the Mirror for the file storage pool in the Secondary cluster
+
+    Execute the following commands on the Control node of the Secondary cluster:
+
+    <Tabs>
+    <Tab label="Command Line">
+    ```bash
+    kubectl -n rook-ceph patch cephfilesystem <fs-name> \
+    --type merge -p '{"spec":{"mirroring":{"enabled": true}}}'
+    ```
+    </Tab>
+    <Tab label="Output">
+    ```bash
+    cephfilesystem.ceph.rook.io/<fs-name> patched
+    ```
+    </Tab>
+    </Tabs>
+  
+    **Parameters**:
+    - `<fs-name>`: Name of the file storage pool.
+
+  ### <a id="token"></a>Obtain the Peer Token
+  
+    This token is the key credential for establishing a mirroring connection between the two clusters.
+
+    Execute the following commands on the Control node of the Secondary cluster:
+
+    <Tabs>
+    <Tab label="Command">
+    ```bash
+    kubectl get secret -n rook-ceph \
+    $(kubectl -n rook-ceph get cephfilesystem <fs-name> -o jsonpath='{.status.info.fsMirrorBootstrapPeerSecretName}') \
+    -o jsonpath='{.data.token}' | base64 -d
+    ```
+    </Tab>
+    <Tab label="Output">
+    ```bash
+    # Due to the involvement of sensitive information, the output has been truncated.
+    eyJmc2lkIjogImMyYjAyNmMzLTA3ZGQtNDA3Z...
+    ```
+    </Tab>
+    </Tabs>
+
+    **Parameters**: 
+    - `<fs-name>`: Name of the file storage pool.
+
+  ### Create Peer Secret in the Primary cluster
+    
+    After obtaining the Peer Token from the Secondary cluster, it is necessary to create a Peer Secret in the Primary cluster.
+
+    Execute the following commands on the Control node of the Primary cluster:
+
+    <Tabs>
+    <Tab label="Command">
+    ```bash
+    kubectl -n rook-ceph create secret generic fs-secondary-site-secret \
+    --from-literal=token=<token> \
+    --from-literal=pool=<fs-name>
+    ```
+    </Tab>
+    <Tab label="Output">
+    ```bash
+    secret/fs-secondary-site-secret created
+    ```
+    </Tab>
+    </Tabs>
+
+    **Parameters**:
+    - `<token>`: The token obtained in [step 2](#token).
+    - `<fs-name>`:Name of the file storage pool.
+
+  ### Enable the Mirror for the file storage pool in the Primary cluster
+
+    Execute the following commands on the Control node of the Primary cluster:
+    
+    <Tabs>
+    <Tab label="Command">
+    ```bash
+    kubectl -n rook-ceph patch cephfilesystem <fs-name> --type merge -p \
+    '{
+      "spec": {
+        "mirroring": {
+          "enabled": true, 
+          "peers": {
+            "secretNames": [
+              "fs-secondary-site-secret"
+            ]
+          }, 
+          "snapshotSchedules": [
+            {
+              "path": "/", 
+              "interval": "<schedule-interval>"
+            }
+          ], 
+          "snapshotRetention": [
+            {
+              "path": "/", 
+              "duration": "<retention-policy>"
+            }
+          ]
+        }
+      }
+    }'
+    ```
+    </Tab>
+    <Tab label="Sample">
+    ```bash
+    kubectl -n rook-ceph patch cephfilesystem cephfs --type merge -p \
+    '{
+      "spec": {
+        "mirroring": {
+          "enabled": true, 
+          "peers": {
+            "secretNames": [
+              "fs-secondary-site-secret"
+            ]
+          }, 
+          "snapshotSchedules": [
+            {
+              "path": "/", 
+              "interval": "1h"
+            }
+          ], 
+          "snapshotRetention": [
+            {
+              "path": "/", 
+              "duration": "h 1"
+            }
+          ]
+        }
+      }
+    }'
+    ```
+    </Tab>
+    <Tab label="Output">
+    ```bash
+    cephfilesystem.ceph.rook.io/<fs-name> patched
+    ```
+    </Tab>
+    </Tabs>
+
+    **Parameters**:
+    - `<fs-name>`:Name of the file storage pool.
+    - `<schedule-interval>`:Snapshot execution cycle. For details, please refer to the [official documentation](https://docs.ceph.com/en/latest/cephfs/snap-schedule/#add-and-remove-schedules).
+    - `<retention-policy>`: Snapshot retention policy. details, please refer to the [official documentation](https://docs.ceph.com/en/latest/cephfs/snap-schedule/#add-and-remove-retention-policies).
+
+
+  ### Deploy the Mirror Daemon in the Primary cluster
+
+    The Mirror Daemon continuously monitors data changes in the file storage pool (with Mirror enabled). It periodically creates snapshots and pushes the snapshot differences to the Secondary cluster over the network.
+
+    Execute the following commands on the Control node of the Primary cluster:
+
+    <Tabs>
+    <Tab label="Command">
+    ```yaml
+    cat << EOF | kubectl apply -f -
+    apiVersion: ceph.rook.io/v1
+    kind: CephFilesystemMirror
+    metadata:
+      name: cephfs-mirror
+      namespace: rook-ceph
+    spec:
+      placement:
+        tolerations:
+        - key: NoSchedule
+          operator: Exists
+      resources:
+        limits:
+          cpu: "500m"
+          memory: "1Gi"
+        requests:
+          cpu: "500m"
+          memory: "1Gi"
+      priorityClassName: system-node-critical
+    EOF
+    ```
+    </Tab>
+    <Tab label="Output">
+    ``` bash
+    cephfilesystemmirror.ceph.rook.io/cephfs-mirror created
+    ```
+    </Tab>
+    </Tabs>
+
+</Steps>
+
+
+## Failover
+  
+  In the event of a Primary cluster failure, you can directly continue using CephFS in the Secondary cluster.
+
+### Prerequisites
+
+- The Kubernetes resources of the Primary cluster have been backed up and restored to the Secondary cluster, including PVCs, PVs, and workloads of the applications.
