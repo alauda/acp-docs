@@ -1,0 +1,163 @@
+---
+weight: 10
+sourceSHA: 04fd2b5d69b047c4603cbcd525bb7044c29dd5ac410d74741630b6329317401f
+---
+
+# 配置 ModSecurity
+
+ModSecurity 是一个开源的 Web 应用防火墙 (WAF)，旨在保护 web 应用免受恶意攻击。它由开源社区维护，并支持各种编程语言和 web 服务器。平台负载均衡器 (ALB) 支持配置 ModSecurity，允许在 Ingress 级别进行单独配置。
+
+## 术语
+
+| 术语                | 解释                                                                                                              |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| **owasp-core-rules** | OWASP 核心规则集是一个开源规则集，用于检测和防止常见的 web 应用攻击。                                                |
+
+## 操作步骤
+
+通过向相应资源的 YAML 文件添加注释或配置 CR 来配置 ModSecurity。
+
+### 方法一：添加注释
+
+向相应 YAML 文件的 metadata.annotations 字段添加以下注释以配置 ModSecurity。
+
+- **Ingress-Nginx 兼容注释**
+
+  | 注释                                                      | 类型    | 适用对象                | 解释                                                                                             |
+  | -------------------------------------------------------- | ------- | ----------------------- | ------------------------------------------------------------------------------------------------ |
+  | **nginx.ingress.kubernetes.io/enable-modsecurity**        | bool    | Ingress                 | 启用 ModSecurity。                                                                                  |
+  | **nginx.ingress.kubernetes.io/enable-owasp-core-rules**   | bool    | Ingress                 | 启用 OWASP 核心规则集。                                                                                |
+  | **nginx.ingress.kubernetes.io/modsecurity-transaction-id** | string  | Ingress                 | 用于标识每个请求的唯一事务 ID，有助于日志记录和调试。                                                   |
+  | **nginx.ingress.kubernetes.io/modsecurity-snippet**       | string  | Ingress, ALB, FT, Rule  | 允许用户插入自定义的 ModSecurity 配置以满足特定的安全需求。                                            |
+
+- **ALB 特殊注释**
+
+  | 注释                                      | 类型    | 适用对象             | 解释                                                                                                                                          |
+  | ------------------------------------------ | ------- | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+  | **alb.modsecurity.cpaas.io/use-recommend** | bool    | Ingress              | 启用或禁用推荐的 ModSecurity 规则；设置为 `true` 以应用一组预定义的安全规则。                                                               |
+  | **alb.modsecurity.cpaas.io/cmref**         | string  | Ingress              | 引用特定的配置，例如，可以通过指定 ConfigMap 的参考路径 (`$ns/$name#$section`) 来加载自定义安全配置。                                      |
+
+### 方法二：配置 CR
+
+1. 打开需要配置的 ALB、FT 或 Rule 配置文件。
+
+2. 根据需要在 spec.config 下添加以下字段。
+
+   ```yaml
+   { 
+    "modsecurity": {
+      "enable": true,   # 启用或禁用 ModSecurity
+      "transactionId": "$xx", # 使用 Nginx 的 ID
+      "useCoreRules": true,   # 添加 modsecurity_rules_file /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+      "useRecommend": true,    # 添加 modsecurity_rules_file /etc/nginx/modsecurity/modsecurity.conf
+      "cmRef": "$ns/$name#$section"  # 从 ConfigMap 添加配置
+    }
+   }
+   ```
+
+3. 保存并应用配置文件。
+
+## 相关说明
+
+### 覆盖
+
+如果在规则中未配置 ModSecurity，它将尝试在 FT 中查找配置；如果 FT 中没有配置，将使用 ALB 的配置。
+
+## 配置示例
+
+以下示例部署了一个名为 `waf-alb` 的 ALB 和一个名为 `hello` 的演示后端应用。此外，部署了一个名为 `ing-waf-enable` 的 Ingress，定义了 `/waf-enable` 路由并配置了 ModSecurity 规则。任何包含查询参数 `test` 的请求，只要值包含字符串 `test`，将被阻止。
+
+```yaml
+apiVersion: crd.alauda.io/v2
+kind: ALB2
+metadata:
+  name: waf-alb
+  namespace: cpaas-system
+spec:
+  config:
+    loadbalancerName: waf-alb
+    projects:
+    - ALL_ALL
+    replicas: 1
+  type: nginx
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+        SecRuleEngine On
+        SecRule ARGS:test "@contains test" "id:1234,deny,log"
+  name: ing-waf-enable
+spec:
+  ingressClassName: waf-alb
+  rules:
+  - http:
+      paths:
+      - backend:
+          service:
+            name: hello
+            port:
+              number: 80
+        path: /waf-enable
+        pathType: ImplementationSpecific
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ing-waf-normal
+spec:
+  ingressClassName: waf-alb
+  rules:
+  - http:
+      paths:
+      - backend:
+          service:
+            name: hello
+            port:
+              number: 80
+        path: /waf-not-enable
+        pathType: ImplementationSpecific
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      service.cpaas.io/name: hello
+      service_name: hello
+  template:
+    metadata:
+      labels:
+        service.cpaas.io/name: hello
+        service_name: hello
+    spec:
+      containers:
+      - name: hello-world
+        image: docker.io/hashicorp/http-echo
+        imagePullPolicy: IfNotPresent
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello
+spec:
+  internalTrafficPolicy: Cluster
+  ipFamilies:
+    - IPv4
+  ipFamilyPolicy: SingleStack
+  ports:
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: 5678
+  selector:
+    service_name: hello
+  sessionAffinity: None
+  type: ClusterIP
+```
