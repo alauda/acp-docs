@@ -1,0 +1,228 @@
+---
+weight: 64
+---
+
+# 文件存储数据容灾
+
+CephFS Mirror 是 Ceph 文件系统的一个特性，用于在不同 Ceph 集群之间实现异步数据复制，从而提供跨集群的灾难恢复（Disaster Recovery）。其核心作用是通过主备模式同步数据，确保在主集群故障时，备集群能快速接管服务。
+
+:::warning
+- CephFS Mirror 基于快照进行增量同步，默认快照间隔为每小时一次（可配置）。​主备集群的差异数据通常为一个快照周期内的写入量。
+- CephFS Mirror 仅提供底层存储数据的备份，并不能处理 Kubernetes 资源的备份，请配合平台 **备份恢复** 功能备份 PVC 和 PV 资源。
+:::
+
+## 名词解释
+
+|名词|解释|
+|:---|:---|
+|**Primary 集群**|主集群，当前运行业务的集群。|
+|**Secondary 集群**| 备集群，用于备份的集群。|
+
+## 备份配置
+
+### 前提条件
+
+- 准备两个可用于部署 Alauda Container Platform (ACP) Storage with Ceph 的集群，即 Primary 集群和 Secondary 集群，且集群间网络互通。
+- 两个集群使用的平台版本（v3.12 及以上版本）必须保持一致。
+- 在 Primary 和 Secondary 集群中[创建分布式存储服务](../../installation/create_service_stand.mdx)。
+- 在 Primary 和 Secondary 集群中创建**名称相同**的文件存储存储池。
+
+### 操作步骤
+
+<Steps>
+
+  ### 开启 Secondary 集群文件存储池的 Mirror 功能
+
+    在 Secondary 集群的 Control 节点上执行下述命令：
+
+    <Tabs>
+    <Tab label="命令">
+    ```bash
+    kubectl -n rook-ceph patch cephfilesystem <fs-name> \
+    --type merge -p '{"spec":{"mirroring":{"enabled": true}}}'
+    ```
+    </Tab>
+    <Tab label="回显">
+    ```bash
+    cephfilesystem.ceph.rook.io/<fs-name> patched
+    ```
+    </Tab>
+    </Tabs>
+  
+    **参数说明**：
+    - `<fs-name>`： 文件存储池名称。
+
+  ### <a id="token"></a>获取 Peer Token
+  
+    该 token 是两个集群建立镜像连接的关键凭证。
+
+    在 Secondary 集群的 Control 节点上执行下述命令：
+
+    <Tabs>
+    <Tab label="命令">
+    ```bash
+    kubectl get secret -n rook-ceph \
+    $(kubectl -n rook-ceph get cephfilesystem <fs-name> -o jsonpath='{.status.info.fsMirrorBootstrapPeerSecretName}') \
+    -o jsonpath='{.data.token}' | base64 -d
+    ```
+    </Tab>
+    <Tab label="回显">
+    ```bash
+    # 由于涉及敏感信息该回显信息已做截断处理
+    eyJmc2lkIjogImMyYjAyNmMzLTA3ZGQtNDA3Z...
+    ```
+    </Tab>
+    </Tabs>
+
+    **参数说明**： 
+    - `<fs-name>`： 文件存储池名称。
+
+  ### 在 Primary 集群创建 Peer Secret
+    
+    在获取到 Secondary 集群的 Peer Token 之后，需要在 Primary 集群中创建 Peer Secret。
+
+    在 Primary 集群的 Control 节点上执行下述命令：
+
+    <Tabs>
+    <Tab label="命令">
+    ```bash
+    kubectl -n rook-ceph create secret generic fs-secondary-site-secret \
+    --from-literal=token=<token> \
+    --from-literal=pool=<fs-name>
+    ```
+    </Tab>
+    <Tab label="回显">
+    ```bash
+    secret/fs-secondary-site-secret created
+    ```
+    </Tab>
+    </Tabs>
+
+    **参数说明**：
+    - `<token>`：[步骤 2](#token) 中的获取的 token。
+    - `<fs-name>`：文件存储池名称。
+
+  ### 开启 Primary 集群文件存储池的 Mirror 功能
+
+    在 Primary 集群的 Control 节点上执行下述命令：
+    
+    <Tabs>
+    <Tab label="命令">
+    ```bash
+    kubectl -n rook-ceph patch cephfilesystem <fs-name> --type merge -p \
+    '{
+      "spec": {
+        "mirroring": {
+          "enabled": true, 
+          "peers": {
+            "secretNames": [
+              "fs-secondary-site-secret"
+            ]
+          }, 
+          "snapshotSchedules": [
+            {
+              "path": "/", 
+              "interval": "<schedule-interval>"
+            }
+          ], 
+          "snapshotRetention": [
+            {
+              "path": "/", 
+              "duration": "<retention-policy>"
+            }
+          ]
+        }
+      }
+    }'
+    ```
+    </Tab>
+    <Tab label="配置示例">
+    ```bash
+    kubectl -n rook-ceph patch cephfilesystem cephfs --type merge -p \
+    '{
+      "spec": {
+        "mirroring": {
+          "enabled": true, 
+          "peers": {
+            "secretNames": [
+              "fs-secondary-site-secret"
+            ]
+          }, 
+          "snapshotSchedules": [
+            {
+              "path": "/", 
+              "interval": "1h"
+            }
+          ], 
+          "snapshotRetention": [
+            {
+              "path": "/", 
+              "duration": "h 1"
+            }
+          ]
+        }
+      }
+    }'
+    ```
+    </Tab>
+    <Tab label="回显">
+    ```bash
+    cephfilesystem.ceph.rook.io/<fs-name> patched
+    ```
+    </Tab>
+    </Tabs>
+
+    **参数说明**：
+    - `<fs-name>`：文件存储池名称。
+    - `<schedule-interval>`：快照执行周期，具体配置说明请参考 [官方说明文档](https://docs.ceph.com/en/latest/cephfs/snap-schedule/#add-and-remove-schedules)。
+    - `<retention-policy>`：快照保留策略，具体配置说明请参考 [官方说明文档](https://docs.ceph.com/en/latest/cephfs/snap-schedule/#add-and-remove-retention-policies)。
+
+
+  ### 在 Primary 集群中部署 Mirror Daemon
+
+    Mirror Daemon 会持续监听文件存储池（已开启 Mirror）的数据变更。它会周期性地创建快照，并通过网络将快照差异推送到 Secondary 集群。
+
+    在 Primary 集群的 Control 节点上执行下述命令：
+
+    <Tabs>
+    <Tab label="命令">
+    ```yaml
+    cat << EOF | kubectl apply -f -
+    apiVersion: ceph.rook.io/v1
+    kind: CephFilesystemMirror
+    metadata:
+      name: cephfs-mirror
+      namespace: rook-ceph
+    spec:
+      placement:
+        tolerations:
+        - key: NoSchedule
+          operator: Exists
+      resources:
+        limits:
+          cpu: "500m"
+          memory: "1Gi"
+        requests:
+          cpu: "500m"
+          memory: "1Gi"
+      priorityClassName: system-node-critical
+    EOF
+    ```
+    </Tab>
+    <Tab label="回显">
+    ``` bash
+    cephfilesystemmirror.ceph.rook.io/cephfs-mirror created
+    ```
+    </Tab>
+    </Tabs>
+
+</Steps>
+
+
+## 故障切换
+  
+  在 Primary 集群故障时，可以直接在 Secondary 集群中继续使用 CephFS。
+
+### 前提条件
+
+- Primary 集群 Kubernetes 资源已经备份，并恢复至 Secondary 集群，比如 PVC、PV、业务的 Workload 等。
