@@ -1,0 +1,193 @@
+---
+weight: 10
+---
+
+# Gatekeeper 使用实践
+
+## 功能简介
+
+Gatekeeper 是一个基于 OPA（Open Policy Agent）的策略引擎，用于在 Kubernetes 集群中实施自定义的准入控制策略。它能够帮助您对集群中的资源创建、更新和删除操作进行细粒度的控制和验证，通过预定义的安全策略和合规策略，实现对集群资源的统一管理和合规性检查。
+
+## 使用场景
+
+- 需要对集群资源进行安全控制和合规检查
+- 想要实施自定义的资源准入策略
+- 需要统一管理和执行组织的安全规范
+- 需要对多集群配置进行合规性验证
+- 需要实时监控和审计资源变更
+
+## 前置条件
+
+使用 Gatekeeper 前，需确保：
+
+- 已经安装了 Kubernetes 集群，版本 1.16 或更高
+- 具有集群管理员权限
+- 已经在集群中安装了 Gatekeeper
+- 了解基本的 Kubernetes 资源概念
+- 熟悉 Rego 策略语言（用于编写约束模板）
+
+## 操作步骤
+
+### 1. 安装 Gatekeeper 插件
+
+1. **在 Customer Portal 中找到《Gatekeeper插件安装》文档，待文档更新后，按照文档指引完成插件部署，后面修改下**
+2. 按照文档指引完成插件部署
+3. 验证安装是否成功：
+   ```bash
+   kubectl get pods -n gatekeeper-system
+   ```
+
+### 2. 创建合规策略
+
+Gatekeeper 使用约束模板（ConstraintTemplate）和约束（Constraint）两个核心概念来实现策略控制。以下是一些常见的策略示例：
+
+#### 2.1 禁止特权容器
+
+1. 创建约束模板：
+```yaml
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8spspprivilegedcontainer
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sPSPPrivilegedContainer
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8spspprivileged
+        violation[{"msg": msg}] {
+          c := input_containers[_]
+          c.securityContext.privileged
+          msg := sprintf("Privileged container is not allowed: %v", [c.name])
+        }
+        input_containers[c] {
+          c := input.review.object.spec.containers[_]
+        }
+        input_containers[c] {
+          c := input.review.object.spec.initContainers[_]
+        }
+```
+
+2. 创建约束：
+```yaml
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sPSPPrivilegedContainer
+metadata:
+  name: psp-privileged-container
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    excludedNamespaces: ["kube-system"]
+```
+
+#### 2.2 强制设置资源限制
+
+1. 创建约束模板：
+```yaml
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredresources
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequiredResources
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8srequiredresources
+        violation[{"msg": msg}] {
+          c := input_containers[_]
+          not c.resources.limits
+          msg := sprintf("Container %v has no resource limits", [c.name])
+        }
+        input_containers[c] {
+          c := input.review.object.spec.containers[_]
+        }
+```
+
+2. 创建约束：
+```yaml
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequiredResources
+metadata:
+  name: required-resources
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+```
+
+### 3. 验证策略生效
+
+1. 创建测试资源
+   ```bash
+   kubectl run test-privileged --image=nginx:latest --privileged
+   ```
+
+2. 查看策略验证结果
+   ```bash
+   kubectl describe pod test-privileged
+   ```
+
+3. 检查审计日志
+   ```bash
+   kubectl logs -n gatekeeper-system -l control-plane=controller-manager
+   ```
+
+参数说明如下：
+
+| **参数** | **说明** | **示例值** |
+| -------- | -------- | ---------- |
+| enforcementAction | 策略执行方式 | deny（拒绝）/ dryrun（审计） |
+| match.kinds | 策略适用的资源类型 | Pod, Deployment, Service |
+| match.excludedNamespaces | 排除的命名空间 | ["kube-system", "gatekeeper-system"] |
+| rego | OPA 策略语言代码 | 策略逻辑实现 |
+| violation | 违规检查规则 | 定义违规条件和消息 |
+
+## 操作结果
+
+完成配置后，您可以：
+- 通过创建测试资源验证策略是否生效
+- 在 Kubernetes 事件中查看策略执行记录
+- 通过 Gatekeeper 审计日志查看违规情况
+- 在合规管理面板中查看策略详情和违规资源
+
+### 策略验证方法
+
+1. 查看约束模板状态
+   ```bash
+   kubectl get constrainttemplates
+   ```
+
+2. 检查约束状态
+   ```bash
+   kubectl get constraints
+   ```
+
+3. 查看违规详情
+   ```bash
+   kubectl get violations
+   ```
+
+## 了解更多
+
+### 常用合规策略
+
+| 优先级 | 策略名称 | 用途 | 安全影响 |
+|-------|---------|------|----------|
+| P0 | privileged-containers | 禁止特权容器 | 防止容器逃逸风险 |
+| P0 | host-namespaces | 禁止使用主机命名空间 | 防止容器访问主机资源 |
+| P1 | users | 禁止以 root 用户运行 | 降低容器逃逸和权限滥用风险 |
+| P1 | capabilities | 限制容器 Capabilities | 控制容器权限范围 |
+| P1 | forbidden-sysctls | 限制系统控制参数 | 防止危险的系统配置修改 |
+| P2 | containerlimits | 强制容器资源限制 | 防止资源耗尽攻击 |
