@@ -1,0 +1,333 @@
+---
+weight: 66
+---
+
+# Object Storagge Disaster Recovery
+
+The Ceph RGW Multi-Site feature is a cross-cluster asynchronous data replication mechanism designed to synchronize object storage data between geographically distributed Ceph clusters, providing High Availability (HA) and Disaster Recovery (DR) capabilities.
+
+## Terminology
+
+| Term               | Explanation                    |
+|:------------------|:------------------------|
+|Primary Cluster | The cluster currently providing storage services.   |
+|Secondary Cluster | The standby cluster used for backup purposes.     |
+|Realm, ZoneGroup, Zone|<ul><li>Realm: The highest-level logical grouping in Ceph object storage. It represents a complete object storage namespace, typically used for multi-site replication and synchronization. A Realm can span different geographical locations or data centers.</li><li>ZoneGroup: A logical grouping within a Realm, containing multiple Zones. ZoneGroups enable data synchronization and replication across Zones, usually within the same geographical region.</li><li>Zone: A logical grouping within a ZoneGroup that physically stores data. Each Zone manages and stores objects independently and can have its own data/metadata pool configurations.</li></ul>|
+
+## Prerequisites
+
+- Prepare two clusters available for deploying Rook-Ceph (Primary and Secondary clusters) with network connectivity between them.
+- Both clusters must use the same platform version (v3.12 or later).
+- Ensure no Ceph object storage is deployed on either the Primary or Secondary cluster.
+- Refer to the [Create Storage Service](../../installation/create_service_stand.mdx) documentation to deploy Operator and create clusters. Do not proceed with object storage pool creation via the wizard after cluster creation. Instead, use CLI tools for configuration as described below.
+
+
+## Procedures
+
+This guide provides a synchronization solution between two Zones in the same ZoneGroup.
+
+<Steps>
+
+  ### Create Object Storage in Primary Cluster
+
+    This step creates the Realm, ZoneGroup, Primary Zone, and Primary Zone's gateway resources.
+    
+    Execute the following commands on the Control node of the Primary cluster:
+
+    <Tabs>
+    <Tab label="Command">
+    ```yaml
+    cat << EOF | kubectl apply -f -
+    ---
+    apiVersion: ceph.rook.io/v1
+    kind: CephObjectRealm
+    metadata:
+      name: <realm-name>
+      namespace: rook-ceph
+      
+    ---
+    apiVersion: ceph.rook.io/v1
+    kind: CephObjectZoneGroup
+    metadata:
+      name: <zonegroup-name>
+      namespace: rook-ceph
+    spec:
+      realm: <realm-name>
+
+    ---
+    apiVersion: ceph.rook.io/v1
+    kind: CephObjectZone
+    metadata:
+      name: <primary-zone-name>
+      namespace: rook-ceph
+    spec:
+      zoneGroup: <zonegroup-name>
+      metadataPool:
+        failureDomain: host
+        replicated:
+          size: 3
+          requireSafeReplicaSize: true
+      dataPool:
+        failureDomain: host
+        replicated:
+          size: 3
+          requireSafeReplicaSize: true
+        parameters:
+          compression_mode: none
+      preservePoolsOnDelete: false
+    
+    ---
+    cat << EOF | kubectl apply -f -
+    apiVersion: ceph.rook.io/v1
+    kind: CephObjectStore
+    metadata:
+      name: <object-store-name>
+      namespace: rook-ceph
+    spec:
+      gateway:
+        port: 7480
+        instances: 2
+      zone:
+        name: <zone-name>    
+    EOF
+    ```
+    </Tab>
+    <Tab label="Output">
+    ```
+    cephobjectrealm.ceph.rook.io/<realm-name> created
+    cephobjectzonegroup.ceph.rook.io/<zonegroup-name> created
+    cephobjectzone.ceph.rook.io/<zone-name> created
+    cephobjectstore.ceph.rook.io/<object-store-name> created
+    ```
+    </Tab>
+    </Tabs>
+
+    **Parameter**：
+    - <a id="realm"></a>`<realm-name>`: Realm name.
+    - <a id="zone-group"></a>`<zonegroup-name>`: ZoneGroup name.
+    - <a id="primary-zone"></a>`<primary-zone-name>`: Primary Zone name.
+    - <a id="gateway"></a>`<object-store-name>`: Gateway name.
+
+  ### Configure External Access for Primary Zone
+    1. <a id="uid"></a>Obtain the UID of the ObjectStore
+
+    ```bash
+    kubectl -n rook-ceph get cephobjectstore <object-store-name> -o jsonpath='{.metadata.uid}'
+    ```
+    **Parameters**
+    - `<object-store-name>`: Gateway name configured in [Step 1](#gateway).
+
+    2. Create an external access Service
+
+    ```yaml
+    cat << EOF | kubectl apply -f -
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: rook-ceph-rgw-<object-store-name>-external
+      namespace: rook-ceph
+      labels:
+        app: rook-ceph-rgw
+        rook_cluster: rook-ceph
+        rook_object_store: <object-store-name>
+      ownerReferences:
+        - apiVersion: ceph.rook.io/v1
+          kind: CephObjectStore
+          name: <object-store-name>
+          uid: <object-store-uid>
+    spec:
+      ports:
+        - name: rgw
+          port: 7480
+          targetPort: 7480
+          protocol: TCP
+      selector:
+        app: rook-ceph-rgw
+        rook_cluster: rook-ceph
+        rook_object_store: <object-store-name>
+      sessionAffinity: None
+      type: NodePort
+    EOF
+    ```
+    **Parameters**:
+    - `<object-store-name>`: Gateway name configured [here](#gateway).
+    - `<object-store-uid>`: UID obtained [here](#uid). 
+
+    3. Add external endpoints to the CephObjectZone.
+
+    ```bash
+    kubectl -n rook-ceph patch cephobjectzone <primary-zone-name> --type merge -p '{"spec":{"customEndpoints":["<external-endpoint>"]}}'
+    ```
+    **Parameters**:
+    - `<zone-name>`: Primary Zone name configured [here](#primary-zone).
+    - `<external-endpoint>`: [External address](#address) obtained from the Primary cluster.
+
+
+  ### <a id="aksk"></a>Obtain `access-key` and `secret-key`
+
+    ```bash
+    kubectl -n rook-ceph get secrets <realm-name>-keys -o yaml | grep access-key
+    kubectl -n rook-ceph get secrets <realm-name>-keys -o yaml | grep secret-key
+    ```
+    **Parameters**:
+    - `<realm-name>`: Realm name configured [here](#realm).
+
+  ### Create Secondary Zone and Configure Realm Sync
+
+    This section explains how to create the Secondary Zone and configure synchronization by pulling Realm information from the Primary cluster.
+
+    Execute the following commands on the Control node of the Secondary cluster:
+
+    ```yaml
+    cat << EOF | kubectl apply -f -
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: <realm-name>-keys
+      namespace: rook-ceph
+    data:
+      access-key: <access-key>
+      secret-key: <secret-key>
+    
+    ---
+    apiVersion: ceph.rook.io/v1
+    kind: CephObjectRealm
+    metadata:
+      name: <realm-name>
+      namespace: rook-ceph
+    spec:
+      pull:
+        endpoint: <realm-endpoint>
+    
+    ---
+    apiVersion: ceph.rook.io/v1
+    kind: CephObjectZoneGroup
+    metadata:
+      name: <zone-group-name>
+      namespace: rook-ceph
+    spec:
+      realm: <realm-name>
+      
+    ---
+    apiVersion: ceph.rook.io/v1
+    kind: CephObjectZone
+    metadata:
+      name: <new-zone-name>
+      namespace: rook-ceph
+    spec:
+      zoneGroup: <zone-group-name>
+      metadataPool:
+        failureDomain: host
+        replicated:
+          size: 3
+          requireSafeReplicaSize: true
+      dataPool:
+        failureDomain: host
+        replicated:
+          size: 3
+          requireSafeReplicaSize: true
+      preservePoolsOnDelete: false
+
+    ---
+    apiVersion: ceph.rook.io/v1
+    kind: CephObjectStore
+    metadata:
+      name: <secondary-object-store-name>
+      namespace: rook-ceph
+    spec:
+      gateway:
+        port: 7480
+        instances: 2
+      zone:
+        name: <secondary-zone-name>
+    EOF
+    ```
+
+    **Parameters**:
+    - `<access-key>`: AK obtain from [here](#aksk).
+    - `<secret-key>`: SK obtain from[here](#aksk).
+    - `<realm-endpoint>`: [External address](#address) obtained from the Primary cluster.
+    - `<realm-name>`: [Realm](#realm).
+    - `<zone-group-name>`: [ZoneGroup](#zone-group).
+    - `<secondary-zone-name>`: Name of the secondary zone.
+    - `<secondary-object-store-name>`: Name of the secndary Gateway.
+
+  ### Configure External Access for Secondary Zone
+    1. <a id="uids"></a>Obtain UID of Secondary Gateway 
+    ```
+    kubectl -n rook-ceph get cephobjectstore <secondary-object-store-name> -o jsonpath='{.metadata.uid}'
+    ```
+    **Parameters**:
+    - `<secondary-object-store-name>`: Name of the Gateway in Secondary cluster.
+
+    2. Create an external access Service
+    ```yaml
+    cat << EOF | kubectl apply -f -
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: rook-ceph-rgw-<object-store-name>-external
+      namespace: rook-ceph
+      labels:
+        app: rook-ceph-rgw
+        rook_cluster: rook-ceph
+        rook_object_store: <object-store-name>
+      ownerReferences:
+        - apiVersion: ceph.rook.io/v1
+          kind: CephObjectStore
+          name: <object-store-name> 
+          uid: <object-store-uid> 
+    spec:
+      ports:
+        - name: rgw
+          port: 7480
+          targetPort: 7480
+          protocol: TCP
+      selector:
+        app: rook-ceph-rgw
+        rook_cluster: rook-ceph
+        rook_object_store: <object-store-name> 
+      sessionAffinity: None
+      type: NodePort
+    EOF
+    ```
+    **Parameters**:
+    - `<secondary-object-store-name>`: Secondary Gateway.
+    - `<secondary-object-store-uid>`: Secondary Gateway UID.
+
+    
+    3. Add external endpoints to the Secondary CephObjectZone
+
+    ```
+    kubectl -n rook-ceph patch cephobjectzone <secondary-zone-name> --type merge -p '{"spec":{"customEndpoints":["<external-endpoint>"]}}'
+    ```
+    **Parameters**:
+    - `<secondary-zone-name>`: Name of the Secondary Zone.
+    - `<secondary-zone-external-endpoint>`: [External address](#address) obtained from the Secondary cluster.
+
+</Steps>
+
+## Failover
+
+When the Primary cluster fails, it is necessary to promote the Secondary Zone to the Primary Zone. After the switch, the Secondary Zone's gateway can continue to provide object storage services.
+
+### Procedures
+
+  Execute the following commands in the `rook-ceph-tool`s` pod of the Secondary cluster
+  ```bash
+  radosgw-admin zone modify --rgw-realm=<realm-name> --rgw-zonegroup=<zone-group-name> --rgw-zone=<secondary-zone-name> --master
+  ```
+  **Parameters**
+  - `<realm-name>`: Realm name.
+  - `<zone-group-name>`: Zone Group name.
+  - `<secondary-zone-name>`: Secondary Zone name.
+
+## Related operations
+
+### <a id="address"></a>Obtaine External address
+
+1. Access **Platform Management**.
+
+2. In the left navigation bar, click **Storage Management** > **Distributed Storage**.
+
+3. In the **Cluster Information** tab, scroll down to the **Storage Pool** area, click on the ⋮ next to the object storage pool and select **View Address**.

@@ -1,0 +1,85 @@
+---
+weight: 20
+sourceSHA: 93f2cdee96956d19218c940a745bd024c1b101ece70ef2e29eb94ce8cf7cd5a9
+---
+
+# MySQL Memory Usage Optimization
+
+One of the key metrics for MySQL is the instance memory usage rate and buffer pool hit rate. High memory usage increases the risk of OOM (Out of Memory) errors, while a low buffer pool hit rate indicates that many data pages are not hitting the cached data pages in the buffer pool, requiring data to be read from storage, which increases IO throughput and latency.
+
+## Checking Memory Usage
+
+### Check Total Memory Usage
+
+```
+select * from sys.memory_global_total;
+```
+
+**Note**: Due to limitations in data update frequency, caching, and kernel usage (this part is not counted), this statement provides an approximate indication of memory usage.
+
+### Check the Top 20 Events by Memory Usage
+
+```
+select event_name,CURRENT_NUMBER_OF_BYTES_USED/1024/1024
+from performance_schema.memory_summary_global_by_event_name
+order by CURRENT_NUMBER_OF_BYTES_USED desc LIMIT 20;
+```
+
+### Check the Top 20 Threads by Memory Usage
+
+```
+select thread_id,event_name,CURRENT_NUMBER_OF_BYTES_USED/1024/1024
+from performance_schema.memory_summary_by_thread_by_event_name
+order by CURRENT_NUMBER_OF_BYTES_USED desc limit 20;
+```
+
+### Check Currently Allocated Memory
+
+```
+select substring_index(event_name,'/',2) as code_area, format_bytes(sum(current_alloc)) as current_alloc
+from sys.x$memory_global_by_current_bytes
+group by substring_index(event_name,'/',2)
+order by sum(current_alloc) DESC;
+```
+
+## Memory Usage Optimization Recommendations
+
+### Multiple Statements
+
+MySQL supports using the semicolon `;` to separate multiple SQL statements, sending them to MySQL together to be processed one by one. However, some memory needs to wait for all SQL statements to finish executing before it can be freed.
+
+If a large number of SQL statements are sent at once, such as reaching several hundred megabytes, then during the execution of the SQL statements, the allocation and cumulative consumption of various objects can be very large, potentially leading to memory exhaustion within the MySQL process.
+
+In addition, using multiple statements to send SQL can lead to a sudden increase in network traffic, which can be assessed through network traffic monitoring and SQL insights. Thus, in business implementations, it is recommended to avoid using multiple statement SQL sending methods as much as possible.
+
+### Buffer Pool Issues
+
+All data pages for tables are stored in the buffer pool. During query execution, if the required data pages hit the buffer pool directly, no physical I/O occurs, achieving higher SQL execution efficiency. The buffer pool manages data pages using an LRU (Least Recently Used) algorithm, with all dirty pages placed in a Flush List linked list.
+
+In systems with a large amount of memory, the InnoDB Buffer Pool memory is usually the largest in the instance memory. The number of buffer pool instances can be increased by modifying the innodb_buffer_pool_instances parameter, which improves concurrency performance.
+
+Common issues related to the buffer pool and optimization recommendations are shown in the table below.
+
+| Problem Description                   | Cause or Recommendation                                                               |
+| ------------------------------------- | ------------------------------------------------------------------------------------ |
+| **Insufficient data page preheating leading to high query latency** | Generally occurs in instances after a restart, cold data reads, or low buffer pool hit rates. It is recommended to either upgrade the instance specifications or precede the data preheating. |
+| **Excessive accumulation of dirty pages**             | When too many dirty pages are not flushed, background threads will trigger synchronization and refresh dirty pages, severely degrading instance performance. Solutions include balancing the write load, avoiding excessive write throughput, adjusting refresh dirty page parameters, or upgrading instance specifications. |
+| **Full table scans contaminating the buffer pool** | Full table scans should be avoided, for example, refrain from using statements like `select * from large_table` to reduce pollution of the buffer pool. |
+
+### Temporary Tables
+
+When using memory temporary tables in MySQL, their size is constrained by the tmp_table_size and max_heap_table_size parameters. Temporary tables that exceed this parameter limit will be converted into disk temporary tables. If a large number of connections create numerous memory temporary tables in a short period, it may lead to a sharp increase in memory usage.
+
+MySQL 8.0 introduces a new temporary table engine. This engine requires that the total size of memory temporary tables allocated by all threads must be less than the parameter temptable_max_ram, which has a default value of 1GB. When memory temporary tables exceed this limit, they will be converted to disk temporary tables.
+
+### Cluster Communication Cache
+
+When using MGR (MySQL Group Replication) to form a cluster, consideration must also be given to the consumption of the XCom Cache communication cache. By default, this cache size is 1GB. In environments with good network quality, a lower group_replication_message_cachesize parameter can be used to create a cluster, thereby reducing memory usage.
+
+### Others
+
+When the number of tables in an instance is particularly high or when the query frequency is very high, the Table Cache can consume a large amount of memory. It is advisable to avoid creating too many tables in an instance or to set the table_open_cache parameter to a proper size.
+
+AHI (Adaptive Hash Index) defaults to occupy 1/64 of the memory in the Buffer Pool. If a significant amount of large fields, such as BLOBs, are queried or written, memory will be dynamically allocated, which increases memory usage. Disabling AHI can more effectively and reasonably utilize the server's memory resources, freeing up more available memory for business systems, and thereby improving overall performance. However, it should be noted that AHI also has the capability to accelerate specific queries, so a balance must be struck between query performance gains and memory optimization when disabling it.
+
+If there is an unusual increase in memory usage or memory exhaustion in the MySQL instance, it is recommended to refer to the [MySQL 5.7 Official Documentation](https://dev.mysql.com/doc/refman/5.7/en/optimizing-innodb-diskio.html) or [MySQL 8.0 Official Documentation](https://dev.mysql.com/doc/refman/8.0/en/optimizing-innodb-diskio.html) to investigate the causes of increased memory usage.
