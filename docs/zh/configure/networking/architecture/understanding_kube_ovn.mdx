@@ -1,0 +1,108 @@
+---
+weight: 10
+sourceSHA: 2a4af49cd3068424248ed6e4ae9736899e9c100de6062e666acfd63f8efd4ab1
+---
+
+# 理解 Kube-OVN
+
+本文档描述了 Kube-OVN 的整体架构、各组件的功能以及它们之间的交互关系。
+
+总体而言，Kube-OVN 充当 Kubernetes 和 OVN 之间的桥梁，将成熟的 SDN 与云原生相结合。
+这意味着 Kube-OVN 不仅实现了 Kubernetes 下的网络规范，例如 CNI、Service 和 NetworkPolicy，
+而且还将大量的 SDN 领域能力带入云原生，比如逻辑交换机、逻辑路由器、VPC、
+网关、QoS、ACL 和流量镜像。
+
+Kube-OVN 还保持了良好的开放性，以便与许多技术解决方案进行集成，如 Cilium、Submariner、Prometheus、KubeVirt 等。
+
+Kube-OVN 的组件大致可以分为三类：
+
+- 上游 OVN/OVS 组件。
+- 核心控制器和代理。
+- 监控、运维工具和扩展组件。
+
+![](../../../../en/configure/networking/assets/kube-ovn-architecture.png)
+
+## 上游 OVN/OVS 组件
+
+这类组件来自 OVN/OVS 社区，经过特定修改以适应 Kube-OVN 使用场景。
+OVN/OVS 本身是一个成熟的 SDN 系统，用于管理虚拟机和容器，
+我们强烈建议对 Kube-OVN 实现感兴趣的用户先阅读 [ovn-architecture(7)](https://www.mankier.com/7/ovn-architecture)
+以了解 OVN 是什么以及如何集成它。
+Kube-OVN 使用 OVN 的北向接口来创建和协调虚拟网络，并将网络概念映射到 Kubernetes 中。
+
+所有与 OVN/OVS 相关的组件都已打包为镜像，并准备在 Kubernetes 中运行。
+
+### ovn-central
+
+`ovn-central` 部署运行 OVN 的控制平面组件，包括 `ovn-nb`、`ovn-sb` 和 `ovn-northd`。
+
+- `ovn-nb`：保存虚拟网络配置，并为虚拟网络管理提供 API。`kube-ovn-controller` 主要与 `ovn-nb` 交互，以配置虚拟网络。
+- `ovn-sb`：保存从 `ovn-nb` 的逻辑网络生成的逻辑流表，以及每个节点的实际物理网络状态。
+- `ovn-northd`：将 `ovn-nb` 的虚拟网络转换为 `ovn-sb` 中的逻辑流表。
+
+多个 `ovn-central` 实例将通过 Raft 协议同步数据，以确保高可用性。
+
+### ovs-ovn
+
+`ovs-ovn` 作为 DaemonSet 在每个节点上运行，`openvswitch`、`ovsdb` 和 `ovn-controller` 在 Pod 内部运行。
+这些组件充当 `ovn-central` 的代理，以将逻辑流表转换为实际的网络配置。
+
+## 核心控制器和代理
+
+这一部分是 Kube-OVN 的核心组件，充当 OVN 和 Kubernetes 之间的桥梁，连接这两个系统，并在它们之间转换网络概念。
+大多数核心功能在这些组件中实现。
+
+### kube-ovn-controller
+
+此组件负责将 Kubernetes 中的所有资源转换为 OVN 资源，并充当整个 Kube-OVN 系统的控制平面。
+`kube-ovn-controller` 监听与网络功能相关的所有资源的事件，并根据资源变化更新 OVN 中的逻辑网络。
+监听的主要资源包括：
+
+Pod，Service，Endpoint，Node，NetworkPolicy，VPC，Subnet，Vlan，ProviderNetwork。
+
+以 Pod 事件为例，`kube-ovn-controller` 监听 Pod 创建事件，通过内置的内存 IPAM 功能分配地址，
+并调用 `ovn-central` 创建逻辑端口、静态路由和可能的 ACL 规则。
+接下来，`kube-ovn-controller` 将分配的地址以及 CIDR、网关、路由等子网信息写入 Pod 的注解。
+然后，`kube-ovn-cni` 读取这个注解，并用于配置本地网络。
+
+### kube-ovn-cni
+
+此组件作为 DaemonSet 在每个节点上运行，实现 CNI 接口，并操作本地 OVS 配置本地网络。
+
+该 DaemonSet 将 `kube-ovn` 二进制文件复制到每台机器上，作为 `kubelet` 和 `kube-ovn-cni` 之间的交互工具。
+该二进制文件向 `kube-ovn-cni` 发送相应的 CNI 请求以进行进一步操作。
+默认情况下，二进制文件将复制到 `/opt/cni/bin` 目录。
+
+`kube-ovn-cni` 将配置特定的网络以执行适当的流量操作，其主要任务包括：
+
+1. 配置 `ovn-controller` 和 `vswitchd`。
+2. 处理 CNI Add/Del 请求：
+   1. 创建或删除 veth 对，并绑定或解绑到 OVS 端口。
+   2. 配置 OVS 端口。
+   3. 更新宿主机的 iptables/ipset/route 规则。
+3. 动态更新网络 QoS。
+4. 创建并配置 `ovn0` NIC，以连接容器网络和宿主机网络。
+5. 配置宿主机 NIC 以实现 Vlan/Underlay/EIP。
+6. 动态配置跨集群网关。
+
+## 监控、运维工具和扩展组件
+
+这些组件提供监控、诊断和操作工具，以及扩展 Kube-OVN 核心网络能力的外部接口，
+并简化日常操作和维护。
+
+### kube-ovn-speaker
+
+此组件作为 DaemonSet 在特定标记的节点上运行，向外部发布路由，
+允许通过 Pod IP 直接访问容器。
+
+### kube-ovn-pinger
+
+此组件作为 DaemonSet 在每个节点上运行，用于收集 OVS 状态信息、节点网络质量、网络延迟等。
+
+### kube-ovn-monitor
+
+此组件收集 OVN 状态信息和监控指标。
+
+### kubectl-ko
+
+此组件是一个 kubectl 插件，可以快速执行常见操作。
