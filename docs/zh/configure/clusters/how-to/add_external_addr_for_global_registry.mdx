@@ -1,0 +1,166 @@
+---
+weight: 20
+title: 为内置注册表添加外部地址
+sourceSHA: 01d895a6ffb5058edcfdfb3404af14c6e6d70b3f73aeffbb9cf29897db011a54
+---
+
+# 为内置注册表添加外部地址
+
+## 概述
+
+当 `global` 集群使用 `Platform Built-in` 注册表时，工作负载集群通常也使用此注册表来拉取镜像。该注册表不仅服务于 `global` 集群中的组件，还必须对工作负载集群的节点可访问。
+
+在某些情况下，工作负载集群节点无法直接访问 `global` 集群的注册表地址——例如，当 `global` 集群位于私有数据中心，而工作负载集群位于公有云或边缘环境中时。
+
+本指南说明如何为平台的默认注册表配置一个外部可访问的地址，以便工作负载集群能够拉取镜像。
+
+## 先决条件
+
+在开始之前，请准备以下内容：
+
+- 一个工作负载集群节点可以访问的域名
+- 域名指向的IP地址
+- 域名的有效SSL证书
+
+<Directive type="warning" title="警告">
+  - 域名必须与平台访问地址不同
+  - 确保域名的IP地址能够将流量转发到 `global` 集群的所有控制平面节点
+</Directive>
+
+## 步骤
+
+### 配置平台注册表的证书和路由规则
+
+1. 将域名的有效证书复制到 `global` 集群的任意控制平面节点
+
+2. 创建一个包含域名证书的TLS密钥：
+
+   ```
+   kubectl create secret tls registry-address.tls --cert=<certificate-filename> --key=<key-filename> -n kube-system
+   ```
+
+   示例：
+
+   ```
+   kubectl create secret tls registry-address.tls --cert=custom.crt --key=custom.key -n kube-system
+   ```
+
+   **注意**：创建证书后，监控 **global** 集群 **kube-system** 命名空间中 **registry-address.tls** 密钥的到期日期。在证书到期之前，请替换证书。
+
+3. 在 `global` 集群的任意控制平面节点上创建入口规则：
+
+   ```
+   REGISTRY_DOMAIN_NAME=<www.registry.com> # 替换为您可访问的域名
+   cat << EOF | kubectl create -f -
+   apiVersion: networking.k8s.io/v1
+   kind: Ingress
+   metadata:
+     annotations:
+       nginx.ingress.kubernetes.io/backend-protocol: HTTPS
+     name: registry-address
+     namespace: kube-system
+     labels:
+       service_name: registry
+   spec:
+     rules:
+       - host: $REGISTRY_DOMAIN_NAME
+         http:
+           paths:
+             - backend:
+                 service:
+                   name: registry
+                   port:
+                     number: 443
+               path: /v2/
+               pathType: ImplementationSpecific
+             - backend:
+                 service:
+                   name: registry
+                   port:
+                     number: 443
+               path: /v2/_catalog
+               pathType: ImplementationSpecific
+             - backend:
+                 service:
+                   name: registry
+                   port:
+                     number: 443
+               path: /v2/.+/tags/list
+               pathType: ImplementationSpecific
+             - backend:
+                 service:
+                   name: registry
+                   port:
+                     number: 443
+               path: /v2/.+/manifests/[A-Za-z0-9_+.-:]+
+               pathType: ImplementationSpecific
+             - backend:
+                 service:
+                   name: registry
+                   port:
+                     number: 443
+               path: /v2/.+/blobls/[A-Za-z0-9-:]+
+               pathType: ImplementationSpecific
+             - backend:
+                 service:
+                   name: registry
+                   port:
+                     number: 443
+               path: /v2/.+/blobls/uploads/[A-Za-z0-9-:]+
+               pathType: ImplementationSpecific
+             - backend:
+                 service:
+                   name: registry
+                   port:
+                     number: 443
+               path: /auth/token
+               pathType: ImplementationSpecific
+     tls:
+       - secretName: registry-address.tls
+         hosts:
+           - $REGISTRY_DOMAIN_NAME
+   EOF
+   ```
+
+   返回的响应类似于 `... created` 表示入口创建成功。
+
+4. 检查是否存在注册表服务资源：
+
+   ```
+   kubectl -n kube-system get svc | grep registry
+   ```
+
+   如果该服务不存在，请使用以下命令创建它：
+
+   ```
+   cat << EOF | kubectl create -f -
+   apiVersion: v1
+   kind: Service
+   metadata:
+     labels:
+       name: registry
+       service_name: registry
+     name: registry
+     namespace: kube-system
+   spec:
+     ports:
+       - protocol: TCP
+         port: 443
+         targetPort: 60080
+     selector:
+       component: registry
+     type: ClusterIP
+   EOF
+   ```
+
+5. 使用域名从注册表拉取镜像以测试配置：
+
+   ```
+   crictl pull <registry-domain-name>/automation/qaimages:helloworld
+   ```
+
+   或者
+
+   ```
+   docker pull <registry-domain-name>/automation/qaimages:helloworld
+   ```
