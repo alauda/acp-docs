@@ -1,0 +1,198 @@
+---
+weight: 30
+---
+
+# Upgrade <Term name="productShort" /> v3.18.0 or v3.18.1 To v4.0
+## Critical Upgrade Precautions
+- **When upgrading k8s from a version lower than 1.31 to 1.31, all pods on the nodes will be restarted once. During this process, pods will not be rebuilt or rescheduled, but service interruption will occur.**
+- Starting from v4.0, to reduce the complexity of upgrading disaster recovery environments, **upgrade the standby cluster first when upgrading disaster recovery environments** to avoid disaster recovery switching during the upgrade process.
+- This upgrade document applies to upgrading x86 and ARM architecture versions v3.18.0 or v3.18.1 to version v4.0.0.
+- Before upgrading, ensure that all clusters have been upgraded to versions v3.18.0 or v3.18.1. The k8s version must have been upgraded to at least version 1.28.
+- Before upgrading, please check the component list of the global cluster. If there are components with abnormal status, do not upgrade unless you plan to resolve them through the upgrade.
+- If the platform has a service mesh deployed and there are service meshes lower than Istio 1.20, you must upgrade the service mesh before performing the platform upgrade.
+- The Costmanager plugin and Kubecost plugin have been discontinued in version 4.0. If the Costmanager plugin and Kubecost plugin are deployed on the platform, please uninstall them before upgrading.
+- If the registry uses MinIO as the storage backend, and MinIO uses the /cpaas/minio directory of the three master nodes of the global cluster, please ensure that the remaining space in the /cpaas/minio directory of the three nodes is at least 120GB. If it is not enough, please expand the capacity.
+- The installation package will be copied to the first master node of the global cluster, and after decompression, it will use up to 120GB of space. Therefore, when the installation package and the decompression directory are on the same disk, the disk needs to have more than 250GB of available space.
+- Uploading images will take approximately two hours, so please plan your upgrade time in advance.
+- If problems occur during the upgrade, please check the upgrade FAQ document first.
+
+## Disaster Recovery Environment (DR) Upgrade Process
+### Data Comparison
+<Directive type="warning" title="WARNING">
+Be sure to perform the following two steps before upgrading.  
+</Directive>
+1. Before upgrading, execute the data comparison script for the disaster recovery environment as per the maintenance documentation to ensure there are no discrepancies between the primary and secondary global clusters.
+2. Execute the following command on both the primary and standby global clusters: `kubectl get machines.platform.tkestack.io`, ensuring there are no non-Running nodes among the returned hosts.
+
+### Uninstall the disaster recovery data synchronization program
+1. Access the **standby cluster** page using the standby cluster's VIP
+    1. If the platform page cannot be accessed via IP, log in to the **standby cluster's** master1 node and modify prdb to add other platform access addresses:
+    ```yaml
+    spec:
+      alternativeURLs:
+      - https://192.168.162.10 # Replace IP with the actual standby cluster VIP
+    ```
+2. On the **standby cluster's** plugin page, uninstall the disaster recovery synchronization program plugin and wait for the uninstallation to complete
+
+### Upgrade the standby cluster
+1. Refer to the [Upload Platform Images](#upload-platform-images) paragraph to upload the platform images to the **standby cluster** .
+2. Refer to the [Upgrade the global cluster](#upgrade-the-global-cluster) paragraph to upgrade the **standby cluster's** global.
+3. Wait for the upgrading of **standby cluster's** global to complete.
+4. At this point, the upgrading of **standby cluster** is complete.
+
+### Upgrade the primary cluster
+1. Refer to the [Upload Platform Images](#upload-platform-images) paragraph to upload the platform images to the primary cluster.
+2. Refer to the [Upgrade the global cluster](#upgrade-the-global-cluster) paragraph to upgrade the primary cluster's global.
+3. Wait for the upgrading of primary cluster's global to complete.
+
+### Start the synchronization program
+1. Start the pod for data synchronization.
+    1. Check the 2379 port of the primary and standby cluster VIPs respectively, and confirm that they have been forwarded to their respective master nodes.
+    2. Access the **standby cluster** platform page via the **standby cluster** Kubernetes VIP, click on the global cluster plugin deployment page, and then click to deploy the etcd synchronization plugin. Follow the on-screen prompts to enter the parameters, where:
+        1. The data check interval is used to generate monitoring data, and the default value can generally be selected.
+        2. The switch for printing detailed logs does not need to be turned on by default and is mainly used for debugging issues.
+2. Wait for the plugin deployment to succeed.
+3. Log in to the **standby cluster's** global master1 node and check whether the etcd synchronization pod is functioning normally.
+```shell
+kubectl get po -n cpaas-system -l app=etcd-sync # make sure the pod status is 1/1 Running
+
+kubectl logs -n cpaas-system $(kubectl get po -n cpaas-system -l app=etcd-sync --no-headers | awk '{print $1}' | head -1) | grep -i "Start Sync update"
+
+# Waiting for the output return "Start Sync update"
+
+# re-create one of the pods instances, to make sure all k8s resources that depend on the ownerefrence get synced.
+kubectl delete po -n cpaas-system $(kubectl get po -n cpaas-system -l app=etcd-sync --no-headers | awk '{print $1}' | head -1)
+```
+4. Log in to the standby cluster's global master1 node to check if data synchronization is complete.
+```shell
+curl "$(kubectl get svc -n cpaas-system etcd-sync-monitor -ojsonpath='{.spec.clusterIP}')/check"
+
+# meaning of the output:
+"LOCAL ETCD missed keys:" # Indicates that the primary cluster has these keys, but the standby cluster does not. This usually occurs because when the pod starts, due to resource order, the keys are garbage collected by k8s after being synchronized. In this case, restarting one of the etcd-sync pods is sufficient:
+
+"LOCAL ETCD surplus keys:" # Indicates keys that exist in the standby cluster but not in the primary cluster. These keys are considered surplus in the standby cluster. Confirm with operations personnel before deleting these keys from the standby cluster.
+```
+
+### [Upgrade Business Clusters](#upgrade-business-clusters-1)
+
+## Backup
+<Directive type="warning" title="WARNING">
+Step 1 must be executed on every master node of all clusters, including the global cluster (both of the primary & standby clusters), and all business clusters.  
+</Directive>
+1. Execute the following command on every master node of all clusters to back up etcd.
+```shell
+tmp_dir="/cpaas/backup_$(date +%Y%m%d%H)"
+mkdir -p "${tmp_dir}" && cp -r /etc/kubernetes/ "${tmp_dir}" && cp -r /var/lib/etcd/ "${tmp_dir}"
+```
+2. If IaaS conditions permit, it is recommended to take snapshot backups for all machines.
+3. If IaaS conditions permit, it is recommended to take snapshot backups for external storage used by third-party tools such as Harbor, Jenkins, GitLab, and Nexus; otherwise, rollback may not be possible.
+4. If IaaS cannot perform snapshot backups for external storage, then: make duplicates of the data directories of third-party tools like Harbor, GitLab, and SonarQube by executing the command `cp -a`.
+
+## Upload Platform Images
+To upload platform images packed in the offline installer, extract the offline installer to any of the master node of the global cluster, then execute the following commands on that node:
+1. Change the working directory to where the offline installer been extracted to.
+2. In case the platform images are NOT going to be holded on a user-provisioned, external image repository, execute the following command to upload images.
+```shell
+bash upgrade.sh --only-sync-image=true
+```
+3. In other cases, the platform images would be holded on an external image repository, execute the following command to upload images.
+```shell
+bash upgrade.sh --registry <external registry address> --target-creds <external registry credential> --only-sync-image=true
+
+# <external registry credential>: The base64 value obtained by concatenating the username and password with a colon
+# For example:
+# The external registry address is: registry.docker.com
+# The username for the external registry address is: admin
+# The password for the external registry address is: password
+registry_address='registry.docker.com'
+registry_user='admin'
+registry_passwd= 'password'
+creds=$(base64 -w 0 <<< "${registry_user}:${registry_passwd}")
+# bash upgrade.sh --registry "$registry_address" --target-creds "$creds" --only-sync-image=true
+```
+
+## Trigger the upgrade
+<Directive type="info" title="INFO">
+For disaster recovery clusters, you must first complete the image upload according to the "Upload Image" step commands before triggering the upgrade.  
+</Directive>
+1. Execute the following command on the master node of the global cluster (where the offline installer has been extracted)
+```shell
+bash upgrade.sh
+```
+2. Wait for the upgrade script to complete.
+
+## Upgrade the global cluster
+1. Access the global page, click Platform Management > Cluster Management > Select the global cluster, choose the feature components, and click Upgrade.
+2. The upgrade interface will display the component upgrade information.
+3. Read the information and confirm.
+<Directive type="note" title="NOTE">
+The component named "Kubernetes" can be left unupgraded, while it is strongly recommended to trigger the upgrading of the "Kubernetes" componenet along with the upgrading of the <Term name="productShort" />.  
+Since the upgrading of the <Term name="productShort" /> itself may also result in workloads interruption, it is not the proper way to avoid the workloads interruption by not upgrading the "Kubernetes" componenet.  
+</Directive>
+4. Click Upgrade.
+5. Wait for the upgrade to complete.
+
+## Upgrade Business Clusters
+### Note
+1. You must first complete the [Upgrade the global cluster](#upgrade-the-global-cluster) before upgrading any of the business clusters.
+2. This upgrade document applies to upgrading business clusters from versions v3.18.0 or v3.18.1 to v4.0.0 for both x86_64 and arm64 architectures.
+3. Before upgrading, please check the component list of the business cluster. If there are components with abnormal status, do not proceed with the upgrade unless the issue is planned to be resolved through the upgrade.
+4. If the cluster utilizes the service mesh functionality, please first refer to the [Upgrade Service Mesh](#upgrade-service-mesh) section to check whether the current business cluster's Kubernetes version meets the Istio upgrade requirements. If not, you need to upgrade Kubernetes to a version that satisfies Istio's upgrade requirements.
+5. The upgrade of the service mesh's Sidecar will perform a rolling update of Pods, which may cause brief business interruptions, especially for long-connection services.
+6. As the cluster upgrades, existing PostgreSQL instances will automatically restart for upgrade updates, resulting in a brief service interruption during the update.
+7. As the cluster upgrades, MySQL-PXC, MySQL-MGR, Redis, Kafka, and RabbitMQ instances set to automatic update policies will automatically restart for upgrade updates, causing brief service interruptions during the update.
+8. If issues occur during the upgrade, prioritize checking the Upgrade FAQ document.
+9. A maximum of 20 business clusters are supported for simultaneous upgrades.
+
+### Upgrade functional components of business clusters
+1. Access the platform management page, click on "Clusters," select the business cluster to be upgraded, click "Functional Components," then click "Upgrade."
+2. The upgrade interface will display component upgrade information.
+3. Read the information and confirm.
+<Directive type="note" title="NOTE">
+The component named "Kubernetes" can be left unupgraded, while it is strongly recommended to trigger the upgrading of the "Kubernetes" componenet along with the upgrading of the <Term name="productShort" />.  
+Since the upgrading of the <Term name="productShort" /> itself may also result in workloads interruption, it is not the proper way to avoid the workloads interruption by not upgrading the "Kubernetes" componenet.  
+</Directive>
+4. Click the Upgrade button.
+5. If the current environment has modified configuration settings, a confirmation pop-up will appear when clicking Upgrade. Contact the operations team to verify whether these configurations affect the upgrade.
+6. Wait for the upgrade to complete.
+
+### Upgrade DevOps Toolchain Instance
+<Directive type="note" title="NOTE">
+(Skip if none of the DevOps Toolchain is deployed)  
+</Directive> 
+1. Go to Platform Management > Toolchain Management > Toolchain Integration, and click on the toolchain name.
+2. On the integration details page, click the instance name to enter the instance details page.
+3. If an upgrade icon appears to the right of the tool name, click Operation > Upgrade on the right side and proceed with the tool upgrade based on customer requirements. Click the upgrade information icon to view the instance update status in real time.
+4. If there is no upgrade icon, it means the tool has no available upgrade version. Check other tools.
+
+### Upgrade Service Mesh
+<Directive type="note" title="NOTE">
+(Skip if Service Mesh is not deployed)  
+</Directive> 
+For the upgrade process, refer to the product user manual: Platform Management > Service Mesh > Upgrade Service Mesh.
+
+#### Kubernetes version requirements for Istio upgrade
+<table>
+  <thead>
+    <tr>
+      <th>Pre-upgrade Istio version</th>
+      <th>Post-upgrade Istio version</th>
+      <th>Kubernetes version requirements for Istio major version upgrade</th>
+      <th>Corresponding ACP upgrade scenario</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Istio 1.20</td>
+      <td>Istio 1.22</td>
+      <td>Kubernetes 1.27,1.28,1.29</td>
+      <td>
+      ACP 3.18 upgrade to 4.0<br />
+      ACP 3.16 upgrade to 4.0
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+## Upgrade FAQ
+No known issues at this time.
