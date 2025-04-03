@@ -1,0 +1,254 @@
+---
+weight: 30
+sourceSHA: 7a55373c4f6bcfa03cffbef082c3355cabc87732c69227f16476104a85059615
+---
+
+# 重要升级注意事项
+
+- **在将 k8s 从版本低于 1.31 升级到 1.31 时，节点上的所有 pods 将会被重启一次。在此过程中，pods 不会被重建或重新调度，但会发生服务中断。**
+- 从 v4.0 开始，为了降低升级灾难恢复环境的复杂性，**在升级灾难恢复环境时，首先升级备用集群**，以避免在升级过程中发生灾难恢复切换。
+- 本升级文档适用于将 x86 和 ARM 架构的版本 v3.16.0、v3.16.1 或 v3.16.2 升级到版本 v4.0.0。
+- 在升级之前，确保所有集群已升级到 v3.16.0、v3.16.1 或 v3.16.2 版本。k8s 版本必须至少升级到 1.28。
+- 在升级之前，请检查全球集群的组件列表。如果有状态异常的组件，除非计划通过升级解决这些问题，否则请不要进行升级。
+- 如果平台上部署了服务网格，并且存在低于 Istio 1.20 的服务网格，必须在进行平台升级之前先升级服务网格。
+- 如果注册表使用 MinIO 作为存储后端，并且 MinIO 使用全球集群三个主节点的 /cpaas/minio 目录，请确保三个节点的 /cpaas/minio 目录剩余空间至少为 120GB。如果不够，请扩展容量。
+- 安装包将被复制到全球集群的第一主节点上，解压后将占用最多 120GB 的空间。因此，当安装包和解压目录在同一磁盘上时，磁盘需要有超过 250GB 的可用空间。
+- 上传镜像大约需要两个小时，因此请提前规划您的升级时间。
+- 如果在升级期间出现问题，请先检查升级 FAQ 文档。
+
+# 灾难恢复环境 (DR) 升级流程
+
+## 数据比较
+
+<Directive type="warning" title="警告">
+  升级之前，请务必执行以下两个步骤。
+</Directive>
+
+1. 在升级之前，按照维护文档为灾难恢复环境执行数据比较脚本，以确保主全球集群和备用全球集群之间没有不一致。
+2. 在主全球集群和备用全球集群上执行以下命令：`kubectl get machines.platform.tkestack.io`，确保返回的主机中没有非 Running 状态的节点。
+
+## 卸载灾难恢复数据同步程序
+
+1. 访问主集群的任何主节点，执行以下命令停止 etcd 同步 pod。
+
+```shell
+helm3 del etcd-sync -n default 2> /dev/null
+helm3 del etcd-sync -n cpaas-system 2> /dev/null
+
+kubectl delete configmaps,secret -n kube-system etcd-master-mirror-cert etcd-slave-mirror-cert etcd-sync-env etcd-sync-ignore-text &> /dev/null
+
+kubectl delete deploy -n kube-system etcd-mirror-etcd-mirror &> /dev/null
+
+kubectl get pod -n kube-system | grep etcd-mirror # 确保没有剩余的 etcd-mirror pod
+```
+
+## 升级备用集群
+
+1. 使用备用集群的 VIP 访问 **备用集群** 页面
+   1.1. 如果无法通过 IP 访问平台页面，请登录到 **备用集群** 的 master1 节点，修改 prdb 添加其他平台访问地址：
+   ```yaml
+   spec:
+     alternativeURLs:
+     - https://192.168.162.10 # 将 IP 替换为实际备用集群 VIP
+   ```
+
+2. 请参考 \[上传平台镜像]\(#上传平台镜像) 段落，将平台镜像上传到 **备用集群**。
+
+3. 请参考 \[升级全球集群]\(#升级全球集群) 段落，升级 **备用集群的** 全球集群。
+
+4. 等待 **备用集群的** 全球集群升级完成。
+
+5. 此时，**备用集群** 的升级已完成。
+
+## 升级主集群
+
+1. 请参考 \[上传平台镜像]\(#上传平台镜像) 段落，将平台镜像上传到主集群。
+2. 请参考 \[升级全球集群]\(#升级全球集群) 段落，升级主集群的全球集群。
+3. 等待主集群的全球集群升级完成。
+
+## 启动同步程序
+
+1. 启动数据同步的 pod。
+   1.1. 分别检查主集群和备用集群 VIP 的 2379 端口，确认它们已转发到各自的主节点。
+   1.2. 通过 **备用集群** Kubernetes VIP 访问 **备用集群** 平台页面，点击全球集群插件部署页面，然后点击部署 etcd 同步插件。根据屏幕提示输入参数，其中：
+   1.2.1. 数据检查间隔用于生成监控数据，默认值一般可以选择。
+   1.2.2. 打印详细日志的开关默认为不启用，主要用于调试问题。
+2. 等待插件部署成功。
+3. 登录到 **备用集群的** 全球 master1 节点，检查 etcd 同步 pod 是否正常运作。
+
+```shell
+kubectl get po -n cpaas-system -l app=etcd-sync # 确保 pod 状态为 1/1 Running
+
+kubectl logs -n cpaas-system $(kubectl get po -n cpaas-system -l app=etcd-sync --no-headers | awk '{print $1}' | head -1) | grep -i "Start Sync update"
+
+# 等待输出返回 "Start Sync update"
+
+# 重新创建其中一个 pod 实例，以确保所有依赖于 ownerreference 的 k8s 资源已同步。
+kubectl delete po -n cpaas-system $(kubectl get po -n cpaas-system -l app=etcd-sync --no-headers | awk '{print $1}' | head -1)
+```
+
+4. 登录到备用集群的全球 master1 节点，检查数据同步是否完成。
+
+```shell
+curl "$(kubectl get svc -n cpaas-system etcd-sync-monitor -ojsonpath='{.spec.clusterIP}')/check"
+
+# 输出的含义：
+"LOCAL ETCD missed keys:" # 表示主集群有这些键，但备用集群没有。这通常发生在 pod 启动时，由于资源顺序，键在同步后被 k8s 垃圾回收。在这种情况下，重新启动其中一个 etcd-sync pod 就足够了：
+
+"LOCAL ETCD surplus keys:" # 表示在备用集群中存在但主集群中不存在的键。这些键在备用集群中被视为多余。在从备用集群中删除这些键之前，请与运维人员确认。
+```
+
+## \[升级业务集群]\(#升级业务集群)
+
+---
+
+# 备份
+
+<Directive type="warning" title="警告">
+  步骤 1 必须在所有集群的每个主节点上执行，包括全球集群（主集群和备用集群）和所有业务集群。
+</Directive>
+
+1. 在所有集群的每个主节点上执行以下命令备份 etcd。
+
+```shell
+tmp_dir="/cpaas/backup_$(date +%Y%m%d%H)"
+mkdir -p "${tmp_dir}" && cp -r /etc/kubernetes/ "${tmp_dir}" && cp -r /var/lib/etcd/ "${tmp_dir}"
+```
+
+2. 如果 IaaS 条件允许，建议对所有机器进行快照备份。
+3. 如果 IaaS 条件允许，建议对第三方工具（如 Harbor、Jenkins、GitLab 和 Nexus）使用的外部存储进行快照备份；否则，可能无法回滚。
+4. 如果 IaaS 无法对外部存储执行快照备份，则通过执行命令 `cp -a` 复制第三方工具（如 Harbor、GitLab 和 SonarQube）的数据目录。
+
+# 上传平台镜像
+
+要上传打包在离线安装程序中的平台镜像，请将离线安装程序解压到全球集群的任何主节点上，然后在该节点执行以下命令：
+
+1. 将工作目录切换到解压离线安装程序的位置。
+2. 如果平台镜像不打算保存在用户提供的外部镜像仓库中，请执行以下命令上传镜像。
+
+```shell
+bash upgrade.sh --only-sync-image=true
+```
+
+3. 在其他情况下，如果平台镜像将保存在外部镜像仓库中，请执行以下命令上传镜像。
+
+```shell
+bash upgrade.sh --registry <external registry address> --target-creds <external registry credential> --only-sync-image=true
+
+# <external registry credential>: 通过冒号连接用户名和密码并进行 base64 编码获得的值
+# 例如：
+# 外部注册表地址为：registry.docker.com
+# 外部注册表用户名为：admin
+# 外部注册表密码为：password
+registry_address='registry.docker.com'
+registry_user='admin'
+registry_passwd='password'
+creds=$(base64 -w 0 <<< "${registry_user}:${registry_passwd}")
+# bash upgrade.sh --registry "$registry_address" --target-creds "$creds" --only-sync-image=true
+```
+
+# 触发升级
+
+<Directive type="info" title="信息">
+  对于灾难恢复集群，必须先根据 "上传镜像" 步骤命令完成镜像上传，然后再触发升级。
+</Directive>
+
+1. 在全球集群的主节点上（离线安装程序已解压的地方）执行以下命令
+
+```shell
+bash upgrade.sh
+```
+
+2. 等待升级脚本完成。
+
+# 升级全球集群
+
+1. 访问全球页面，点击平台管理 > 集群管理 > 选择全球集群，选择功能组件，然后点击升级。
+2. 升级界面将显示组件升级信息。
+3. 阅读信息并确认。
+
+<Directive type="note" title="注意">
+  名为 "Kubernetes" 的组件可以不进行升级，但强烈建议在升级 <Term name="productShort" /> 时一并触发 "Kubernetes" 组件的升级。
+  由于 <Term name="productShort" /> 自身的升级也可能导致工作负载中断，因此通过不升级 "Kubernetes" 组件来避免工作负载中断并不是合适的方法。
+</Directive>
+
+4. 点击升级。
+5. 等待升级完成。
+
+# 升级业务集群
+
+## 注意事项
+
+1. 必须首先完成 \[升级全球集群]\(#升级全球集群)，然后才能升级任何业务集群。
+2. 本升级文档适用于将业务集群从版本 v3.16.0、v3.16.1 或 v3.16.2 升级到 v4.0.0，支持 x86\_64 和 arm64 架构。
+3. 在升级之前，请检查业务集群的组件列表。如果有状态异常的组件，除非计划通过升级解决这个问题，否则请不要继续升级。
+4. 如果集群利用了服务网格的功能，请先参考 \[升级服务网格]\(#升级服务网格) 部分，检查当前业务集群的 Kubernetes 版本是否符合 Istio 升级要求。如果不符合，则需将 Kubernetes 升级到满足 Istio 升级要求的版本。
+5. 服务网格的 Sidecar 升级将对 Pods 进行滚动更新，这可能会导致短暂的业务中断，特别是对于长连接服务。
+6. 随着集群的升级，现有的 PostgreSQL 实例将自动重启以进行升级更新，这将在更新期间导致短暂的服务中断。
+7. 随着集群的升级，设置为自动更新策略的 MySQL-PXC、MySQL-MGR、Redis、Kafka 和 RabbitMQ 实例将自动重启以进行升级更新，从而在更新期间导致短暂的服务中断。
+8. 如果在升级过程中出现问题，优先检查升级 FAQ 文档。
+9. 支持最多 20 个业务集群同时升级。
+
+## 升级业务集群的功能组件
+
+1. 访问平台管理页面，点击 "集群"，选择要升级的业务集群，点击 "功能组件"，然后点击 "升级"。
+2. 升级界面将显示组件升级信息。
+3. 阅读信息并确认。
+
+<Directive type="note" title="注意">
+  名为 "Kubernetes" 的组件可以不进行升级，但强烈建议在升级 <Term name="productShort" /> 时一并触发 "Kubernetes" 组件的升级。
+  由于 <Term name="productShort" /> 自身的升级也可能导致工作负载中断，因此通过不升级 "Kubernetes" 组件来避免工作负载中断并不是合适的方法。
+</Directive>
+
+4. 点击升级按钮。
+5. 如果当前环境修改了配置设置，点击升级时会出现确认弹窗。请联系运维团队确认这些配置是否会影响升级。
+6. 等待升级完成。
+
+## 升级 DevOps 工具链实例
+
+<Directive type="note" title="注意">
+  （如果未部署 DevOps 工具链，请跳过）
+</Directive>
+
+1. 进入平台管理 > 工具链管理 > 工具链集成，并点击工具链名称。
+2. 在集成详情页面，点击实例名称进入实例详情页面。
+3. 如果工具名称右侧出现升级图标，请单击操作 > 升级，并根据客户要求进行工具升级。点击升级信息图标以实时查看实例更新状态。
+4. 如果没有升级图标，表示该工具没有可用的升级版本。请检查其他工具。
+
+## 升级服务网格
+
+<Directive type="note" title="注意">
+  （如果未部署服务网格，请跳过）
+</Directive>
+
+升级流程请参考产品用户手册：平台管理 > 服务网格 > 升级服务网格。
+
+### Istio 升级的 Kubernetes 版本要求
+
+<table>
+  <thead>
+    <tr>
+      <th>升级前 Istio 版本</th>
+      <th>升级后 Istio 版本</th>
+      <th>Istio 主要版本升级的 Kubernetes 版本要求</th>
+      <th>对应的 ACP 升级场景</th>
+    </tr>
+  </thead>
+
+  <tbody>
+    <tr>
+      <td>Istio 1.20</td>
+      <td>Istio 1.22</td>
+      <td>Kubernetes 1.27,1.28,1.29</td>
+
+      <td>
+        ACP 3.18 升级到 4.0<br />
+        ACP 3.16 升级到 4.0
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+# 升级 FAQ
+
+目前没有已知问题。
