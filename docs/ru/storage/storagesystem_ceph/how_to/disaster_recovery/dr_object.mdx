@@ -1,0 +1,353 @@
+---
+weight: 66
+sourceSHA: 03834cc32f46c1e5cff17043b66ff305859c581f126cf0a3756b22625a08053b
+---
+
+# Восстановление после катастрофы для объектного хранилища
+
+Функция многоузловой службы Ceph RGW является асинхронным механизмом репликации данных между кластерами, предназначенным для синхронизации данных объектного хранения между географически распределенными кластерами Ceph, обеспечивая высокую доступность (HA) и возможность восстановления после катастроф (DR).
+
+## Терминология
+
+| Термин                 | Объяснение                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| :--------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Основной кластер       | Кластер, который в настоящее время предоставляет услуги хранения данных.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| Резервный кластер      | Резервный кластер, используемый в целях резервного копирования.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| Реал, группа зон, зона | <ul><li>Реал: Наивысший уровень логической группировки в объектном хранилище Ceph. Он представляет собой полное пространство имен объектного хранения, обычно используемое для репликации и синхронизации между несколькими сайтами. Реал может охватывать различные географические места или центры обработки данных.</li><li>Группа зон: Логическая группировка внутри Реала, содержащая несколько Зон. Группы зон позволяют синхронизировать и реплицировать данные между Зонами, обычно находящимися в одном географическом регионе.</li><li>Зона: Логическая группировка внутри Группы зон, которая физически хранит данные. Каждая Зона управляет и хранит объекты независимо и может иметь собственные конфигурации пулов данных/метаданных.</li></ul> |
+
+## Предварительные требования
+
+- Подготовьте два кластера, доступные для развертывания Rook-Ceph (основной и резервный кластеры) с сетевым подключением между ними.
+- Оба кластера должны использовать одну и ту же версию платформы (v3.12 или более позднюю).
+- Убедитесь, что ни одно объектное хранилище Ceph не развернуто в основном или резервном кластере.
+- Пожалуйста, обратитесь к документации [Создание службы хранения](../../installation/create_service_stand.mdx), чтобы развернуть оператор и создать кластеры. После создания кластеров не продолжайте создание пула объектного хранения через мастер. Вместо этого используйте инструменты командной строки для конфигурации, как описано ниже.
+
+## Процедуры
+
+Этот справочник предоставляет решение для синхронизации между двумя Зонами в одной Группе зон.
+
+<Steps>
+  ### Создание объектного хранилища в основном кластере
+
+  Этот шаг создает Реал, Группу зон, Основную зону и ресурсы шлюза основной зоны.
+
+  Выполните следующие команды на контрольном узле основного кластера:
+
+  <Tabs>
+    <Tab label="Команда">
+      ```yaml
+      cat << EOF | kubectl apply -f -
+      ---
+      apiVersion: ceph.rook.io/v1
+      kind: CephObjectRealm
+      metadata:
+        name: <realm-name>
+        namespace: rook-ceph
+        
+      ---
+      apiVersion: ceph.rook.io/v1
+      kind: CephObjectZoneGroup
+      metadata:
+        name: <zonegroup-name>
+        namespace: rook-ceph
+      spec:
+        realm: <realm-name>
+
+      ---
+      apiVersion: ceph.rook.io/v1
+      kind: CephObjectZone
+      metadata:
+        name: <primary-zone-name>
+        namespace: rook-ceph
+      spec:
+        zoneGroup: <zonegroup-name>
+        metadataPool:
+          failureDomain: host
+          replicated:
+            size: 3
+            requireSafeReplicaSize: true
+        dataPool:
+          failureDomain: host
+          replicated:
+            size: 3
+            requireSafeReplicaSize: true
+          parameters:
+            compression_mode: none
+        preservePoolsOnDelete: false
+
+      ---
+      cat << EOF | kubectl apply -f -
+      apiVersion: ceph.rook.io/v1
+      kind: CephObjectStore
+      metadata:
+        name: <object-store-name>
+        namespace: rook-ceph
+      spec:
+        gateway:
+          port: 7480
+          instances: 2
+        zone:
+          name: <zone-name>    
+      EOF
+      ```
+    </Tab>
+
+    <Tab label="Вывод">
+      ```
+      cephobjectrealm.ceph.rook.io/<realm-name> создан
+      cephobjectzonegroup.ceph.rook.io/<zonegroup-name> создан
+      cephobjectzone.ceph.rook.io/<zone-name> создан
+      cephobjectstore.ceph.rook.io/<object-store-name> создан
+      ```
+    </Tab>
+  </Tabs>
+
+  **Параметр**：
+
+  - <a id="realm" />`<realm-name>`: Имя Реала.
+  - <a id="zone-group" />`<zonegroup-name>`: Имя Группы зон.
+  - <a id="primary-zone" />`<primary-zone-name>`: Имя Главной зоны.
+  - <a id="gateway" />`<object-store-name>`: Имя шлюза.
+
+  ### Настройка внешнего доступа для основной зоны
+
+  1. <a id="uid" />Получите UID ObjectStore
+
+  ```bash
+  kubectl -n rook-ceph get cephobjectstore <object-store-name> -o jsonpath='{.metadata.uid}'
+  ```
+
+  **Параметры**
+
+  - `<object-store-name>`: Имя шлюза, настроенное в [Шаге 1](#gateway).
+
+  2. Создайте сервис для внешнего доступа
+
+  ```yaml
+  cat << EOF | kubectl apply -f -
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: rook-ceph-rgw-<object-store-name>-external
+    namespace: rook-ceph
+    labels:
+      app: rook-ceph-rgw
+      rook_cluster: rook-ceph
+      rook_object_store: <object-store-name>
+    ownerReferences:
+      - apiVersion: ceph.rook.io/v1
+        kind: CephObjectStore
+        name: <object-store-name>
+        uid: <object-store-uid>
+  spec:
+    ports:
+      - name: rgw
+        port: 7480
+        targetPort: 7480
+        protocol: TCP
+    selector:
+      app: rook-ceph-rgw
+      rook_cluster: rook-ceph
+      rook_object_store: <object-store-name>
+    sessionAffinity: None
+    type: NodePort
+  EOF
+  ```
+
+  **Параметры**:
+
+  - `<object-store-name>`: Имя шлюза, настроенное [здесь](#gateway).
+  - `<object-store-uid>`: UID, полученный [здесь](#uid).
+
+  3. Добавьте внешние конечные точки к CephObjectZone.
+
+  ```bash
+  kubectl -n rook-ceph patch cephobjectzone <primary-zone-name> --type merge -p '{"spec":{"customEndpoints":["<external-endpoint>"]}}'
+  ```
+
+  **Параметры**:
+
+  - `<zone-name>`: Имя основной зоны, настроенное [здесь](#primary-zone).
+  - `<external-endpoint>`: [Внешний адрес](#address), полученный из основного кластера.
+
+  ### <a id="aksk" />Получите `access-key` и `secret-key`
+
+  ```bash
+  kubectl -n rook-ceph get secrets <realm-name>-keys -o yaml | grep access-key
+  kubectl -n rook-ceph get secrets <realm-name>-keys -o yaml | grep secret-key
+  ```
+
+  **Параметры**:
+
+  - `<realm-name>`: Имя Реала, настроенное [здесь](#realm).
+
+  ### Создание резервной зоны и настройка синхронизации Реала
+
+  В этом разделе объясняется, как создать резервную зону и настроить синхронизацию, запрашивая информацию о Реале из основного кластера.
+
+  Выполните следующие команды на контрольном узле резервного кластера:
+
+  ```yaml
+  cat << EOF | kubectl apply -f -
+  apiVersion: v1
+  kind: Secret
+  metadata:
+    name: <realm-name>-keys
+    namespace: rook-ceph
+  data:
+    access-key: <access-key>
+    secret-key: <secret-key>
+
+  ---
+  apiVersion: ceph.rook.io/v1
+  kind: CephObjectRealm
+  metadata:
+    name: <realm-name>
+    namespace: rook-ceph
+  spec:
+    pull:
+      endpoint: <realm-endpoint>
+
+  ---
+  apiVersion: ceph.rook.io/v1
+  kind: CephObjectZoneGroup
+  metadata:
+    name: <zone-group-name>
+    namespace: rook-ceph
+  spec:
+    realm: <realm-name>
+    
+  ---
+  apiVersion: ceph.rook.io/v1
+  kind: CephObjectZone
+  metadata:
+    name: <new-zone-name>
+    namespace: rook-ceph
+  spec:
+    zoneGroup: <zone-group-name>
+    metadataPool:
+      failureDomain: host
+      replicated:
+        size: 3
+        requireSafeReplicaSize: true
+    dataPool:
+      failureDomain: host
+      replicated:
+        size: 3
+        requireSafeReplicaSize: true
+    preservePoolsOnDelete: false
+
+  ---
+  apiVersion: ceph.rook.io/v1
+  kind: CephObjectStore
+  metadata:
+    name: <secondary-object-store-name>
+    namespace: rook-ceph
+  spec:
+    gateway:
+      port: 7480
+      instances: 2
+    zone:
+      name: <secondary-zone-name>
+  EOF
+  ```
+
+  **Параметры**:
+
+  - `<access-key>`: AK, полученный [здесь](#aksk).
+  - `<secret-key>`: SK, полученный [здесь](#aksk).
+  - `<realm-endpoint>`: [Внешний адрес](#address), полученный из основного кластера.
+  - `<realm-name>`: [Реал](#realm).
+  - `<zone-group-name>`: [Группа зон](#zone-group).
+  - `<secondary-zone-name>`: Имя резервной зоны.
+  - `<secondary-object-store-name>`: Имя резервного шлюза.
+
+  ### Настройка внешнего доступа для резервной зоны
+
+  1. <a id="uids" />Получите UID резервного шлюза
+
+  ```
+  kubectl -n rook-ceph get cephobjectstore <secondary-object-store-name> -o jsonpath='{.metadata.uid}'
+  ```
+
+  **Параметры**:
+
+  - `<secondary-object-store-name>`: Имя шлюза в резервном кластере.
+
+  2. Создайте сервис для внешнего доступа
+
+  ```yaml
+  cat << EOF | kubectl apply -f -
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: rook-ceph-rgw-<object-store-name>-external
+    namespace: rook-ceph
+    labels:
+      app: rook-ceph-rgw
+      rook_cluster: rook-ceph
+      rook_object_store: <object-store-name>
+    ownerReferences:
+      - apiVersion: ceph.rook.io/v1
+        kind: CephObjectStore
+        name: <object-store-name> 
+        uid: <object-store-uid> 
+  spec:
+    ports:
+      - name: rgw
+        port: 7480
+        targetPort: 7480
+        protocol: TCP
+    selector:
+      app: rook-ceph-rgw
+      rook_cluster: rook-ceph
+      rook_object_store: <object-store-name> 
+    sessionAffinity: None
+    type: NodePort
+  EOF
+  ```
+
+  **Параметры**:
+
+  - `<secondary-object-store-name>`: Резервный шлюз.
+  - `<secondary-object-store-uid>`: UID резервного шлюза.
+
+  3. Добавьте внешние конечные точки к резервному CephObjectZone
+
+  ```
+  kubectl -n rook-ceph patch cephobjectzone <secondary-zone-name> --type merge -p '{"spec":{"customEndpoints":["<external-endpoint>"]}}'
+  ```
+
+  **Параметры**:
+
+  - `<secondary-zone-name>`: Имя резервной зоны.
+  - `<secondary-zone-external-endpoint>`: [Внешний адрес](#address), полученный из резервного кластера.
+</Steps>
+
+## Переключение
+
+Когда основной кластер выходит из строя, необходимо продвигать резервную зону до статуса основной зоны. После переключения шлюз резервной зоны может продолжать предоставлять услуги объектного хранения.
+
+### Процедуры
+
+Выполните следующие команды в поде `rook-ceph-tools` резервного кластера
+
+```bash
+radosgw-admin zone modify --rgw-realm=<realm-name> --rgw-zonegroup=<zone-group-name> --rgw-zone=<secondary-zone-name> --master
+```
+
+**Параметры**
+
+- `<realm-name>`: Имя Реала.
+- `<zone-group-name>`: Имя группы зон.
+- `<secondary-zone-name>`: Имя резервной зоны.
+
+## Связанные операции
+
+### <a id="address" />Получение внешнего адреса
+
+1. Перейдите в **Управление платформой**.
+
+2. В левой навигационной панели нажмите **Управление хранилищем** > **Распределенное хранилище**.
+
+3. На вкладке **Информация о кластере** прокрутите вниз до области **Пул хранения**, нажмите на ⋮ рядом с пулом объектного хранения и выберите **Просмотреть адрес**.

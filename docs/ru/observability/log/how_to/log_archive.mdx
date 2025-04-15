@@ -1,0 +1,478 @@
+---
+weight: 10
+sourceSHA: b5e50c9e15e16ae9d7eaea68694c5ba0ba84972dfb285abf07534ab0051c28b3
+---
+
+# Как архивировать логи в стороннее хранилище
+
+В настоящее время логи, создаваемые платформой, будут храниться в компоненте хранения логов; однако срок хранения этих логов относительно короткий. Для предприятий с высокими требованиями к соблюдению норм логи, как правило, требуют более длительного срока хранения для выполнения требований аудита. Кроме того, экономический аспект хранения также является одной из ключевых проблем для предприятий.
+
+Исходя из приведенных выше сценариев, платформа предлагает решение для архивирования логов, позволяющее пользователям передавать логи во внешнее хранилище NFS или объектное хранилище.
+
+## Передача в внешнее NFS
+
+### Предварительные требования
+
+| Ресурс           | Описание                                                                                                                                                                                                                                                                                                                                                                                            |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **NFS**          | Предварительно настройте службу NFS и определите путь NFS, который будет смонтирован.                                                                                                                                                                                                                                                                                                                |
+| **Kafka**        | Предварительно получите адрес службы Kafka.                                                                                                                                                                                                                                                                                                                                                           |
+| **Адрес образа** | Необходимо использовать инструмент CLI в кластере `global`, чтобы выполнить следующие команды для получения адресов образов:<br />- Получить адрес образа alpine: `kubectl get daemonset nevermore -n cpaas-system -o jsonpath='{.spec.template.spec.initContainers[0].image}'` <br />- Получить адрес образа razor: `kubectl get deployment razor -n cpaas-system -o jsonpath='{.spec.template.spec.containers[0].image}'` |
+
+### Создание ресурсов синхронизации логов
+
+1. Нажмите на **Управление кластерами** > **Кластеры** в левой панели навигации.
+
+2. Нажмите кнопку действия с правой стороны кластера, в который будут переданы логи > **Инструмент CLI**.
+
+3. Измените YAML на основе следующих описаний параметров; после изменения вставьте код в открытую командную строку **Инструмента CLI** и нажмите Enter для выполнения.
+
+   | Тип ресурса    | Путь к полю                                     | Описание                                                                                                                                                              |
+   | --------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+   | ConfigMap      | `data.export.yml.output.compression`           | Сжать текст логов; поддерживаемые варианты: **none (без сжатия)**, **zlib**, **gzip**.                                                                                 |
+   | ConfigMap      | `data.export.yml.output.file_type`             | Тип экспортируемого файла журнала; поддерживаются txt, csv, json.                                                                                                                |
+   | ConfigMap      | `data.export.yml.output.max_size`              | Размер одного архивированного файла; единица измерения - МБ. Если он превышает это значение, логи будут автоматически сжаты и архивированы в соответствии с настройками поля сжатия. |
+   | ConfigMap      | `data.export.yml.scopes`                       | Область передачи логов; в настоящее время поддерживаемые логи включают: системные логи, журналы приложений, журналы Kubernetes, продуктовые логи.                          |
+   | Deployment     | `spec.template.spec.containers[0].command[7]` | Адрес службы Kafka.                                                                                                                                                   |
+   | Deployment     | `spec.template.spec.volumes[3].hostPath.path` | Путь NFS, который необходимо смонтировать.                                                                                                                                                  |
+   | Deployment     | `spec.template.spec.initContainers[0].image`   | Адрес образа Alpine.                                                                                                                                                  |
+   | Deployment     | `spec.template.spec.containers[0].image`       | Адрес образа Razor.                                                                                                                                                   |
+
+   ```yaml
+   cat << "EOF" |kubectl apply -f -
+   apiVersion: v1
+   data:
+     export.yml: |
+       scopes: # Область передачи логов; по умолчанию собираются только журналы приложений
+         system: false  # Системные логи
+         workload: true # Журналы приложений
+         kubernetes: false # Журналы Kubernetes
+         platform: false # Продуктовые логи
+       output:
+         type: local                              
+         path: /cpaas/data/logarchive           
+         layout: TimePrefixed
+         # Размер одного архивированного файла; единица измерения - МБ. Если он превышает это значение, логи будут автоматически сжаты и архивированы в соответствии с настройками поля сжатия.
+         max_size: 200         
+         compression: zlib    # Дополнительно: none (без сжатия) / zlib / gzip
+         file_type: txt   # Дополнительно: txt csv json
+   kind: ConfigMap
+   metadata:
+     name: log-exporter-config
+     namespace: cpaas-system
+    
+   ---
+   apiVersion: apps/v1
+   kind: Deployment
+   metadata:
+     labels:
+       service_name: log-exporter
+     name: log-exporter
+     namespace: cpaas-system
+   spec:
+     progressDeadlineSeconds: 600
+     replicas: 1
+     revisionHistoryLimit: 5
+     selector:
+       matchLabels:
+         service_name: log-exporter
+     strategy:
+       rollingUpdate:
+         maxSurge: 0
+         maxUnavailable: 1
+       type: RollingUpdate
+     template:
+       metadata:
+         creationTimestamp: null
+         labels:
+           app: lanaya
+           cpaas.io/product: Platform-Center
+           service_name: log-exporter
+           version: v1
+         namespace: cpaas-system
+       spec:
+         affinity:
+           podAffinity: {}
+           podAntiAffinity:
+             preferredDuringSchedulingIgnoredDuringExecution:
+               - podAffinityTerm:
+                   labelSelector:
+                     matchExpressions:
+                       - key: service_name
+                         operator: In
+                         values:
+                           - log-exporter
+                   topologyKey: kubernetes.io/hostname
+                 weight: 50
+         initContainers:
+           - args:
+               - -ecx
+               - |
+                 chown -R 697:697 /cpaas/data/logarchive
+             command:
+               - /bin/sh
+             image: registry.example.cn:60080/ops/alpine:3.16 # Адрес образа Alpine
+             imagePullPolicy: IfNotPresent
+             name: chown
+             resources:
+               limits:
+                 cpu: 100m
+                 memory: 200Mi
+               requests:
+                 cpu: 10m
+                 memory: 50Mi
+             securityContext:
+               runAsUser: 0
+             terminationMessagePath: /dev/termination-log
+             terminationMessagePolicy: File
+             volumeMounts:
+               - mountPath: /cpaas/data/logarchive
+                 name: data
+         containers:
+           - command:
+             - /razor
+             - consumer
+             - --v=1
+             - --kafka-group-log=log-nfs
+             - --kafka-auth-enabled=true
+             - --kafka-tls-enabled=true
+             - --kafka-endpoint=192.168.143.120:9092  # Заполните на основе фактической среды
+             - --database-type=file
+             - --export-config=/etc/log-export/export.yml
+             image: registry.example.cn:60080/ait/razor:v3.16.0-beta.3.g3df8e987  # Образ Razor
+             imagePullPolicy: Always
+             livenessProbe:
+               failureThreshold: 5
+               httpGet:
+                 path: /metrics
+                 port: 8080
+                 scheme: HTTP
+               initialDelaySeconds: 20
+               periodSeconds: 10
+               successThreshold: 1
+               timeoutSeconds: 3
+             name: log-export
+             ports:
+               - containerPort: 80
+                 protocol: TCP
+             readinessProbe:
+               failureThreshold: 5
+               httpGet:
+                 path: /metrics
+                 port: 8080
+                 scheme: HTTP
+               initialDelaySeconds: 20
+               periodSeconds: 10
+               successThreshold: 1
+               timeoutSeconds: 3
+             resources:
+               limits:
+                 cpu: "2"
+                 memory: 4Gi
+               requests:
+                 cpu: 440m
+                 memory: 1280Mi
+             securityContext:
+               runAsGroup: 697
+               runAsUser: 697
+             terminationMessagePath: /dev/termination-log
+             terminationMessagePolicy: File
+             volumeMounts:
+               - mountPath: /etc/secrets/kafka
+                 name: kafka-basic-auth
+                 readOnly: true
+               - mountPath: /etc/log-export
+                 name: config
+                 readOnly: true
+               - mountPath: /cpaas/data/logarchive 
+                 name: data
+         dnsPolicy: ClusterFirst
+         nodeSelector:
+           kubernetes.io/os: linux
+         restartPolicy: Always
+         schedulerName: default-scheduler
+         securityContext:
+           fsGroup: 697
+         serviceAccount: lanaya
+         serviceAccountName: lanaya
+         terminationGracePeriodSeconds: 10
+         tolerations:
+           - effect: NoSchedule
+             key: node-role.kubernetes.io/master
+             operator: Exists
+           - effect: NoSchedule
+             key: node-role.kubernetes.io/control-plane
+             operator: Exists
+           - effect: NoSchedule
+             key: node-role.kubernetes.io/cpaas-system
+             operator: Exists
+         volumes:
+           - name: kafka-basic-auth
+             secret:
+               defaultMode: 420
+               secretName: kafka-basic-auth
+           - name: elasticsearch-basic-auth
+             secret:
+               defaultMode: 420
+               secretName: elasticsearch-basic-auth
+           - configMap:
+               defaultMode: 420
+               name: log-exporter-config
+             name: config
+           - hostPath:
+               path: /cpaas/data/logarchive    # Путь NFS, который необходимо смонтировать
+               type: DirectoryOrCreate
+             name: data
+   EOF
+   ```
+
+4. После изменения статуса контейнера на Работает вы можете просмотреть постоянно архивируемые логи по пути NFS; структура каталогов файлов логов следующая:
+
+   ```bash
+   /cpaas/data/logarchive/$date/$project/$namespace-$cluster/logfile
+   ```
+
+## Передача в внешнее хранилище S3
+
+### Предварительные требования
+
+| Ресурс           | Описание                                                                                                                                                                                                                                                                                                                                                                                            |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **S3 Storage**   | Предварительно подготовьте адрес службы хранения S3 и получите значения для `access_key_id` и `secret_access_key`; создайте ведро, в которое будут храниться логи.                                                                                                                                                                                                                                  |
+| **Kafka**        | Предварительно получите адрес службы Kafka.                                                                                                                                                                                                                                                                                                                                                           |
+| **Адрес образа** | Необходимо использовать инструмент CLI в кластере `global`, чтобы выполнить следующие команды для получения адресов образов:<br />- Получить адрес образа alpine: `kubectl get daemonset nevermore -n cpaas-system -o jsonpath='{.spec.template.spec.initContainers[0].image}'` <br />- Получить адрес образа razor: `kubectl get deployment razor -n cpaas-system -o jsonpath='{.spec.template.spec.containers[0].image}'` |
+
+### Создание ресурсов синхронизации логов
+
+1. Нажмите на **Управление кластерами** > **Кластры** в левой панели навигации.
+
+2. Нажмите кнопку действия с правой стороны кластера, в который будут переданы логи > **Инструмент CLI**.
+
+3. Измените YAML на основе следующих описаний параметров; после изменения вставьте код в открытую командную строку **Инструмента CLI** и нажмите Enter для выполнения.
+
+   | Тип ресурса    | Путь к полю                                     | Описание                                                                                                                                                              |
+   | --------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+   | Secret         | `data.access_key_id`                           | Кодирование в Base64 полученного access\_key\_id.                                                                                                                  |
+   | Secret         | `data.secret_access_key`                       | Кодирование в Base64 полученного secret\_access\_key.                                                                                                              |
+   | ConfigMap      | `data.export.yml.output.compression`           | Сжать текст логов; поддерживаемые варианты: **none (без сжатия)**, **zlib**, **gzip**.                                                                                 |
+   | ConfigMap      | `data.export.yml.output.file_type`             | Тип экспортируемого файла журнала; поддерживаются txt, csv, json.                                                                                                                |
+   | ConfigMap      | `data.export.yml.output.max_size`              | Размер одного архивированного файла; единица измерения - МБ. Если он превышает это значение, логи будут автоматически сжаты и архивированы в соответствии с настройками поля сжатия. |
+   | ConfigMap      | `data.export.yml.scopes`                       | Область передачи логов; в настоящее время поддерживаемые логи включают: системные логи, журналы приложений, журналы Kubernetes, продуктовые логи.                          |
+   | ConfigMap      | `data.export.yml.output.s3.bucket_name`        | Имя ведра.                                                                                                                                                             |
+   | ConfigMap      | `data.export.yml.output.s3.endpoint`           | Адрес службы хранения S3.                                                                                                                                              |
+   | ConfigMap      | `data.export.yml.output.s3.region`             | Информация о регионе для службы хранения S3.                                                                                                                          |
+   | Deployment     | `spec.template.spec.containers[0].command[7]` | Адрес службы Kafka.                                                                                                                                                   |
+   | Deployment     | `spec.template.spec.volumes[3].hostPath.path`  | Локальный путь, который нужно смонтировать, используется для временного хранения информации о логах. Файлы логов будут автоматически удалены после синхронизации с хранилищем S3.                     |
+   | Deployment     | `spec.template.spec.initContainers[0].image`   | Адрес образа Alpine.                                                                                                                                                  |
+   | Deployment     | `spec.template.spec.containers[0].image`       | Адрес образа Razor.                                                                                                                                                   |
+
+   ```yaml
+   cat << "EOF" |kubectl apply -f -
+   apiVersion: v1
+   type: Opaque
+   data:
+     # Должны быть включены следующие два ключа
+     access_key_id: bWluaW9hZG1pbg==  # Кодирование в Base64 полученного access_key_id
+     secret_access_key: bWluaW9hZG1pbg==  # Кодирование в Base64 полученного secret_access_key
+   kind: Secret
+   metadata:
+     name: log-export-s3-secret
+     namespace: cpaas-system
+     
+   ---
+   apiVersion: v1
+   data:
+     export.yml: |
+       scopes: # Область передачи логов; по умолчанию собираются только журналы приложений
+         system: false  # Системные логи
+         workload: true # Журналы приложений
+         kubernetes: false # Журналы Kubernetes
+         platform: false # Продуктовые логи
+       output:
+         type: s3                             
+         path: /cpaas/data/logarchive             
+         
+         s3:
+           s3forcepathstyle: true
+           bucket_name: baucket_name_s3           # Заполните подготовленным именем ведра
+           endpoint: http://192.168.179.86:9000   # Заполните подготовленным адресом службы хранения S3
+           region: "dummy"                        # Информация о регионе
+           access_secret: log-export-s3-secret    
+           insecure: true
+                               
+         layout: TimePrefixed
+         # Размер одного архивированного файла; единица измерения - МБ. Если он превышает это значение, логи будут автоматически сжаты и архивированы в соответствии с настройками поля сжатия.
+         max_size: 200                            
+         compression: zlib                        # Дополнительно: none (без сжатия) / zlib / gzip
+         file_type: txt                           # Дополнительно: txt, csv, json
+   kind: ConfigMap
+   metadata:
+     name: log-exporter-config
+     namespace: cpaas-system
+    
+   ---
+   apiVersion: apps/v1
+   kind: Deployment
+   metadata:
+     labels:
+       service_name: log-exporter
+     name: log-exporter
+     namespace: cpaas-system
+   spec:
+     progressDeadlineSeconds: 600
+     replicas: 1
+     revisionHistoryLimit: 5
+     selector:
+       matchLabels:
+         service_name: log-exporter
+     strategy:
+       rollingUpdate:
+         maxSurge: 0
+         maxUnavailable: 1
+       type: RollingUpdate
+     template:
+       metadata:
+         creationTimestamp: null
+         labels:
+           app: lanaya
+           cpaas.io/product: Platform-Center
+           service_name: log-exporter
+           version: v1
+         namespace: cpaas-system
+       spec:
+         affinity:
+           podAffinity: {}
+           podAntiAffinity:
+             preferredDuringSchedulingIgnoredDuringExecution:
+               - podAffinityTerm:
+                   labelSelector:
+                     matchExpressions:
+                       - key: service_name
+                         operator: In
+                         values:
+                           - log-exporter
+                   topologyKey: kubernetes.io/hostname
+                 weight: 50
+         initContainers:
+           - args:
+               - -ecx
+               - |
+                 chown -R 697:697 /cpaas/data/logarchive
+             command:
+               - /bin/sh
+             image: registry.example.cn:60080/ops/alpine:3.16 # Адрес образа Alpine
+             imagePullPolicy: IfNotPresent
+             name: chown
+             resources:
+               limits:
+                 cpu: 100m
+                 memory: 200Mi
+               requests:
+                 cpu: 10m
+                 memory: 50Mi
+             securityContext:
+               runAsUser: 0
+             terminationMessagePath: /dev/termination-log
+             terminationMessagePolicy: File
+             volumeMounts:
+               - mountPath: /cpaas/data/logarchive
+                 name: data
+         containers:
+           - command:
+               - /razor
+               - consumer
+               - --v=1
+               - --kafka-group-log=log-s3   
+               - --kafka-auth-enabled=true
+               - --kafka-tls-enabled=true
+               - --kafka-endpoint=192.168.179.86:9092  # Заполните адрес службы Kafka на основе фактической среды
+               - --database-type=file
+               - --export-config=/etc/log-export/export.yml
+             image: registry.example.cn:60080/ait/razor:v3.16.0-beta.3.g3df8e987  # Образ Razor
+             imagePullPolicy: Always
+             livenessProbe:
+               failureThreshold: 5
+               httpGet:
+                 path: /metrics
+                 port: 8080
+                 scheme: HTTP
+               initialDelaySeconds: 20
+               periodSeconds: 10
+               successThreshold: 1
+               timeoutSeconds: 3
+             name: log-export
+             ports:
+               - containerPort: 80
+                 protocol: TCP
+             readinessProbe:
+               failureThreshold: 5
+               httpGet:
+                 path: /metrics
+                 port: 8080
+                 scheme: HTTP
+               initialDelaySeconds: 20
+               periodSeconds: 10
+               successThreshold: 1
+               timeoutSeconds: 3
+             resources:
+               limits:
+                 cpu: "2"
+                 memory: 4Gi
+               requests:
+                 cpu: 440m
+                 memory: 1280Mi
+             securityContext:
+               runAsGroup: 697
+               runAsUser: 697
+             terminationMessagePath: /dev/termination-log
+             terminationMessagePolicy: File
+             volumeMounts:
+               - mountPath: /etc/secrets/kafka
+                 name: kafka-basic-auth
+                 readOnly: true
+               - mountPath: /etc/log-export
+                 name: config
+                 readOnly: true
+               - mountPath: /cpaas/data/logarchive
+                 name: data
+         dnsPolicy: ClusterFirst
+         nodeSelector:
+           kubernetes.io/os: linux
+         restartPolicy: Always
+         schedulerName: default-scheduler
+         securityContext:
+           fsGroup: 697
+         serviceAccount: lanaya
+         serviceAccountName: lanaya
+         terminationGracePeriodSeconds: 10
+         tolerations:
+           - effect: NoSchedule
+             key: node-role.kubernetes.io/master
+             operator: Exists
+           - effect: NoSchedule
+             key: node-role.kubernetes.io/control-plane
+             operator: Exists
+           - effect: NoSchedule
+             key: node-role.kubernetes.io/cpaas-system
+             operator: Exists
+         volumes:
+           - name: kafka-basic-auth
+             secret:
+               defaultMode: 420
+               secretName: kafka-basic-auth
+           - name: elasticsearch-basic-auth
+             secret:
+               defaultMode: 420
+               secretName: elasticsearch-basic-auth
+           - configMap:
+               defaultMode: 420
+               name: log-exporter-config
+             name: config
+           - hostPath:
+               path: /cpaas/data/logarchive    # Адрес локального временного хранилища для логов
+               type: DirectoryOrCreate
+             name: data
+   EOF
+   ```
+
+4. После изменения статуса контейнера на Работает вы можете просмотреть постоянно архивируемые логи в ведре.

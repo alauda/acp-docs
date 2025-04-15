@@ -1,0 +1,162 @@
+---
+weight: 50
+sourceSHA: 7afc258420255df124723ed9d39e35746a58874a28c7694773121d6cdc708349
+---
+
+# Клонирование Виртуальной Машины
+
+Клонирование виртуальной машины подразумевает создание точной копии виртуальной машины в определенный момент времени. Клонированная виртуальная машина содержит все настройки, операционные системы, приложения и данные оригинальной виртуальной машины.
+
+## Предварительные требования
+
+- Для использования функции клонирования виртуальной машины её диск должен использовать класс хранилища, который поддерживает возможности снимков. Снимки виртуальной машины сохраняют текущее состояние виртуальной машины, что может быть использовано для восстановления виртуальной машины до этого момента времени в случае неожиданного сбоя.
+
+- Пакет jq должен быть установлен на узле, где будет выполняться скрипт. jq — это легковесный инструмент командной строки для обработки JSON, используемый для парсинга и обработки данных JSON.
+
+## Шаги для Операции
+
+**Примечание**: Все операции, описанные ниже, должны выполняться на главном узле кластера, где находится виртуальная машина.
+
+1. Откройте инструмент командной строки.
+
+2. Выполните следующую команду, чтобы создать и открыть файл vm-clone.sh.
+
+   ```
+   vi vm-clone.sh
+   ```
+
+3. Нажмите `i` и скопируйте следующий контент в файл vm-clone.sh.
+
+   ```
+   #!/bin/bash
+    
+   vm_clone() {
+     NAMESPACE=$1
+     VM_NAME=$2
+     VM_CLONE_NAME=$3
+    
+     cat <<EOF | kubectl create -f -
+   kind: VirtualMachineClone
+   apiVersion: clone.kubevirt.io/v1alpha1
+   metadata:
+     name: clone-$VM_NAME
+     namespace: $NAMESPACE
+   spec:
+     source:
+       apiGroup: kubevirt.io
+       kind: VirtualMachine
+       name: $VM_NAME
+     target:
+       apiGroup: kubevirt.io
+       kind: VirtualMachine
+       name: $VM_CLONE_NAME
+     labelFilters:
+       - "*"
+       - "!ovn.kubernetes.io/*"
+     annotationFilters:
+       - "*"
+       - "!ovn.kubernetes.io/*"
+     template:
+       labelFilters:
+         - "*"
+         - "!ovn.kubernetes.io/*"
+       annotationFilters:
+         - "*"
+         - "!ovn.kubernetes.io/*"
+   EOF
+    
+     if [ $? -eq 0 ]; then
+       echo "Создание ресурса vmclone завершено успешно"
+     else
+       echo "Не удалось создать ресурс vmclone"
+       exit 1
+     fi
+    
+     echo "Ожидание завершения клонирования виртуальной машины"
+     while true; do
+       phase=$(kubectl -n $NAMESPACE get vmclone clone-$VM_NAME -o jsonpath='{.status.phase}')
+       if [ "$phase" == "Succeeded" ]; then
+         break
+       elif [ "$phase" == "Failed" ]; then
+         echo "Фаза ресурса VirtualMachineClone провалилась"
+         exit 1
+       fi
+       sleep 5
+     done
+     echo "Клонирование виртуальной машины завершено"
+    
+     dvList=$(kubectl -n $NAMESPACE get vm $VM_CLONE_NAME -o jsonpath='{.spec.template.spec.volumes}' | jq . | grep restore- | grep name | awk '{print $2}')
+    
+     for dv in $dvList; do
+       kubectl -n $NAMESPACE label --overwrite dv $(echo $dv | sed 's/"//g') vm.cpaas.io/used-by=$VM_CLONE_NAME
+       if [ $? -ne 0 ]; then
+         echo "Не удалось обновить метку DV"
+         exit 1
+       fi
+     done
+    
+     pvcList=$(kubectl -n $NAMESPACE get vm $VM_CLONE_NAME -o jsonpath='{.spec.template.spec.volumes}' | jq . | grep restore- | grep claimName | awk '{print $2}')
+    
+     for pvc in $pvcList; do
+       kubectl -n $NAMESPACE label --overwrite pvc $(echo $pvc | sed 's/"//g') vm.cpaas.io/used-by=$VM_CLONE_NAME
+       if [ $? -ne 0 ]; then
+         echo "Не удалось обновить метку PVC"
+         exit 1
+       fi
+     done
+   }
+    
+   if [ $# -ne 3 ]; then
+     echo "Ошибка: ошибка параметров"
+     echo "Использование: ./vm-clone.sh NAMESPACE VM_NAME VM_CLONE_NAME"
+     exit 1
+   fi
+    
+   # выполнение клонирования виртуальной машины
+   vm_clone "$1" "$2" "$3"
+   ```
+
+4. Нажмите `shift+:wq`, чтобы сохранить файл.
+
+5. Выполните следующую команду, чтобы добавить права на выполнение для файла vm-clone.sh.
+
+   ```
+   chmod +x vm-clone.sh
+   ```
+
+6. Выполните следующую команду для запуска скрипта.\{#clone}
+
+   ```
+   ./vm-clone.sh <NAMESPACE> <VM_NAME> <VM_CLONE_NAME>
+   ```
+
+   Описание параметров:
+
+   - **NAMESPACE**: Укажите пространство имен виртуальной машины, которую нужно клонировать, заменив часть \<NAMESPACE> на это пространство имен.
+   - **VM\_NAME**: Укажите имя виртуальной машины, которую нужно клонировать, заменив часть \<VM\_NAME> на это имя.
+   - **VM\_CLONE\_NAME**: Укажите имя клонированной виртуальной машины, заменив часть \<VM\_CLONE\_NAME> на это имя.
+
+7. Когда появится сообщение, похожее на следующее, это означает, что клонирование завершено.
+
+   ```
+   virtualmachineclone.clone.kubevirt.io/clone-k1 создан
+   Создание ресурса vmclone завершено успешно
+   Ожидание завершения клонирования виртуальной машины
+   Клонирование виртуальной машины завершено
+   datavolume.cdi.kubevirt.io/restore-e8ff0e7b-dc7e-4140-aec7-8556cfcf4533-rootfs помечен
+   datavolume.cdi.kubevirt.io/restore-e8ff0e7b-dc7e-4140-aec7-8556cfcf4533-1 помечен
+   ```
+
+## Связанные Операции
+
+### Просмотр и Запуск Клонированной Виртуальной Машины
+
+1. Перейдите в **Управление Платформой**.
+
+2. В левой навигационной панели нажмите **Управление Виртуализацией** > **Образы Виртуальных Машин**.
+
+3. Вы увидите клонированную виртуальную машину с указанным именем из шага [Запуск Скрипта](#clone); состояние клонированной виртуальной машины по умолчанию **Остановлено**.
+
+4. Нажмите на имя этой виртуальной машины, и страница будет перенаправлена на страницу деталей виртуальной машины в Контейнерной Платформе.
+
+5. Нажмите **Запустить**, чтобы успешно запустить виртуальную машину.
