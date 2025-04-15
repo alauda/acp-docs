@@ -1,0 +1,163 @@
+---
+weight: 10
+sourceSHA: 04fd2b5d69b047c4603cbcd525bb7044c29dd5ac410d74741630b6329317401f
+---
+
+# Настройка ModSecurity
+
+ModSecurity — это открытый веб-фаервол (WAF), предназначенный для защиты веб-приложений от вредоносных атак. Он поддерживается сообществом с открытым исходным кодом и поддерживает различные языки программирования и веб-серверы. Платформа Load Balancer (ALB) поддерживает настройку ModSecurity, позволяя осуществлять индивидуальные настройки на уровне Ingress.
+
+## Терминология
+
+| Термин                | Объяснение                                                                                                        |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| **owasp-core-rules**  | Набор правил OWASP Core представляет собой набор открытых правил, используемых для обнаружения и предотвращения распространенных атак на веб-приложения. |
+
+## Шаги для работы
+
+Настройте ModSecurity, добавив аннотации в соответствующий файл YAML ресурса или через настройку CR.
+
+### Метод первый: добавление аннотаций
+
+Добавьте следующие аннотации в поле metadata.annotations соответствующего файла YAML для настройки ModSecurity.
+
+- **Совместимые аннотации Ingress-Nginx**
+
+  | Аннотация                                                | Тип    | Применимый объект     | Объяснение                                                                                                            |
+  | -------------------------------------------------------- | ------ | --------------------- | -------------------------------------------------------------------------------------------------------------------- |
+  | **nginx.ingress.kubernetes.io/enable-modsecurity**       | bool   | Ingress               | Включить ModSecurity.                                                                                               |
+  | **nginx.ingress.kubernetes.io/enable-owasp-core-rules**  | bool   | Ingress               | Включить набор правил OWASP Core.                                                                                   |
+  | **nginx.ingress.kubernetes.io/modsecurity-transaction-id** | string | Ingress               | Используется для идентификации уникальных идентификаторов транзакций для каждого запроса, помогает в регистрации и отладке. |
+  | **nginx.ingress.kubernetes.io/modsecurity-snippet**      | string | Ingress, ALB, FT, Rule | Позволяет пользователям вставлять пользовательские настройки ModSecurity для удовлетворения конкретным требованиям безопасности. |
+
+- **Специальные аннотации ALB**
+
+  | Аннотация                                   | Тип    | Применимый объект | Объяснение                                                                                                                                       |
+  | -------------------------------------------- | ------ | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+  | **alb.modsecurity.cpaas.io/use-recommend**   | bool   | Ingress           | Включить или отключить рекомендуемые правила ModSecurity; установите в `true`, чтобы применить предопределенный набор правил безопасности.        |
+  | **alb.modsecurity.cpaas.io/cmref**           | string | Ingress           | Ссылка на конкретные настройки, например, пользовательские настройки безопасности могут быть загружены, указав путь ссылки ConfigMap (`$ns/$name#$section`). |
+
+### Метод второй: настройка CR
+
+1. Откройте файл конфигурации ALB, FT или Rule, который необходимо настроить.
+
+2. Добавьте следующие поля в spec.config по мере необходимости.
+
+   ```yaml
+   { 
+    "modsecurity": {
+      "enable": true,   # Включить или отключить ModSecurity
+      "transactionId": "$xx", # Использовать ID из Nginx
+      "useCoreRules": true,   # Добавить modsecurity_rules_file /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+      "useRecommend": true,    # Добавить modsecurity_rules_file /etc/nginx/modsecurity/modsecurity.conf
+      "cmRef": "$ns/$name#$section"  # Добавить настройки из ConfigMap
+    }
+   }
+   ```
+
+3. Сохраните и примените файл конфигурации.
+
+## Связанные объяснения
+
+### Отключение
+
+Если ModSecurity не настроен в правиле, он попытается найти настройки в FT; если настройки не будут найдены в FT, он использует настройки из ALB.
+
+## Пример конфигурации
+
+Следующий пример разворачивает ALB с именем `waf-alb` и демонстрационное бэкэнд-приложение с именем `hello`. Кроме того, развертывается Ingress с именем `ing-waf-enable`, который определяет маршрут `/waf-enable` и настраивает правила ModSecurity. Любой запрос, содержащий параметр запроса `test`, значение которого включает строку `test`, будет заблокирован.
+
+```yaml
+apiVersion: crd.alauda.io/v2
+kind: ALB2
+metadata:
+  name: waf-alb
+  namespace: cpaas-system
+spec:
+  config:
+    loadbalancerName: waf-alb
+    projects:
+    - ALL_ALL
+    replicas: 1
+  type: nginx
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+        SecRuleEngine On
+        SecRule ARGS:test "@contains test" "id:1234,deny,log"
+  name: ing-waf-enable
+spec:
+  ingressClassName: waf-alb
+  rules:
+  - http:
+      paths:
+      - backend:
+          service:
+            name: hello
+            port:
+              number: 80
+        path: /waf-enable
+        pathType: ImplementationSpecific
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ing-waf-normal
+spec:
+  ingressClassName: waf-alb
+  rules:
+  - http:
+      paths:
+      - backend:
+          service:
+            name: hello
+            port:
+              number: 80
+        path: /waf-not-enable
+        pathType: ImplementationSpecific
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      service.cpaas.io/name: hello
+      service_name: hello
+  template:
+    metadata:
+      labels:
+        service.cpaas.io/name: hello
+        service_name: hello
+    spec:
+      containers:
+      - name: hello-world
+        image: docker.io/hashicorp/http-echo
+        imagePullPolicy: IfNotPresent
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello
+spec:
+  internalTrafficPolicy: Cluster
+  ipFamilies:
+    - IPv4
+  ipFamilyPolicy: SingleStack
+  ports:
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: 5678
+  selector:
+    service_name: hello
+  sessionAffinity: None
+  type: ClusterIP
+```

@@ -1,0 +1,156 @@
+---
+weight: 10
+sourceSHA: 8693c4a00fdfa2433cf6c7bf52c31dcd29af8adc33e648a6e05886da1b7b66ac
+---
+
+# Устранение неполадки: ошибка float16 поддерживается только на графических процессорах с вычислительной способностью не менее xx в vLLM
+
+## Описание проблемы
+
+### Среда
+
+- **Аппаратное обеспечение**: графические процессоры NVIDIA с вычислительной способностью \<8.0 (например, Tesla V100, T4)
+- **Типы моделей**: LLM, требующие точности bfloat16/FP8 (например, LLaMA-2-70B, GPT-NeoX-20B)
+
+### Симптомы
+
+1. Явное сообщение об ошибке:
+   ```
+   ValueError: float16/bfloat16 поддерживается только на графических процессорах с вычислительной способностью не менее 8.0
+   ```
+2. Ошибка компиляции ядра при загрузке модели
+
+### Связанные журналы
+
+```bash
+# Стек ошибок vLLM
+File "/usr/local/lib/python3.10/site-packages/vllm/model_executor/layers/quantization/__init__.py", line 37, in _verify_cuda_compute_capability
+    raise ValueError(
+ValueError: bfloat16 поддерживается только на графических процессорах с вычислительной способностью не менее 8.0. Текущий GPU: Tesla V100-PCIE-16GB, вычислительная способность 7.0
+```
+
+## Основная причина
+
+### Первичная причина
+
+**Недостаточная вычислительная способность GPU**
+Вычислительная способность GPU (CC) не соответствует минимальным требованиям для некоторых типов данных:
+
+- **bfloat16/FP8**: требуется CC ≥8.0 (архитектура Ampere или новее)
+- **Оптимизация Tensor Core для FP16**: требуется CC \≥7.0 (архитектура Volta или новее)
+
+### Технический анализ
+
+1. **Ограничения архитектуры**:
+   - GPU до архитектуры Ampere (CC \<8.0) не имеют специализированных единиц матричной математики для операций bfloat16
+   - Tensor Cores в Volta/Turing (CC 7.0-7.5) поддерживают только смешанную точность FP16/FP32
+
+2. **Усиление фреймворка**:
+   ```python
+   # Проверка возможностей vLLM (упрощенная)
+   def _verify_cuda_compute_capability():
+       if device.compute_capability < MIN_REQUIRED_CC:
+           raise ValueError(f"Требуется вычислительная способность ≥{MIN_REQUIRED_CC}")
+   ```
+
+## Устранение неполадок
+
+### Шаг 1: Проверьте вычислительную способность GPU
+
+```python
+import torch
+print(f"Вычислительная способность: {torch.cuda.get_device_capability()}")
+```
+
+### Шаг 2: Проверьте требования к точности модели
+
+```bash
+cat model/config.json | grep "torch_dtype"
+# Ожидаемый вывод: "bfloat16" или "float16"
+```
+
+### Шаг 3: Проверьте совместимость фреймворка
+
+```python
+from vllm import _is_cuda_compute_capability_compatible as compat
+print(f"Поддержка bfloat16: {compat((8,0))}")
+```
+
+## Решение
+
+### Решение для недостаточной вычислительной способности
+
+#### Условия
+
+- Ожидается снижение производительности при понижении точности
+- Точность модели может варьироваться при различных типах точности
+
+#### Предварительные условия
+
+- CUDA Toolkit ≥11.8
+
+#### Шаги
+
+1. **Измените yaml для InferenceService**:
+   добавьте аргументы, такие как --dtype=half
+   ```yaml
+   apiVersion: serving.kserve.io/v1beta1
+   kind: InferenceService
+   metadata:
+     name: llama-2-service
+     annotations:
+       serving.kserve.io/enable-prometheus-scraping: "true"
+   spec:
+     predictor:
+       containers:
+       - name: kserve-container
+         image: vllm/vllm-serving:0.3.2
+         args:
+           - --model=meta-llama/Llama-2-7b-chat-hf
+           - --dtype=half  # Принудительная FP16 точность
+           - --tensor-parallel-size=1
+         resources:
+           limits:
+             nvidia.com/gpu: "1"
+   ```
+2. **Подождите перезапуска развертывания**
+
+## Профилактические меры
+
+1. **Предварительные проверки**:
+   ```python
+   from vllm import LLM
+   LLM.validate_environment(model_dtype="bfloat16")
+   ```
+
+2. **Конфигурация кластера**:
+   ```bash
+   # Конфигурация плагина устройства NVIDIA
+   helm upgrade -i nvidia-device-plugin \
+     --set compatabilityPolicy=strict \
+     --set computeCapabilities=8.0+
+   ```
+
+3. **Оптимизация модели**:
+   ```python
+   # Применение квантования AWQ
+   llm = LLM(model="codellama/CodeLlama-34b",
+             quantization="awq",
+             load_format="awq")
+   ```
+
+## Связанное содержимое
+
+### Справочная информация о вычислительной способности GPU
+
+| Архитектура | Диапазон CC | Поддерживаемые точности       |
+| ------------ | -------- | -------------------------- |
+| Volta        | 7.0-7.2  | Tensor Core FP16           |
+| Turing       | 7.5      | FP16/INT8                  |
+| Ampere       | 8.0-8.9  | bfloat16/TF32/FP8          |
+| Hopper       | 9.0+     | FP4/FP8 с динамическим масштабом |
+
+### Официальные ссылки
+
+1. [Таблица вычислительной способности NVIDIA](https://developer.nvidia.com/cuda-gpus)
+2. [Аппаратные требования vLLM](https://docs.vllm.ai/en/latest/getting_started/installation.html)

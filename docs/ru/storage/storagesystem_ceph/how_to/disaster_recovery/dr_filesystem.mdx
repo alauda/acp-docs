@@ -1,0 +1,236 @@
+---
+weight: 64
+sourceSHA: 42488c8a6dff243d30ca516a98b158dcd6fe4117eb4a764a43ab08b4fc3ef69f
+---
+
+# Восстановление после катастрофы в файловом хранилище
+
+CephFS Mirror — это функция файловой системы Ceph, предназначенная для обеспечения асинхронной репликации данных между различными кластерами Ceph, тем самым обеспечивая восстановление после катастрофы между кластерами. Его основная функциональность заключается в синхронизации данных в режиме основного-резервного, что обеспечивает быструю передачу услуг в резервный кластер в случае сбоя основного кластера.
+
+:::warning
+
+- CephFS Mirror выполняет инкрементальную синхронизацию на основе снимков, при этом интервал снимков по умолчанию установлен на один раз в час (можно настроить). Дифференциальные данные между основным и резервным кластерами обычно состоят из объема данных, записанных в течение одного цикла снимка.
+- CephFS Mirror предоставляет исключительно резервное копирование данных подлежащего хранилища и не может управлять резервным копированием ресурсов Kubernetes. Пожалуйста, используйте функцию **Резервное копирование и восстановление** платформы для резервного копирования ресурсов PVC и PV в совокупности.
+:::
+
+## Терминология
+
+| Термин                | Объяснение                                       |
+| :-------------------- | :------------------------------------------------ |
+| **Основной кластер**  | Кластер, который в настоящее время предоставляет услуги хранения. |
+| **Резервный кластер** | Кластер для резервного копирования.              |
+
+## Конфигурация резервного копирования
+
+### Предварительные условия
+
+- Подготовьте два кластера, подходящих для развертывания хранилища Alauda Container Platform (ACP) Storage с Ceph, а именно Основной кластер и Резервный кластер, обеспечив взаимосвязь сетей между кластерами.
+- Версии платформы, используемые обоими кластерами (v3.12 и выше), должны быть согласованы.
+- [Создайте распределенную службу хранения](../../installation/create_service_stand.mdx) в обоих кластерах: Основном и Резервном.
+- Создайте пулы файлового хранения с **одинаковым именем** в Основном и Резервном кластерах.
+
+### Процедура
+
+<Steps>
+  ### Включите Mirror для пула файлового хранения в Резервном кластере
+
+  Выполните следующие команды на Управляющем узле Резервного кластера:
+
+  <Tabs>
+    <Tab label="Командная строка">
+      ```bash
+      kubectl -n rook-ceph patch cephfilesystem <fs-name> \
+      --type merge -p '{"spec":{"mirroring":{"enabled": true}}}'
+      ```
+    </Tab>
+
+    <Tab label="Вывод">
+      ```bash
+      cephfilesystem.ceph.rook.io/<fs-name> patched
+      ```
+    </Tab>
+  </Tabs>
+
+  **Параметры**:
+
+  - `<fs-name>`: Имя пула файлового хранения.
+
+  ### <a id="token" />Получите токен партнера
+
+  Этот токен является учетными данными для установления соединения репликации между двумя кластерами.
+
+  Выполните следующие команды на Управляющем узле Резервного кластера:
+
+  <Tabs>
+    <Tab label="Команда">
+      ```bash
+      kubectl get secret -n rook-ceph \
+      $(kubectl -n rook-ceph get cephfilesystem <fs-name> -o jsonpath='{.status.info.fsMirrorBootstrapPeerSecretName}') \
+      -o jsonpath='{.data.token}' | base64 -d
+      ```
+    </Tab>
+
+    <Tab label="Вывод">
+      ```bash
+      # Из-за наличия конфиденциальной информации вывод был обрезан.
+      eyJmc2lkIjogImMyYjAyNmMzLTA3ZGQtNDA3Z...
+      ```
+    </Tab>
+  </Tabs>
+
+  **Параметры**:
+
+  - `<fs-name>`: Имя пула файлового хранения.
+
+  ### Создайте секрет партнера в Основном кластере
+
+  После получения токена партнера из Резервного кластера необходимо создать секрет партнера в Основном кластере.
+
+  Выполните следующие команды на Управляющем узле Основного кластера:
+
+  <Tabs>
+    <Tab label="Команда">
+      ```bash
+      kubectl -n rook-ceph create secret generic fs-secondary-site-secret \
+      --from-literal=token=<token> \
+      --from-literal=pool=<fs-name>
+      ```
+    </Tab>
+
+    <Tab label="Вывод">
+      ```bash
+      secret/fs-secondary-site-secret created
+      ```
+    </Tab>
+  </Tabs>
+
+  **Параметры**:
+
+  - `<token>`: Токен, полученный на [шаге 2](#token).
+  - `<fs-name>`: Имя пула файлового хранения.
+
+  ### Включите Mirror для пула файлового хранения в Основном кластере
+
+  Выполните следующие команды на Управляющем узле Основного кластера:
+
+  <Tabs>
+    <Tab label="Команда">
+      ```bash
+      kubectl -n rook-ceph patch cephfilesystem <fs-name> --type merge -p \
+      '{
+        "spec": {
+          "mirroring": {
+            "enabled": true, 
+            "peers": {
+              "secretNames": [
+                "fs-secondary-site-secret"
+              ]
+            }, 
+            "snapshotSchedules": [
+              {
+                "path": "/", 
+                "interval": "<schedule-interval>"
+              }
+            ], 
+            "snapshotRetention": [
+              {
+                "path": "/", 
+                "duration": "<retention-policy>"
+              }
+            ]
+          }
+        }
+      }'
+      ```
+    </Tab>
+
+    <Tab label="Пример">
+      ```bash
+      kubectl -n rook-ceph patch cephfilesystem cephfs --type merge -p \
+      '{
+        "spec": {
+          "mirroring": {
+            "enabled": true, 
+            "peers": {
+              "secretNames": [
+                "fs-secondary-site-secret"
+              ]
+            }, 
+            "snapshotSchedules": [
+              {
+                "path": "/", 
+                "interval": "1h"
+              }
+            ], 
+            "snapshotRetention": [
+              {
+                "path": "/", 
+                "duration": "h 1"
+              }
+            ]
+          }
+        }
+      }'
+      ```
+    </Tab>
+
+    <Tab label="Вывод">
+      ```bash
+      cephfilesystem.ceph.rook.io/<fs-name> patched
+      ```
+    </Tab>
+  </Tabs>
+
+  **Параметры**:
+
+  - `<fs-name>`: Имя пула файлового хранения.
+  - `<schedule-interval>`: Цикл выполнения снимков. Для получения информации обратитесь к [официальной документации](https://docs.ceph.com/en/latest/cephfs/snap-schedule/#add-and-remove-schedules).
+  - `<retention-policy>`: Политика хранения снимков. Для получения информации обратитесь к [официальной документации](https://docs.ceph.com/en/latest/cephfs/snap-schedule/#add-and-remove-retention-policies).
+
+  ### Разверните демона Mirror в Основном кластере
+
+  Демон Mirror постоянно отслеживает изменения данных в пуле файлового хранения (с включенным Mirror). Он периодически создает снимки и отправляет различия снимков в Резервный кластер по сети.
+
+  Выполните следующие команды на Управляющем узле Основного кластера:
+
+  <Tabs>
+    <Tab label="Команда">
+      ```yaml
+      cat << EOF | kubectl apply -f -
+      apiVersion: ceph.rook.io/v1
+      kind: CephFilesystemMirror
+      metadata:
+        name: cephfs-mirror
+        namespace: rook-ceph
+      spec:
+        placement:
+          tolerations:
+          - key: NoSchedule
+            operator: Exists
+        resources:
+          limits:
+            cpu: "500m"
+            memory: "1Gi"
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+        priorityClassName: system-node-critical
+      EOF
+      ```
+    </Tab>
+
+    <Tab label="Вывод">
+      ```bash
+      cephfilesystemmirror.ceph.rook.io/cephfs-mirror created
+      ```
+    </Tab>
+  </Tabs>
+</Steps>
+
+## Переключение на резервный кластер
+
+В случае сбоя Основного кластера вы можете напрямую продолжать использовать CephFS в Резервном кластере.
+
+### Предварительные условия
+
+- Ресурсы Kubernetes основного кластера были выполнены резервное копирование и восстановление в резервный кластер, включая PVC, PV и рабочие нагрузки приложений.
