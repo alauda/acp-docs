@@ -1,0 +1,452 @@
+---
+weight: 65
+sourceSHA: 26799b20a8c7d8309306745fc5a0a8eb1ebfdf314c2943573b730b0d1953052c
+---
+
+# Восстановление данных в блоковом хранилище
+
+RBD Mirror — это функция Ceph Block Storage (RBD), которая позволяет асинхронную репликацию данных между различными кластерами Ceph, обеспечивая возможность восстановления после аварий (DR) в разных кластерах. Его основная функция заключается в синхронизации данных в режиме "основной-резервный", что обеспечивает быструю передачу обслуживания резервным кластером в случае сбоя основного кластера.
+
+:::warning
+
+- RBD Mirror выполняет инкрементальную синхронизацию на основе снимков, с интервалом по умолчанию один раз в час (настраиваемым). Дифференциальные данные между основным и резервным кластерами, как правило, соответствуют записям в пределах одного цикла снимка.
+- RBD Mirror предоставляет только резервное копирование данных подлежащего хранилища и не обрабатывает резервные копии ресурсов Kubernetes. Пожалуйста, используйте функцию **Резервное копирование и восстановление** платформы для резервного копирования ресурсов PVC и PV.
+  :::
+
+## Терминология
+
+| Термин                  | Пояснение                                      |
+| :---------------------- | :---------------------------------------------- |
+| **Основной кластер**   | Кластер, который в данный момент предоставляет услуги хранения. |
+| **Резервный кластер**   | Резервный кластер, используемый для целей резервирования.     |
+
+## Конфигурация резервного копирования
+
+### Предварительные условия
+
+- Подготовьте два кластера, которые могут развернуть Alauda Container Platform (ACP) Storage с Ceph: основной кластер и резервный кластер, с сетевым подключением между ними.
+- Оба кластера должны работать на одной и той же версии платформы (v3.12 или более поздней).
+- [Создайте распределенные хранилищные услуги](../../installation/create_service_stand.mdx) в обоих кластерах: основном и резервном.
+- Создайте пулы блокового хранилища с **идентичными именами** в обоих кластерах: основном и резервном.
+- Пожалуйста, убедитесь, что следующие три изображения загружены в частный репозиторий изображений платформы:
+  - `quay.io/csiaddons/k8s-controller:v0.5.0`
+  - `quay.io/csiaddons/k8s-sidecar:v0.8.0`
+  - `quay.io/brancz/kube-rbac-proxy:v0.8.0`
+
+### Процедуры
+
+<Steps>
+  ### Включите зеркалирование для пула блокового хранилища основного кластера
+
+  Выполните следующую команду на узле управления основного кластера:
+
+  <Tabs>
+    <Tab label="Команда">
+      ```bash
+      kubectl -n rook-ceph patch cephblockpool <block-pool-name> \
+      --type merge -p '{"spec":{"mirroring":{"enabled":true,"mode":"image"}}}'
+      ```
+    </Tab>
+
+    <Tab label="Вывод">
+      ```bash
+      cephblockpool.ceph.rook.io/<block-pool-name> patched
+      ```
+    </Tab>
+  </Tabs>
+
+  **Параметры**:
+
+  - `<block-pool-name>`: Имя пула блокового хранилища.
+
+  ### <a id="blocktoken" />Получите токен пиринга
+
+  Этот токен служит критически важным учетным данными для установления зеркальных соединений между кластерами.
+
+  Выполните следующую команду на узле управления основного кластера:
+
+  <Tabs>
+    <Tab label="Команда">
+      ```bash
+      kubectl get secret -n rook-ceph \
+      $(kubectl get cephblockpool.ceph.rook.io <block-pool-name> -n rook-ceph -o jsonpath='{.status.info.rbdMirrorBootstrapPeerSecretName}') \
+      -o jsonpath='{.data.token}' | base64 -d
+      ```
+    </Tab>
+
+    <Tab label="Вывод">
+      ```bash
+      # Вывод сокращён из-за конфиденциальной информации
+      eyJmc2lkIjoiMjc2N2I3ZmEtY2YwYi00N...
+      ```
+    </Tab>
+  </Tabs>
+
+  **Параметры**:
+
+  - `<block-pool-name>`: Имя пула блокового хранилища.
+
+  ### Создайте секрет токена пиринга в резервном кластере
+
+  Выполните следующую команду на узле управления резервного кластера:
+
+  <Tabs>
+    <Tab label="Команда">
+      ```bash
+      kubectl -n rook-ceph create secret generic rbd-primary-site-secret \
+      --from-literal=token=<token> \
+      --from-literal=pool=<block-pool-name>
+      ```
+    </Tab>
+
+    <Tab label="Вывод">
+      ```
+      secret/rbd-primary-site-secret создан
+      ```
+    </Tab>
+  </Tabs>
+
+  **Параметры**:
+
+  - `<token>`: Токен, полученный из [Шага 2](#blocktoken).
+  - `<block-pool-name>`: Имя пула блокового хранилища.
+
+  ### Включите зеркалирование для пула блокового хранилища резервного кластера
+
+  Выполните следующую команду на узле управления резервного кластера:
+
+  <Tabs>
+    <Tab label="Команда">
+      ```bash
+      kubectl -n rook-ceph patch cephblockpool <block-pool-name> --type merge -p \
+      '{
+        "spec": {
+          "mirroring": {
+            "enabled": true, 
+            "mode": "image", 
+            "peers": {
+              "secretNames": [
+                "rbd-primary-site-secret"
+              ]
+            }
+          }
+        }
+      }'
+      ```
+    </Tab>
+
+    <Tab label="Вывод">
+      ```
+      cephblockpool.ceph.rook.io/<block-pool-name> patched
+      ```
+    </Tab>
+  </Tabs>
+
+  **Параметры**:
+
+  - `<block-pool-name>`: Имя пула блокового хранилища.
+
+  ### Разверните демон зеркалирования в резервном кластере
+
+  Этот демон отвечает за мониторинг и управление процессами синхронизации RBD, включая синхронизацию данных и обработку ошибок.
+
+  Выполните следующую команду на узле управления резервного кластера:
+
+  <Tabs>
+    <Tab label="Команда">
+      ```yaml
+      cat << EOF | kubectl apply -f -
+      apiVersion: ceph.rook.io/v1
+      kind: CephRBDMirror
+      metadata:
+        name: rbd-mirror
+        namespace: rook-ceph
+      spec:
+        count: 1
+      EOF
+      ```
+    </Tab>
+
+    <Tab label="Вывод">
+      ```
+      cephrbdmirror.ceph.rook.io/rbd-mirror создан
+      ```
+    </Tab>
+  </Tabs>
+
+  ### Проверьте статус зеркалирования
+
+  Выполните следующую команду на узле управления резервного кластера:
+
+  <Tabs>
+    <Tab label="Команда">
+      ```bash
+      kubectl get cephblockpools.ceph.rook.io <block-pool-name> -n rook-ceph -o jsonpath='{.status.mirroringStatus.summary}'
+      ```
+    </Tab>
+
+    <Tab label="Вывод">
+      ```bash
+      # Все статусы "OK" указывают на нормальную работу
+      {"daemon_health":"OK","health":"OK","image_health":"OK","states":{}}
+      ```
+    </Tab>
+  </Tabs>
+
+  **Параметры**:
+
+  - `<block-pool-name>`: Имя пула блокового хранилища.
+
+  ### Включите сторонний сервис репликации
+
+  Эта функция позволяет эффективную репликацию и синхронизацию данных без прерывания операций основного приложения, повышая надежность и доступность системы.
+
+  1. Разверните csiaddons-controller
+
+  Выполните следующие команды на узлах управления обоих кластеров: основном и резервном:
+
+  <details>
+    <summary>Нажмите, чтобы просмотреть</summary>
+
+    ```yaml
+    kubectl create -f https://raw.githubusercontent.com/csi-addons/kubernetes-csi-addons/v0.5.0/deploy/controller/crds.yaml
+    kubectl create -f https://raw.githubusercontent.com/csi-addons/kubernetes-csi-addons/v0.5.0/deploy/controller/rbac.yaml
+     
+    cat << EOF | kubectl apply -f -
+    apiVersion: v1
+    data:
+      controller_manager_config.yaml: |
+        apiVersion: controller-runtime.sigs.k8s.io/v1alpha1
+        kind: ControllerManagerConfig
+        health:
+          healthProbeBindAddress: :8081
+        metrics:
+          bindAddress: 127.0.0.1:8080
+        webhook:
+          port: 9443
+        leaderElection:
+          leaderElect: true
+          resourceName: e8cd140a.openshift.io
+    kind: ConfigMap
+    metadata:
+      name: csi-addons-manager-config
+      namespace: csi-addons-system
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      labels:
+        app.kubernetes.io/name: csi-addons
+      name: csi-addons-controller-manager
+      namespace: csi-addons-system
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app.kubernetes.io/name: csi-addons
+      template:
+        metadata:
+          annotations:
+            kubectl.kubernetes.io/default-container: manager
+          labels:
+            app.kubernetes.io/name: csi-addons
+        spec:
+          containers:
+          - args:
+            - --secure-listen-address=0.0.0.0:8443
+            - --upstream=http://127.0.0.1:8080/
+            - --logtostderr=true
+            - --v=10
+            image: <registry>/brancz/kube-rbac-proxy:v0.8.0
+            name: kube-rbac-proxy
+            ports:
+            - containerPort: 8443
+              name: https
+              protocol: TCP
+            resources:
+              limits:
+                cpu: 500m
+                memory: 128Mi
+              requests:
+                cpu: 10m
+                memory: 64Mi
+          - args:
+            - --health-probe-bind-address=:8081
+            - --metrics-bind-address=127.0.0.1:8080
+            - --leader-elect
+            command:
+            - /manager
+            image: <registry>/csiaddons/k8s-controller:v0.5.0
+            livenessProbe:
+              httpGet:
+                path: /healthz
+                port: 8081
+              initialDelaySeconds: 15
+              periodSeconds: 20
+            name: manager
+            readinessProbe:
+              httpGet:
+                path: /readyz
+                port: 8081
+              initialDelaySeconds: 5
+              periodSeconds: 10
+            resources:
+              limits:
+                cpu: 500m
+                memory: 128Mi
+              requests:
+                cpu: 10m
+                memory: 64Mi
+            securityContext:
+              allowPrivilegeEscalation: false
+          securityContext:
+            runAsNonRoot: true
+          serviceAccountName: csi-addons-controller-manager
+          terminationGracePeriodSeconds: 10
+    EOF
+    ```
+  </details>
+
+  **Параметры**:
+
+  - `<registry>`: Адрес реестра платформы.
+
+  2. Включите csi-сайдкар
+
+  Выполните следующие команды на узлах управления обоих кластеров: основном и резервном:
+
+  ```bash
+  kubectl patch cm rook-ceph-operator-config -n rook-ceph --type json --patch \
+  '[
+    {
+      "op": "add", 
+      "path": "/data/CSI_ENABLE_OMAP_GENERATOR", 
+      "value": "true"
+    }, 
+    {
+      "op": "add", 
+      "path": "/data/CSI_ENABLE_CSIADDONS", 
+      "value": "true"
+    }
+  ]'
+  ```
+
+  ### Создайте VolumeReplicationClass
+
+  Выполните следующие команды на узлах управления обоих кластеров: основном и резервном:
+
+  <Tabs>
+    <Tab label="Команда">
+      ```yaml
+      cat << EOF | kubectl apply -f -
+      apiVersion: replication.storage.openshift.io/v1alpha1
+      kind: VolumeReplicationClass
+      metadata:
+        name: rbd-volumereplicationclass
+      spec:
+        provisioner: rook-ceph.rbd.csi.ceph.com
+        parameters:
+          mirroringMode: snapshot
+          schedulingInterval: "<scheduling-interval>" # [!code callout]
+          replication.storage.openshift.io/replication-secret-name: rook-csi-rbd-provisioner
+          replication.storage.openshift.io/replication-secret-namespace: rook-ceph
+      EOF
+      ```
+    </Tab>
+
+    <Tab label="Вывод">
+      ```bash
+      volumereplicationclass.replication.storage.openshift.io/rbd-volumereplicationclass создан
+      ```
+    </Tab>
+  </Tabs>
+
+  <Callouts>
+    1. `<scheduling-interval>`: Интервал планирования (например, schedulingInterval: "1h" указывает на выполнение каждый 1 час).
+  </Callouts>
+
+  ### Включите зеркалирование для PVC
+
+  Выполните следующую команду на узле управления основного кластера:
+
+  <Tabs>
+    <Tab label="Команда">
+      ```yaml
+      cat << EOF | kubectl apply -f -
+      apiVersion: replication.storage.openshift.io/v1alpha1
+      kind: VolumeReplication
+      metadata:
+        name: <vr-name> # [!code callout]
+        namespace: <namespace> # [!code callout]
+      spec:
+        autoResync: false
+        volumeReplicationClass: rbd-volumereplicationclass
+        replicationState: primary
+        dataSource:
+          apiGroup: ""
+          kind: PersistentVolumeClaim
+          name: <pvc-name> # [!code callout]
+      EOF
+      ```
+    </Tab>
+
+    <Tab label="Вывод">
+      ```bash
+      volumereplication.replication.storage.openshift.io/<mirror-pvc-name> создан
+      ```
+    </Tab>
+  </Tabs>
+
+  <Callouts>
+    1. `<vr-name>`: Имя объекта VolumeReplication, рекомендуется использовать то же имя, что и у PVC.
+    2. `<namespace>`: Пространство имен, к которому принадлежит VolumeReplication, должно совпадать с пространством имен PVC.
+    3. `<pvc-name>`: Имя PVC, для которого необходимо включить зеркалирование.
+  </Callouts>
+
+  **Примечание**
+  После включения образ RBD в резервном кластере становится доступным только для чтения.
+</Steps>
+
+## Переключение
+
+Когда основной кластер выходит из строя, необходимо переключить отношения "основной-резервный" для образа RBD.
+
+### Предварительные условия
+
+- Ресурсы Kubernetes основного кластера были восстановлены в резервный кластер, включая PVC, PV, рабочие нагрузки приложений и т.д.
+
+### Процедуры
+
+<Steps>
+  #### Создание VolumeReplication
+
+  Выполните следующую команду на узле управления резервного кластера:
+
+  ```yaml
+  cat << EOF | kubectl apply -f -
+  apiVersion: replication.storage.openshift.io/v1alpha1
+  kind: VolumeReplication
+  metadata:
+    name: <vr-name> # [!code callout]
+    namespace: <namespace> # [!code callout]
+  spec:
+    autoResync: false
+    dataSource:
+      apiGroup: ""
+      kind: PersistentVolumeClaim
+      name: <mirror-pvc-name> # [!code callout]
+    replicationHandle: ""
+    replicationState: primary
+    volumeReplicationClass: rbd-volumereplicationclass
+  EOF
+  ```
+
+  <Callouts>
+    1. `<vr-name>`: Имя VolumeReplication.
+    2. `<namespace>`: Пространство имен PVC.
+    3. `<mirror-pvc-name>`: Имя PVC.
+  </Callouts>
+
+  **Примечание**
+  После создания образ RBD в резервном кластере становится основным и доступен для записи.
+</Steps>
