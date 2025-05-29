@@ -1,0 +1,165 @@
+---
+weight: 30
+---
+# Upgrade the global cluster
+
+<Term name="productShort" /> consists of a **global cluster** and one or more **workload clusters**.
+The global cluster **must** be upgraded before any workload clusters.
+
+This document walks you through the upgrade procedure for the global cluster.
+
+If the global cluster is configured with the **global DR (Disaster Recovery)** solution, follow the [global DR procedure](#global_dr) strictly. Otherwise, follow the [Standard procedure](#standard) .
+
+## Standard procedure \{#standard}
+
+<Steps>
+
+### Upload images
+
+Copy the upgrade package to **any control plane node** of the global cluster. Extract the package and `cd` into the extracted directory.
+
+* If the global cluster uses the **built-in registry**, run:
+
+  ```bash
+  bash upgrade.sh --only-sync-image=true
+  ```
+
+<Directive type="warning" title="WARNING">
+
+If the global cluster uses the **global DR procedure** and you are uploading images to the **standby** global cluster, you must specify the `--registry` parameter — this should point to the standby global cluster’s image registry:
+
+  ```bash
+  bash upgrade.sh --only-sync-image=true --registry <registry-address>   --username <username> --password <password>
+
+  # Example:
+  # bash upgrade.sh --only-sync-image=true --registry example.com   --username admin --password password
+  ```
+
+</Directive>
+
+* If the global cluster uses an **external registry**, you also need to provide the registry address:
+
+  ```bash
+  bash upgrade.sh --only-sync-image=true --registry <registry-address> --username <username> --password <password>
+  ```
+
+<Directive type="info" title="INFO">
+Uploading images typically takes about 2 hours, depending on your network and disk performance.
+If your platform uses the global DR, remember that the **standby global cluster also requires image upload**, and plan your maintenance window accordingly.
+</Directive>
+
+### Trigger the upgrade
+
+After the image upload is complete, run the following command to start the upgrade process:
+
+```bash
+bash upgrade.sh --skip-sync-image
+```
+
+Wait for the script to finish before proceeding.
+
+### Upgrade the global cluster
+
+1. Log into the Web Console of the global cluster and switch to **Administrator** view.
+2. Navigate to **Clusters > Clusters**.
+3. Click on the `global` cluster to open its detail view.
+4. Go to the **Functional Components** tab.
+5. Click the **Upgrade** button.
+
+Review the available component updates shown in the dialog, and confirm to continue.
+
+<Directive type="info" title="INFO">
+Upgrading the Kubernetes version is optional.
+However, since service disruptions may occur regardless, we recommend including the Kubernetes upgrade to avoid multiple maintenance windows.
+</Directive>
+
+</Steps>
+
+## global DR procedure \{#global_dr}
+
+<Steps>
+
+### Compare data consistency
+
+1. Follow your regular global DR inspection procedures to ensure that data in the **standby global cluster** is consistent with the **primary global cluster**.If inconsistencies are detected, **contact technical support** before proceeding.
+2. On **both** clusters, run the following to ensure no `Machine` nodes are in a non-running state:
+
+```bash
+kubectl get machines.platform.tkestack.io
+```
+
+If any such nodes exist, contact technical support to resolve them before continuing.
+
+### Uninstall the etcd sync plugin
+
+<Tabs>
+  <Tab label="Upgrading from 3.18">
+  1. Access the Web Console of the **standby global cluster** via its IP or VIP.
+  2. Switch to the **Platform Management** view.
+  3. Navigate to **Catalog > Cluster Plugin**.
+  4. Select `global` from the cluster dropdown.
+  5. Find the **EtcdSync** plugin and click **Uninstall**. Wait for the uninstallation to complete.
+  </Tab>
+
+  <Tab label="Upgrading from 3.16">
+  Log into any **control plane node** of the **primary global cluster**, then run:
+
+  ```bash
+  helm3 del etcd-sync -n default 2> /dev/null
+  helm3 del etcd-sync -n cpaas-system 2> /dev/null
+
+  kubectl delete configmaps,secret -n kube-system   etcd-master-mirror-cert etcd-slave-mirror-cert etcd-sync-env   etcd-sync-ignore-text &> /dev/null
+
+  kubectl delete deploy -n kube-system etcd-mirror-etcd-mirror &> /dev/  null
+
+  kubectl get pod -n kube-system | grep etcd-mirror  # Ensure no   etcd-mirror pods remain
+  ```
+  </Tab>
+</Tabs>
+
+### Upgrade the standby global cluster
+
+Follow the same procedure as described in the [Standard procedure](#standard) section to upgrade the **standby global cluster** first.
+
+### Upgrade the primary global cluster
+
+After the standby is upgraded, follow the same [Standard procedure](#standard) to upgrade the **primary global cluster**.
+
+### Reinstall the etcd sync plugin
+
+Before reinstalling, verify that port `2379` is properly forwarded from both global cluster VIPs to their control plane nodes.
+
+To reinstall:
+
+1. Access the Web Console of the **standby global cluster** via its IP or VIP.
+2. Switch to **Administrator** view.
+3. Go to **Marketplace > Cluster Plugins**.
+4. Select the `global` cluster.
+5. Locate **Alauda Container Platform etcd Synchronizer**, click **Install**, and provide the required parameters.
+
+To verify installation:
+
+```bash
+kubectl get po -n cpaas-system -l app=etcd-sync  # Ensure pod is 1/1 Running
+
+kubectl logs -n cpaas-system $(kubectl get po -n cpaas-system -l app=etcd-sync --no-headers | awk '{print $1}' | head -1) | grep -i "Start Sync update"
+# Wait until the logs contain "Start Sync update"
+
+# Recreate the pod to trigger synchronization of resources with ownerReferences
+kubectl delete po -n cpaas-system $(kubectl get po -n cpaas-system -l app=etcd-sync --no-headers | awk '{print $1}' | head -1)
+```
+
+### Check Synchronization Status
+
+Run the following to verify the synchronization status:
+
+```bash
+curl "$(kubectl get svc -n cpaas-system etcd-sync-monitor -ojsonpath='{.spec.clusterIP}')/check"
+```
+
+**Explanation of output:**
+
+* `"LOCAL ETCD missed keys:"` – Keys exist in the **primary cluster** but are missing in the standby. This often resolves after a pod restart.
+* `"LOCAL ETCD surplus keys:"` – Keys exist in the **standby cluster** but not in the primary. Review these with your operations team before deletion.
+
+</Steps>
