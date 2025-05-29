@@ -1,17 +1,128 @@
 ---
 weight: 20
-sourceSHA: 50a71ed4f4bd316160593a2371cdf2fb141654f99e6d8eab4191bfe1b0956b80
+sourceSHA: cb1bc83d75a4d7c58091eddcb4644810fef6b574f854883cb6424a5010e15fab
 ---
 
 # 配置 HPA
 
-对于无状态应用，HPA（Horizontal Pod Autoscaler，水平 Pod 自动扩缩器）能够根据您的业务需求和预设策略自动调整容器组的数量，以应对业务负载的急剧变化或合理节省资源供其他应用使用。
+HPA（水平 Pod 自动扩缩器）根据预设策略和指标自动调整 Pod 的数量，以应对业务负载的突然变化，同时在低流量期间优化资源利用率。
+
+## 理解水平 Pod 自动扩缩器
+
+您可以创建一个水平 Pod 自动扩缩器，以指定希望运行的 Pod 的最小和最大数量，以及 Pod 应该目标的 CPU 利用率或内存利用率。
+
+在您创建水平 Pod 自动扩缩器后，平台开始查询 Pod 上的 CPU 和/或内存资源指标。当这些指标可用时，水平 Pod 自动扩缩器计算当前指标利用率与期望指标利用率的比率，并相应地进行扩展或缩减。查询和扩缩操作在固定的时间间隔内进行，但在指标可用之前可能需要一到两分钟。
+
+对于复制控制器，这种扩缩直接对应于复制控制器的副本数。对于部署配置，扩缩直接对应于部署配置的副本数。请注意，自动扩缩仅适用于处于完成阶段的最新部署。
+
+平台会自动考虑资源，并在资源峰值期间（例如启动时）防止不必要的自动扩缩。处于未就绪状态的 Pod 在扩展时 CPU 使用率为 0，自动扩缩器在缩减时会忽略这些 Pod。没有已知指标的 Pod 在扩展时 CPU 使用率为 0%，在缩减时为 100%。这使得 HPA 决策期间更加稳定。要使用此功能，您必须配置就绪检查，以确定新 Pod 是否准备好使用。
+
+### HPA 如何工作？
+
+水平 Pod 自动扩缩器（HPA）扩展了 Pod 自动扩缩的概念。HPA 允许您创建和管理一组负载均衡的节点。当给定的 CPU 或内存阈值被超越时，HPA 会自动增加或减少 Pod 的数量。
+
+HPA 作为一个控制循环工作，默认同步周期为 15 秒。在此期间，控制器管理器根据 HPA 配置中定义的内容查询 CPU、内存利用率或两者。控制器管理器从资源指标 API 获取每个 Pod 的资源指标，如 CPU 或内存。
+
+如果设置了利用率目标值，控制器将利用率值计算为每个 Pod 中容器的等效资源请求的百分比。然后，控制器计算所有目标 Pod 的利用率平均值，并生成一个比率，用于扩展所需的副本数量。
+
+### 支持的指标
+
+水平 Pod 自动扩缩器支持以下指标：
+
+| 指标                         | 描述                                                                                     |
+| ---------------------------- | ---------------------------------------------------------------------------------------- |
+| **CPU 利用率**               | 使用的 CPU 核心数。可用于计算 Pod 请求的 CPU 的百分比。                                 |
+| **内存利用率**               | 使用的内存量。可用于计算 Pod 请求的内存的百分比。                                     |
+| **网络入站流量**             | 进入 Pod 的网络流量量，以 KiB/s 为单位测量。                                            |
+| **网络出站流量**             | 从 Pod 出去的网络流量量，以 KiB/s 为单位测量。                                          |
+| **存储读取流量**             | 从存储中读取的数据量，以 KiB/s 为单位测量。                                            |
+| **存储写入流量**             | 写入存储的数据量，以 KiB/s 为单位测量。                                                |
+
+> **重要**：对于基于内存的自动扩缩，内存使用量必须与副本数量成比例地增加和减少。平均而言：
+>
+> - 副本数量的增加必须导致每个 Pod 的内存（工作集）使用量整体减少。
+> - 副本数量的减少必须导致每个 Pod 的内存使用量整体增加。
+> - 使用平台检查应用程序的内存行为，并确保在使用基于内存的自动扩缩之前，您的应用程序满足这些要求。
 
 ## 前提条件
 
 请确保当前集群已部署监控组件，并且它们工作正常。您可以通过单击平台右上角的 <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', verticalAlign: 'middle' }}><img src="./assets/question.png" alt="expand" style={{ verticalAlign: 'middle' }} /> <span>  > **平台健康状态**</span></span> 查看监控组件的部署和健康状态。
 
-## 操作步骤
+## 创建水平 Pod 自动扩缩器
+
+### 使用 CLI
+
+您可以通过定义 YAML 文件并使用 `kubectl create` 命令来创建水平 Pod 自动扩缩器。以下示例展示了对 Deployment 对象的自动扩缩。初始部署需要 3 个 Pod。HPA 对象将最小值增加到 5。如果 Pod 的 CPU 使用率达到 75%，Pod 数量将增加到 7：
+
+1. 创建一个名为 `hpa.yaml` 的 YAML 文件，内容如下：
+
+```yaml
+apiVersion: autoscaling/v2 # [!code callout]
+kind: HorizontalPodAutoscaler # [!code callout]
+metadata:
+  name: hpa-demo # [!code callout]
+  namespace: default
+spec:
+  maxReplicas: 7 # [!code callout]
+  minReplicas: 3 # [!code callout]
+  scaleTargetRef:
+    apiVersion: apps/v1 # [!code callout]
+    kind: Deployment # [!code callout]
+    name: deployment-demo # [!code callout]
+  targetCPUUtilizationPercentage: 75 # [!code callout]
+```
+
+<Callouts>
+  1. 使用 autoscaling/v2 API。
+  2. HPA 资源的名称。
+  3. 要扩缩的部署名称。
+  4. 最大扩展副本数。
+  5. 维持的最小副本数。
+  6. 指定要扩缩的对象的 API 版本。
+  7. 指定对象的类型。对象必须是 Deployment、ReplicaSet 或 StatefulSet。
+  8. HPA 适用的目标资源。
+  9. 触发扩缩的目标 CPU 利用率百分比。
+</Callouts>
+
+2. 应用 YAML 文件以创建 HPA：
+
+```bash
+$ kubectl create -f hpa.yaml
+```
+
+示例输出：
+
+```
+horizontalpodautoscaler.autoscaling/hpa-demo created
+```
+
+3. 创建 HPA 后，您可以通过运行以下命令查看部署的新状态：
+
+```bash
+$ kubectl get deployment deployment-demo
+```
+
+示例输出：
+
+```
+NAME              READY   UP-TO-DATE   AVAILABLE   AGE
+deployment-demo   5/5     5            5           3m
+```
+
+4. 您还可以检查 HPA 的状态：
+
+```bash
+$ kubectl get hpa hpa-demo
+```
+
+示例输出：
+
+```
+NAME         REFERENCE                  TARGETS    MINPODS   MAXPODS   REPLICAS   AGE
+hpa-demo   Deployment/deployment-demo   0%/75%     3         7         3          2m
+```
+
+### 使用 Web 控制台
 
 1. 进入 **容器平台**。
 
@@ -31,15 +142,203 @@ sourceSHA: 50a71ed4f4bd316160593a2371cdf2fb141654f99e6d8eab4191bfe1b0956b80
 
 6. 点击 **更新**。
 
-**说明**：
+### 使用自定义指标进行 HPA
 
-- 对于 **CPU 利用率** 和 **内存利用率** 指标，仅当实际值波动超出目标阈值的±10%时，才会触发自动伸缩。
+自定义指标 HPA 扩展了原始的水平 Pod 自动扩缩器，支持超出 CPU 和内存利用率的额外指标。
+
+#### 要求
+
+- kube-controller-manager: horizontal-pod-autoscaler-use-rest-clients=true
+- 预安装的 metrics-server
+- Prometheus
+- custom-metrics-api
+
+#### 传统（核心指标）HPA
+
+传统 HPA 支持 CPU 利用率和内存指标，以动态调整 Pod 实例的数量，如下例所示：
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: nginx-app-nginx
+  namespace: test-namespace
+spec:
+  maxReplicas: 1
+  minReplicas: 1
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: nginx-app-nginx
+  targetCPUUtilizationPercentage: 50
+```
+
+在此 YAML 中，`scaleTargetRef` 指定了用于扩缩的工作负载对象，`targetCPUUtilizationPercentage` 指定了 CPU 利用率触发指标。
+
+#### 自定义指标 HPA
+
+要使用自定义指标，您需要安装 prometheus-operator 和 custom-metrics-api。安装后，custom-metrics-api 提供大量自定义指标资源：
+
+```json
+{
+  "kind": "APIResourceList",
+  "apiVersion": "v1",
+  "groupVersion": "custom.metrics.k8s.io/v1beta1",
+  "resources": [
+    {
+      "name": "namespaces/go_memstats_heap_sys_bytes",
+      "singularName": "",
+      "namespaced": false,
+      "kind": "MetricValueList",
+      "verbs": ["get"]
+    },
+    {
+      "name": "jobs.batch/go_memstats_last_gc_time_seconds",
+      "singularName": "",
+      "namespaced": true,
+      "kind": "MetricValueList",
+      "verbs": ["get"]
+    },
+    {
+      "name": "pods/go_memstats_frees",
+      "singularName": "",
+      "namespaced": true,
+      "kind": "MetricValueList",
+      "verbs": ["get"]
+    }
+  ]
+}
+```
+
+这些资源都是 MetricValueList 下的子资源。您可以通过 Prometheus 创建规则来创建或维护子资源。自定义指标的 HPA YAML 格式与传统 HPA 不同：
+
+```yaml
+apiVersion: autoscaling/v2beta1
+kind: HorizontalPodAutoscaler
+metadata:
+  name: demo
+spec:
+  scaleTargetRef:
+    apiVersion: extensions/v1beta1
+    kind: Deployment
+    name: demo
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Pods
+      pods:
+        metricName: metric-demo
+        targetAverageValue: 10
+```
+
+在此示例中，`scaleTargetRef` 指定了工作负载。
+
+#### 触发条件定义
+
+- `metrics` 是数组类型，支持多个指标
+- `metric type` 可以是：Object（描述 k8s 资源）、Pods（描述每个 Pod 的指标）、Resources（内置 k8s 指标：CPU、内存）或 External（通常是集群外部的指标）
+- 如果 Prometheus 没有提供自定义指标，您需要通过创建规则等一系列操作来创建新的指标
+
+指标的主要结构如下：
+
+```json
+{
+      "describedObject": {  # 描述对象（Pod）
+        "kind": "Pod",
+        "namespace": "monitoring",
+        "name": "nginx-788f78d959-fd6n9",
+        "apiVersion": "/v1"
+      },
+      "metricName": "metric-demo",
+      "timestamp": "2020-02-5T04:26:01Z",
+      "value": "50"
+}
+```
+
+这些指标数据由 Prometheus 收集和更新。
+
+#### 自定义指标 HPA 兼容性
+
+自定义指标 HPA YAML 实际上与原始核心指标（CPU）兼容。以下是编写方式：
+
+```yaml
+apiVersion: autoscaling/v2beta1
+kind: HorizontalPodAutoscaler
+metadata:
+  name: nginx
+spec:
+  scaleTargetRef:
+    apiVersion: extensions/v1beta1
+    kind: Deployment
+    name: nginx
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        targetAverageUtilization: 80
+    - type: Resource
+      resource:
+        name: memory
+        targetAverageValue: 200Mi
+```
+
+- `targetAverageValue` 是每个 Pod 获得的平均值
+- `targetAverageUtilization` 是从直接值计算的利用率
+
+算法参考为：
+
+```
+replicas = ceil(sum(CurrentPodsCPUUtilization) / Target)
+```
+
+#### autoscaling/v2beta2 的更新
+
+autoscaling/v2beta2 支持内存利用率：
+
+```yaml
+apiVersion: autoscaling/v2beta2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: nginx
+  namespace: default
+spec:
+  minReplicas: 1
+  maxReplicas: 3
+  metrics:
+    - resource:
+        name: cpu
+        target:
+          averageUtilization: 70
+          type: Utilization
+      type: Resource
+    - resource:
+        name: memory
+        target:
+          averageUtilization:
+          type: Utilization
+      type: Resource
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: nginx
+```
+
+更改：`targetAverageUtilization` 和 `targetAverageValue` 已更改为 `target`，并转换为 `xxxValue` 和 `type` 的组合：
+
+- `xxxValue`：AverageValue（平均值）、AverageUtilization（平均利用率）、Value（直接值）
+- `type`：Utilization（利用率）、AverageValue（平均值）
+
+**注意**：
+
+- 对于 **CPU 利用率** 和 **内存利用率** 指标，只有当实际值波动超出目标阈值的±10%时，才会触发自动扩缩。
 
 - 缩容可能会影响正在进行的业务，请谨慎操作。
 
 ## 计算规则
 
-当业务指标发生变化时，平台将根据以下规则自动计算符合业务量的目标 Pod 数量，并进行相应调整。如果业务指标持续波动，Pod 数量将调整至设定的 **最小 Pod 数量** 或 **最大 Pod 数量**。
+当业务指标发生变化时，平台将根据以下规则自动计算符合业务量的目标 Pod 数量，并进行相应调整。如果业务指标持续波动，值将调整至设定的 **最小 Pod 数量** 或 **最大 Pod 数量**。
 
 - 单一策略目标 Pod 数量：ceil\[(sum(实际指标值)/指标阈值)]。即所有 Pod 实际指标值之和除以指标阈值，向上取整为最小大于或等于结果的整数。例如：如果当前有 3 个 Pod，CPU 利用率分别为 80%、80% 和 90%，设置的 CPU 利用率阈值为 60%。根据公式，Pod 数量将被自动调整为：ceil\[(80%+80%+90%)/60%] = ceil 4.1 = 5 个。
 
