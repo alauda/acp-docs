@@ -1,0 +1,156 @@
+---
+weight: 80
+i18n:
+  title:
+    en: Troubleshooting
+    zh: 故障排查
+sourceSHA: 5f23ef8a9e03040966c726d151ca2d57685f306f24c0d9242fa02104d46c033d
+title: 故障排查
+---
+
+# 故障排查
+
+### 我删除/损坏了我的仓库，无法删除我的应用？
+
+如果 Argo CD 无法生成清单，则无法删除应用。您需要：
+
+1. 恢复/修复您的仓库。
+2. 使用 `--cascade=false` 删除应用，然后手动删除资源。
+
+### 为什么我的应用在成功同步后仍然显示 `OutOfSync`？
+
+请参阅 [Diffing Documentation](https://argo-cd.readthedocs.io/en/stable/user-guide/diff-strategies/) 了解资源可能处于 OutOfSync 状态的原因，以及如何配置 Argo CD 忽略预期差异的字段。
+
+### 为什么我的应用卡在 `Progressing` 状态？
+
+Argo CD 为多个标准 Kubernetes 类型提供健康检查。`Ingress`、`StatefulSet` 和 `SealedSecret` 类型存在已知问题，可能导致健康检查返回 `Progressing` 状态而不是 `Healthy`。
+
+- 如果 `status.loadBalancer.ingress` 列表非空，并且至少有一个 `hostname` 或 `IP` 的值，则 `Ingress` 被视为健康。一些 ingress 控制器（如 contour、traefik）不会更新 `status.loadBalancer.ingress` 字段，这会导致 `Ingress` 永远卡在 `Progressing` 状态。
+
+- 如果 `status.updatedReplicas` 字段的值与 `spec.replicas` 字段匹配，则 `StatefulSet` 被视为健康。由于 Kubernetes 的 bug [kubernetes#68573](https://github.com/kubernetes/kubernetes/issues/68573)，`status.updatedReplicas` 未被填充。因此，除非您运行的 Kubernetes 版本包含修复 [kubernetes#67570](https://github.com/kubernetes/kubernetes/pull/67570)，否则 StatefulSet 可能会保持在 Progressing 状态。
+
+- 您的 `StatefulSet` 或 `DaemonSet` 使用的是 `OnDelete` 而不是 `RollingUpdate` 策略。
+
+- 有关 `SealedSecret` 的问题，请参见 [为什么类型为 `SealedSecret` 的资源卡在 `Progressing` 状态？](#sealedsecret)
+
+作为解决方法，Argo CD 允许提供 [健康检查](https://argo-cd.readthedocs.io/en/stable/operator-manual/health/) 自定义，以覆盖默认行为。
+
+如果您使用 Traefik 作为 Ingress，您可以更新 Traefik 配置，通过 [publishedservice](https://doc.traefik.io/traefik/providers/kubernetes-ingress/#publishedservice) 发布 loadBalancer IP，从而解决此问题。
+
+```yaml
+providers:
+  kubernetesIngress:
+    publishedService:
+      enabled: true
+```
+
+### 如何禁用管理员用户？
+
+在 `argocd-cm` ConfigMap 中添加 `admin.enabled: "false"`。
+
+### Argo CD 无法在没有互联网访问的情况下部署 Helm Chart 基于的应用，我该如何解决？
+
+如果 Helm Chart 的依赖项位于外部仓库，Argo CD 可能无法生成 Helm Chart 清单。要解决此问题，您需要确保 `requirements.yaml` 仅使用内部可用的 Helm 仓库。即使 Chart 仅使用来自内部仓库的依赖项，Helm 也可能决定刷新 `stable` 仓库。作为解决方法，在 `argocd-cm` 配置映射中覆盖 `stable` 仓库 URL：
+
+```yaml
+data:
+  repositories: |
+    - type: helm
+      url: http://<internal-helm-repo-host>:8080
+      name: stable
+```
+
+### 在使用 Argo CD 创建 Helm 应用后，我无法通过 helm ls 和其他 Helm 命令查看它？
+
+在部署 Helm 应用时，Argo CD 仅将 Helm 用作模板机制。它运行 `helm template`，然后将生成的清单部署到集群，而不是执行 `helm install`。这意味着您无法使用任何 Helm 命令查看/验证应用。它完全由 Argo CD 管理。请注意，Argo CD 原生支持一些您可能在 Helm 中缺失的功能（例如历史记录和回滚命令）。
+
+做出此决定是为了使 Argo CD 对所有清单生成器保持中立。
+
+### 我已配置集群密钥，但在 CLI/UI 中未显示，如何修复？
+
+检查集群密钥是否具有标签 `argocd.argoproj.io/secret-type: cluster`。如果密钥具有该标签但集群仍不可见，可能是权限问题。尝试使用 `admin` 用户列出集群（例如：`argocd login --username admin && argocd cluster list`）。
+
+检查集群密钥是否具有 `argocd.argoproj.io/secret-type: cluster` 标签。如果密钥具有该标签但集群仍不可见，则确保可能是权限问题。尝试使用 `admin` 用户列出集群（例如：`argocd login --username admin && argocd cluster list`）。
+
+### 为什么我的应用在同步后仍然显示 Out Of Sync？
+
+在某些情况下，您使用的工具可能会通过添加 `app.kubernetes.io/instance` 标签与 Argo CD 冲突。例如，使用 Kustomize 的公共标签功能。
+
+Argo CD 会自动设置 `app.kubernetes.io/instance` 标签，并使用它来确定哪些资源构成应用。如果工具也这样做，则会导致混淆。您可以通过在 `argocd-cm` 中设置 `application.instanceLabelKey` 值来更改此标签。我们建议您使用 `argocd.argoproj.io/instance`。
+
+:::info
+当您进行此更改时，您的应用将变为不同步，并需要重新同步。
+:::
+
+### Argo CD 多久检查一次我的 Git 或 Helm 仓库的更改？
+
+默认轮询间隔为 3 分钟（180 秒），并具有可配置的抖动。您可以通过更新 `argocd-cm` 配置映射中的 `timeout.reconciliation` 值和 `timeout.reconciliation.jitter` 来更改此设置。如果有任何 Git 更改，Argo CD 仅会更新启用了 `auto-sync` 设置的应用。如果您将其设置为 0，则 Argo CD 将停止自动轮询 Git 仓库，您只能使用其他方法（如 `webhooks` 和/或 `手动同步`）来创建应用。
+
+### 如何修复无效的 cookie，长度超过最大长度 4093？
+
+Argo CD 使用 JWT 作为身份验证令牌。您可能属于多个组，并且超过了为 cookie 设置的 4KB 限制。您可以通过打开“开发者工具 -> 网络”获取组的列表：
+
+1. 点击登录到 Argo CD 仪表板 [如何获取 Argo CD 访问信息](./how_to/argocd_info.mdx)
+2. 找到对 `<argocd_instance>/auth/callback?code=<random_string>` 的调用
+
+在 [jwt.io](https://jwt.io/) 解码令牌。这将提供您可以移除的团队列表。
+
+### 为什么在使用 CLI 时我会收到 rpc error: code = Unavailable desc = transport is closing？
+
+您可能在一个不支持 HTTP 2 的代理后面？尝试使用 `--grpc-web` 标志：
+
+```bash
+argocd ... --grpc-web
+```
+
+### 为什么类型为 SealedSecret 的资源卡在 Progressing 状态？<a id="sealedsecret" />
+
+`SealedSecret` 资源的控制器可能会在其提供的资源上公开状态条件。从 `v2.0.0` 版本开始，Argo CD 会获取该状态条件以推导 `SealedSecret` 的健康状态。
+
+在 `SealedSecret` 控制器的 `v0.15.0` 之前的版本受到此状态条件更新问题的影响，因此在这些版本中此功能默认禁用。可以通过使用 `--update-status` 命令行参数启动 `SealedSecret` 控制器或设置 `SEALED_SECRETS_UPDATE_STATUS` 环境变量来启用状态条件更新。
+
+要禁用 Argo CD 检查 `SealedSecret` 资源的状态条件，请通过 `resource.customizations.health.<group_kind>` 键在 `argocd-cm` ConfigMap 中添加以下资源自定义。
+
+:::yaml
+resource.customizations.health.bitnami.com\_SealedSecret: |
+hs = {}
+hs.status = "Healthy"
+hs.message = "Controller doesn't report resource status"
+return hs
+:::
+
+### 如何轮换 Redis 密钥？
+
+- 删除安装 Argo CD 的命名空间中的 `argocd-redis` 密钥。
+
+```bash
+kubectl delete secret argocd-redis -n <argocd namesapce>
+```
+
+- 如果您在 HA 模式下运行 Redis，请重启 HA 模式下的 Redis。
+
+```bash
+kubectl rollout restart deployment argocd-redis-ha-haproxy
+kubectl rollout restart statefulset argocd-redis-ha-server
+```
+
+- 如果您在非 HA 模式下运行 Redis，请重启 Redis。
+
+```bash
+kubectl rollout restart deployment argocd-redis
+```
+
+4. 重启其他组件。
+
+```bash
+kubectl rollout restart deployment argocd-server argocd-repo-server
+kubectl rollout restart statefulset argocd-application-controller
+```
+
+### 如何修复清单生成错误（缓存）？
+
+`Manifest generation error (cached)` 意味着在生成清单时发生了错误，并且错误消息已被缓存以避免重复重试。
+
+进行强制刷新（忽略缓存错误）可以克服瞬态问题。但是，如果清单生成失败的原因仍然存在，强制刷新将无济于事。
+
+相反，尝试在 repo-server 日志中搜索应用名称，以识别导致清单生成失败的错误。
