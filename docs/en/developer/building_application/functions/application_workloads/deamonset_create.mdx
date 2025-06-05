@@ -12,30 +12,102 @@ i18n:
 
 Refer to the official Kubernetes documentation: [DaemonSets](https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/)
 
-A **DaemonSet** is a Kubernetes controller object that ensures all (or a subset of) cluster nodes run exactly one replica of a specified Pod. Unlike Deployments, DaemonSets are node-centric rather than application-centric, making them ideal for cluster-wide infrastructure services. 
+A **DaemonSet** is a Kubernetes controller that ensures all (or a subset of) cluster nodes run exactly one replica of a specified Pod. Unlike Deployments, DaemonSets are node-centric rather than application-centric, making them ideal for deploying cluster-wide infrastructure services such as log collectors, monitoring agents, or storage daemons. 
 
 :::warning
 **DaemonSet Operational Notes**
 
 1. **Behavior Characteristics** 
-   - **Pod Distribution**  
+   - **Pod Distribution**: A DaemonSet deploys exactly one **Pod** replica per schedulable **Node** that matches its criteria:
       - Deploys exactly **one Pod replica per schedulable node** matching:
-         - `nodeSelector` criteria
-         - Not in `NotReady` state
-         - No `NoSchedule`/`NoExecute` taints (unless tolerations are configured)
-      - **Pod Count Formula**:  
-     `Number of Pods = Number of qualified nodes`
+         - Matches `nodeSelector` or `nodeAffinity` criteria (if specified).
+         - Is not in the `NotReady` state.
+         - Does not have `NoSchedule` or `NoExecute` **Taints** unless corresponding **Tolerations** are configured in the **Pod Template**.
+   - **Pod Count Formula**: The **number of Pods** managed by a DaemonSet **equals** the **number of qualified Nodes**.
 
-   - **Dual-Role Node Handling**  
-      - Nodes serving both control plane and worker roles will only run **one Pod instance** regardless of role labels.
+   - **Dual-Role Node Handling**: Nodes serving both **Control Plane** and **Worker Node** roles will only run one **Pod** instance of the DaemonSet, regardless of their role labels, provided they are schedulable.
 
-2. **Key Constraints**: ❌ Excluded Nodes
-   - Nodes with `Unschedulable: true` flag
-   - Nodes with `NotReady` status
-   - Nodes having incompatible taints without matching tolerations
+2. **Key Constraints** (Excluded Nodes)
+   - Nodes explicitly marked `Unschedulable: true` (e.g., via `kubectl cordon`).
+   - Nodes with a `NotReady` status.
+   - Nodes having incompatible **Taints** without matching Tolerations configured in the DaemonSet's **Pod Template**.
 :::
 
-## Prerequisites
+## Creating DaemonSets
+
+### Creating a DaemonSet by using CLI
+
+#### Prerequisites
+
+- Ensure you have `kubectl` configured and connected to your cluster.
+
+#### YAML file example
+```yaml
+# example-daemonSet.yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluentd-elasticsearch
+  namespace: kube-system
+  labels:
+    k8s-app: fluentd-logging
+spec:
+  selector: # defines how the DaemonSet identifies its managed Pods. Must match `template.metadata.label`s.
+    matchLabels:
+      name: fluentd-elasticsearch
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1 
+  template: # defines the Pod Template for the DaemonSet. Each Pod created by this DaemonSet will conform to this template
+    metadata:
+      labels:
+        name: fluentd-elasticsearch
+    spec:
+      tolerations: # these tolerations are to have the daemonset runnable on control plane nodes, remove them if your control plane nodes should not run pods
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      - key: node-role.kubernetes.io/master
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: fluentd-elasticsearch
+        image: quay.io/fluentd_elasticsearch/fluentd:v2.5.2
+        resources:
+          limits:
+            memory: 200Mi
+          requests:
+            cpu: 100m
+            memory: 200Mi
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log
+      # it may be desirable to set a high priority class to ensure that a DaemonSet Pod
+      # preempts running Pods
+      # priorityClassName: important
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+
+```
+
+#### Creating a DaemonSet via YAML
+
+```bash
+# Step 1: To create the DaemonSet defined in *example-daemonSet.yaml*, execute the following command
+kubectl apply -f example-daemonSet.yaml
+
+# Step 2: To verify the creation and status of your DaemonSet and its associated Pods:
+kubectl get daemonset fluentd-elasticsearch # View DaemonSet
+kubectl get pods -l name=fluentd-elasticsearch -o wide # Check Pods managed by this DaemonSet on specific nodes
+```
+
+### Creating a DaemonSet by using web console
+
+#### Prerequisites
 
 Obtain the image address. The source of the images can be from the image repository integrated by the platform administrator through the toolchain or from third-party platforms' image repositories.
 
@@ -43,48 +115,105 @@ Obtain the image address. The source of the images can be from the image reposit
 
 - If it is a third-party platform's image repository, ensure that images can be pulled directly from it in the current cluster.
 
-## Procedure
+#### Procedure - Configure Basic Info
 
 1. **Container Platform**, navigate to **Workloads** > **DaemonSets** in the left sidebar. 
 
-2. Click **Create DaemonSets**.
+2. Click **Create DaemonSet**.
 
 3. **Select** or **Input** an image, and click **Confirm**.
 
 :::info
-   **Note**: When using images from the image repository integrated into web console, you can filter images by **Already Integrated**. The **Integration Project Name**, for example, images (docker-registry-projectname), which includes the project name projectname in this web console and the project name containers in the image repository.
+**Note**: When using images from the image repository integrated into web console, you can filter images by **Already Integrated**. The **Integration Project Name**, for example, images (docker-registry-projectname), which includes the project name projectname in this web console and the project name containers in the image repository.
 :::
 
-### Configure Basic info
-
-In the **Basic Info** section, configure declarative parameters for Deployment workloads: 
+In the **Basic Info** section, configure declarative parameters for DaemonSet workloads:
 
    | **Parameters** | **Description** |
    |:--------------------------|:--------------------------|
-   | **More** > **Update Strategy** | Configures the `rollingUpdate` strategy for zero-downtime deployments: <br/>  **Max surge** (`maxSurge`):  <ul><li>Maximum number of Pods that can exceed the desired replica count during an update. </li><li> Accepts absolute values (e.g., `2`) or percentages (e.g., `20%`). </li><li> Percentage calculation: `ceil(current_replicas × percentage)`. </li><li>Example: 4.1 → `5` when calculated from 10 replicas. </li></ul> **Max unavailable** (`maxUnavailable`): <ul><li> Maximum number of Pods that can be temporarily unavailable during an update.  </li><li>Percentage values cannot exceed `100%`.  </li><li>Percentage calculation: `floor(current_replicas × percentage)`.   </li><li> Example: 4.9 → `4` when calculated from 10 replicas.  </li></ul> **Notes**: <br/> 1. **Default values**: `maxSurge=1`, `maxUnavailable=1` if not explicitly set.  <br/> 2. **Non-running Pods** (e.g., in `Pending`/`CrashLoopBackOff` states) are considered unavailable.  <br/> 3. **Simultaneous constraints**: <ul><li> `maxSurge` and `maxUnavailable` cannot both be `0` or `0%`. </li><li>If percentage values resolve to `0` for both parameters, Kubernetes forces `maxUnavailable=1` to ensure update progress.  </li></ul> **Example**: <br/> For a Deployment with 10 replicas: <br/><ul><li> `maxSurge=2` → Total Pods during update: `10 + 2 = 12`. </li><li>`maxUnavailable=3` → Minimum available Pods: `10 - 3 = 7`. </li><li> This ensures availability while allowing controlled rollout. </li></ul> |
+   | **More** > **Update Strategy** | Configures the `rollingUpdate` strategy for zero-downtime updates of DaemonSet Pods. <br/>  **Max unavailable** (`maxUnavailable`): The maximum number of Pods that can be temporarily unavailable during an update. Accepts absolute values (e.g., 1) or percentages (e.g., 10%). <br/>**Example**: If there are 10 nodes and maxUnavailable is 10%, then floor(10 * 0.1) = 1 Pod can be unavailable. <br/><br/>**Notes:** <ul><li> **Default Values**: If not explicitly set, `maxSurge` defaults to 0 and `maxUnavailable` defaults to 1 (or 10% if `maxUnavailable` is specified as a percentage).  </li><li> **Non-running Pods**: Pods in states like `Pending` or `CrashLoopBackOff` are considered unavailable.  </li><li> **Simultaneous Constraints**: `maxSurge` and `maxUnavailable` cannot both be 0 or 0%. If percentage values resolve to 0 for both parameters, Kubernetes forces `maxUnavailable=1` to ensure update progress.  </li></ul> |
 
-### Configure Pod
+#### Procedure - Configure Pod
 
-In the **Pod** section, please refer to [Deployment - Configure Pod](./deployment_create.mdx#configurepod)
+**Pod** section, please refer to [Deployment - Configure Pod](./deployment_create.mdx#configurepod)
 
-### Configure Containers
+#### Procedure - Configure Containers
 
-In the **Container** section, please refer to [Deployment - Configure Containers](./deployment_create.mdx#configurecontainers)
+**Containers** section, please refer to [Deployment - Configure Containers](./deployment_create.mdx#configurecontainers)
 
-### Create
+#### Procedure - Create
 
 Click **Create**.
-After clicking **Create**, the DaemonSet will: 
 
-✅ Automatically deploy Pod replicas to all **eligible nodes** meeting:  
-   - `nodeSelector` criteria (if defined)  
-   - `tolerations` configuration  
-   - Node in `Ready` state & `Schedulable: true`
+After clicking **Create**, the DaemonSet will:
 
-❌ **Excluded Nodes**:  
-   - Nodes with `NoSchedule` taint (unless tolerated)  
-   - Manually cordoned nodes (`kubectl cordon`)  
-   - Nodes in `NotReady`/`Unschedulable` state
+- ✅ Automatically deploy Pod replicas to all eligible Nodes meeting:
 
+   - `nodeSelector` criteria (if defined).
+   - `tolerations` configuration (allowing scheduling on tainted nodes).
+   - Node is in `Ready` state and `Schedulable: true`.
 
+- ❌ Excluded Nodes:
+
+   - Nodes with a `NoSchedule` taint (unless explicitly tolerated).
+   - Manually cordoned Nodes (`kubectl cordon`).
+   - Nodes in `NotReady` or `Unschedulable` states.
+
+## Managing DaemonSets
+
+### Managing a DaemonSet by using CLI
+
+#### Viewing a DaemonSet
+
+- To get a summary of all DaemonSets in a namespace.
+```bash
+kubectl get daemonsets -n <namespace>
+```
+- To get detailed information about a specific DaemonSet, including its events and Pod status
+```bash
+kubectl describe daemonset <daemonset-name>
+```
+#### Updating a DaemonSet
+
+When you modify the **Pod Template** of a DaemonSet (e.g., changing the container image or adding a volume mount), Kubernetes automatically performs a rolling update by default (if `updateStrategy.type` is `RollingUpdate`, which is the default).
+
+- First, edit the YAML file (e.g., `example-daemonset.yaml`) with the desired changes, then apply it:
+
+```bash
+kubectl apply -f example-daemonset.yaml
+```
+
+- You can monitor the progress of the rolling update:
+
+```bash
+kubectl rollout status daemonset/<daemonset-name>
+```
+
+#### Deleting a DaemonSet
+
+To delete a DaemonSet and all the Pods it manages:
+
+```bash
+kubectl delete daemonset <daemonset-name>
+```
+
+### Managing a DaemonSet by using web console
+
+#### Viewing a DaemonSet
+
+1. **Container Platform**, and navigate to **Workloads** > **DaemonSets**.
+2. Locate the DaemonSet you wish to view.
+3. Click the DaemonSet name to see the **Details**, **Topology**, **Logs**, **Events**, **Monitoring**, etc.
+
+#### Updating a DaemonSet
+
+1. **Container Platform**, and navigate to **Workloads** > **DaemonSets**.
+2. Locate the DaemonSet you wish to update.
+3. In the **Actions** drop-down menu, select **Update** to view the Edit DaemonSet page, you can update `Replicas`, `image`, `updateStrategy`, etc.
+
+#### Deleting a DaemonSet
+
+1. **Container Platform**, and navigate to **Workloads** > **DaemonSets**.
+2. Locate the DaemonSet you wish to delete.
+3. In the **Actions** drop-down menu, Click the **Delete** button in the operations column and confirm.
 
