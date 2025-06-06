@@ -1,0 +1,150 @@
+---
+weight: 30
+sourceSHA: 0501ce7fe65c53dbd49863e7f35e77e97dc1f361463a206ea135ff5b35ea4830
+---
+
+# 升级全局集群
+
+<Term name="productShort" /> 包含一个 **全局集群** 和一个或多个 **业务集群**。
+全局集群 **必须** 在任何业务集群之前进行升级。
+
+本文档将指导您完成全局集群的升级操作步骤。
+
+如果全局集群配置了 **全局 DR（灾难恢复）** 解决方案，请严格遵循 [全局 DR 操作步骤](#global_dr)。否则，请遵循 [标准操作步骤](#standard)。
+
+## 标准操作步骤 \{#standard}
+
+<Steps>
+  ### 上传镜像
+
+  将升级包复制到 **全局集群的任意控制平面节点**。解压包并 `cd` 进入解压后的目录。
+
+  - 如果全局集群使用 **内置注册中心**，请运行：
+
+    ```bash
+    bash upgrade.sh --only-sync-image=true
+    ```
+
+  - 如果全局集群使用 **外部注册中心**，您还需要提供注册中心地址：
+
+    ```bash
+    bash upgrade.sh --only-sync-image=true --registry <registry-address> --username <username> --password <password>
+    ```
+
+  <Directive type="info" title="信息">
+    上传镜像通常需要大约 2 小时，具体取决于您的网络和磁盘性能。
+    如果您的平台使用全局 DR，请记住 **备用全局集群也需要上传镜像**，并相应地规划维护窗口。
+  </Directive>
+
+  ### 触发升级
+
+  在镜像上传完成后，运行以下命令以启动升级过程：
+
+  ```bash
+  bash upgrade.sh --skip-sync-image
+  ```
+
+  等待脚本完成后再继续。
+
+  ### 升级全局集群
+
+  1. 登录全局集群的 Web 控制台并切换到 **管理员** 视图。
+  2. 导航到 **集群 > 集群**。
+  3. 点击 `global` 集群以打开其详细视图。
+  4. 转到 **功能组件** 标签。
+  5. 点击 **升级** 按钮。
+
+  查看对话框中显示的可用组件更新，并确认继续。
+
+  <Directive type="info" title="信息">
+    升级 Kubernetes 版本是可选的。
+    但是，由于可能会发生服务中断，我们建议包括 Kubernetes 升级，以避免多个维护窗口。
+  </Directive>
+</Steps>
+
+## 全局 DR 操作步骤 \{#global\_dr}
+
+<Steps>
+  ### 比较数据一致性
+
+  1. 按照您常规的全局 DR 检查程序，确保 **备用全局集群** 中的数据与 **主全局集群** 一致。如果发现不一致，请 **联系技术支持** 后再继续。
+  2. 在 **两个** 集群上，运行以下命令以确保没有 `Machine` 节点处于非运行状态：
+
+  ```bash
+  kubectl get machines.platform.tkestack.io
+  ```
+
+  如果存在这样的节点，请联系技术支持以解决问题后再继续。
+
+  ### 卸载 etcd 同步插件
+
+  <Tabs>
+    <Tab label="从 3.18 升级">
+      1. 通过其 IP 或 VIP 访问 **备用全局集群** 的 Web 控制台。
+      2. 切换到 **平台管理** 视图。
+      3. 导航到 **目录 > 集群插件**。
+      4. 从集群下拉菜单中选择 `global`。
+      5. 找到 **EtcdSync** 插件并点击 **卸载**。等待卸载完成。
+    </Tab>
+
+    <Tab label="从 3.16 升级">
+      登录 **主全局集群** 的任意 **控制平面节点**，然后运行：
+
+      ```bash
+      helm3 del etcd-sync -n default 2> /dev/null
+      helm3 del etcd-sync -n cpaas-system 2> /dev/null
+
+      kubectl delete configmaps,secret -n kube-system   etcd-master-mirror-cert etcd-slave-mirror-cert etcd-sync-env   etcd-sync-ignore-text &> /dev/null
+
+      kubectl delete deploy -n kube-system etcd-mirror-etcd-mirror &> /dev/null
+
+      kubectl get pod -n kube-system | grep etcd-mirror  # 确保没有   etcd-mirror pods 剩余
+      ```
+    </Tab>
+  </Tabs>
+
+  ### 升级备用全局集群
+
+  按照 [标准操作步骤](#standard) 中描述的相同程序先升级 **备用全局集群**。
+
+  ### 升级主全局集群
+
+  在备用集群升级后，按照相同的 [标准操作步骤](#standard) 升级 **主全局集群**。
+
+  ### 重新安装 etcd 同步插件
+
+  在重新安装之前，确保端口 `2379` 从两个全局集群 VIP 正确转发到它们的控制平面节点。
+
+  重新安装步骤：
+
+  1. 通过其 IP 或 VIP 访问 **备用全局集群** 的 Web 控制台。
+  2. 切换到 **管理员** 视图。
+  3. 转到 **市场 > 集群插件**。
+  4. 选择 `global` 集群。
+  5. 找到 **Alauda Container Platform etcd Synchronizer**，点击 **安装**，并提供所需的参数。
+
+  验证安装：
+
+  ```bash
+  kubectl get po -n cpaas-system -l app=etcd-sync  # 确保 pod 状态为 1/1 Running
+
+  kubectl logs -n cpaas-system $(kubectl get po -n cpaas-system -l app=etcd-sync --no-headers | awk '{print $1}' | head -1) | grep -i "Start Sync update"
+  # 等待日志中包含 "Start Sync update"
+
+  # 重新创建 pod 以触发与 ownerReferences 的资源同步
+  kubectl delete po -n cpaas-system $(kubectl get po -n cpaas-system -l app=etcd-sync --no-headers | awk '{print $1}' | head -1)
+  ```
+
+  ### 检查同步状态
+
+  运行以下命令以验证同步状态：
+
+  ```bash
+  curl "$(kubectl get svc -n cpaas-system etcd-sync-monitor -ojsonpath='{.spec.clusterIP}')/check"
+  ```
+
+  **输出说明：**
+
+  - `"LOCAL ETCD missed keys:"` – 键存在于 **主集群** 中，但在备用集群中缺失。这通常在 pod 重启后解决。
+  - `"LOCAL ETCD surplus keys:"` – 键存在于 **备用集群** 中，但在主集群中缺失。在删除之前请与您的运维团队审查这些键。
+</Steps>
