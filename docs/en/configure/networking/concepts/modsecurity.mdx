@@ -1,0 +1,163 @@
+---
+weight: 10
+sourceSHA: 94d0b86b6c433c1d3c18b471e28bc9d50c08c9fae33c162c7ae90573eda00f04
+---
+
+# ModSecurity
+
+ModSecurity is an open-source Web Application Firewall (WAF) designed to protect web applications from malicious attacks. It is maintained by the open-source community and supports various programming languages and web servers. The platform Load Balancer (ALB) supports configuring ModSecurity, allowing for individual configurations at the Ingress level.
+
+## Terminology
+
+| Term                 | Explanation                                                                                                  |
+| -------------------- | ------------------------------------------------------------------------------------------------------------ |
+| **owasp-core-rules** | The OWASP Core Rule Set is an open-source ruleset used to detect and prevent common web application attacks. |
+
+## Procedure to Operate
+
+Configure ModSecurity by adding annotations to the corresponding resource's YAML file or by configuring CR.
+
+### Method One: Add Annotations
+
+Add the following annotations to the metadata.annotations field of the corresponding YAML file to configure ModSecurity.
+
+- **Ingress-Nginx Compatible Annotations**
+
+  | Annotation                                                 | Type   | Applicable Object      | Explanation                                                                                      |
+  | ---------------------------------------------------------- | ------ | ---------------------- | ------------------------------------------------------------------------------------------------ |
+  | **nginx.ingress.kubernetes.io/enable-modsecurity**         | bool   | Ingress                | Enable ModSecurity.                                                                              |
+  | **nginx.ingress.kubernetes.io/enable-owasp-core-rules**    | bool   | Ingress                | Enable the OWASP Core Rule Set.                                                                  |
+  | **nginx.ingress.kubernetes.io/modsecurity-transaction-id** | string | Ingress                | Used to identify unique transaction IDs for each request, aiding in logging and debugging.       |
+  | **nginx.ingress.kubernetes.io/modsecurity-snippet**        | string | Ingress, ALB, FT, Rule | Allows users to insert custom ModSecurity configurations to meet specific security requirements. |
+
+- **ALB Special Annotations**
+
+  | Annotation                                 | Type   | Applicable Object | Explanation                                                                                                                                                |
+  | ------------------------------------------ | ------ | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+  | **alb.modsecurity.cpaas.io/use-recommend** | bool   | Ingress           | Enable or disable recommended ModSecurity rules; set to `true` to apply a predefined set of security rules.                                                |
+  | **alb.modsecurity.cpaas.io/cmref**         | string | Ingress           | Reference specific configurations, e.g., custom security configurations can be loaded by specifying the ConfigMap's reference path (`$ns/$name#$section`). |
+
+### Method Two: Configure CR
+
+1. Open the ALB, FT, or Rule configuration file that needs to be configured.
+
+2. Add the following fields under spec.config as required.
+
+   ```yaml
+   { "modsecurity": {
+         "enable": true, # Enable or disable ModSecurity
+         "transactionId": "$xx", # Use ID from Nginx
+         "useCoreRules": true, # Add modsecurity_rules_file /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+         "useRecommend": true, # Add modsecurity_rules_file /etc/nginx/modsecurity/modsecurity.conf
+         "cmRef": "$ns/$name#$section", # Add configuration from ConfigMap
+       } }
+   ```
+
+3. Save and apply the configuration file.
+
+## Related Explanations
+
+### Override
+
+If ModSecurity is not configured in the Rule, it will attempt to find the configuration in FT; if there is no configuration in FT, it will use the configuration from ALB.
+
+## Configuration Example
+
+The following example deploys an ALB named `waf-alb` and a demo backend application named `hello`. Additionally, an Ingress named `ing-waf-enable` is deployed, which defines the `/waf-enable` route and configures ModSecurity rules. Any request containing the query parameter `test`, where the value includes the string `test`, will be blocked.
+
+```yaml
+cat <<EOF | kubectl apply -f -
+apiVersion: crd.alauda.io/v2
+kind: ALB2
+metadata:
+  name: waf-alb
+  namespace: cpaas-system
+spec:
+  config:
+    loadbalancerName: waf-alb
+    projects:
+      - ALL_ALL
+    replicas: 1
+  type: nginx
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      SecRuleEngine On
+      SecRule ARGS:test "@contains test" "id:1234,deny,log"
+  name: ing-waf-enable
+spec:
+  ingressClassName: waf-alb
+  rules:
+    - http:
+        paths:
+          - backend:
+              service:
+                name: hello
+                port:
+                  number: 80
+            path: /waf-enable
+            pathType: ImplementationSpecific
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ing-waf-normal
+spec:
+  ingressClassName: waf-alb
+  rules:
+    - http:
+        paths:
+          - backend:
+              service:
+                name: hello
+                port:
+                  number: 80
+            path: /waf-not-enable
+            pathType: ImplementationSpecific
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      service.cpaas.io/name: hello
+      service_name: hello
+  template:
+    metadata:
+      labels:
+        service.cpaas.io/name: hello
+        service_name: hello
+    spec:
+      containers:
+        - name: hello-world
+          image: docker.io/hashicorp/http-echo
+          imagePullPolicy: IfNotPresent
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello
+spec:
+  internalTrafficPolicy: Cluster
+  ipFamilies:
+    - IPv4
+  ipFamilyPolicy: SingleStack
+  ports:
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: 5678
+  selector:
+    service_name: hello
+  sessionAffinity: None
+  type: ClusterIP
+EOF
+```
