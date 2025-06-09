@@ -1,12 +1,13 @@
 /// <reference types="react/experimental" />
 
 import { useLang } from '@alauda/doom/runtime'
-import { useI18n } from '@rspress/core/runtime'
+import { isProduction, useI18n } from '@rspress/core/runtime'
 import { startTransition, useCallback, useRef, useState } from 'react'
 import { Tooltip } from 'react-tooltip'
 
-import { AIAssistant } from './AIAssistant/index.js'
+import { AIAssistant } from './AIAssistant'
 import AssistantIcon from './assistant.svg?react'
+import { CloudAuthProvider } from './context'
 import classes from './styles.module.scss'
 
 const getViewTransitionHackStyle = () =>
@@ -33,9 +34,13 @@ const removeClipViewTransition = () => {
   }
 }
 
-export const Intelligence = () => {
-  const lang = useLang()
+const ALLOWED_DOMAINS = new Set(['docs.alauda.cn'])
 
+if (!isProduction()) {
+  ALLOWED_DOMAINS.add('localhost')
+}
+
+const Intelligence_ = () => {
   const t = useI18n<typeof import('@docs/i18n.json')>()
 
   const [open, setOpen] = useState(false)
@@ -50,12 +55,8 @@ export const Intelligence = () => {
     })
   }, [])
 
-  if (lang !== 'en') {
-    return
-  }
-
   return (
-    <>
+    <CloudAuthProvider>
       {open ? (
         <AIAssistant
           onOpenChange={toggleOpen}
@@ -69,8 +70,22 @@ export const Intelligence = () => {
       <Tooltip anchorSelect={`.${classes.entry}`} place="left">
         {t('ai_assistant')}
       </Tooltip>
-    </>
+    </CloudAuthProvider>
   )
+}
+
+const Intelligence = () => {
+  const lang = useLang()
+
+  if (
+    lang !== 'en' ||
+    typeof location === 'undefined' ||
+    !ALLOWED_DOMAINS.has(location.hostname)
+  ) {
+    return
+  }
+
+  return <Intelligence_ />
 }
 
 export default Intelligence
