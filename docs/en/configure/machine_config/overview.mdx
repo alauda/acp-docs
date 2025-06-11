@@ -1,0 +1,146 @@
+---
+weight: 10
+title: Overview
+---
+
+# Overview
+
+## How Machine Configuration Works
+
+Machine Configuration handles file updates, systemd unit management, and SSH public key deployment across cluster nodes. The system provides a MachineConfig Custom Resource Definition (CRD) for writing configuration files to hosts, and a MachineConfigPool CRD for organizing nodes into configuration groups.
+
+Each MachineConfigPool governs a set of nodes and their associated MachineConfigs. Node roles determine MachineConfigPool membership—pools manage nodes based on their role labels.
+
+During cluster installation, the system automatically creates two MachineConfigPools (master and worker) along with two empty MachineConfigs (00-master and 00-worker). The master pool manages the 00-master configuration, while the worker pool manages the 00-worker configuration.
+
+You can create custom MachineConfigPools for worker nodes that require specialized configurations. Master nodes cannot use custom pools.
+
+Custom MachineConfigPools inherit all configurations from the worker pool and add their own specific settings. Any changes to the worker pool automatically propagate to custom pools. Machine Configuration does not support custom pools that don't inherit from the worker pool.
+
+The cluster includes a default MachineConfiguration CR named "cluster" for setting global node update policies. See the Node Disruption Policy documentation for details.
+
+Sometimes node configurations drift from their intended state. The machine-config-daemon continuously monitors for configuration drift and marks affected nodes as Degraded until an administrator resolves the issue. Degraded nodes remain operational but cannot receive updates.
+
+## Key Concepts
+
+**Configuration Processing**
+MachineConfigs are processed alphabetically. The first configuration serves as the base, with subsequent configs layered on top. Each MachineConfigPool renders its managed configs into a single MachineConfig named: `render-<pool-name>-<content-hash>`, which gets applied to all nodes in that pool.
+
+**Update Strategy**
+Machine Configuration updates nodes by age, starting with the oldest. The `maxUnavailable` field in each MachineConfigPool controls how many nodes update simultaneously.
+
+**Scope of Management**
+Machine Configuration only manages explicitly configured items. Manual system changes remain untouched by the Machine Configuration Operator.
+
+**Configuration Format**
+All MachineConfigs use the Ignition v3.4.0 specification format.
+
+**Drift Detection**
+When Machine Configuration-managed files change outside the system, machine-config-daemon marks the node as Degraded but doesn't overwrite the modified files.
+
+**Pool Benefits**
+MachineConfigPools ensure that new nodes automatically receive the correct configuration when they join the cluster.
+
+**Supported Modifications**
+- Regular files (in writable, non-root directories)
+- systemd units and their configurations
+- SSH public keys for the boot user only
+
+Machine Configuration doesn't create users or groups. You must create the boot user and group before configuring SSH keys.
+
+**Important**: Avoid manual node modifications—they can cause configuration conflicts.
+
+## Configuration Types
+
+**Files**
+Create or modify file content and permissions. Files can only be managed if their containing partition is writable.
+
+**Systemd Units**
+Define new systemd services or extend existing ones with additional configuration.
+
+**SSH Public Keys**
+Configure SSH access for the boot user. Keys for other users are rejected as invalid.
+
+## Node Update Process
+
+When you apply a MachineConfig, Machine Configuration ensures all affected nodes reach the desired state. The Machine Configuration Operator generates a new rendered configuration and machine-config-daemon executes these steps on each node:
+
+1. **Cordon** - Mark node unschedulable for new workloads
+2. **Drain** - Terminate existing workloads and reschedule them elsewhere
+3. **Apply** - Write the new configuration to disk
+4. **Reboot** - Restart the node to activate changes
+5. **Uncordon** - Mark node schedulable again
+
+## Checking MachineConfigPool Status
+
+Check pool status with:
+
+```bash
+kubectl get machineconfigpool
+```
+
+Example output:
+```
+NAME     CONFIG                    UPDATED  UPDATING  DEGRADED  MACHINECOUNT  READYMACHINECOUNT  UPDATEDMACHINECOUNT  DEGRADEDMACHINECOUNT  AGE
+master   rendered-master-06c9c4    True     False     False     3             3                  3                    0                     4h42m
+worker   rendered-worker-f4b64     False    True      False     3             2                  2                    0                     4h42m
+```
+
+**Field Reference:**
+- **NAME**: Pool identifier
+- **CONFIG**: Most recently applied configuration across all pool nodes
+- **UPDATED**: `True` when all nodes have the current config; `False` during updates
+- **UPDATING**: `True` when at least one node is updating; `False` when all are current
+- **DEGRADED**: `True` when config cannot be applied to at least one node
+- **MACHINECOUNT**: Total nodes in the pool
+- **READYMACHINECOUNT**: Nodes with current config in healthy, schedulable state
+- **UPDATEDMACHINECOUNT**: Nodes that have applied the current config
+- **DEGRADEDMACHINECOUNT**: Nodes marked as degraded or unreconcilable
+
+In this example, all three master nodes are current, while the worker pool is updating—two nodes are complete and one is in progress.
+
+Get detailed pool information:
+```bash
+kubectl describe machineconfigpool worker
+```
+
+View all MachineConfigs:
+```bash
+kubectl get machineconfig
+```
+
+Example output:
+```
+NAME                    IGNITIONVERSION  AGE
+00-master               3.4.0            3h2m
+00-worker               3.4.0            3h2m
+rendered-master-ccb     3.4.0            1h12m
+rendered-worker-bad     3.4.0            1h20m
+```
+
+Examine specific configurations:
+```bash
+kubectl describe machineconfig 00-master
+```
+
+Check individual node status:
+```bash
+kubectl get node -o custom-columns=NODE:.metadata.name,DESIRED:.metadata.annotations."machineconfiguration\.alauda\.io/desiredConfig",CURRENT:.metadata.annotations."machineconfiguration\.alauda\.io/currentConfig",STATE:.metadata.annotations."machineconfiguration\.alauda\.io/state"
+```
+
+Example output:
+```
+NODE              DESIRED                                    CURRENT                                    STATE
+192.168.132.216   rendered-master-98db9ca4f4b4cd             rendered-master-98db9ca4f4b4cd             Degraded
+192.168.135.83    rendered-worker-05f27341ba49cf86dc4b      rendered-master-e08d9cab50e383             Working
+192.168.134.99    rendered-worker-05f27341ba49cf86dc4b      rendered-worker-05f27341ba49cf86dc4b      Done
+```
+
+**Node State Reference:**
+- **NODE**: Node identifier
+- **DESIRED**: Target configuration for the node
+- **CURRENT**: Currently applied configuration
+- **STATE**: Configuration status
+  - `Done`: Node healthy with matching desired and current configs
+  - `Working`: Node updating (current ≠ desired)
+  - `Degraded`: Configuration drift detected or application failed—check logs for root cause
