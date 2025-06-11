@@ -1,0 +1,149 @@
+---
+weight: 20
+title: Managing Node Configuration with MachineConfig
+---
+
+# Managing Node Configuration with MachineConfig
+
+You can use the tasks described in this section to create `MachineConfig` objects that modify files, systemd units, and SSH public keys on nodes, as well as to recover nodes that have experienced configuration drift.
+
+`MachineConfig` supports Ignition specification version 3.4. All `MachineConfig` objects must be created in compliance with this version.
+
+In certain situations, the configuration on a node may not fully match the configuration currently applied through the `MachineConfig`. This condition is referred to as configuration drift. The machine configuration daemon periodically verifies whether a node’s configuration has drifted. If drift is detected, the node is marked as `Degraded` and remains in that state until an administrator restores the expected configuration.
+
+The following examples demonstrate how to use `MachineConfig` objects to manage node configurations.
+
+---
+
+## Configuring the Chrony Time Service
+
+To configure the Chrony time synchronization service (`chronyd`) and specify the NTP servers and related settings, you can update the `chrony.conf` file on the target nodes via a `MachineConfig` object.
+
+1. First, create a temporary file that contains the desired Chrony configuration:
+
+```text
+chrony.conf
+server 0.centos.pool.ntp.org iburst
+server 1.centos.pool.ntp.org iburst
+makestep 1.0 3
+rtcsync
+logdir /var/log/chrony
+```
+
+2. Then, base64-encode the contents of the file:
+
+```bash
+$ base64 -w0 chrony.conf
+```
+
+3. Create a `MachineConfig` object named `99-worker-chrony`. In the `.spec.config.storage.files[0].contents.source` field, insert the base64-encoded string in the format `data:text/plain;base64,<encoded-content>`:
+
+```yaml
+apiVersion: machineconfiguration.alauda.io/v1alpha1
+kind: MachineConfig
+metadata:
+  name: 99-worker-chrony
+  labels:
+    machineconfiguration.alauda.io/role: worker
+spec:
+  config:
+    ignition:
+      version: 3.4.0
+    storage:
+      files:
+        - path: /etc/chrony.conf
+          mode: 0644
+          contents:
+            source: "data:text/plain;base64,c2VydmVyIDAuY2VudG9zLnBvb2wubnRwLm9yZyBpYnVyc3QKc2VydmVyIDEuY2VudG9zLnBvb2wubnRwLm9yZyBpYnVyc3QKbWFrZXN0ZXAgMS4wIDMKcnRjc3luYwpsb2dkaXIgL3Zhci9sb2cvY2hyb255Cg=="
+```
+
+This configuration creates a `MachineConfig` object that applies a customized `chrony.conf` file to nodes associated with the `worker` machine configuration pool. The file will be written to `/etc/chrony.conf` on each node, with file permissions set to `0644`.
+
+---
+
+## Disabling the Chrony Time Service
+
+To disable the Chrony time synchronization service on nodes with a specific role, you can create a `MachineConfig` object that overrides the systemd unit definition and disables the service.
+
+Example configuration:
+
+```yaml
+apiVersion: machineconfiguration.alauda.io/v1alpha1
+kind: MachineConfig
+metadata:
+  name: 99-worker-disable-chrony
+  labels:
+    machineconfiguration.alauda.io/role: worker
+spec:
+  config:
+    ignition:
+      version: 3.4.0
+    systemd:
+      units:
+        - name: chronyd.service
+          enabled: false
+          contents: |
+            [Unit]
+            Description=NTP client/server
+            Documentation=man:chronyd(8) man:chrony.conf(5)
+            After=ntpdate.service sntp.service ntpd.service
+            Conflicts=ntpd.service systemd-timesyncd.service
+            ConditionCapability=CAP_SYS_TIME
+
+            [Service]
+            Type=forking
+            PIDFile=/run/chrony/chronyd.pid
+            EnvironmentFile=-/etc/sysconfig/chronyd
+            ExecStart=/usr/sbin/chronyd $OPTIONS
+            ExecStartPost=/usr/libexec/chrony-helper update-daemon
+            PrivateTmp=yes
+            ProtectHome=yes
+            ProtectSystem=full
+
+            [Install]
+            WantedBy=multi-user.target
+```
+
+This configuration pushes a custom version of the `chronyd.service` unit file to the nodes in the `worker` machine configuration pool. The service is explicitly disabled. Once the configuration is applied and the nodes are rebooted, the Chrony service will no longer start automatically.
+
+---
+
+## Configuring the SSH Public Key for the `boot` User
+
+The machine configuration system allows you to configure an SSH public key for the `boot` user on managed nodes. Configuration for other user accounts is not supported. Note that machine configuration will not create users or groups automatically—you must ensure that the `boot` user and group exist on the node before applying the configuration.
+
+Example configuration:
+
+```yaml
+apiVersion: machineconfiguration.alauda.io/v1alpha1
+kind: MachineConfig
+metadata:
+  name: 99-worker-ssh
+  labels:
+    machineconfiguration.alauda.io/role: worker
+spec:
+  config:
+    ignition:
+      version: 3.4.0
+    passwd:
+      users:
+        - user: boot
+          sshAuthorizedKeys:
+            - ssh-rsa <ssh-public-key>
+```
+
+This `MachineConfig` will install the specified SSH key in the `/home/boot/.ssh/authorized_keys` file on nodes in the `worker` machine configuration pool.
+
+---
+
+## Recovering from Configuration Drift
+
+If a node's configuration diverges from its assigned `MachineConfig`, it will be marked as `Degraded`. In this state, the node continues to operate but cannot receive further configuration updates until the issue is resolved.
+
+There are two ways to restore a node from this degraded state:
+
+1. **Manually revert the configuration**
+   You can manually adjust the files and permissions on the node to exactly match those specified in the assigned `MachineConfig`. The system will detect the correction and clear the degraded status.
+
+2. **Force the configuration to be reapplied**
+   Create an empty file at `/run/machine-config-daemon-force` on the affected node. The machine configuration daemon will detect this trigger, reapply the current `MachineConfig`, delete the trigger file, and reboot the node. After rebooting, the node will transition from `Degraded` back to `Done`.
