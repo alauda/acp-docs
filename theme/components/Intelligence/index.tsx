@@ -6,7 +6,7 @@ import { startTransition, useCallback, useRef, useState } from 'react'
 import { Tooltip } from 'react-tooltip'
 
 import { AIAssistant } from './AIAssistant'
-import AssistantIcon from './assistant.svg?react'
+import assistantIcon from './assistant.svg'
 import { CloudAuthProvider } from './context'
 import classes from './styles.module.scss'
 
@@ -51,20 +51,20 @@ const Intelligence_ = () => {
     disposedRef.current?.()
     disposedRef.current = removeClipViewTransition()
     startTransition(() => {
-      setOpen((prev) => !prev)
+      setOpen(prev => !prev)
     })
   }, [])
 
   return (
     <CloudAuthProvider>
-      {open ? (
-        <AIAssistant
-          onOpenChange={toggleOpen}
-          onCleanup={disposedRef.current}
-        />
-      ) : (
+      <AIAssistant
+        open={open}
+        onOpenChange={toggleOpen}
+        onCleanup={disposedRef.current}
+      />
+      {open || (
         <div className={classes.entry} onClick={toggleOpen}>
-          <AssistantIcon />
+          <img src={assistantIcon} />
         </div>
       )}
       <Tooltip anchorSelect={`.${classes.entry}`} place="left">

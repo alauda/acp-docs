@@ -1,35 +1,69 @@
-import { useI18n } from '@rspress/core/runtime'
-import { useCallback, unstable_ViewTransition as ViewTransition } from 'react'
+import { flushSync, useI18n } from '@rspress/core/runtime'
+import clsx from 'clsx'
+import { noop } from 'es-toolkit'
+import {
+  useRef,
+  useState,
+  unstable_ViewTransition as ViewTransition,
+} from 'react'
+import { Tooltip } from 'react-tooltip'
 
-import { X } from '@theme/components/_X'
+import { useMemorizedFn } from '@theme/hooks'
 
-import AssistantIcon from '../assistant.svg?react'
 import { CloudAuth, useCloudAuth } from '../context'
 import { AuthInfo } from '../types'
+
+import { Chat } from './Chat'
 import CloseIcon from './close.svg?react'
-import SendIcon from './send.svg?react'
+import NewChatIcon from './new-chat.svg?react'
+import { Preamble } from './Preamble'
+import { ResizableUserInput } from './ResizableUserInput'
 import classes from './styles.module.scss'
+import { ChatMessage } from './types'
 
 export interface AIAssistantProps {
   open?: boolean
-  onOpenChange: (open: boolean) => void
-  onCleanup?: () => void
+  onOpenChange(open: boolean): void
+  onCleanup?(): void
 }
 
 const isLoggedIn_ = (
   authInfo: CloudAuth | null,
 ): authInfo is CloudAuth & { detail: AuthInfo } => Boolean(authInfo?.detail)
 
-export const AIAssistant = ({ onOpenChange, onCleanup }: AIAssistantProps) => {
+export const AIAssistant = ({
+  open,
+  onOpenChange,
+  onCleanup,
+}: AIAssistantProps) => {
   const { authInfo } = useCloudAuth()
   const t = useI18n<typeof import('@docs/i18n.json')>()
-  const onClose = useCallback(() => onOpenChange(false), [])
+  const onClose = useMemorizedFn(() => onOpenChange(false))
 
   const isLoggedIn = isLoggedIn_(authInfo)
 
+  const [messages, setMessages] = useState<ChatMessage[]>([])
+
+  const chatRef = useRef<HTMLUListElement>(null)
+
+  const onSend = useMemorizedFn((content: string) => {
+    setMessages(messages => [
+      ...messages,
+      { id: Date.now(), role: 'user' as const, content },
+    ])
+
+    flushSync(noop)
+
+    const chatEl = chatRef.current!
+
+    chatEl.scrollTop = chatEl.scrollHeight
+  })
+
+  const onNewChat = useMemorizedFn(() => setMessages([]))
+
   return (
     <ViewTransition name="flip" onEnter={onCleanup} onExit={onCleanup}>
-      <div className={classes.container}>
+      <div className={clsx(classes.container, open && classes.open)}>
         <div className={classes.header}>
           <div>
             {t('ai_assistant')}
@@ -39,44 +73,24 @@ export const AIAssistant = ({ onOpenChange, onCleanup }: AIAssistantProps) => {
               </span>
             )}
           </div>
-          <CloseIcon className={classes.close} onClick={onClose} />
-        </div>
-        <div className={classes.preamble}>
-          <AssistantIcon width={48} height={40} />
-          <div className={classes.title}>
-            {t(isLoggedIn ? 'hi_there' : 'not_logged_in')}
-            {t('exclamation')}
-          </div>
-          <div className={classes.content}>
-            {isLoggedIn ? (
-              t('ai_assistant_tip')
-            ) : (
+          <div className={classes.icons}>
+            {messages.length ? (
               <>
-                <div>
-                  {t('not_logged_in_tip_china')}
-                  <X.a href="https://cloud.alauda.cn/login">
-                    {t('custom_portal_china')}
-                  </X.a>
-                  {t('semicolon')}
-                </div>
-                <div>
-                  {t('not_logged_in_tip_global')}
-                  <X.a href="https://cloud.alauda.io/login">
-                    {t('custom_portal_global')}
-                  </X.a>
-                  {t('period')}
-                </div>
-                <div>{t('not_logged_in_tip')}</div>
+                <NewChatIcon className={classes.newChat} onClick={onNewChat} />
+                <Tooltip anchorSelect={`.${classes.newChat}`}>
+                  {t('new_chat')}
+                </Tooltip>
               </>
-            )}
+            ) : null}
+            <CloseIcon className={classes.close} onClick={onClose} />
           </div>
         </div>
-        {isLoggedIn && (
-          <div className={classes.input}>
-            <textarea placeholder={t('ai_assistant_placeholder')} />
-            <SendIcon className={classes.send} />
-          </div>
+        {messages.length ? (
+          <Chat ref={chatRef} messages={messages} />
+        ) : (
+          <Preamble isLoggedIn={isLoggedIn} />
         )}
+        {isLoggedIn && <ResizableUserInput onSend={onSend} />}
       </div>
     </ViewTransition>
   )
