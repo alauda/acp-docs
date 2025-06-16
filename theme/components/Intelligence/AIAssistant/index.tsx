@@ -27,7 +27,7 @@ export interface AIAssistantProps {
   onCleanup?(): void
 }
 
-const isLoggedIn_ = (
+const isLoggedIn = (
   authInfo: CloudAuth | null,
 ): authInfo is CloudAuth & { detail: AuthInfo } => Boolean(authInfo?.detail)
 
@@ -40,7 +40,7 @@ export const AIAssistant = ({
   const t = useI18n<typeof import('@docs/i18n.json')>()
   const onClose = useMemorizedFn(() => onOpenChange(false))
 
-  const isLoggedIn = isLoggedIn_(authInfo)
+  const loggedIn = isLoggedIn(authInfo)
 
   const [messages, setMessages] = useState<ChatMessage[]>([])
 
@@ -67,7 +67,7 @@ export const AIAssistant = ({
         <div className={classes.header}>
           <div>
             {t('ai_assistant')}
-            {isLoggedIn && (
+            {loggedIn && (
               <span className={classes.username}>
                 ({authInfo.detail!.user.name})
               </span>
@@ -88,9 +88,9 @@ export const AIAssistant = ({
         {messages.length ? (
           <Chat ref={chatRef} messages={messages} />
         ) : (
-          <Preamble isLoggedIn={isLoggedIn} />
+          <Preamble loggedIn={loggedIn} />
         )}
-        {isLoggedIn && <ResizableUserInput onSend={onSend} />}
+        {loggedIn && <ResizableUserInput onSend={onSend} />}
       </div>
     </ViewTransition>
   )

@@ -1,4 +1,6 @@
 import { createContext, ReactNode, useContext, useMemo, useState } from 'react'
+
+import { CLOUD_AUTH_ORIGIN_KEY, CLOUD_AUTH_TOKEN_KEY } from './constants'
 import { AuthInfo } from './types'
 import { getAuthInfoFromToken, setLocalStorage } from './utils'
 
@@ -16,18 +18,15 @@ export const CloudAuthContext = createContext<CloudAuthContext>(null!)
 
 export const useCloudAuth = () => useContext(CloudAuthContext)
 
-const CLOUD_AUTH_ORIGIN_KEY = '__CLOUD_AUTH_ORIGIN__'
-const CLOUD_AUTH_TOKEN_KEY = '__CLOUD_AUTH_TOKEN__'
-
 const getCloudAuth = (): CloudAuth | null => {
   const origin = localStorage.getItem(CLOUD_AUTH_ORIGIN_KEY)
   const token = localStorage.getItem(CLOUD_AUTH_TOKEN_KEY)
 
-  if (!origin) {
+  if (origin == null) {
     return null
   }
 
-  if (!token) {
+  if (token == null) {
     return { origin }
   }
 

@@ -3,10 +3,10 @@ import { decodeUrl } from 'ab64'
 import { AuthInfo, AuthTokenInfo } from './types'
 
 export const setLocalStorage = (key: string, value?: string) => {
-  if (value) {
-    localStorage.setItem(key, value)
-  } else {
+  if (value == null) {
     localStorage.removeItem(key)
+  } else {
+    localStorage.setItem(key, value)
   }
 }
 

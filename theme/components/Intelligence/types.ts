@@ -32,3 +32,8 @@ export interface AuthInfo {
   tenant?: string
   user: AuthUser
 }
+
+export interface CloudAuthRegion {
+  name: 'global' | 'china' | 'local'
+  value: string
+}
