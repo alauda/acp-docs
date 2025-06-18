@@ -1,19 +1,16 @@
-## 文档依赖
+## Documentation Dependencies
 
-* 确保本地已安装 [Node.js](https://nodejs.org/en/) 和 [npm](https://www.npmjs.com/)
-* 使用 `yarn` 安装依赖
+* Ensure that [Node.js](https://nodejs.org/en/) and [npm](https://www.npmjs.com/) are installed locally
+* Use `yarn` to install dependencies
 
 ```bash
 $ yarn install
 ```
 
-* 推荐使用 [Visual Studio Code](https://code.visualstudio.com/) 编辑器并安装 [MDX](https://marketplace.visualstudio.com/items?itemName=unifiedjs.vscode-mdx) 插件进行文档编写
+* It's recommended to use [Visual Studio Code](https://code.visualstudio.com/) editor and install the [MDX](https://marketplace.visualstudio.com/items?itemName=unifiedjs.vscode-mdx) extension for document writing
 
-## 文档快速开始
+## Documentation Quick Start
 
-* `yarn dev`: 启动本地开发服务器，文件修改将实时更新。(**注意：** 左导航栏相关修改需要重启服务)
-* `yarn build`: 构建生产环境代码，构建完成后会在 `dist` 目录生成静态文件
-* `yarn serve`: 本地预览构建后的静态文件
-* `yarn info @alauda/doom`: 查看 `doom` 的版本和依赖
-* `yarn up @alauda/doom`: 升级 `doom`
-* `npm view @alauda/doom versions`: 查看 `doom` 的所有版本
+* `yarn dev`: Start the local development server, file modifications will update in real-time. (**Note:** Left navigation bar related modifications require restarting the service)
+* `yarn build`: Build production environment code, static files will be generated in the `dist` directory after build completion
+* `yarn serve`: Preview the built static files locally
