@@ -2,8 +2,10 @@
 
 import { useLang } from '@alauda/doom/runtime'
 import { isProduction, useI18n } from '@rspress/core/runtime'
-import { startTransition, useCallback, useRef, useState } from 'react'
+import { startTransition, useRef, useState } from 'react'
 import { Tooltip } from 'react-tooltip'
+
+import { useMemoizedFn } from '@theme/hooks'
 
 import { AIAssistant } from './AIAssistant'
 import assistantIcon from './assistant.svg'
@@ -47,25 +49,27 @@ const Intelligence_ = () => {
 
   const disposedRef = useRef<() => void>(undefined)
 
-  const toggleOpen = useCallback(() => {
+  const toggleOpen = useMemoizedFn(() => {
     disposedRef.current?.()
     disposedRef.current = removeClipViewTransition()
     startTransition(() => {
       setOpen(prev => !prev)
     })
-  }, [])
+  })
+
+  const onCleanup = useMemoizedFn(() => disposedRef.current?.())
 
   return (
     <CloudAuthProvider>
       <AIAssistant
         open={open}
         onOpenChange={toggleOpen}
-        onCleanup={disposedRef.current}
+        onCleanup={onCleanup}
       />
       {open || (
-        <div className={classes.entry} onClick={toggleOpen}>
-          <img src={assistantIcon} />
-        </div>
+        <button type="button" className={classes.entry} onClick={toggleOpen}>
+          <img alt={t('ai_assistant')} src={assistantIcon} />
+        </button>
       )}
       <Tooltip anchorSelect={`.${classes.entry}`} place="left">
         {t('ai_assistant')}

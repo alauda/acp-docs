@@ -1,2 +1,2 @@
-export * from './memorized-fn'
+export * from './memoized-fn'
 export * from './timer'

@@ -1,6 +1,5 @@
-import { flushSync, useI18n } from '@rspress/core/runtime'
+import { useI18n } from '@rspress/core/runtime'
 import clsx from 'clsx'
-import { noop } from 'es-toolkit'
 import {
   useRef,
   useState,
@@ -9,7 +8,7 @@ import {
 import { Tooltip } from 'react-tooltip'
 import { ApiMethod, xfetch } from 'x-fetch'
 
-import { useMemorizedFn } from '@theme/hooks'
+import { useMemoizedFn } from '@theme/hooks'
 
 import { CloudAuth, useCloudAuth } from '../context'
 import { AuthInfo } from '../types'
@@ -54,23 +53,36 @@ export const AIAssistant = ({
 
   const chatRef = useRef<HTMLUListElement>(null)
 
-  const onLogout = useMemorizedFn(() => setAuthBasic())
+  const onLogout = useMemoizedFn(() => setAuthBasic())
 
-  const onNewChat = useMemorizedFn(() => {
+  const onNewChat = useMemoizedFn(() => {
     sessionIdRef.current = null
     setMessages([])
   })
 
-  const onClose = useMemorizedFn(() => onOpenChange(false))
+  const onClose = useMemoizedFn(() => onOpenChange(false))
 
-  const onSend = useMemorizedFn(async (content: string) => {
+  const flushMessages = useMemoizedFn(
+    (setMessagesAction: (messages: ChatMessage[]) => ChatMessage[]) => {
+      setMessages(setMessagesAction)
+      setTimeout(() => {
+        const chatEl = chatRef.current
+        if (!chatEl) {
+          return
+        }
+        chatEl.scrollTop = chatEl.scrollHeight
+      }, 200)
+    },
+  )
+
+  const onSend = useMemoizedFn(async (content: string) => {
     const assistantMessage: ChatMessage = {
       id: Date.now(),
       role: 'assistant' as const,
       content: <Thinking />,
     }
 
-    setMessages(messages => [
+    flushMessages(messages => [
       ...messages,
       { id: Date.now(), role: 'user' as const, content },
       assistantMessage,
@@ -119,7 +131,7 @@ export const AIAssistant = ({
         continue
       }
 
-      setMessages(messages => {
+      flushMessages(messages => {
         const index = messages.findLastIndex(
           msg => msg.role === 'assistant' && msg.id === assistantMessage.id,
         )
@@ -133,12 +145,6 @@ export const AIAssistant = ({
         ]
       })
     }
-
-    flushSync(noop)
-
-    const chatEl = chatRef.current!
-
-    chatEl.scrollTop = chatEl.scrollHeight
   })
 
   return (

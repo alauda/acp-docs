@@ -25,12 +25,12 @@ export const FocusInput = ({
     setActive(true)
     setFocus(true)
     onFocus?.(ev)
-  }, [])
+  }, [onFocus])
   const handleBlur = useCallback((ev: React.FocusEvent<HTMLInputElement>) => {
     setActive(!!ev.target.value)
     setFocus(false)
     onBlur?.(ev)
-  }, [])
+  }, [onBlur])
   return (
     <div
       className={clsx(

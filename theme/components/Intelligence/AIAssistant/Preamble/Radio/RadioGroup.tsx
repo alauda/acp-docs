@@ -21,24 +21,33 @@ export interface RadioGroupProps {
 }
 
 export const RadioGroup = ({
-  id = useId(),
-  name = id,
+  id: id_,
+  name,
   value,
   onChange,
   children,
   prefix,
   suffix,
 }: RadioGroupProps) => {
+  const innerId = useId()
+
+  const id = id_ || innerId
+
+  name ??= id
+
   const [innerValue, setInnerValue] = useState(value ?? '')
 
   if (value != null && innerValue !== value) {
     setInnerValue(value)
   }
 
-  const handleChange = useCallback((ev: ChangeEvent<HTMLInputElement>) => {
-    onChange?.(ev)
-    setInnerValue(ev.target.value)
-  }, [])
+  const handleChange = useCallback(
+    (ev: ChangeEvent<HTMLInputElement>) => {
+      onChange?.(ev)
+      setInnerValue(ev.target.value)
+    },
+    [onChange],
+  )
 
   return (
     <div id={id} className="radio-group">

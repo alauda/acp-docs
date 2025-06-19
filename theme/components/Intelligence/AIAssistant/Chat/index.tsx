@@ -13,25 +13,23 @@ export interface ChatProps {
   messages: ChatMessage[]
 }
 
-export const Chat = ({ ref, messages }: ChatProps) => {
-  return (
-    <ul ref={ref} className={classes.container}>
-      {messages.map(({ id, role, content, thinkingProcess, refDocs }) => (
-        <li key={`${role}-${id}`} className={clsx(classes.chat, classes[role])}>
-          {role === 'assistant' && <AssistantIcon className={classes.icon} />}
-          <div className={classes.content}>
-            {thinkingProcess && (
-              <ThinkingProcess>{thinkingProcess}</ThinkingProcess>
-            )}
-            {refDocs?.length ? <ChatRefDocs refDocs={refDocs} /> : null}
-            {typeof content === 'string' ? (
-              <Markdown>{content}</Markdown>
-            ) : (
-              content
-            )}
-          </div>
-        </li>
-      ))}
-    </ul>
-  )
-}
+export const Chat = ({ ref, messages }: ChatProps) => (
+  <ul ref={ref} className={classes.container}>
+    {messages.map(({ id, role, content, thinkingProcess, refDocs }) => (
+      <li key={`${role}-${id}`} className={clsx(classes.chat, classes[role])}>
+        {role === 'assistant' && <AssistantIcon className={classes.icon} />}
+        <div className={classes.content}>
+          {thinkingProcess && (
+            <ThinkingProcess>{thinkingProcess}</ThinkingProcess>
+          )}
+          {refDocs?.length ? <ChatRefDocs refDocs={refDocs} /> : null}
+          {typeof content === 'string' ? (
+            <Markdown>{content}</Markdown>
+          ) : (
+            content
+          )}
+        </div>
+      </li>
+    ))}
+  </ul>
+)

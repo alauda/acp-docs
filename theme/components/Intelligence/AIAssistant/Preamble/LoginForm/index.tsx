@@ -2,7 +2,6 @@ import { useI18n } from '@rspress/core/runtime'
 import {
   type FormEvent,
   type FormHTMLAttributes,
-  useCallback,
   useRef,
   useState,
 } from 'react'
@@ -19,11 +18,11 @@ import { ApiErrorAlert } from '../ApiErrorAlert'
 import { Button } from '../Button'
 import { CaptchaInput } from '../CaptchaInput'
 import { FormItem } from '../FormItem'
-import { FocusInput } from '../FoucsInput'
+import { FocusInput } from '../FocusInput'
 import { Radio, RadioGroup } from '../Radio'
 import QuestionCycleIcon from '../question-circle.svg?react'
 
-import { useMemorizedFn } from '@theme/hooks'
+import { useMemoizedFn } from '@theme/hooks'
 
 import classes from './styles.module.scss'
 import type { LoginError, LoginResponse, PasswordPubKey } from './types'
@@ -39,93 +38,95 @@ export const LoginForm = ({ onSubmit, ...props }: LoginFormProps) => {
 
   const [origin, setOrigin] = useState(() => {
     let origin = localStorage.getItem(CLOUD_AUTH_ORIGIN_KEY)
-    if (origin == null || CLOUD_AUTH_ORIGIN_VALUES.includes(origin)) {
+    if (origin == null || !CLOUD_AUTH_ORIGIN_VALUES.includes(origin)) {
       origin = CLOUD_AUTH_ORIGIN_VALUES[0]
       localStorage.setItem(CLOUD_AUTH_ORIGIN_KEY, origin)
     }
     return origin
   })
 
-  const onRegionChange = useCallback(
-    (ev: React.ChangeEvent<HTMLInputElement>) => {
-      const origin = ev.target.value
-      setOrigin(origin)
-      localStorage.setItem(CLOUD_AUTH_ORIGIN_KEY, origin)
-    },
-    [],
-  )
-
-  const { setAuthBasic } = useCloudAuth()
-
   const [loading, setLoading] = useState<boolean>()
   const [error, setError] = useState<LoginError>()
 
   const pwdPubkeyRef = useRef<PasswordPubKey>(null)
 
+  const onRegionChange = useMemoizedFn(
+    (ev: React.ChangeEvent<HTMLInputElement>) => {
+      const origin = ev.target.value
+      setOrigin(origin)
+      setError(undefined)
+      pwdPubkeyRef.current = null
+      localStorage.setItem(CLOUD_AUTH_ORIGIN_KEY, origin)
+    },
+  )
+
+  const { setAuthBasic } = useCloudAuth()
+
   const captchaId = error?.data?.extra?.captchaId
 
   const [timestamp, setTimestamp] = useState<number>()
 
-  const handleSubmit = useMemorizedFn(
-    async (ev: FormEvent<HTMLFormElement>) => {
-      ev.preventDefault()
-      ev.stopPropagation()
+  const handleSubmit = useMemoizedFn(async (ev: FormEvent<HTMLFormElement>) => {
+    ev.preventDefault()
+    ev.stopPropagation()
 
-      onSubmit?.(ev)
+    onSubmit?.(ev)
 
-      const formData = new FormData(ev.currentTarget)
-      const origin = formData.get('origin') as string
-      formData.delete('origin')
+    const formData = new FormData(ev.currentTarget)
+    const origin = formData.get('origin') as string
+    formData.delete('origin')
 
-      setLoading(true)
+    setLoading(true)
 
-      if (pwdPubkeyRef.current == null) {
+    if (pwdPubkeyRef.current == null) {
+      try {
         pwdPubkeyRef.current = await xfetch<PasswordPubKey>(
           `${origin}/api/v1/pubkey`,
         )
+      } catch (err) {
+        setError(err as LoginError)
+        setLoading(false)
+        return
       }
+    }
 
-      formData.set(
-        'password',
-        cryptoPassword(
-          pwdPubkeyRef.current,
-          formData.get('password') as string,
-        ),
+    formData.set(
+      'password',
+      cryptoPassword(pwdPubkeyRef.current, formData.get('password') as string),
+    )
+
+    if (captchaId) {
+      formData.set('captchaId', captchaId)
+    }
+
+    try {
+      const { accessToken } = await xfetch<LoginResponse>(
+        `${origin}/api/v1/login`,
+        {
+          method: ApiMethod.POST,
+          body: formData,
+        },
       )
 
-      if (captchaId) {
-        formData.set('captchaId', captchaId)
+      setAuthBasic({
+        origin,
+        token: accessToken,
+      })
+    } catch (err) {
+      if (!isLoginError(err)) {
+        throw err
       }
 
-      try {
-        const { accessToken } = await xfetch<LoginResponse>(
-          `${origin}/api/v1/login`,
-          {
-            method: ApiMethod.POST,
-            body: formData,
-          },
-        )
-
-        setAuthBasic({
-          origin,
-          token: accessToken,
-        })
-      } catch (err) {
-        if (!isLoginError(err)) {
-          throw err
-        }
-
-        if (err.data?.reason === 'PubkeyExpireError') {
-          pwdPubkeyRef.current = null
-          return handleSubmit(ev)
-        }
-
-        setError(err)
-      } finally {
-        setLoading(false)
+      if (err.data?.reason === 'PubkeyExpireError') {
+        pwdPubkeyRef.current = null
+        return handleSubmit(ev)
       }
-    },
-  )
+
+      setError(err)
+    } finally {
+      setLoading(false)
+    }
+  })
 
   return (
     <form onSubmit={handleSubmit} {...props}>

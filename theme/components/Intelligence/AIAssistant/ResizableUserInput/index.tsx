@@ -9,7 +9,7 @@ import {
 } from 'react'
 import stringWidth from 'string-width'
 
-import { useMemorizedFn } from '@theme/hooks'
+import { useMemoizedFn } from '@theme/hooks'
 
 import SendIcon from './send.svg?react'
 import classes from './styles.module.scss'
@@ -41,7 +41,7 @@ export const ResizableUserInput = ({
     [maxCharsExceeded, innerValue],
   )
 
-  const handleSend = useMemorizedFn(() => {
+  const handleSend = useMemoizedFn(() => {
     if (isSendDisabled) {
       return
     }
@@ -53,7 +53,7 @@ export const ResizableUserInput = ({
     setInnerValue('')
   })
 
-  const handleChange = useMemorizedFn(
+  const handleChange = useMemoizedFn(
     (ev: ChangeEvent<HTMLTextAreaElement>) => {
       const value = ev.target.value
       onChange?.(value)
@@ -61,7 +61,7 @@ export const ResizableUserInput = ({
     },
   )
 
-  const onKeyDown = useMemorizedFn(
+  const onKeyDown = useMemoizedFn(
     (
       ev: KeyboardEvent<HTMLTextAreaElement> &
         SyntheticEvent<HTMLTextAreaElement, InputEvent>,

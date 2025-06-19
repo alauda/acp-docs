@@ -39,7 +39,12 @@ export const ChatRefDocs = ({ refDocs }: ChatRefDocsProps) => {
       <ul className={classes.docs}>
         {displayedDocs.map(doc => (
           <li key={doc.id} className={classes.doc}>
-            <X.a href="" title={doc.content}>
+            <X.a
+              href={doc.path}
+              title={doc.content}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
               {doc.content}
             </X.a>
           </li>

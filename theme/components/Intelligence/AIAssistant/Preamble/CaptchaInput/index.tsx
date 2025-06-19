@@ -6,6 +6,7 @@ import { FormItem } from '../FormItem'
 import { Input, InputProps } from '../Input'
 
 import './styles.scss'
+import { useI18n } from '@rspress/core/runtime'
 
 export interface CaptchaInputProps extends Omit<InputProps, 'type'> {
   Component?: ComponentType<InputProps>
@@ -23,9 +24,11 @@ export const CaptchaInput = ({
   onTimestampChange,
   ...props
 }: CaptchaInputProps) => {
+  const t = useI18n<typeof import('@docs/i18n.json')>()
+
   const captcha = useMemo(
     () => normalizeUrl(`${origin}/api/v1/captcha`, { captchaId, timestamp }),
-    [captchaId, timestamp],
+    [origin, captchaId, timestamp],
   )
 
   const onRefresh = useCallback(() => {
@@ -40,7 +43,7 @@ export const CaptchaInput = ({
             className="captcha-input__captcha"
             src={captcha}
             onClick={onRefresh}
-            alt="captcha"
+            alt={t('captcha')}
           />
         }
       >
