@@ -17,6 +17,7 @@ import { AuthInfo } from '../types'
 import { Chat } from './Chat'
 import CloseIcon from './close.svg?react'
 import NewChatIcon from './new-chat.svg?react'
+import LogoutIcon from './logout.svg?react'
 import { Preamble } from './Preamble'
 import { ResizableUserInput } from './ResizableUserInput'
 import classes from './styles.module.scss'
@@ -41,9 +42,9 @@ export const AIAssistant = ({
   onOpenChange,
   onCleanup,
 }: AIAssistantProps) => {
-  const { authInfo } = useCloudAuth()
   const t = useI18n<typeof import('@docs/i18n.json')>()
-  const onClose = useMemorizedFn(() => onOpenChange(false))
+
+  const { authInfo, setAuthBasic } = useCloudAuth()
 
   const loggedIn = isLoggedIn(authInfo)
 
@@ -52,6 +53,15 @@ export const AIAssistant = ({
   const [messages, setMessages] = useState<ChatMessage[]>([])
 
   const chatRef = useRef<HTMLUListElement>(null)
+
+  const onLogout = useMemorizedFn(() => setAuthBasic())
+
+  const onNewChat = useMemorizedFn(() => {
+    sessionIdRef.current = null
+    setMessages([])
+  })
+
+  const onClose = useMemorizedFn(() => onOpenChange(false))
 
   const onSend = useMemorizedFn(async (content: string) => {
     const assistantMessage: ChatMessage = {
@@ -131,21 +141,22 @@ export const AIAssistant = ({
     chatEl.scrollTop = chatEl.scrollHeight
   })
 
-  const onNewChat = useMemorizedFn(() => {
-    sessionIdRef.current = null
-    setMessages([])
-  })
-
   return (
     <ViewTransition name="flip" onEnter={onCleanup} onExit={onCleanup}>
       <div className={clsx(classes.container, open && classes.open)}>
         <div className={classes.header}>
-          <div>
+          <div className={classes.title}>
             {t('ai_assistant')}
             {loggedIn && (
-              <span className={classes.username}>
-                ({authInfo.detail!.user.name})
-              </span>
+              <>
+                <span className={classes.username}>
+                  ({authInfo.detail!.user.name})
+                </span>
+                <LogoutIcon className={classes.logout} onClick={onLogout} />
+                <Tooltip anchorSelect={`.${classes.logout}`}>
+                  {t('logout')}
+                </Tooltip>
+              </>
             )}
           </div>
           <div className={classes.icons}>
@@ -158,6 +169,7 @@ export const AIAssistant = ({
               </>
             ) : null}
             <CloseIcon className={classes.close} onClick={onClose} />
+            <Tooltip anchorSelect={`.${classes.close}`}>{t('close')}</Tooltip>
           </div>
         </div>
         {messages.length ? (

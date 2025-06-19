@@ -11,7 +11,7 @@ export interface CloudAuth {
 
 export interface CloudAuthContext {
   authInfo: CloudAuth | null
-  setAuthBasic: (authBasic: { origin: string; token: string } | null) => void
+  setAuthBasic: (authBasic?: { origin: string; token: string } | null) => void
 }
 
 export const CloudAuthContext = createContext<CloudAuthContext>(null!)
@@ -41,7 +41,10 @@ export const CloudAuthProvider = ({ children }: { children: ReactNode }) => {
         () => ({
           authInfo,
           setAuthBasic(authBasic) {
-            setLocalStorage(CLOUD_AUTH_ORIGIN_KEY, authBasic?.origin)
+            // keep origin in localStorage for next login
+            if (authBasic?.origin != null) {
+              setLocalStorage(CLOUD_AUTH_ORIGIN_KEY, authBasic.origin)
+            }
             setLocalStorage(CLOUD_AUTH_TOKEN_KEY, authBasic?.token)
             setAuthInfo(getCloudAuth)
           },
