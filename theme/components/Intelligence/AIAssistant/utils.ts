@@ -9,8 +9,10 @@ export const unicodeToString = (unicodeStr: string) =>
     String.fromCharCode(Number.parseInt(p1, 16)),
   )
 
-export const removePrefix = (prefix: string, text: string) =>
-  prefix && text.startsWith(prefix) ? text.slice(prefix.length) : text
+export const removePrefix = (
+  prefix: string | null | undefined,
+  text: string,
+) => (prefix && text.startsWith(prefix) ? text.slice(prefix.length) : text)
 
 export function parseStreamContent(text: string) {
   const matchDocs = text.match(/<docs>([\s\S]*?)<\/docs>/)
@@ -30,13 +32,13 @@ export function parseStreamContent(text: string) {
   if (matched) {
     matched = removePrefix(firstMatched || '', matched)
   }
-  const thinkingProcess = (matchThinks && matched) || ''
+  const thinkingProcess = matchThinks && matched
 
   return {
     refDocs,
     thinkingProcess,
-    result: unicodeToString(
-      removePrefix(thinkingProcess, removePrefix(matchDocs?.[0] ?? '', text)),
+    content: unicodeToString(
+      removePrefix(thinkingProcess, removePrefix(matchDocs?.[0], text)),
     ),
   }
 }

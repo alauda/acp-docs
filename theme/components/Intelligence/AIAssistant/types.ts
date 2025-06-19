@@ -1,3 +1,5 @@
+import { ReactNode } from "react"
+
 export interface RefDoc {
   content: string
   cos_sim: number
@@ -8,6 +10,7 @@ export interface RefDoc {
 export interface ChatMessage {
   id: number
   role: 'user' | 'assistant'
-  content: string
+  content: ReactNode
   refDocs?: RefDoc[]
+  thinkingProcess?: string | null
 }
