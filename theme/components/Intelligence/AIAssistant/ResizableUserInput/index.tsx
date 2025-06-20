@@ -17,12 +17,14 @@ import classes from './styles.module.scss'
 export interface ResizableUserInputProps {
   placeholder?: string
   value?: string
+  loading?: boolean
   onChange?(value: string): void
   onSend?(value?: string): void
 }
 
 export const ResizableUserInput = ({
   value,
+  loading,
   onChange,
   onSend,
 }: ResizableUserInputProps) => {
@@ -37,8 +39,8 @@ export const ResizableUserInput = ({
   const maxCharsExceeded = innerValue.length > 2000
 
   const isSendDisabled = useMemo(
-    () => maxCharsExceeded || !innerValue.trim(),
-    [maxCharsExceeded, innerValue],
+    () => loading || maxCharsExceeded || !innerValue.trim(),
+    [loading, maxCharsExceeded, innerValue],
   )
 
   const handleSend = useMemoizedFn(() => {
@@ -53,13 +55,11 @@ export const ResizableUserInput = ({
     setInnerValue('')
   })
 
-  const handleChange = useMemoizedFn(
-    (ev: ChangeEvent<HTMLTextAreaElement>) => {
-      const value = ev.target.value
-      onChange?.(value)
-      setInnerValue(value)
-    },
-  )
+  const handleChange = useMemoizedFn((ev: ChangeEvent<HTMLTextAreaElement>) => {
+    const value = ev.target.value
+    onChange?.(value)
+    setInnerValue(value)
+  })
 
   const onKeyDown = useMemoizedFn(
     (
@@ -114,7 +114,6 @@ export const ResizableUserInput = ({
         onKeyDown={onKeyDown}
         style={inputStyle}
       />
-
       <div className={classes.actions}>
         <SendIcon
           className={clsx(classes.send, isSendDisabled && classes.disabled)}

@@ -75,12 +75,16 @@ export const AIAssistant = ({
     },
   )
 
-  const onSend = useMemoizedFn(async (content: string) => {
+  const assistantMessageIndexRef = useRef<number>(-1)
+
+  const onSend_ = async (content: string) => {
     const assistantMessage: ChatMessage = {
       id: Date.now(),
       role: 'assistant' as const,
       content: <Thinking />,
     }
+
+    const index = (assistantMessageIndexRef.current = messages.length + 1)
 
     flushMessages(messages => [
       ...messages,
@@ -131,19 +135,31 @@ export const AIAssistant = ({
         continue
       }
 
+      flushMessages(messages => [
+        ...messages.slice(0, index),
+        { ...messages[index], ...parsed },
+        ...messages.slice(index + 1),
+      ])
+    }
+  }
+
+  const [loading, setLoading] = useState(false)
+
+  const onSend = useMemoizedFn(async (content: string) => {
+    setLoading(true)
+    try {
+      await onSend_(content)
+    } catch {
       flushMessages(messages => {
-        const index = messages.findLastIndex(
-          msg => msg.role === 'assistant' && msg.id === assistantMessage.id,
-        )
-        if (index === -1) {
-          return [...messages, { ...assistantMessage, ...parsed }]
-        }
+        const index = assistantMessageIndexRef.current
         return [
           ...messages.slice(0, index),
-          { ...messages[index], ...parsed },
+          { ...messages[index], content: t('NetworkError') },
           ...messages.slice(index + 1),
         ]
       })
+    } finally {
+      setLoading(false)
     }
   })
 
@@ -183,7 +199,7 @@ export const AIAssistant = ({
         ) : (
           <Preamble loggedIn={loggedIn} />
         )}
-        {loggedIn && <ResizableUserInput onSend={onSend} />}
+        {loggedIn && <ResizableUserInput loading={loading} onSend={onSend} />}
       </div>
     </ViewTransition>
   )
