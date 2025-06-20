@@ -36,7 +36,7 @@ const removeClipViewTransition = () => {
   }
 }
 
-const ALLOWED_DOMAINS = new Set(['docs.alauda.cn'])
+const ALLOWED_DOMAINS = new Set(['docs-dev.alauda.cn', 'docs.alauda.io'])
 
 if (!isProduction()) {
   ALLOWED_DOMAINS.add('localhost')
