@@ -1,7 +1,7 @@
 /// <reference types="react/experimental" />
 
 import { useLang } from '@alauda/doom/runtime'
-import { isProduction, useI18n } from '@rspress/core/runtime'
+import { isProduction, NoSSR, useI18n } from '@rspress/core/runtime'
 import { startTransition, useRef, useState } from 'react'
 import { Tooltip } from 'react-tooltip'
 
@@ -81,15 +81,15 @@ const Intelligence_ = () => {
 const Intelligence = () => {
   const lang = useLang()
 
-  if (
-    lang !== 'en' ||
-    typeof location === 'undefined' ||
-    !ALLOWED_DOMAINS.has(location.hostname)
-  ) {
+  if (lang !== 'en' || !ALLOWED_DOMAINS.has(location.hostname)) {
     return
   }
 
   return <Intelligence_ />
 }
 
-export default Intelligence
+export default () => (
+  <NoSSR>
+    <Intelligence />
+  </NoSSR>
+)
