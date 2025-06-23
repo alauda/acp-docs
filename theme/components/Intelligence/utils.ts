@@ -1,6 +1,6 @@
 import { decodeUrl } from 'ab64'
 
-import { AuthInfo, AuthTokenInfo } from './types'
+import { AuthInfo, AuthTokenInfo } from './types.js'
 
 export const setLocalStorage = (key: string, value?: string) => {
   if (value == null) {

@@ -18,8 +18,8 @@ export interface ResizableUserInputProps {
   placeholder?: string
   value?: string
   loading?: boolean
-  onChange?(value: string): void
-  onSend?(value?: string): void
+  onChange?: (value: string) => void
+  onSend?: (value: string) => void
 }
 
 export const ResizableUserInput = ({

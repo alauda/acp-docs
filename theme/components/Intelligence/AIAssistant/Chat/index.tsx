@@ -3,10 +3,10 @@ import clsx from 'clsx'
 import { Ref } from 'react'
 
 import AssistantIcon from '../../assistant.svg?react'
-import { ChatMessage } from '../types'
-import { ChatRefDocs } from './ChatRefDocs'
+import { ChatMessage } from '../types.js'
+import { ChatRefDocs } from './ChatRefDocs/index.js'
 import classes from './styles.module.scss'
-import { ThinkingProcess } from './ThinkingProcess'
+import { ThinkingProcess } from './ThinkingProcess/index.js'
 
 export interface ChatProps {
   ref?: Ref<HTMLUListElement>

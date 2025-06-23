@@ -1,8 +1,8 @@
-import { createContext, ReactNode, useContext, useMemo, useState } from 'react'
+import { createContext, ReactNode, use, useMemo, useState } from 'react'
 
-import { CLOUD_AUTH_ORIGIN_KEY, CLOUD_AUTH_TOKEN_KEY } from './constants'
-import { AuthInfo } from './types'
-import { getAuthInfoFromToken, setLocalStorage } from './utils'
+import { CLOUD_AUTH_ORIGIN_KEY, CLOUD_AUTH_TOKEN_KEY } from './constants.js'
+import { AuthInfo } from './types.js'
+import { getAuthInfoFromToken, setLocalStorage } from './utils.js'
 
 export interface CloudAuth {
   origin: string
@@ -16,7 +16,7 @@ export interface CloudAuthContext {
 
 export const CloudAuthContext = createContext<CloudAuthContext>(null!)
 
-export const useCloudAuth = () => useContext(CloudAuthContext)
+export const useCloudAuth = () => use(CloudAuthContext)
 
 const getCloudAuth = (): CloudAuth | null => {
   const origin = localStorage.getItem(CLOUD_AUTH_ORIGIN_KEY)
@@ -36,7 +36,7 @@ const getCloudAuth = (): CloudAuth | null => {
 export const CloudAuthProvider = ({ children }: { children: ReactNode }) => {
   const [authInfo, setAuthInfo] = useState(getCloudAuth)
   return (
-    <CloudAuthContext.Provider
+    <CloudAuthContext
       value={useMemo(
         () => ({
           authInfo,
@@ -53,6 +53,6 @@ export const CloudAuthProvider = ({ children }: { children: ReactNode }) => {
       )}
     >
       {children}
-    </CloudAuthContext.Provider>
+    </CloudAuthContext>
   )
 }

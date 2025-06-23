@@ -1,7 +1,7 @@
 import { useI18n } from '@rspress/core/runtime'
 import { useMemo } from 'react'
 
-import { ApiError } from '../types'
+import { ApiError } from '../types.js'
 
 import AlertIcon from './alert.svg?react'
 

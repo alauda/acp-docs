@@ -6,7 +6,8 @@ import {
   useMemo,
   useState,
 } from 'react'
-import { RadioGroupContext } from './context'
+
+import { RadioGroupContext } from './context.js'
 
 import './styles.scss'
 
@@ -51,7 +52,7 @@ export const RadioGroup = ({
 
   return (
     <div id={id} className="radio-group">
-      <RadioGroupContext.Provider
+      <RadioGroupContext
         value={useMemo(
           () => ({
             name,
@@ -64,7 +65,7 @@ export const RadioGroup = ({
         {prefix && <span className="radio-group__prefix">{prefix}</span>}
         {children}
         {suffix && <span className="radio-group__suffix">{suffix}</span>}
-      </RadioGroupContext.Provider>
+      </RadioGroupContext>
     </div>
   )
 }

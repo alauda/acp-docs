@@ -16,7 +16,7 @@ export interface FormItemProps<T> {
   children: ReactElement<{
     defaultValue?: T
     value?: T
-    onChange?(ev: ChangeEvent<{ value: T }>): void
+    onChange?: (ev: ChangeEvent<{ value: T }>) => void
     required?: boolean
   }>
   required?: boolean
@@ -59,11 +59,14 @@ export const FormItem = <T,>({
     <>
       <div className={clsx('form-item', error && 'form-item--error')}>
         {prefix && <span className="form-item__prefix">{prefix}</span>}
-        {cloneElement(children, {
-          value: innerValue,
-          onChange,
-          required,
-        })}
+        {
+          /* eslint-disable-next-line @eslint-react/no-clone-element */
+          cloneElement(children, {
+            value: innerValue,
+            onChange,
+            required,
+          })
+        }
         {suffix && <span className="form-item__suffix">{suffix}</span>}
       </div>
       {error && (

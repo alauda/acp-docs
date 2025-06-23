@@ -12,23 +12,23 @@ import {
   CLOUD_AUTH_ORIGIN_KEY,
   CLOUD_AUTH_ORIGIN_VALUES,
   CLOUD_AUTH_ORIGINS,
-} from '../../../constants'
-import { useCloudAuth } from '../../../context'
-import { ApiErrorAlert } from '../ApiErrorAlert'
-import { Button } from '../Button'
-import { CaptchaInput } from '../CaptchaInput'
-import { FormItem } from '../FormItem'
-import { FocusInput } from '../FocusInput'
-import { Radio, RadioGroup } from '../Radio'
+} from '../../../constants.js'
+import { useCloudAuth } from '../../../context.js'
+import { ApiErrorAlert } from '../ApiErrorAlert/index.js'
+import { Button } from '../Button/index.js'
+import { CaptchaInput } from '../CaptchaInput/index.js'
+import { FormItem } from '../FormItem/index.js'
+import { FocusInput } from '../FocusInput/index.js'
+import { Radio, RadioGroup } from '../Radio/index.js'
 import QuestionCycleIcon from '../question-circle.svg?react'
 
 import { useMemoizedFn } from '@theme/hooks'
 
 import classes from './styles.module.scss'
-import type { LoginError, LoginResponse, PasswordPubKey } from './types'
-import { cryptoPassword } from './utils'
+import type { LoginError, LoginResponse, PasswordPubKey } from './types.js'
+import { cryptoPassword } from './utils.js'
 
-export interface LoginFormProps extends FormHTMLAttributes<HTMLFormElement> {}
+export type LoginFormProps = FormHTMLAttributes<HTMLFormElement>
 
 const isLoginError = (err: unknown): err is LoginError =>
   err instanceof ResponseError
