@@ -1,6 +1,6 @@
 import { JSEncrypt } from 'jsencrypt'
 
-import type { PasswordPubKey } from './types'
+import type { PasswordPubKey } from './types.js'
 
 export const crypto = (pubkey: string, encryptString: string) => {
   const encrypt = new JSEncrypt()

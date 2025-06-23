@@ -10,24 +10,24 @@ import { ApiMethod, xfetch } from 'x-fetch'
 
 import { useMemoizedFn } from '@theme/hooks'
 
-import { CloudAuth, useCloudAuth } from '../context'
-import { AuthInfo } from '../types'
+import { CloudAuth, useCloudAuth } from '../context.js'
+import { AuthInfo } from '../types.js'
 
-import { Chat } from './Chat'
+import { Chat } from './Chat/index.js'
 import CloseIcon from './close.svg?react'
 import NewChatIcon from './new-chat.svg?react'
 import LogoutIcon from './logout.svg?react'
-import { Preamble } from './Preamble'
-import { ResizableUserInput } from './ResizableUserInput'
+import { Preamble } from './Preamble/index.js'
+import { ResizableUserInput } from './ResizableUserInput/index.js'
 import classes from './styles.module.scss'
-import { Thinking } from './Thinking'
-import { ChatMessage } from './types'
-import { parseStreamContent } from './utils'
+import { Thinking } from './Thinking.js'
+import { ChatMessage } from './types.js'
+import { parseStreamContent } from './utils.js'
 
 export interface AIAssistantProps {
   open?: boolean
-  onOpenChange(open: boolean): void
-  onCleanup?(): void
+  onOpenChange: (open: boolean) => void
+  onCleanup?: () => void
 }
 
 const isLoggedIn = (
@@ -172,7 +172,7 @@ export const AIAssistant = ({
             {loggedIn && (
               <>
                 <span className={classes.username}>
-                  ({authInfo.detail!.user.name})
+                  ({authInfo.detail.user.name})
                 </span>
                 <LogoutIcon className={classes.logout} onClick={onLogout} />
                 <Tooltip anchorSelect={`.${classes.logout}`}>

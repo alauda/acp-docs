@@ -1,5 +1,6 @@
 import { isProduction } from '@rspress/shared'
-import { CloudAuthRegion } from './types'
+
+import { CloudAuthRegion } from './types.js'
 
 export const CLOUD_AUTH_ORIGIN_KEY = '__CLOUD_AUTH_ORIGIN__'
 export const CLOUD_AUTH_TOKEN_KEY = '__CLOUD_AUTH_TOKEN__'

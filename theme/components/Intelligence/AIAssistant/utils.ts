@@ -2,7 +2,7 @@
 
 import { isObject } from 'es-toolkit/compat'
 
-import { RefDoc } from './types'
+import { RefDoc } from './types.js'
 
 export const unicodeToString = (unicodeStr: string) =>
   unicodeStr.replace(/\\u([0-9a-fA-F]{4})/g, (_match, p1: string) =>
@@ -22,7 +22,9 @@ export function parseStreamContent(text: string) {
   let refDocs: RefDoc[] = []
   try {
     refDocs = (JSON.parse(docsReferences) as RefDoc[]).filter(r => isObject(r))
-  } catch {}
+  } catch {
+    //
+  }
 
   const matchThinks = text.match(
     /<think>([\s\S]*?)<\/think>|^([\s\S]*?)<\/think>/g,

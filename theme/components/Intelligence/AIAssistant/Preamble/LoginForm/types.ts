@@ -1,4 +1,4 @@
-import { ApiError } from '../types'
+import { ApiError } from '../types.js'
 
 export interface PasswordPubKey {
   ts: string

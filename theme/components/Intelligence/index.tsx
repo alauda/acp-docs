@@ -7,9 +7,9 @@ import { Tooltip } from 'react-tooltip'
 
 import { useMemoizedFn } from '@theme/hooks'
 
-import { AIAssistant } from './AIAssistant'
+import { AIAssistant } from './AIAssistant/index.js'
 import assistantIcon from './assistant.svg'
-import { CloudAuthProvider } from './context'
+import { CloudAuthProvider } from './context.js'
 import classes from './styles.module.scss'
 
 const getViewTransitionHackStyle = () =>

@@ -1,9 +1,9 @@
 import { useI18n } from '@rspress/core/runtime'
 import { useCallback, useMemo, useState } from 'react'
 
-import { X } from '@theme/components/_X'
+import { X } from '@theme/components/_X.js'
 
-import { RefDoc } from '../../types'
+import { RefDoc } from '../../types.js'
 import AngleDownIcon from './angle-down.svg?react'
 import classes from './styles.module.scss'
 import clsx from 'clsx'

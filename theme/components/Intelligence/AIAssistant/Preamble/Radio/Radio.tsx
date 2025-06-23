@@ -1,6 +1,6 @@
-import { useCallback, useContext, type ChangeEvent } from 'react'
+import { useCallback, use, type ChangeEvent } from 'react'
 
-import { RadioGroupContext } from './context'
+import { RadioGroupContext } from './context.js'
 
 export interface RadioProps {
   label: string
@@ -13,7 +13,7 @@ export const Radio = ({ label, value, onChange }: RadioProps) => {
     name,
     value: groupValue,
     onChange: onGroupChange,
-  } = useContext(RadioGroupContext)
+  } = use(RadioGroupContext)
 
   const handleChange = useCallback(
     (ev: ChangeEvent<HTMLInputElement>) => {

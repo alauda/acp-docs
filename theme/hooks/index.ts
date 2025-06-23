@@ -1,2 +1,2 @@
-export * from './memoized-fn'
-export * from './timer'
+export * from './memoized-fn.js'
+export * from './timer.js'

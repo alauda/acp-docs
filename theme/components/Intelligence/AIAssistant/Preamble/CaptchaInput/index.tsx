@@ -1,9 +1,9 @@
 import { ComponentType, useCallback, useMemo } from 'react'
 import { normalizeUrl } from 'x-fetch'
 
-import { FormItem } from '../FormItem'
+import { FormItem } from '../FormItem/index.js'
 
-import { Input, InputProps } from '../Input'
+import { Input, InputProps } from '../Input/index.js'
 
 import './styles.scss'
 import { useI18n } from '@rspress/core/runtime'
@@ -13,7 +13,7 @@ export interface CaptchaInputProps extends Omit<InputProps, 'type'> {
   origin: string
   captchaId: string
   timestamp?: number
-  onTimestampChange(timestamp: number): void
+  onTimestampChange: (timestamp: number) => void
 }
 
 export const CaptchaInput = ({

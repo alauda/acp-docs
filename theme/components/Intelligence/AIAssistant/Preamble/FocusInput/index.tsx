@@ -1,7 +1,7 @@
 import clsx from 'clsx'
 import { ComponentType, useCallback, useState } from 'react'
 
-import { Input, type InputProps } from '../Input'
+import { Input, type InputProps } from '../Input/index.js'
 
 import './styles.scss'
 
