@@ -165,7 +165,7 @@ export const AIAssistant = ({
 
   return (
     <ViewTransition name="flip" onEnter={onCleanup} onExit={onCleanup}>
-      <div className={clsx(classes.container, open && classes.open)}>
+      <div className={clsx(classes.container, 'rspress-doc', open && classes.open)}>
         <div className={classes.header}>
           <div className={classes.title}>
             {t('ai_assistant')}
