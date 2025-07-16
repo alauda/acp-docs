@@ -1,4 +1,3 @@
-import { useI18n } from '@rspress/core/runtime'
 import clsx from 'clsx'
 import {
   type ChangeEvent,
@@ -7,6 +6,7 @@ import {
   useMemo,
   useState,
 } from 'react'
+import { useI18n } from 'rspress/runtime'
 import stringWidth from 'string-width'
 
 import { useMemoizedFn } from '@theme/hooks'
