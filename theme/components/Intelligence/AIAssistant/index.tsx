@@ -1,4 +1,3 @@
-import { useI18n } from '@rspress/core/runtime'
 import clsx from 'clsx'
 import {
   useRef,
@@ -6,6 +5,7 @@ import {
   unstable_ViewTransition as ViewTransition,
 } from 'react'
 import { Tooltip } from 'react-tooltip'
+import { useI18n } from 'rspress/runtime'
 import { ApiMethod, xfetch } from 'x-fetch'
 
 import { useMemoizedFn } from '@theme/hooks'
@@ -15,8 +15,8 @@ import { AuthInfo } from '../types.js'
 
 import { Chat } from './Chat/index.js'
 import CloseIcon from './close.svg?react'
-import NewChatIcon from './new-chat.svg?react'
 import LogoutIcon from './logout.svg?react'
+import NewChatIcon from './new-chat.svg?react'
 import { Preamble } from './Preamble/index.js'
 import { ResizableUserInput } from './ResizableUserInput/index.js'
 import classes from './styles.module.scss'

@@ -1,4 +1,3 @@
-import { useI18n } from '@rspress/core/runtime'
 import {
   type FormEvent,
   type FormHTMLAttributes,
@@ -6,6 +5,7 @@ import {
   useState,
 } from 'react'
 import { Tooltip } from 'react-tooltip'
+import { useI18n } from 'rspress/runtime'
 import { ApiMethod, ResponseError, xfetch } from 'x-fetch'
 
 import {
@@ -17,8 +17,8 @@ import { useCloudAuth } from '../../../context.js'
 import { ApiErrorAlert } from '../ApiErrorAlert/index.js'
 import { Button } from '../Button/index.js'
 import { CaptchaInput } from '../CaptchaInput/index.js'
-import { FormItem } from '../FormItem/index.js'
 import { FocusInput } from '../FocusInput/index.js'
+import { FormItem } from '../FormItem/index.js'
 import { Radio, RadioGroup } from '../Radio/index.js'
 import QuestionCycleIcon from '../question-circle.svg?react'
 

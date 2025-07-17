@@ -14,163 +14,164 @@ Follow these steps to use the feature:
 
 1. Deploy kind
 
-```bash
-kind create cluster --name alb-auth --image=kindest/node:v1.28.0
-kind get kubeconfig --name=alb-auth > ~/.kube/config
-```
+   ```bash
+   kind create cluster --name alb-auth --image=kindest/node:v1.28.0
+   kind get kubeconfig --name=alb-auth > ~/.kube/config
+   ```
 
 2. Deploy alb
 
-```bash
-helm repo add alb https://alauda.github.io/alb/;helm repo update;helm search repo|grep alb
-helm install alb-operator alb/alauda-alb2
-alb_ip=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' alb-auth-control-plane)
-echo $alb_ip
-cat <<EOF | kubectl apply -f -
-apiVersion: crd.alauda.io/v2
-kind: ALB2
-metadata:
-    name: alb-auth
-spec:
-    address: "$alb_ip"
-    type: "nginx"
-    config:
-        networkMode: host
-        loadbalancerName: alb-demo
-        projects:
-        - ALL_ALL
-        replicas: 1
-EOF
-```
+   ```bash
+   helm repo add alb https://alauda.github.io/alb/;helm repo update;helm search repo|grep alb
+   helm install alb-operator alb/alauda-alb2
+   alb_ip=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' alb-auth-control-plane)
+   echo $alb_ip
+   cat <<EOF | kubectl apply -f -
+   apiVersion: crd.alauda.io/v2
+   kind: ALB2
+   metadata:
+       name: alb-auth
+   spec:
+       address: "$alb_ip"
+       type: "nginx"
+       config:
+           networkMode: host
+           loadbalancerName: alb-demo
+           projects:
+           - ALL_ALL
+           replicas: 1
+   EOF
+   ```
 
 3. Deploy test application
+   - Create [github oauth app](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app)
+     > Note that `$GITHUB_CLIENT_ID` `$GITHUB_CLIENT_SECRET` will be obtained in this step, which needs to be set in the environment variable
+   - Configure dns
+     > Here we use echo.com as the application domain, auth.alb.echo.com and alb.echo.com
+   - Deploy oauth-proxy
+     > oauth2-proxy needs to access github, which may require setting the HTTPS_PROXY environment variable
 
-- Create [github oauth app](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app)
-  - Note that `$GITHUB_CLIENT_ID` `$GITHUB_CLIENT_SECRET` will be obtained in this step, which needs to be set in the environment variable
-- Configure dns
-  - Here we use echo.com as the application domain, auth.alb.echo.com and alb.echo.com
-- Deploy oauth-proxy
-  > oauth2-proxy needs to access github, which may require setting the HTTPS_PROXY environment variable
+   {/* lint ignore code-block-split-list */}
 
-```bash
-COOKIE_SECRET=$(python -c 'import os,base64; print(base64.urlsafe_b64encode(os.urandom(32)).decode())')
-OAUTH2_PROXY_IMAGE="quay.io/oauth2-proxy/oauth2-proxy:v7.7.1"
-kind load docker-image $OAUTH2_PROXY_IMAGE --name alb-auth
-cat <<EOF | kubectl apply -f -
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  labels:
-    k8s-app: oauth2-proxy
-  name: oauth2-proxy
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
+   ```bash
+   COOKIE_SECRET=$(python -c 'import os,base64; print(base64.urlsafe_b64encode(os.urandom(32)).decode())')
+   OAUTH2_PROXY_IMAGE="quay.io/oauth2-proxy/oauth2-proxy:v7.7.1"
+   kind load docker-image $OAUTH2_PROXY_IMAGE --name alb-auth
+   cat <<EOF | kubectl apply -f -
+   apiVersion: apps/v1
+   kind: Deployment
+   metadata:
+     labels:
+       k8s-app: oauth2-proxy
+     name: oauth2-proxy
+   spec:
+     replicas: 1
+     selector:
+       matchLabels:
+         k8s-app: oauth2-proxy
+     template:
+       metadata:
+         labels:
+           k8s-app: oauth2-proxy
+       spec:
+         containers:
+           - args:
+               - --http-address=0.0.0.0:4180
+               - --redirect-url=http://auth.alb.echo.com/oauth2/callback
+               - --provider=github
+               - --whitelist-domain=.alb.echo.com
+               - --email-domain=*
+               - --upstream=file:///dev/null
+               - --cookie-domain=.alb.echo.com
+               - --cookie-secure=false
+               - --reverse-proxy=true
+             env:
+               - name: OAUTH2_PROXY_CLIENT_ID
+                 value: $GITHUB_CLIENT_ID
+               - name: OAUTH2_PROXY_CLIENT_SECRET
+                 value: $GITHUB_CLIENT_SECRET
+               - name: OAUTH2_PROXY_COOKIE_SECRET
+                 value: $COOKIE_SECRET
+             image: $OAUTH2_PROXY_IMAGE
+             imagePullPolicy: IfNotPresent
+             name: oauth2-proxy
+             ports:
+             - containerPort: 4180
+               name: http
+               protocol: TCP
+             - containerPort: 44180
+               name: metrics
+               protocol: TCP
+   ---
+   apiVersion: v1
+   kind: Service
+   metadata:
+     labels:
+       k8s-app: oauth2-proxy
+     name: oauth2-proxy
+   spec:
+    ports:
+    - appProtocol: http
+      name: http
+      port: 80
+      protocol: TCP
+      targetPort: http
+    - appProtocol: http
+      name: metrics
+      port: 44180
+      protocol: TCP
+      targetPort: metrics
+    selector:
       k8s-app: oauth2-proxy
-  template:
-    metadata:
-      labels:
-        k8s-app: oauth2-proxy
-    spec:
-      containers:
-        - args:
-            - --http-address=0.0.0.0:4180
-            - --redirect-url=http://auth.alb.echo.com/oauth2/callback
-            - --provider=github
-            - --whitelist-domain=.alb.echo.com
-            - --email-domain=*
-            - --upstream=file:///dev/null
-            - --cookie-domain=.alb.echo.com
-            - --cookie-secure=false
-            - --reverse-proxy=true
-          env:
-            - name: OAUTH2_PROXY_CLIENT_ID
-              value: $GITHUB_CLIENT_ID
-            - name: OAUTH2_PROXY_CLIENT_SECRET
-              value: $GITHUB_CLIENT_SECRET
-            - name: OAUTH2_PROXY_COOKIE_SECRET
-              value: $COOKIE_SECRET
-          image: $OAUTH2_PROXY_IMAGE
-          imagePullPolicy: IfNotPresent
-          name: oauth2-proxy
-          ports:
-          - containerPort: 4180
-            name: http
-            protocol: TCP
-          - containerPort: 44180
-            name: metrics
-            protocol: TCP
----
-apiVersion: v1
-kind: Service
-metadata:
-  labels:
-    k8s-app: oauth2-proxy
-  name: oauth2-proxy
-spec:
- ports:
- - appProtocol: http
-   name: http
-   port: 80
-   protocol: TCP
-   targetPort: http
- - appProtocol: http
-   name: metrics
-   port: 44180
-   protocol: TCP
-   targetPort: metrics
- selector:
-   k8s-app: oauth2-proxy
-EOF
-```
+   EOF
+   ```
 
 4. Configure ingress
 
-- We will configure two ingresses, auth.alb.echo.com and alb.echo.com
+   We will configure two ingresses, auth.alb.echo.com and alb.echo.com
 
-```bash
-cat <<EOF | kubectl apply -f -
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  annotations:
-    nginx.ingress.kubernetes.io/auth-url: "https://auth.alb.echo.com/oauth2/auth"
-    nginx.ingress.kubernetes.io/auth-signin: "https://auth.alb.echo.com/oauth2/start?rd=http://\$host\$request_uri"
-  name: echo-resty
-spec:
-  ingressClassName: alb-auth
-  rules:
-    - host: alb.echo.com
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: echo-resty
-                port:
-                  number: 80
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: oauth2-proxy
-spec:
-  ingressClassName: alb-auth
-  rules:
-    - host: auth.alb.echo.com
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: oauth2-proxy
-                port:
-                  number: 80
-EOF
-```
+   ```bash
+   cat <<EOF | kubectl apply -f -
+   apiVersion: networking.k8s.io/v1
+   kind: Ingress
+   metadata:
+     annotations:
+       nginx.ingress.kubernetes.io/auth-url: "https://auth.alb.echo.com/oauth2/auth"
+       nginx.ingress.kubernetes.io/auth-signin: "https://auth.alb.echo.com/oauth2/start?rd=http://\$host\$request_uri"
+     name: echo-resty
+   spec:
+     ingressClassName: alb-auth
+     rules:
+       - host: alb.echo.com
+         http:
+           paths:
+             - path: /
+               pathType: Prefix
+               backend:
+                 service:
+                   name: echo-resty
+                   port:
+                     number: 80
+   ---
+   apiVersion: networking.k8s.io/v1
+   kind: Ingress
+   metadata:
+     name: oauth2-proxy
+   spec:
+     ingressClassName: alb-auth
+     rules:
+       - host: auth.alb.echo.com
+         http:
+           paths:
+             - path: /
+               pathType: Prefix
+               backend:
+                 service:
+                   name: oauth2-proxy
+                   port:
+                     number: 80
+   EOF
+   ```
 
 ## Result
 
