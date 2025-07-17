@@ -1,9 +1,9 @@
 /// <reference types="react/experimental" />
 
 import { useLang } from '@alauda/doom/runtime'
-import { isProduction, NoSSR, useI18n } from '@rspress/core/runtime'
 import { startTransition, useRef, useState } from 'react'
 import { Tooltip } from 'react-tooltip'
+import { isProduction, NoSSR, useI18n } from 'rspress/runtime'
 
 import { useMemoizedFn } from '@theme/hooks'
 

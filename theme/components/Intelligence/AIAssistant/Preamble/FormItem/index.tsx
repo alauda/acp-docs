@@ -7,9 +7,9 @@ import {
   useCallback,
   useState,
 } from 'react'
+import { useI18n } from 'rspress/runtime'
 
 import './styles.scss'
-import { useI18n } from '@rspress/core/runtime'
 
 export interface FormItemProps<T> {
   label?: string

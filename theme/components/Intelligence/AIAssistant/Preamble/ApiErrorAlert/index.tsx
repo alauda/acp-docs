@@ -1,5 +1,5 @@
-import { useI18n } from '@rspress/core/runtime'
 import { useMemo } from 'react'
+import { useI18n } from 'rspress/runtime'
 
 import { ApiError } from '../types.js'
 
