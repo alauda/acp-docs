@@ -1,0 +1,105 @@
+---
+weight: 91
+title: Automated Rotate Kuberentes Certificates
+---
+
+# Automated Rotate Kuberentes Certificates
+
+This guide helps you install, understand, and operate the Kubernetes Certificate Rotator in <Term name="productShort" textCase="upper" /> to automate the rotation of Kubernetes certificates within your clusters.
+
+## Installation
+
+See [Cluster Plugin](/extend/cluster_plugin.mdx) for installation instructions.
+
+> **Note:**
+>
+> * Currently supported:
+>
+>   * On-Premises clusters
+>   * DCS clusters
+
+## How it works
+
+This plugin handles automatic rotation for the following certificates.
+
+| Certificate file                                 | Function                                                               | Node Type          |
+| ------------------------------------------------ | ---------------------------------------------------------------------- | ------------------ |
+| apiserver.crt                                    | Server certificate for kube-apiserver                                  | Control Plane Node |
+| apiserver-etcd-client.crt                        | Client certificate for kube-apiserver to access etcd                   | Control Plane Node |
+| apiserver-kubelet-client.crt                     | Client certificate for kube-apiserver to access kubelet                | Control Plane Node |
+| front-proxy-client.crt                           | Client certificate for kube-apiserver to access aggregated API servers | Control Plane Node |
+| etcd/server.crt                                  | Server certificate for etcd                                            | Control Plane Node |
+| etcd/peer.crt                                    | Peer communication certificate between etcd members                    | Control Plane Node |
+| /root/.kube/config, admin.conf, super-admin.conf | Client certificate in kubeconfig for cluster administration            | Control Plane Node |
+| controller-manager.conf                          | Client certificate in kubeconfig for kube-controller-manager           | Control Plane Node |
+| scheduler.conf                                   | Client certificate in kubeconfig for kube-scheduler                    | Control Plane Node |
+| kubelet.crt                                      | Server certificate for kubelet                                         | All Nodes          |
+| kubelet-client-current.pem                       | Client certificate for kubelet (referenced by kubelet.conf)            | All Nodes          |
+
+### Rotation Process
+
+1.  **Load certificate information**
+
+    The initial step involves gathering metadata for all target certificates. Since these certificates are stored in different paths on the host, their contents must be read from the respective files. To achieve this, a temporary Pod is created on the target node with the certificate directories mounted, allowing the Pod to read the information. The certificate's information is collected once per day. Certificate details (paths, expiration) are maintained in the ConfigMap `cpaas-system/node-local-certs-<node-name>`. The encrypted CA certificate is stored in Secret `cpaas-system/kubernetes-ca`.
+
+2.  **Rotation Trigger Condition**
+
+    The `notBefore` and `notAfter` fields of the certificate indicate the validity period. Rotation is triggered if the remaining validity period is less than 20% or 30 days.
+
+3.  **Rotation queue**
+
+    Certificates requiring rotation are placed in a queue for processing. The rotation program evaluates recent rotation activities and the urgency of pending tasks to decide whether to process them immediately. This prevents potential cluster health issues caused by the simultaneous rotation of multiple certificates.
+
+4.  **Generate new certificates**
+
+    The rotation program generates new certificates based on internally stored CA information. The rotation process creates a temporary Pod on the target node with the necessary certificate directories mounted, allowing for controlled file modifications.
+
+5.  **Restart the components**
+
+    **Requiring restart:**
+
+      * `kube-apiserver`: It needs to be restarted to load the new certificates. During restart, it regenerates its internal loopback certificate (valid for one year, used only internally and can not be externally rotated).
+      * `kube-controller-manager`: It needs to be restarted to reload the kubeconfig file.
+      * `kube-scheduler`: It needs to be restarted to reload the kubeconfig file.
+      * `kubelet`: It needs to be restarted to reload the server certificate.
+
+    **Restart method:** Add annotations to the respective static Pods' YAML files to trigger the kubelet to recreate the Pods. To restart kubelet, mount the host filesystem with `hostPID is true` and run "systemctl restart kubelet" in the container.
+
+    **Auto-reloading:**
+
+      * Etcd can auto-reload the certificates.
+
+6.  **Rotation Timelines**
+
+      * `kubelet` certificates: Rotate at 61 days (91-day validity)
+      * Control plane certificates: Rotate at 292 days (365-day validity)
+
+## Operation Considerations
+
+If `kubelet` is in an abnormal state during the rotation window and cannot rotate certificates automatically, manual rotation is required:
+
+Operators must manually renew the certificates.
+
+Run the following commands to renew the certificates manually:
+
+```bash
+cert-renew --ca-cert <ca-cert-path> --ca-key <ca-key-path> --days <days> <certificate or kubeconfig 1> <certificate or kubeconfig 2> ...
+```
+
+For example to renew the `kubelet.crt`:
+
+```bash
+cert-renew --ca-cert /etc/kubernetes/pki/ca.crt --ca-key /etc/kubernetes/pki/ca.key --days 91 /etc/kubenetes/pki/kubelet.crt
+```
+
+To download and prepare the `cert-renew` tool, run:
+
+```bash
+curl "$(kubectl get services -n cpaas-system frontend -o jsonpath='{.spec.clusterIP}'):8080/cluster-cert-rotator/download/cert-renew" -o ./cert-renew && chmod +x ./cert-renew
+```
+
+Optionally, download `renew-all.sh` to renew all certificates on the node:
+
+```bash
+curl "$(kubectl get services -n cpaas-system frontend -o jsonpath='{.spec.clusterIP}'):8080/cluster-cert-rotator/download/renew-all.sh" -o ./renew-all.sh
+```
