@@ -1,5 +1,5 @@
 import { Markdown } from '@alauda/doom/runtime'
-import { useI18n } from 'rspress/runtime'
+import { useI18n } from '@rspress/core/runtime'
 
 export interface ThinkingProcessProps {
   children: string

@@ -1,5 +1,5 @@
+import { useI18n } from '@rspress/core/runtime'
 import clsx from 'clsx'
-import { useI18n } from 'rspress/runtime'
 
 import AssistantIcon from '../../assistant.svg?react'
 
