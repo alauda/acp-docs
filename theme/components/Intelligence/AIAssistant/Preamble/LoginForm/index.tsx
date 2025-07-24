@@ -1,3 +1,4 @@
+import { useI18n } from '@rspress/core/runtime'
 import {
   type FormEvent,
   type FormHTMLAttributes,
@@ -5,7 +6,6 @@ import {
   useState,
 } from 'react'
 import { Tooltip } from 'react-tooltip'
-import { useI18n } from 'rspress/runtime'
 import { ApiMethod, ResponseError, xfetch } from 'x-fetch'
 
 import {

@@ -1,3 +1,4 @@
+import { useI18n } from '@rspress/core/runtime'
 import clsx from 'clsx'
 import {
   type ChangeEvent,
@@ -7,7 +8,6 @@ import {
   useCallback,
   useState,
 } from 'react'
-import { useI18n } from 'rspress/runtime'
 
 import './styles.scss'
 

@@ -1,6 +1,6 @@
+import { useI18n } from '@rspress/core/runtime'
 import { useInterval } from '@theme/hooks'
 import { useState } from 'react'
-import { useI18n } from 'rspress/runtime'
 
 const CHUNKS = ['', '.', '..', '...']
 

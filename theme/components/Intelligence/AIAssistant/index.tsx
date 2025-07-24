@@ -1,3 +1,4 @@
+import { useI18n } from '@rspress/core/runtime'
 import clsx from 'clsx'
 import {
   useRef,
@@ -5,7 +6,6 @@ import {
   unstable_ViewTransition as ViewTransition,
 } from 'react'
 import { Tooltip } from 'react-tooltip'
-import { useI18n } from 'rspress/runtime'
 import { ApiMethod, xfetch } from 'x-fetch'
 
 import { useMemoizedFn } from '@theme/hooks'

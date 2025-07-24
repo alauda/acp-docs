@@ -1,6 +1,6 @@
+import { useI18n } from '@rspress/core/runtime'
 import clsx from 'clsx'
 import { useCallback, useMemo, useState } from 'react'
-import { useI18n } from 'rspress/runtime'
 
 import { X } from '@theme/components/_X.js'
 
