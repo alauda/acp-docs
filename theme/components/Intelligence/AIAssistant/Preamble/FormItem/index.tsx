@@ -1,3 +1,4 @@
+import { useI18n } from '@rspress/core/runtime'
 import clsx from 'clsx'
 import {
   type ChangeEvent,
@@ -9,7 +10,6 @@ import {
 } from 'react'
 
 import './styles.scss'
-import { useI18n } from '@rspress/core/runtime'
 
 export interface FormItemProps<T> {
   label?: string

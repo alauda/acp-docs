@@ -3,8 +3,8 @@ import clsx from 'clsx'
 
 import AssistantIcon from '../../assistant.svg?react'
 
-import classes from './styles.module.scss'
 import { LoginForm } from './LoginForm/index.js'
+import classes from './styles.module.scss'
 
 export interface PreambleProps {
   loggedIn: boolean

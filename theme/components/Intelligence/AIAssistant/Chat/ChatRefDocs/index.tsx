@@ -1,4 +1,5 @@
 import { useI18n } from '@rspress/core/runtime'
+import clsx from 'clsx'
 import { useCallback, useMemo, useState } from 'react'
 
 import { X } from '@theme/components/_X.js'
@@ -6,7 +7,6 @@ import { X } from '@theme/components/_X.js'
 import { RefDoc } from '../../types.js'
 import AngleDownIcon from './angle-down.svg?react'
 import classes from './styles.module.scss'
-import clsx from 'clsx'
 
 export interface ChatRefDocsProps {
   refDocs: RefDoc[]
