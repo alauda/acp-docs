@@ -103,12 +103,14 @@ export const AIAssistant = ({
       sessionIdRef.current = session_id
     }
 
+    const sessionId = sessionIdRef.current
+
     const res = await xfetch('/smart/api/smart_answer', {
       type: null,
       method: ApiMethod.POST,
       body: {
         input_text: content,
-        session_id: sessionIdRef.current,
+        session_id: sessionId,
       },
     })
 
@@ -117,6 +119,10 @@ export const AIAssistant = ({
     let text = ''
 
     for await (const chunk_ of res.body! as unknown as AsyncIterable<Uint8Array>) {
+      if (sessionId !== sessionIdRef.current) {
+        break
+      }
+
       const chunk = textDecoder.decode(chunk_)
 
       text += chunk
@@ -165,7 +171,9 @@ export const AIAssistant = ({
 
   return (
     <ViewTransition name="flip" onEnter={onCleanup} onExit={onCleanup}>
-      <div className={clsx(classes.container, 'rspress-doc', open && classes.open)}>
+      <div
+        className={clsx(classes.container, 'rspress-doc', open && classes.open)}
+      >
         <div className={classes.header}>
           <div className={classes.title}>
             {t('ai_assistant')}
