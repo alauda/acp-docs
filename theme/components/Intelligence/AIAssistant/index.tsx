@@ -1,12 +1,19 @@
 import { useI18n } from '@rspress/core/runtime'
 import clsx from 'clsx'
 import {
+  useEffect,
   useRef,
   useState,
   unstable_ViewTransition as ViewTransition,
 } from 'react'
 import { Tooltip } from 'react-tooltip'
-import { ApiMethod, xfetch } from 'x-fetch'
+import {
+  ApiMethod,
+  xfetch,
+  interceptors,
+  ApiInterceptor,
+  ResponseError,
+} from 'x-fetch'
 
 import { useMemoizedFn } from '@theme/hooks'
 
@@ -168,6 +175,29 @@ export const AIAssistant = ({
       setLoading(false)
     }
   })
+
+  useEffect(() => {
+    const interceptor: ApiInterceptor = async (req, next) => {
+      if (!req.url.startsWith('/smart/api/')) {
+        return next(req)
+      }
+      if (!req.headers.has('Authorization')) {
+        req.headers.set('Authorization', `Bearer ${authInfo!.token}`)
+      }
+      try {
+        return await next(req)
+      } catch (err) {
+        if (err instanceof ResponseError && err.response.status === 401) {
+          onLogout()
+        }
+        throw err
+      }
+    }
+    interceptors.use(interceptor)
+    return () => {
+      interceptors.eject(interceptor)
+    }
+  }, [])
 
   return (
     <ViewTransition name="flip" onEnter={onCleanup} onExit={onCleanup}>
