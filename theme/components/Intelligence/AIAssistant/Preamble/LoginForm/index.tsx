@@ -148,7 +148,7 @@ export const LoginForm = ({ onSubmit, ...props }: LoginFormProps) => {
           {CLOUD_AUTH_ORIGINS.map(({ name, value }) => (
             <Radio
               key={name}
-              label={name === 'local' ? 'Local' : t(`custom_portal_${name}`)}
+              label={name === 'local' ? 'Local' : t(`customer_portal_${name}`)}
               value={value}
             ></Radio>
           ))}
