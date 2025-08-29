@@ -59,11 +59,12 @@ The roles of **Primary Cluster** and **Standby Cluster** are relative: the clust
 ## Process Overview
 
 1. Prepare a unified domain name for platform access;
-2. Point the domain to the Primary Cluster's VIP and install the Primary Cluster;
+2. Point the domain to the **Primary Cluster's** VIP and install the **Primary Cluster**;
 3. Temporarily switch DNS resolution to the standby VIP to install the Standby Cluster;
-4. Install and enable the etcd synchronization plugin;
-5. Verify sync status and perform regular checks;
-6. In case of failure, switch DNS to the standby cluster to complete disaster recovery.
+4. Copy the ETCD encryption key of the **Primary Cluster** to the nodes that will later be the control plane nodes of Standby Cluster;
+5. Install and enable the etcd synchronization plugin;
+6. Verify sync status and perform regular checks;
+7. In case of failure, switch DNS to the standby cluster to complete disaster recovery.
 
 ## Required Resources
 
@@ -89,13 +90,15 @@ Configuration notes:
 ### Step 2: Install the Standby Cluster
 
 1. Temporarily point the domain name to the standby cluster's VIP;
-2. Log into the first master node of the Primary Cluster and copy the etcd encryption config to all standby cluster master nodes:
+2. Log into the first control plane node of the **Primary Cluster** and copy the etcd encryption config to all standby cluster control plane nodes:
 
     ```bash
-    for i in 1.1.1.1 2.2.2.2 3.3.3.3  # Replace with standby cluster control plane node IPs
+    # Let the control plane nodes of the primary cluster are 1.1.1.1, 2.2.2.2 & 3.3.3.3
+    # the control plane nodes of the standby cluster are 4.4.4.4, 5.5.5.5 & 6.6.6.6
+    for i in 4.4.4.4 5.5.5.5 6.6.6.6  # Replace with standby cluster control plane node IPs
     do
-      ssh $i "mkdir -p /etc/kubernetes/"
-      scp /etc/kubernetes/encryption-provider.conf $i:/etc/kubernetes/encryption-provider.conf
+      ssh "<user>@$i" "mkdir -p /etc/kubernetes/"
+      scp /etc/kubernetes/encryption-provider.conf "<user>@$i:/etc/kubernetes/encryption-provider.conf"
     done
     ```
 
@@ -227,3 +230,85 @@ If any keys are missing or surplus, follow the instructions in the output to res
 
 When using **`violet`** to upload packages to a standby cluster, you must specify the `--dest-repo` parameter with the VIP of the standby cluster.
 If this parameter is omitted, the package will be uploaded to the image repository of the primary cluster, preventing the standby cluster from installing or upgrading the corresponding extension.
+
+## FAQ
+
+* Here are the instructions in case that the ETCD encryption key of the standby cluster has not synced with the one of **primary cluster** before Installing the standby cluster.
+
+1. Get the ETCD encryption key on any of the standby cluster's control plane nodes:
+
+    ```bash
+    ssh <user>@<STANDBY cluster control plane node> cat /etc/kubernetes/encryption-provider.conf
+    ```
+
+It should look like:
+
+    ```yaml
+    apiVersion: apiserver.config.k8s.io/v1
+    kind: EncryptionConfiguration
+    resources:
+      - resources:
+        - secrets
+        providers:
+        - aescbc:
+            keys:
+            - name: key1
+              secret: MTE0NTE0MTkxOTgxMA==
+    ```
+
+2. Merge that ETCD encryption key into the primary cluster's `/etc/kubernetes/encryption-provider.conf` file, ensuring the key names are unique. For example, if the primary cluster's key is `key1`, rename the standby's key to `key2`:
+
+    ```yaml
+    apiVersion: apiserver.config.k8s.io/v1
+    kind: EncryptionConfiguration
+    resources:
+      - resources:
+        - secrets
+        providers:
+        - aescbc:
+            keys:
+            - name: key1
+              secret: My4xNDE1OTI2NTM1ODk3
+            - name: key2
+              secret: MTE0NTE0MTkxOTgxMA==
+    ```
+
+3. Make sure the new `/etc/kubernetes/encryption-provider.conf` file overwrites EVERY replicas on the control plane nodes of both clusters:
+
+    ```bash
+    # Let the control plane nodes of the primary cluster are 1.1.1.1, 2.2.2.2 & 3.3.3.3
+    # the control plane nodes of the standby cluster are 4.4.4.4, 5.5.5.5 & 6.6.6.6
+
+    # assume the 1.1.1.1 has already been configured to use both of the ETCD encryption keys,
+    # login into the node 1.1.1.1, and issue the following commands:
+    for i in \
+        2.2.2.2 3.3.3.3 \
+        4.4.4.4 5.5.5.5 6.6.6.6 \
+    ; do
+        scp /etc/kubernetes/encryption-provider.conf "<user>@${i}:/etc/kubernetes/encryption-provider.conf"
+        ssh "<user>@${i}" '
+    #!/bin/bash
+    _pod_name="kube-apiserver"
+    _pod_id=$(crictl ps --name "${_pod_name}" --no-trunc --quiet)
+    if [[ -z "${_pod_id}" ]]; then
+        echo "FATAL: could not find pod 'kube-apiserver' on node ${i}"
+        exit 1
+    fi
+    crictl rm --force "${_pod_id}"
+    systemctl restart kubelet.service
+    '
+    done
+    ```
+
+4. Restart the kube-apiserver on node 1.1.1.1
+
+    ```bash
+    _pod_name="kube-apiserver"
+    _pod_id=$(crictl ps --name "${_pod_name}" --no-trunc --quiet)
+    if [[ -z "${_pod_id}" ]]; then
+        echo "FATAL: could not find pod 'kube-apiserver' on node ${i}"
+        exit 1
+    fi
+    crictl rm --force "${_pod_id}"
+    systemctl restart kubelet.service
+    ```
