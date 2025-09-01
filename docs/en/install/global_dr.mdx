@@ -27,6 +27,8 @@ The roles of **Primary Cluster** and **Standby Cluster** are relative: the clust
 
 * This solution only synchronizes etcd data of the `global` cluster; it does not include data from registry, chartmuseum, or other components;
 
+* In favor of facilitating troubleshooting and management, it is recommended to name nodes in a style like `standby-global-m1`, to indicates which cluster the node belongs to (Primary or Standby).
+
 * Disaster recovery of application data within the cluster is not supported;
 
 * Stable network connectivity is required between the two clusters to ensure reliable etcd synchronization;
@@ -52,67 +54,85 @@ The roles of **Primary Cluster** and **Standby Cluster** are relative: the clust
   operators
   ```
 
-* If both clusters use built-in image registries, packages must be uploaded separately to each;
+* If both clusters are set to use built-in image registries, container images must be uploaded separately to each;
 
 * If the Primary Cluster deploys **<Term name="company" /> DevOps Eventing v3** (knative-operator) and instances thereof, the same components must be pre-deployed in the standby cluster.
 
 ## Process Overview
 
 1. Prepare a unified domain name for platform access;
-2. Point the domain to the Primary Cluster's VIP and install the Primary Cluster;
+2. Point the domain to the **Primary Cluster's** VIP and install the **Primary Cluster**;
 3. Temporarily switch DNS resolution to the standby VIP to install the Standby Cluster;
-4. Install and enable the etcd synchronization plugin;
-5. Verify sync status and perform regular checks;
-6. In case of failure, switch DNS to the standby cluster to complete disaster recovery.
+4. Copy the ETCD encryption key of the **Primary Cluster** to the nodes that will later be the control plane nodes of Standby Cluster;
+5. Install and enable the etcd synchronization plugin;
+6. Verify sync status and perform regular checks;
+7. In case of failure, switch DNS to the standby cluster to complete disaster recovery.
 
 ## Required Resources
 
-* One domain name used as the platform's access entry point;
-* Two VIPs, one for each cluster (Primary and Standby);
+* A unified domain which will be the `Platform Access Address`, and the TLS certificate plus private key for serving HTTPS on that domain;
+* A dedicated virtual IP address for each cluster — one for the **Primary Cluster** and another for the Standby Cluster;
 
-  * Both VIPs must forward TCP ports `80`, `443`, `6443`, `2379`, and `11443` to the three Control Plane nodes of the cluster.
+  * Preconfigure the load balancer to route TCP traffic on ports `80`, `443`, `6443`, `2379`, and `11443` to the control-plane nodes behind the corresponding VIP.
 
 ## Process
 
 ### Step 1: Install the Primary Cluster
+
+<Directive type="warning" title="NOTES OF DR (Disaster Recovery Environment) INSTALLING">
+While installing the primary cluster of the DR Environment,
+
+* First of all, documenting all of the parameters set while following the guide of the installation web UI. It is necessary to keep some options the same while installing the standby cluster.
+* A **User-provisioned** Load Balancer MUST be preconfigured to route traffic sent to the virtual IP. The `Self-built VIP` option is NOT available.
+* The `Platform Access Address` field MUST be a domain, while the `Cluster Endpoint` MUST be the virtual IP address.
+* Both clusters MUST be configured to use `An Existing Certificate` (has be the same one), request a legit certificate if necessary. The `Self-signed Certificate` option is NOT available.
+* When `Image Repository` is set to `Platform Deployment`, both `Username` and `Password` fields MUST NOT be empty; The `IP/Domain` field MUST be set to the domain used as the `Platform Access Address`.
+* Both `HTTP Port` and `HTTPS Port` fields of `Platform Access Address` MUST be 80 and 443.
+* When coming to the second page the of the installation guide (Step: `Advanced`), the `Other Platform Access Addresses` field MUST include the virtual IP of current Cluster.
+</Directive>
 
 Refer to the following documentation to complete installation:
 
 * [Prepare for Installation](./prepare/index.mdx)
 * [Installing](./installing.mdx)
 
-Configuration notes:
-
-* Add the cluster's VIP in `Other Platform Access Addresses`;
-* The Platform Access Address must use the unified domain.
-
 ### Step 2: Install the Standby Cluster
 
 1. Temporarily point the domain name to the standby cluster's VIP;
-2. Log into the first master node of the Primary Cluster and copy the etcd encryption config to all standby cluster master nodes:
+2. Log into the first control plane node of the **Primary Cluster** and copy the etcd encryption config to all standby cluster control plane nodes:
 
     ```bash
-    for i in 1.1.1.1 2.2.2.2 3.3.3.3  # Replace with standby cluster control plane node IPs
+    # Assume the primary cluster control plane nodes are 1.1.1.1, 2.2.2.2 & 3.3.3.3
+    # and the standby cluster control plane nodes are 4.4.4.4, 5.5.5.5 & 6.6.6.6
+    for i in 4.4.4.4 5.5.5.5 6.6.6.6  # Replace with standby cluster control plane node IPs
     do
-      ssh $i "mkdir -p /etc/kubernetes/"
-      scp /etc/kubernetes/encryption-provider.conf $i:/etc/kubernetes/encryption-provider.conf
+      ssh "<user>@$i" "sudo mkdir -p /etc/kubernetes/"
+      scp /etc/kubernetes/encryption-provider.conf "<user>@$i:/tmp/encryption-provider.conf"
+      ssh "<user>@$i" "sudo install -o root -g root -m 600 /tmp/encryption-provider.conf /etc/kubernetes/encryption-provider.conf && rm -f /tmp/encryption-provider.conf"
     done
     ```
 
-3. Install the standby cluster in the same way as the primary, referring to:
+3. Install the standby cluster in the same way as the primary cluster
+
+<Directive type="warning" title="NOTES FOR INSTALLING STANDBY CLUSTER">
+While installing the standby cluster of the DR Environment,
+the following options MUST be set to the same as the **primary cluster**:
+* The `Platform Access Address` field.
+* All fields of `Certificate`.
+* All fields of `Image Repository`
+* Important: ensure the credentials of image repository and the ACP admin user match those set on the **Primary Cluster**.
+
+and MAKE SURE you followed the `NOTES OF DR (Disaster Recovery Environment) INSTALLING` in Step 1.
+</Directive>
+
+Refer to the following documentation to complete installation:
 
 * [Prepare for Installation](./prepare/index.mdx)
 * [Installing](./installing.mdx)
 
-Configuration notes:
-
-* Use the same domain and certificates as the primary;
-* Use the same image registry and credentials;
-* Add the standby cluster's VIP in `Other Platform Access Addresses`.
-
 ### Step 3: Enable etcd Synchronization \{#etcd_sync}
 
-1. Ensure port `2379` is properly forwarded to the control plane nodes of both clusters;
+1. Configure the load balancer to forward port `2379` to control plane nodes of the corresponding cluster. ONLY TCP mode is supported; forwarding on L7 is not supported.
 2. Access the **standby global cluster** Web Console using its VIP, and switch to **Administrator** view;
 3. Navigate to **Marketplace > Cluster Plugins**, select the `global` cluster;
 4. Find **<Term name="product" /> etcd Synchronizer**, click **Install**, configure parameters:
@@ -167,12 +187,25 @@ If the following components are installed, restart their services:
 
 ## Disaster Recovery Process
 
-1. If <Term name="product" /> Log Storage for Elasticsearch is installed, run the following on the standby cluster:
+1. Restart Elasticsearch on the standby cluster in case it is necessary:
 
     ```bash
-    # Copy installer/res/packaged-scripts/for-upgrade/ensure-asm-template.sh to /root and execute:
-    bash /root/ensure-asm-template.sh
-    # If it returns 401, restart Elasticsearch and retry
+    # Copy installer/res/packaged-scripts/for-upgrade/ensure-asm-template.sh to /root:
+    # DO NOT skip this step
+
+    # switch to the root user if necessary
+    sudo -i
+
+    # check whether the Log Storage for Elasticsearch is installed on global cluster
+    _es_pods=$(kubectl get po -n cpaas-system | grep cpaas-elasticsearch | awk '{print $1}')
+    if [[ -n "${_es_pods}" ]]; then
+        # In case the script returned the 401 error, restart Elasticsearch
+        # then execute the script to check the cluster again
+        bash /root/ensure-asm-template.sh
+
+        # Restart Elasticsearch
+        xargs -r -t -- kubectl delete po -n cpaas-system <<< "${_es_pods}"
+    fi
     ```
 
 2. Verify data consistency in the standby cluster (same check as in [Step 3](#etcd_sync));
@@ -227,3 +260,88 @@ If any keys are missing or surplus, follow the instructions in the output to res
 
 When using **`violet`** to upload packages to a standby cluster, you must specify the `--dest-repo` parameter with the VIP of the standby cluster.
 If this parameter is omitted, the package will be uploaded to the image repository of the primary cluster, preventing the standby cluster from installing or upgrading the corresponding extension.
+
+## FAQ
+
+* Here are the instructions in case that the ETCD encryption key of the standby cluster has not synced with the one of **primary cluster** before Installing the standby cluster.
+
+1. Get the ETCD encryption key on any of the standby cluster's control plane nodes:
+
+    ```bash
+    ssh <user>@<STANDBY cluster control plane node> sudo cat /etc/kubernetes/encryption-provider.conf
+    ```
+
+It should look like:
+
+    ```yaml
+    apiVersion: apiserver.config.k8s.io/v1
+    kind: EncryptionConfiguration
+    resources:
+      - resources:
+        - secrets
+        providers:
+        - aescbc:
+            keys:
+            - name: key1
+              secret: MTE0NTE0MTkxOTgxMA==
+    ```
+
+2. Merge that ETCD encryption key into the primary cluster's `/etc/kubernetes/encryption-provider.conf` file, ensuring the key names are unique. For example, if the primary cluster's key is `key1`, rename the standby's key to `key2`:
+
+    ```yaml
+    apiVersion: apiserver.config.k8s.io/v1
+    kind: EncryptionConfiguration
+    resources:
+      - resources:
+        - secrets
+        providers:
+        - aescbc:
+            keys:
+            - name: key1
+              secret: My4xNDE1OTI2NTM1ODk3
+            - name: key2
+              secret: MTE0NTE0MTkxOTgxMA==
+    ```
+
+3. Make sure the new `/etc/kubernetes/encryption-provider.conf` file overwrites EVERY replicas on the control plane nodes of both clusters:
+
+    ```bash
+    # Let the control plane nodes of the primary cluster are 1.1.1.1, 2.2.2.2 & 3.3.3.3
+    # the control plane nodes of the standby cluster are 4.4.4.4, 5.5.5.5 & 6.6.6.6
+
+    # assume the 1.1.1.1 has already been configured to use both of the ETCD encryption keys,
+    # login into the node 1.1.1.1, and issue the following commands:
+    for i in \
+        2.2.2.2 3.3.3.3 \
+        4.4.4.4 5.5.5.5 6.6.6.6 \
+    ; do
+        scp /etc/kubernetes/encryption-provider.conf "<user>@${i}:/tmp/encryption-provider.conf"
+        ssh "<user>@${i}" '
+    #!/bin/bash
+    set -euo pipefail
+    
+    sudo install -o root -g root -m 600 /tmp/encryption-provider.conf /etc/kubernetes/encryption-provider.conf && rm -f /tmp/encryption-provider.conf
+    _pod_name="kube-apiserver"
+    _pod_id=$(sudo crictl ps --name "${_pod_name}" --no-trunc --quiet)
+    if [[ -z "${_pod_id}" ]]; then
+        echo "FATAL: could not find pod `kube-apiserver` on node $(hostname)"
+        exit 1
+    fi
+    sudo crictl rm --force "${_pod_id}"
+    sudo systemctl restart kubelet.service
+    '
+    done
+    ```
+
+4. Restart the kube-apiserver on node 1.1.1.1
+
+    ```bash
+    _pod_name="kube-apiserver"
+    _pod_id=$(sudo crictl ps --name "${_pod_name}" --no-trunc --quiet)
+    if [[ -z "${_pod_id}" ]]; then
+        echo "FATAL: could not find pod `kube-apiserver` on node $(hostname)"
+        exit 1
+    fi
+    sudo crictl rm --force "${_pod_id}"
+    sudo systemctl restart kubelet.service
+    ```
