@@ -1,0 +1,190 @@
+# Configuring Persistent Storage Using Local volumes
+
+Alauda Container Platform can be provisioned with persistent storage by using local volumes. Local persistent volumes allow you to access local storage devices, such as a disk or partition, by using the standard persistent volume claim interface.
+
+Local volumes can be used without manually scheduling pods to nodes because the system is aware of the volume node constraints. However, local volumes are still subject to the availability of the underlying node and are not suitable for all applications.
+
+:::note
+Local volumes can only be used as a statically created persistent volume.
+:::
+
+## Prerequisites
+
+- **Download** the **Alauda Build of LocalStorage** installation package corresponding to your platform architecture.
+
+- **Upload** the **Alauda Build of LocalStorage** installation package using the Upload Packages mechanism.
+
+- You have a local disk that meets the following conditions:
+
+    - It is attached to a node.
+    - It is not mounted.
+    - It does not contain partitions.
+
+## Procedure
+
+<Steps>
+
+### Installing the Local Storage Operator
+
+1. Login, go to the **Administrator** page.
+
+2. Click **Marketplace** > **OperatorHub** to enter the **OperatorHub** page.
+
+3. Find the **Alauda Build of LocalStorage**, click **Install**, and navigate to the **Install Alauda Build of LocalStorage** page.
+
+    Configuration Parameters:
+    | **Parameter**   | **Recommended Configuration**                          |
+    | :-------------- | :----------------------------------------------------- |
+    | **Channel**     | The default channel is `stable`.                       |
+    | **Installation Mode**  | `Cluster`: All namespaces in the cluster share a single Operator instance for creation and management, resulting in lower resource usage. |
+    | **Installation Place** | Select `Recommended`, Namespace only support **acp-storage**.|
+    | **Upgrade Strategy**   | `Manual`: When there is a new version in the Operator Hub, manual confirmation is required to upgrade the Operator to the latest version. |
+
+### Provisioning local volumes by using the Local Storage Operator
+
+Local volumes cannot be created by dynamic provisioning. Instead, persistent volumes can be created by the Local Storage Operator. The local volume provisioner looks for any file system or block volume devices at the paths specified in the defined resource.
+
+1. Create the local volume resource. This resource must define the nodes and paths to the local volumes.
+    
+    :::note
+    Do not use different storage class names for the same device. Doing so will create multiple persistent volumes (PVs).
+    :::
+
+    ```yaml
+    cat << EOF | kubectl create -f -
+    apiVersion: "local.storage.openshift.io/v1"
+    kind: "LocalVolume"
+    metadata:
+      name: "local-disks"
+      namespace: "acp-storage" # [!code callout]
+    spec:
+      nodeSelector: # [!code callout]
+        nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+              - worker-01
+              - worker-02
+              - worker-03
+      storageClassDevices:
+        - storageClassName: "local-sc" # [!code callout]
+          forceWipeDevicesAndDestroyAllData: false # [!code callout]
+          volumeMode: Block # [!code callout]
+          fsType: xfs # [!code callout]
+          devicePaths: # [!code callout]
+            - /path/to/device # [!code callout]
+    EOF
+    ```
+
+    <Callouts>
+    1. The namespace where the Local Storage Operator is installed, default is `acp-storage`.
+    2. Optional: A node selector containing a list of nodes where the local storage volumes are attached. This example uses the node hostnames, obtained from `kubectl get node`. If a value is not defined, then the Local Storage Operator will attempt to find matching disks on all available nodes.
+    3. The name of the storage class to use when creating persistent volume objects. The Local Storage Operator automatically creates the storage class if it does not exist. Be sure to use a storage class that uniquely identifies this set of local volumes.
+    4. This setting defines whether or not to call wipefs, which removes partition table signatures (magic strings) making the disk ready to use for Local Storage Operator (LSO) provisioning. No other data besides signatures is erased. The default is "false" (wipefs is not invoked). Setting forceWipeDevicesAndDestroyAllData to "true" can be useful in scenarios where previous data can remain on disks that need to be re-used. In these scenarios, setting this field to true eliminates the need for administrators to erase the disks manually.
+    5. The volume mode, either `Filesystem` or `Block`, that defines the type of local volumes.
+    6. Optional: The file system that is created when the local volume is mounted for the first time. This parameter must be configured only if `volumeMode` set to `Filesystem`.
+    7. The path containing a list of local storage devices to choose from. 
+    8. Replace this value with your actual local disks filepath to the `LocalVolume` resource `by-id`, such as `/dev/disk/by-id/wwn`. PVs are created for these local disks when the provisioner is deployed successfully.
+    </Callouts>
+
+2. Verify that the persistent volumes were created:
+
+    ```bash
+    kubectl get pv
+    ```
+
+    Example output:
+    ```bash
+    NAME                CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS      CLAIM   STORAGECLASS   REASON   AGE
+    local-pv-n8xlrd2a   100Gi      RWO            Delete           Available           local-sc                88m
+    local-pv-tc78vc73   100Gi      RWO            Delete           Available           local-sc                82m
+    local-pv-q86px4df   100Gi      RWO            Delete           Available           local-sc                48m    
+    ```
+
+    :::note
+    Editing the LocalVolume object does not change the fsType or volumeMode of existing persistent volumes because doing so might result in a destructive operation.
+    :::
+
+3. Creating the local volume persistent volume claim
+
+    ```yaml
+    cat << EOF | kubectl create -f -
+    kind: PersistentVolumeClaim
+    apiVersion: v1
+    metadata:
+      name: local-pvc-name # [!code callout]
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      volumeMode: Block # [!code callout]
+      resources:
+        requests:
+          storage: 100Gi # [!code callout]
+      storageClassName: local-sc # [!code callout]
+    EOF  
+    ```
+
+    <Callouts>
+    1. Name of the PVC.
+    2. The type of the PVC. Defaults to `Filesystem`.
+    3. The amount of storage available to the PVC.
+    4. Name of the storage class required by the claim.
+    </Callouts>
+
+</Steps>
+
+## Automating discovery local storage devices
+
+The Local Storage Operator automates local storage discovery.
+
+### Prerequisites
+
+- You have installed the Local Storage Operator.
+
+###  Procedure
+
+1. Create LocalVolumeDiscovery object
+
+    ```yaml
+    cat << EOF | kubectl create -f -
+    apiVersion: local.storage.openshift.io/v1alpha1
+    kind: LocalVolumeDiscovery
+    metadata:
+      name: auto-discover-devices
+      namespace: acp-storage
+    spec:
+      nodeSelector: # [!code callout]
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: In
+                values:
+                  - worker-01
+                  - worker-02
+                  - worker-03
+      tolerations: # [!code callout]
+        - operator: Exists
+    EOF
+    ```
+
+    <Callouts>
+    1. Optional: Nodes on which the automatic detection policies must run. If a value is not defined, then the Local Storage Operator will attempt to automatic detection on all available nodes.
+    2. Optional: If specified tolerations is the list of toleration that is passed to the LocalVolumeDiscovery Daemon
+    </Callouts>
+
+2. Verify discover result
+
+    ```bash
+    kubectl -n acp-storage get localvolumediscoveryresult
+    ```
+
+    Example output:
+    ```bash
+    NAME                               AGE
+    discovery-result-worker-01         21m
+    discovery-result-worker-02         21m
+    discovery-result-worker-03         21m
+    ```
+
+    A dedicated LocalVolumeDiscoveryResult object is generated for selected nodes in LocalVolumeDiscovery Object, from which you can inspect the block devices discovered on that node.
