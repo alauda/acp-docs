@@ -1,0 +1,191 @@
+---
+weight: 20
+title: Optimize Pod Performance with Manager Policies
+---
+# Optimize Pod Performance with Manager Policies
+
+This guide provides Kubernetes cluster administrators with a practical, ready-to-apply manual for enabling and validating **CPU ManagerPolicy**, **Memory ManagerPolicy**, and **Topology ManagerPolicy**. By aligning CPU pinning, NUMA affinity, and topology alignment, you can deliver consistent latency and improved performance for critical workloads.
+
+
+## Scope and Prerequisites
+
+**Roles and Permissions**
+
+* Requires maintenance window access, `kubectl` admin privileges, and SSH access to nodes.
+
+**Workload Requirements**
+
+* To achieve dedicated CPU and NUMA affinity, Pods must run in **Guaranteed QoS** class: requests = limits and CPU specified in full cores (e.g., 2, 4).
+
+**Not Covered**
+
+* HugePages are out of scope. If you need HugePages support, contact your support team.
+
+
+## Quick Start: Sample Kubelet Config
+
+Add the following snippet to `/var/lib/kubelet/config.yaml`, adjusting values for your environment:
+
+```yaml
+# —— CPU ManagerPolicy ——
+cpuManagerPolicy: "static"              # Options: none | static
+cpuManagerPolicyOptions:
+  full-pcpus-only: "true"               # Recommended: allocate only full cores
+cpuManagerReconcilePeriod: "5s"
+reservedSystemCPUs: ""                  # e.g. "0-1" if reserving specific CPUs for the system
+
+# —— Memory ManagerPolicy ——
+memoryManagerPolicy: "Static"           # Options: none | Static 
+reservedMemory:
+  - numaNode: 0
+    limits:
+      memory: "2048Mi"
+  - numaNode: 1
+    limits:
+      memory: "2048Mi"
+
+# —— Topology ManagerPolicy ——
+topologyManagerPolicy: "single-numa-node"     # Options: none | best-effort | restricted | single-numa-node
+topologyManagerScope: "pod"                   # Options: container | pod
+```
+
+**Notes:**
+
+* `full-pcpus-only: "true"` improves latency consistency.
+* `topologyManagerScope: pod` ensures containers within the same Pod align to a common NUMA topology.
+* `reservedMemory` must be calculated based on kubelet config and eviction thresholds (see next section).
+
+
+## How to Calculate `reservedMemory`
+
+Formula:
+```
+R_total = kubeReserved(memory) + systemReserved(memory) + evictionHard(memory.available)
+```
+
+The sum of `reservedMemory` across all NUMA nodes must equal `R_total`.
+
+**Steps (for N NUMA nodes):**
+
+1. Calculate `R_total` (Mi).
+2. Compute division and remainder:
+
+   * base = floor(R\_total / N)
+   * rem  = R\_total − base × N
+3. Assign values:
+
+   * NUMA node 0 = base + rem
+   * Remaining NUMA nodes = base
+
+**Example (2 NUMA nodes):**
+
+* kubeReserved=512Mi, systemReserved=512Mi, evictionHard=100Mi → R\_total = 1124Mi
+* base = 562, rem = 0
+   ```yaml
+   reservedMemory:
+   - numaNode: 0
+     limits:
+       memory: "562Mi"
+   - numaNode: 1
+     limits:
+       memory: "562Mi"
+   ```
+
+
+## Applying the Configuration
+
+For each node:
+
+1. **Cordon and Drain**
+
+   ```bash
+   kubectl cordon <node>
+   kubectl drain <node> --ignore-daemonsets --delete-emptydir-data
+   ```
+
+2. **Stop Kubelet and Clear State**
+
+   ```bash
+   sudo systemctl stop kubelet
+   sudo rm -f /var/lib/kubelet/cpu_manager_state
+   sudo rm -f /var/lib/kubelet/memory_manager_state
+   ```
+
+3. **Restart Kubelet**
+
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl start kubelet
+   ```
+
+4. **Reschedule Pods**
+
+   ```bash
+   kubectl uncordon <node>
+   ```
+
+* For DaemonSets and system Pods, restart or delete Pods explicitly.
+
+5. **Verify Recovery**
+
+   ```bash
+   kubectl get nodes
+   kubectl get pods -A -o wide | grep <node>
+   ```
+
+
+## Verification
+
+**CPU ManagerPolicy State**
+
+```bash
+sudo cat /var/lib/kubelet/cpu_manager_state | jq .
+```
+
+Check:
+
+* `.policyName` = `"static"`
+* `.defaultCpuSet` lists non-dedicated CPUs
+* `.entries` show container-to-CPU assignments
+
+**Memory ManagerPolicy State**
+
+```bash
+sudo cat /var/lib/kubelet/memory_manager_state | jq .
+```
+
+Check:
+
+* `.policyName` = `"Static"`
+* Sum of reserved memory matches `R_total`
+* Guaranteed Pods are assigned to NUMA nodes per `single-numa-node` policy
+
+
+## Key Policies and Behaviors
+
+**CPU ManagerPolicy**
+
+* Purpose: Allocate exclusive physical CPUs to Guaranteed Pods
+* Config: `cpuManagerPolicy: static`, `full-pcpus-only: "true"`
+* Behavior: Only applies to Guaranteed Pods; Burstable/BestEffort are unaffected
+
+**Memory ManagerPolicy**
+
+* Purpose: Reserve and align memory at NUMA node level
+* Config: `memoryManagerPolicy: "Static"`, `reservedMemory`
+* Behavior: Works best with Topology ManagerPolicy for alignment
+
+**Topology ManagerPolicy**
+
+* Purpose: Align CPU, memory, and device allocation on a single NUMA node
+* Config: `topologyManagerPolicy: single-numa-node`, `topologyManagerScope: pod`
+* Modes: best-effort, restricted, single-numa-node (strict)
+
+
+## Terminology
+
+* **NUMA node**: Non-Uniform Memory Access domain
+* **CPU pinning**: Binding containers to dedicated CPUs
+* **NUMA affinity**: Preferring memory from the same NUMA node as CPU
+* **Topology alignment**: Co-locating CPU, memory, and devices on one NUMA node
+* **Guaranteed Pod**: requests = limits; CPU specified as full cores
