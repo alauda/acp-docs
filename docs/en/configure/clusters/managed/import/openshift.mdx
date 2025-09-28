@@ -1,0 +1,193 @@
+---
+weight: 20
+title: Import OpenShift Cluster
+---
+
+# Import OpenShift Cluster
+
+Supports integrating deployed OpenShift clusters into the platform for unified management.
+
+## Prerequisites
+
+* The Kubernetes version and parameters of the cluster must meet the [Standard Kubernetes Cluster Requirements](/configure/clusters/overview.mdx#version-compatibility).
+
+* During integration, `kubectl` commands are required. Please install the CLI tool on the bastion host that can access the cluster.
+
+* To enable real-time monitoring of metrics such as nodes, workloads (Deployment, StatefulSet, DaemonSet), Pods, and containers, ensure **Prometheus** is already deployed in the target cluster.
+
+## Obtain Registry Address
+
+* To use the registry deployed by the platform during **global cluster** installation, run the following command on a global control node:
+
+    ```shell
+    if [ "$(kubectl get productbase -o jsonpath='{.items[].spec.registry.preferPlatformURL}')" = 'false' ]; then
+        REGISTRY=$(kubectl get cm -n kube-public global-info -o jsonpath='{.data.registryAddress}')
+    else
+        REGISTRY=$(kubectl get cm -n kube-public global-info -o jsonpath='{.data.platformURL}' | awk -F // '{print $NF}')
+    fi
+    echo "Registry address is: $REGISTRY"
+    ```
+
+* To use an **external registry**, manually set the **REGISTRY** variable:
+
+    ```shell
+    REGISTRY=<external-registry-address>  # e.g., registry.example.cn:60080 or 192.168.134.43
+    echo "Registry address is: $REGISTRY"
+    ```
+
+## Check if Extra Registry Config is Needed
+
+1. Run the following command to check if the registry supports HTTPS and uses a trusted CA certificate:
+
+    ```shell
+    REGISTRY=<registry-address-from-previous-step>
+
+    if curl -s -o /dev/null --retry 3 --retry-delay 5 -- "https://${REGISTRY}/v2/"; then
+        echo 'Pass: Registry uses a trusted CA certificate. No extra config needed.'
+    else
+        echo 'Fail: Registry does not support HTTPS or uses an untrusted certificate. Follow "Trust Insecure Registry".'
+    fi
+    ```
+
+2. If the check fails, follow the steps below.
+
+### Trust Insecure Registry
+
+1. **Log in to all OCP cluster nodes.**
+
+2. On each node, configure the registry settings:
+
+    ```shell
+    sudo -i
+    sudo chattr -i /
+
+    sudo mkdir -p /etc/systemd/system/crio.service.d/
+    cat | sudo tee /etc/systemd/system/crio.service.d/99-registry-cpaas-system.conf << 'EOF'
+    [Service]
+    ExecStart=
+    ExecStart=/usr/bin/crio \
+              --insecure-registry='<registry-address>' \  # e.g., registry.example.cn:60080 or 192.168.134.43
+              $CRIO_CONFIG_OPTIONS \
+              $CRIO_RUNTIME_OPTIONS \
+              $CRIO_STORAGE_OPTIONS \
+              $CRIO_NETWORK_OPTIONS \
+              $CRIO_METRICS_OPTIONS
+    EOF
+    ```
+
+3. Restart `crio`:
+
+    ```shell
+    sudo systemctl daemon-reload && sudo systemctl restart crio
+    ```
+
+## Configure DNS for the Cluster
+
+Modify the CoreDNS `ConfigMap` in the global cluster to configure DNS.
+
+1. From the bastion host, get the OCP cluster base domain:
+
+    ```shell
+    oc get dns cluster -o jsonpath='{.spec.baseDomain}'
+    ```
+
+    Example output:
+
+    ```
+    ocp.example.com
+    ```
+
+2. Log in to the platform management console, switch to the **global** cluster, then go to **Cluster Management** > **Resource Management**.
+
+3. Edit the `cpaas-coredns` `ConfigMap` in the `kube-system` namespace.
+
+    Add a new block using the OCP base domain and DNS server address (from `/etc/resolv.conf` on a cluster node).
+
+    Example:
+
+    ```
+    Corefile: |
+    ocp.example.com:1053 {
+        log
+        forward . 192.168.31.220
+    }
+    .:1053 {
+    ```
+
+## Get Cluster Info
+
+Choose one of the following:
+
+### Method 1 (Recommended): Get the KubeConfig File
+
+1. On the bastion host, search for the `kubeconfig` file and verify it contains an admin context.  
+2. Copy the kubeconfig file from the bastion host to your local machine:
+
+    ```shell
+    scp root@<bastion-ip>:</path/to/kubeconfig> <local-path>
+    ```
+
+### Method 2: Use Token, API Server Address, and CA Certificate
+
+See [How to fetch cluster information?](/configure/clusters/how-to/fetch-kubeconfig.mdx).
+
+## Import Cluster
+
+1. In the left navigation, go to **Cluster Management** > **Clusters**.  
+2. Click **Import Cluster**.  
+3. Configure the parameters:  
+
+    | Parameter | Description |
+    | --------- | ----------- |
+    | **Registry** | Registry storing platform component images.**Platform Default**: registry configured during global setup.**Private Registry**: requires registry address, port, username, and password.**Public Registry**: requires [updating cloud credentials](/configure/clusters/how-to/update_public_repository_credentials.mdx). |
+    | **Cluster Info** | Either upload the KubeConfig file or enter manually.**Cluster Address**: API Server address.**CA Certificate**: decoded Base64 CA certificate.**Authentication**: token or client certificate with cluster-admin permissions. |
+
+4. Click **Check Connectivity**.  
+5. If successful, click **Import**. Progress can be viewed in the execution log. Once imported, the cluster appears healthy in the list.
+
+## Network Configuration
+
+Ensure network connectivity between the global cluster and the imported cluster. See [Network Configuration for Imported Clusters](/configure/clusters/how-to/annotate-platform-url.mdx).
+
+## Deploy Add-ons
+
+After successful integration, go to **Marketplace** to deploy required add-ons such as monitoring, log collection, and log storage.
+
+*Before deploying log collection, ensure `/var/cpaas/` has more than 50GB free space:*
+
+```shell
+df -h /var/cpaas
+```
+
+## Update Audit Policy
+
+You can modify the audit policy (`spec.audit.profile`) of the cluster:
+
+* **Default**: logs metadata of read/write requests (OAuth access token creation logs the body).  
+* **WriteRequestBodies**: logs metadata for all requests and bodies of write requests.  
+* **AllRequestBodies**: logs metadata and bodies of all requests.
+
+Sensitive resources (e.g., Secrets, Routes, OAuthClient) only log metadata.
+
+Update with:
+
+```shell
+oc edit apiserver cluster
+```
+
+## FAQ
+
+### Why is the "Add Node" button disabled?
+
+Adding nodes via the platform UI is not supported. Use the vendor's method.
+
+### Which certificates are supported?
+
+1. **Kubernetes Certificates**: Only API Server certificates are visible, no auto-rotation.  
+2. **Platform Component Certificates**: Visible and auto-rotated.
+
+### Which features are unsupported for OpenShift clusters?
+
+* Audit data collection.  
+* ETCD, Scheduler, Controller Manager monitoring (only API Server metrics available).  
+* Certificates other than API Server.
