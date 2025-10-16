@@ -1,0 +1,205 @@
+---
+title: "AWS EKS Cluster Network Initialization Configuration"
+description: "AWS EKS cluster network initialization configuration."
+weight: 10
+---
+
+## Support Overview
+
+| Feature | Support Status | Requirements |
+|---|---|---|
+| **LoadBalancer Service** | Supported | Optionally [deploy AWS Load Balancer Controller](#deploy-aws-load-balancer-controller). Without this controller, LoadBalancer capabilities are limited. |
+| **Ingress** | Supported | Optionally [deploy AWS Load Balancer Controller](#deploy-aws-load-balancer-controller). Optionally enable **Ingress Class** functionality (once enabled, you can manually select ingress classes when creating ingress through the form interface). |
+
+## Prerequisites
+
+* Prepare two subnets with the **kubernetes.io/role/elb** tag. For shared subnets, add the **kubernetes.io/cluster/\<cluster-name\>: shared** tag. See [Adding Tags to Subnets](#add-tags-to-subnets).
+
+* If you have created an EKS cluster, [import the Amazon EKS cluster](/configure/clusters/managed/import/aws-eks.mdx). 
+{/* if not, [create an AWS EKS cluster](/configure/clusters/managed/create/aws-eks.mdx). */}
+
+* Ensure kubectl, Helm, AWS CLI, and eksctl tools are available before deploying AWS Load Balancer Controller.
+
+    **Note**: After installing the tools, configure login information using the user who created the cluster via AWS CLI, and [test if AWS CLI and eksctl tools are correctly installed](#test-aws-cli-and-eksctl-installation).
+
+* Obtain [ACCOUNT_ID](#get-account_id), **REGION**, and **CLUSTER_NAME** in advance, and replace `<ACCOUNT_ID>`, `<REGION>`, and `<CLUSTER_NAME>` in the documentation with the actual values.
+
+    **Note**: **ACCOUNT_ID** is the Account ID of the user who created the cluster, **REGION** is the cluster region, and **CLUSTER_NAME** is the cluster name.
+
+* Update and verify the [Kubeconfig configuration file](#kubeconfig-configuration-file).
+
+## Configuration Steps
+
+### Deploy AWS Load Balancer Controller
+
+**Note**: For detailed information on deploying AWS Load Balancer Controller, see [official documentation](https://docs.aws.amazon.com/zh_cn/eks/latest/userguide/aws-load-balancer-controller.html).
+
+**Configure OIDC Provider**
+
+Kubernetes clusters use OpenID Connect (OIDC) for identity management and are associated with an OIDC issuer URL. To enable AWS Identity in the cluster and allow IAM roles for Service Accounts, create an IAM OIDC Provider associated with the cluster's OIDC issuer URL.
+
+Execute the following command in eksctl to configure the OIDC Provider:
+
+```bash
+eksctl utils associate-iam-oidc-provider --region=<REGION> --cluster=<CLUSTER_NAME> --approve
+```
+
+<span id="configure-service-account">**Configure Service Account**</span>
+
+Execute the following commands to create an IAM policy and create a Service Account named `aws-load-balancer-controller`, associating it with an IAM role:
+
+```bash
+curl -o aws-load-balancer-controller-iam-policy.json https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.4.7/docs/install/iam_policy.json
+aws iam create-policy \
+    --policy-name <CLUSTER_NAME>-AWSLoadBalancerControllerIAMPolicy \
+    --policy-document file://aws-load-balancer-controller-iam-policy.json
+
+eksctl create iamserviceaccount \
+  --cluster=<CLUSTER_NAME> \
+  --namespace=kube-system \
+  --name=aws-load-balancer-controller \
+  --role-name AmazonEKSLoadBalancerControllerRole \
+  --attach-policy-arn=arn:aws:iam::<ACCOUNT_ID>:policy/<CLUSTER_NAME>-AWSLoadBalancerControllerIAMPolicy \
+  --approve
+```
+
+**Deploy AWS Load Balancer Controller to Cluster**
+
+Execute the following commands in eksctl to deploy AWS Load Balancer Controller:
+
+1. Add the eks-charts repository:
+
+    ```bash
+    helm repo add eks https://aws.github.io/eks-charts
+    ```
+
+2. Update the local repository:
+
+    ```bash
+    helm repo update eks
+    ```
+
+3. Deploy the AWS Load Balancer Controller Helm Chart to the cluster:
+
+    **Note**: `aws-load-balancer-controller` is the **Service Account** created in [Configure Service Account](#configure-service-account).
+
+    ```bash
+    helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+      -n kube-system \
+      --version=v2.4.7 \
+      --set ingressClassConfig.default=true \
+      --set clusterName=<CLUSTER_NAME> \
+      --set serviceAccount.create=false \
+      --set serviceAccount.name=aws-load-balancer-controller
+    ```
+
+### Create Ingress and LoadBalancer Services
+
+You can create ingress and LoadBalancer services simultaneously or choose one based on your needs.
+
+**Create Ingress**
+
+1. In **Container Platform**, click **Network** > **Ingress** in the left navigation.
+
+2. Click **Create Ingress** and select **EKS Ingress Class** for **Ingress Class**.
+
+3. Select **Protocol**. Default is **HTTP**. For **HTTPS**, first [create a certificate](#create-certificate) and select it.
+
+4. Switch to **YAML** and add the following annotations. For details, see [annotation documentation](https://docs.aws.amazon.com/zh_cn/eks/latest/userguide/alb-ingress.html):
+
+    ```yaml
+    alb.ingress.kubernetes.io/scheme: internet-facing ## Specify public access
+    alb.ingress.kubernetes.io/target-type: ip  ## Route traffic directly to pods
+    ```
+
+5. Click **Create**.
+
+**Create LoadBalancer Service**
+
+1. In **Container Platform**, click **Network** > **Services** in the left navigation.
+
+2. Click **Create Service** and select **LoadBalancer** for **External Access**.
+
+3. Expand **annotations** and fill in [LoadBalancer service annotations](/configure/networking/how_to/alb/deploy_alb.mdx#14) as needed.
+
+4. Click **Create**.
+
+## Related Operations
+
+### Test AWS CLI and eksctl Installation
+
+* Execute the following command. If it returns a cluster list, AWS CLI is correctly installed:
+
+    ```bash
+    aws eks list-clusters
+    ```
+
+* Execute the following command. If it returns a cluster list, eksctl is correctly installed:
+
+    ```bash
+    eksctl get clusters
+    ```
+
+### Get ACCOUNT_ID
+
+Execute `aws sts get-caller-identity` to get **ACCOUNT_ID**. The `651168850570` in the response is the **ACCOUNT_ID**:
+
+```json
+{
+"ARN": "arn:aws:iam::651168850570:user/jwshi"
+}
+```
+
+### Kubeconfig Configuration File
+
+1. Execute the following command to update the Kubeconfig file for the specified region:
+
+    ```bash
+    aws eks --region <REGION>  update-kubeconfig --name <CLUSTER_NAME>
+    ```
+
+2. Execute the following command to verify the Kubeconfig file. If it returns information normally, the configuration is correct:
+
+    ```bash
+    kubectl get svc -n cpaas-system
+    ```
+
+### Add Tags to Subnets
+
+1. Execute the following command to get cluster subnets:
+
+    ```bash
+    eksctl get cluster --name <CLUSTER_NAME>
+    ```
+    
+2. Execute the following command to get subnet details:
+
+    ```bash
+    aws ec2 describe-subnets
+    ```
+
+3. Execute the following commands to add tags to subnets. Replace `<subnet-id>` with actual values. See [Subnet auto-discovery](https://kubernetes-sigs.github.io/aws-load-balancer-controller/v2.5/deploy/subnet_discovery/#common-tag):
+
+    * Add the `kubernetes.io/role/elb` tag to subnets:
+
+        ```bash
+        aws ec2 create-tags --resources <subnet-id> --tags Key=kubernetes.io/role/elb,Value="1"
+        ```
+
+    * Add the `kubernetes.io/cluster/<CLUSTER_NAME>: shared` tag to shared subnets:
+
+        ```bash
+        aws ec2 create-tags --resources <subnet-id> --tags Key=kubernetes.io/cluster/<CLUSTER_NAME>,Value="shared"
+        ```
+
+### Create Certificate
+
+When using HTTPS protocol, save HTTPS certificate credentials as a Secret (TLS type) in advance.
+
+1. In **Container Platform**, click **Configuration** > **Secrets** in the left navigation.
+
+2. Click **Create Secret**.
+
+3. Select **TLS** type and import or fill in **Certificate** and **Private Key** as needed.
+
+4. Click **Create**.
