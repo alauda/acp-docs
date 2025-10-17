@@ -1,0 +1,76 @@
+---
+weight: 20
+title: Disk Configuration
+---
+
+## Storage Capacity \{#storage_capacity}
+
+:::info
+Mount the following partitions on dedicated disks or on LVM-provisioned logical volumes so they can be expanded later.
+:::
+
+| partition | Minimum size | Recommended size | Notes |
+|---|---|---|---|
+| /var/lib/etcd | 10GB | 20GB | A dedicated high-IO disk is recommended for hosting etcd data. |
+| /var/lib/containerd/ | 100GB | 150GB |  |
+| /cpaas/ | For control plane nodes of global cluster, at least 100GB;<br></br>For other nodes, at least 40GB | 200GB | Plan for additional space if you expect the infra node components which requires more space on /cpaas/. |
+| / | 50GB | 100GB, higher is better. | Ensure there is enough free disk space to keep utilization below 80%. If usage rises above this threshold, pods on the node may be evicted. |
+| arbitrary location for downloading and unpacking the installer packages, extensions and so on. | 20GB | 250GB | Actual storage needs will vary depending on which extensions you plan to install.<br></br>Plan for additional space if you expect to add more components or enable extra features later. |
+
+## Recommended ETCD Practices
+
+Fast storage is essential for etcd to perform reliably. etcd depends on durable, low-latency disk operations to persist proposals to its write-ahead log (WAL).  
+If disk writes take too long, fsync delays can cause the member to miss heartbeats, fail to commit proposals promptly, and experience request timeouts or temporary leader changes. These issues can also slow the Kubernetes API and degrade overall cluster responsiveness.  
+In conclusion, HDDs are a poor choice and are not recommended. If you must use HDDs for etcd, choose the fastest available (for example, 15,000 RPM).  
+
+:::info
+The following hard drive practices provide optimal etcd performance:
+
+- Prefer SSDs or NVMe as etcd drives. When write endurance and stability are priorities, consider server-grade single-level cell (SLC) SSDs. Avoid NAS, SAN, and HDDs.
+  - Prefer drives with high write throughput to accelerate compaction and defragmentation.
+  - Prefer drives with strong read bandwidth to reduce recovery time after failures.
+  - Prefer drives with consistently low latency to ensure fast read and write operations.
+- Avoid distributed block storage systems such as Ceph RADOS Block Device (RBD), Network File System (NFS), and other network-attached backends, because they introduce unpredictable latency.
+
+- Keep etcd data on a dedicated drive or a dedicated logical volume.
+  - Do not place I/O-sensitive (such as logging) or other intensive filesystem activity on control-plane hosts, or at least do not let them share the same underlying storage with etcd.
+
+- Continuously benchmark with tools like `fio` and use the results to track performance as the cluster grows. Refer to the [disk benchmarking guide](#benchmark_with_fio) for more information.
+:::
+
+### Validating the hardware for etcd
+
+| Specification | Minimum Requirement | Recommended | Notes |
+|----------------|---------------------|--------------|--------|
+| Sequential write IOPS | 50 | 500 (higher is better) | Most cloud providers publish *concurrent* IOPS rather than *sequential* IOPS. The concurrent IOPS values are typically about 10× higher than sequential ones. |
+| Disk bandwidth | 10 MB/s | 100 MB/s (higher is better) | Higher disk bandwidth allows faster data recovery when a failed member needs to catch up with the cluster. |
+| Throughput (sequential 8 kB write with `fdatasync`) | 50 writes per 10 ms | 500 writes per 2 ms | Reflects sustained write throughput when data is flushed to disk after each write operation. |
+
+#### Benchmarking with fio \{#benchmark_with_fio}
+
+To measure actual sequential IOPS and throughput, we suggest using the disk benchmarking tool `fio`. You may refer to the following instructions:
+
+:::warning
+Do not run these tests against any nodes of the <Term name="productShort" /> clusters.  
+Instead, run the tests against a dedicated VM that has the same set up as the control plane nodes.  
+:::
+
+```bash
+set -e
+mkdir -p /var/lib/etcd/
+
+echo "INFO: Running fio"
+fio --rw=write --ioengine=sync --fdatasync=1 --directory=/var/lib/etcd --size=100m --bs=8000 --name=etcd_perf --output-format=json --runtime=60 --time_based=1 | tee /tmp/fio.out
+
+# Scrape the fio output for p99 of fsync in ns
+fsync=$(cat /tmp/fio.out | jq '.jobs[0].sync.lat_ns.percentile["99.000000"]')
+iops=$(cat /tmp/fio.out | jq '.jobs[0].write.iops')
+echo "INFO: 99th percentile of fsync is $fsync ns"
+
+# Compare against the recommended value
+if [[ $fsync -ge 10000000 ]]; then
+    echo "WARN: IOPS is $iops, 99th percentile of the fsync is greater than the recommended value which is ${fsync} ns > 10 ms, faster disks are recommended to host etcd for better performance"
+else
+    echo "INFO: IOPS is $iops, 99th percentile of the fsync is within the recommended threshold: - 10 ms, the disk can be used to host etcd"
+fi
+```
