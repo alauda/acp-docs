@@ -14,4 +14,4 @@ $ yarn install
 * `yarn dev`: Start the local development server, file modifications will update in real-time. (**Note:** Left navigation bar related modifications require restarting the service)
 * `yarn build`: Build production environment code, static files will be generated in the `dist` directory after build completion
 * `yarn serve`: Preview the built static files locally
-
+* `yarn up @alauda/doom`: Upgrade doom
