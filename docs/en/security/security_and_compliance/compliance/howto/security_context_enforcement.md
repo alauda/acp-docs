@@ -574,6 +574,143 @@ spec:
                   - ALL
 ```
 
+### Scenario 4: Specified Namespace Security Context Enforcement
+
+Implementing label-based namespace security policy injection:
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: Policy
+metadata:
+  annotations:
+    policies.kyverno.io/category: Pod Security Standards
+    policies.kyverno.io/description: 'Strictly follow the Security Context configuration in the image to automatically add, allowPrivilegeEscalation:
+      false, capabilities drop ALL,  runAsNonRoot: true, seccompProfile: RuntimeDefault'
+    policies.kyverno.io/minversion: 1.13.0
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/title: Add precise Security Context configuration
+  creationTimestamp: "2025-06-04T03:26:54Z"
+  generation: 1
+  labels:
+    velero.io/backup-name: app-backup-20250604111354
+    velero.io/restore-name: app-recovery
+  name: add-exact-security-context
+  namespace: test-1
+spec:
+  admission: true
+  background: true
+  emitWarning: false
+  rules:
+  - match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+    context:
+    - name: namespaceInfo
+      apiCall:
+        urlPath: "/api/v1/namespaces/{{request.namespace}}"
+        jmesPath: "metadata.labels.\"pod-security.kubernetes.io/enforce\" || 'restricted'"
+    preconditions:
+      all:
+      - key: "{{ namespaceInfo }}"
+        operator: NotEquals
+        value: "privileged"
+    mutate:
+      foreach:
+      - list: request.object.spec.containers
+        patchStrategicMerge:
+          spec:
+            containers:
+            - name: '{{ element.name }}'
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                  - ALL
+                runAsNonRoot: true
+                seccompProfile:
+                  type: RuntimeDefault
+    name: add-container-security-context
+    skipBackgroundRequests: true
+  - match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+    context:
+    - name: namespaceInfo
+      apiCall:
+        urlPath: "/api/v1/namespaces/{{request.namespace}}"
+        jmesPath: "metadata.labels.\"pod-security.kubernetes.io/enforce\" || 'restricted'"
+    preconditions:
+      all:
+      - key: "{{ namespaceInfo }}"
+        operator: NotEquals
+        value: "privileged"
+      - key: '{{ request.object.spec.initContainers || `[]` | length(@) }}'
+        operator: GreaterThan
+        value: 0
+    mutate:
+      foreach:
+      - list: request.object.spec.initContainers
+        patchStrategicMerge:
+          spec:
+            initContainers:
+            - name: '{{ element.name }}'
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                  - ALL
+                runAsNonRoot: true
+                seccompProfile:
+                  type: RuntimeDefault
+    name: add-init-container-security-context
+    skipBackgroundRequests: true
+  - match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+    context:
+    - name: namespaceInfo
+      apiCall:
+        urlPath: "/api/v1/namespaces/{{request.namespace}}"
+        jmesPath: "metadata.labels.\"pod-security.kubernetes.io/enforce\" || 'restricted'"
+    preconditions:
+      all:
+      - key: "{{ namespaceInfo }}"
+        operator: NotEquals
+        value: "privileged"
+      - key: '{{ request.object.spec.ephemeralContainers || `[]` | length(@) }}'
+        operator: GreaterThan
+        value: 0
+    mutate:
+      foreach:
+      - list: request.object.spec.ephemeralContainers
+        patchStrategicMerge:
+          spec:
+            ephemeralContainers:
+            - name: '{{ element.name }}'
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                  - ALL
+                runAsNonRoot: true
+                seccompProfile:
+                  type: RuntimeDefault
+    name: add-ephemeral-container-security-context
+    skipBackgroundRequests: true
+  validationFailureAction: Audit
+```
+
+If you do not expect certain namespaces to be injected with security context detection, please add the label for namespace `pod-security.kubernetes.io/enforce: privileged` 
+
+
+
 ## Testing and Validation
 
 ### Test Root Container (Should Fail)
