@@ -1,0 +1,269 @@
+---
+weight: 40
+---
+
+# Using Velero
+
+
+Velero is an open-source Kubernetes cluster backup and migration tool by VMware. KubeVirt provides a Velero plugin to support virtual machine backup and restoration.
+
+## Prerequisites
+
+- **Kubernetes Version**: 1.20 or higher (Velero requirement)
+- **S3 Storage**: For Velero BackupStorageLocation, use platform-provided Ceph or MinIO object storage
+- **Block Storage**: Platform-provided Ceph RBD
+
+## Operation Steps
+
+### Preparation
+
+1. Deploy Velero on the ACP platform via **Platform Management → Cluster Management → Backup and Recovery → Backup Repository**. Use object storage details to create the backup repository.
+
+2. Enable the CSI feature and add the KubeVirt plugin:
+   ```bash
+   kubectl edit deploy -n cpaas-system velero
+   ```
+   Add the following to the Velero deployment:
+   ```yaml
+   containers:
+   - args:
+     - server
+     - --uploader-type=restic
+     - --namespace=cpaas-system
+     - --features=EnableCSI
+     command:
+     - /velero
+   ```
+   Add to the initContainers section:
+   ```yaml
+   initContainers:
+   - image: registry.example.org/3rdparty/kubevirt/kubevirt-velero-plugin:v0.7.0
+     imagePullPolicy: IfNotPresent
+     name: velero-plugin-kubevirt
+     resources: {}
+     terminationMessagePath: /dev/termination-log
+     terminationMessagePolicy: File
+     volumeMounts:
+     - mountPath: /target
+       name: plugins
+   ```
+
+3. Verify the KubeVirt plugin installation:
+   ```bash
+   POD=$(kubectl -n cpaas-system get pod -l app.kubernetes.io/name=velero -o jsonpath='{.items[0].metadata.name}')
+   kubectl -n cpaas-system exec -ti "$POD" -- /velero get plugins | grep kubevirt
+   ```
+   Example output:
+   ```
+   kubevirt-velero-plugin/backup-datavolume-action               BackupItemAction
+   kubevirt-velero-plugin/backup-datavolume-action               BackupItemAction
+   kubevirt-velero-plugin/backup-virtualmachine-action           BackupItemAction
+   kubevirt-velero-plugin/backup-virtualmachine-action           BackupItemAction
+   kubevirt-velero-plugin/backup-virtualmachineinstance-action   BackupItemAction
+   kubevirt-velero-plugin/backup-virtualmachineinstance-action   BackupItemAction
+   kubevirt-velero-plugin/restore-pod-action                     RestoreItemAction
+   kubevirt-velero-plugin/restore-pod-action                     RestoreItemAction
+   kubevirt-velero-plugin/restore-pvc-action                     RestoreItemAction
+   kubevirt-velero-plugin/restore-pvc-action                     RestoreItemAction
+   kubevirt-velero-plugin/restore-vm-action                      RestoreItemAction
+   kubevirt-velero-plugin/restore-vm-action                      RestoreItemAction
+   kubevirt-velero-plugin/restore-vmi-action                     RestoreItemAction
+   kubevirt-velero-plugin/restore-vmi-action                     RestoreItemAction
+   ```
+
+4. Adjust node-agent to mount the host kubelet directory and enable privileged mode (required for data movement via `/var/lib/kubelet`):
+   ```bash
+   kubectl edit ds -n cpaas-system node-agent
+   ```
+   Update with:
+   ```yaml
+   securityContext:
+     privileged: true
+   volumeMounts:
+   - mountPath: /host_pods
+     mountPropagation: HostToContainer
+     name: host-pods
+   - mountPath: /var/lib/kubelet/plugins
+     mountPropagation: HostToContainer
+     name: host-plugins
+   - mountPath: /scratch
+     name: scratch
+   securityContext:
+     runAsUser: 0
+   volumes:
+   - hostPath:
+       path: /var/lib/kubelet/pods
+       type: ""
+     name: host-pods
+   - hostPath:
+       path: /var/lib/kubelet/plugins
+       type: ""
+     name: host-plugins
+   - emptyDir: {}
+     name: scratch
+   ```
+
+### Backup
+
+1. Create a virtual machine with multiple disks as needed.
+
+2. Create a backup resource:
+   ```yaml
+   apiVersion: velero.io/v1
+   kind: Backup
+   metadata:
+     annotations:
+       velero.io/resource-timeout: 10m0s
+       velero.io/source-cluster-k8s-gitversion: v1.30.4
+       velero.io/source-cluster-k8s-major-version: "1"
+       velero.io/source-cluster-k8s-minor-version: "30"
+     labels:
+       velero.io/storage-location: default
+     name: example-backup
+     namespace: cpaas-system
+   spec:
+     csiSnapshotTimeout: 10m0s
+     defaultVolumesToFsBackup: false
+     hooks: {}
+     includedNamespaces:
+     - example-namespace
+     itemOperationTimeout: 4h0m0s
+     metadata: {}
+     snapshotMoveData: true
+     storageLocation: default
+     ttl: 720h0m0s
+   ```
+
+3. Wait for the backup to complete and verify:
+   ```bash
+   POD=$(kubectl -n cpaas-system get pod -l app.kubernetes.io/name=velero -o jsonpath='{.items[0].metadata.name}')
+   kubectl -n cpaas-system exec -ti "$POD" -- /velero backup describe example-backup --details
+   kubectl -n cpaas-system exec -ti "$POD" -- /velero backup get example-backup
+   ```
+   Example output:
+   ```
+   NAME             STATUS                       ERRORS   WARNINGS   CREATED                         EXPIRES   STORAGE LOCATION   SELECTOR
+   example-backup   WaitingForPluginOperations   0        0          2025-01-25 14:14:08 +0000 UTC   29d       default            <none>
+   ```
+
+4. Check dataupload status for data movement:
+   ```bash
+   kubectl get dataupload -n cpaas-system
+   ```
+   Example output:
+   ```
+   NAME                   STATUS      STARTED   BYTES DONE    TOTAL BYTES   STORAGE LOCATION   AGE   NODE
+   example-backup-fhc6b   Completed   11h       21474836480   21474836480   default            11h   192.168.254.66
+   example-backup-qwwzh   Completed   11h       21474836480   21474836480   default            11h   192.168.254.15
+   ```
+
+5. Verify backup completion:
+   ```bash
+   POD=$(kubectl -n cpaas-system get pod -l app.kubernetes.io/name=velero -o jsonpath='{.items[0].metadata.name}')
+   kubectl -n cpaas-system exec -ti "$POD" -- /velero backup get example-backup
+   ```
+   Example output:
+   ```
+   NAME             STATUS      ERRORS   WARNINGS   CREATED                         EXPIRES   STORAGE LOCATION   SELECTOR
+   example-backup   Completed   0        0          2025-01-25 14:14:08 +0000 UTC   29d       default            <none>
+   ```
+
+6. Check the backup repository (e.g., MinIO) for directories:
+   ```bash
+   mc ls <backup-repository>
+   ```
+   Example output:
+   ```
+   [2025-01-26 09:23:08 CST]     0B backups/
+   [2025-01-26 09:23:08 CST]     0B kopia/
+   [2025-01-26 09:23:08 CST]     0B restic/
+   ```
+
+### Restore
+
+1. Delete the original virtual machine.
+
+2. Create a restore resource via **Platform Management → Cluster Management → Backup and Recovery → Restore Management** or manually:
+   ```yaml
+   apiVersion: velero.io/v1
+   kind: Restore
+   metadata:
+     annotations:
+       cpaas.io/description: ""
+     finalizers:
+     - restores.velero.io/external-resources-finalizer
+     name: example-restore
+     namespace: cpaas-system
+   spec:
+     backupName: example-backup
+     excludedResources:
+     - nodes
+     - events
+     - events.events.k8s.io
+     - backups.velero.io
+     - restores.velero.io
+     - resticrepositories.velero.io
+     - csinodes.storage.k8s.io
+     - volumeattachments.storage.k8s.io
+     - backuprepositories.velero.io
+     hooks: {}
+     includedNamespaces:
+     - example-namespace
+     itemOperationTimeout: 4h0m0s
+     namespaceMapping: {}
+   ```
+
+3. Verify the restore:
+   ```bash
+   kubectl exec -ti -n cpaas-system velero-5df7bb7598-ljjrn -- /velero restore get
+   ```
+   Check datadownload status:
+   ```bash
+   kubectl get datadownload -n cpaas-system
+   ```
+   Example output:
+   ```
+   NAME       STATUS      STARTED   BYTES DONE    TOTAL BYTES   STORAGE LOCATION   AGE   NODE
+   example-restore-7lfcm   Completed   11m       21474836480   21474836480   default            15m   192.168.254.66
+   example-restore-cjcd8   Completed   15m       21474836480   21474836480   default            15m   192.168.254.66
+   ```
+   Restore status:
+   ```
+   NAME   BACKUP           STATUS      STARTED                         COMPLETED                       ERRORS   WARNINGS   CREATED                         SELECTOR
+   aa     example-backup   Completed   2025-01-26 01:53:14 +0000 UTC   2025-01-26 02:01:24 +0000 UTC   0        2          2025-01-26 01:53:14 +0000 UTC   <none>
+   ```
+
+4. Confirm the virtual machine is restored and operational.
+
+### Cross-Cluster Restore
+
+1. Deploy Velero on the new cluster and complete the preparation steps.
+2. Configure the same backup repository (same bucket and directory) as the original cluster. The backup resource will automatically appear.
+3. Follow the restore steps above.
+
+### Restore to a Different Namespace
+
+Add a `namespaceMapping` field to the restore spec:
+```yaml
+spec:
+  namespaceMapping:
+    example-namespace: test-namespace
+```
+
+### Restore to a Different Storage Class
+
+1. Create a ConfigMap in the `cpaas-system` namespace before initiating the restore:
+   ```yaml
+   apiVersion: v1
+   kind: ConfigMap
+   metadata:
+     name: change-storage-class-config
+     namespace: cpaas-system
+     labels:
+       velero.io/plugin-config: ""
+       velero.io/change-storage-class: RestoreItemAction
+   data:
+     vm-cephrbd: vm-topolvm-a
+   ```
+2. Ensure storage capabilities (e.g., cross-node access, RWX) are consistent.
+3. Note: RWX mode modification is not currently supported.

@@ -1,0 +1,122 @@
+---
+title: "AWS EKS Cluster Storage Initialization Configuration"
+description: "Platform integration with AWS EKS and storage initialization configuration."
+weight: 600
+---
+
+Platform integration with AWS EKS and storage initialization configuration.
+
+## Constraints and Limitations
+
+* The default efs-sc file storage class may not support permission modifications after mounting, which may cause some applications like PostgreSQL and Jenkins to fail to run properly.
+
+* A1 series instances are not supported by AL2023 AMIs, which prevents the EBS block storage plugin (Amazon EBS CSI Driver) from deploying properly. The EBS CSI driver has GA multi-architecture/ARM support, so the limitation is with AMI/instance support rather than the driver itself. If you need to use EBS block storage classes, avoid using the following instance types and consider Graviton2/3 alternatives instead:
+
+    * a1.medium
+    * a1.large
+    * a1.xlarge
+    * a1.2xlarge
+    * a1.4xlarge
+
+    **Recommended alternatives**: Use Graviton2/3 instance families such as m6g, c6g, r6g, t4g, etc., which provide better performance and full EBS CSI driver support.
+
+## Prerequisites
+
+* Ensure [kubectl](https://docs.aws.amazon.com/zh_cn/eks/latest/userguide/install-kubectl.html) and AWS CLI tools are available.
+
+* If you have created an EKS cluster, import the Amazon EKS cluster; if not, create an AWS EKS cluster.
+
+* Deploy the EFS file storage plugin **Amazon EFS CSI Driver** and EBS block storage plugin **Amazon EBS CSI Driver** in the EKS cluster.
+
+    **Note**: If using EFS file storage, create file storage in the EKS region and record the **File System ID** from the **File System**.
+
+## Configuration Steps
+
+### Create Storage Classes
+
+1. Go to **Platform Management** and click **Storage Management** > **Storage Classes** in the left navigation.
+
+2. Click the dropdown next to **Create Storage Class** > **Create from YAML**.
+
+3. Add the following content to the YAML file to create default storage classes as needed. The default storage class name for [file storage](https://aws.amazon.com/cn/efs/) is **efs-sc**, and for [block storage](https://aws.amazon.com/ebs/) is **ebs-sc**.
+
+    * EFS File Storage
+    
+        **Note**: Replace `<File System ID>` with the actual **File System ID**, e.g., `fileSystemId: fs-05aef9e1edd309f2b`.
+    
+        ```yaml
+        kind: StorageClass
+        apiVersion: storage.k8s.io/v1
+        metadata:
+          name: efs-sc
+        provisioner: efs.csi.aws.com
+        parameters:
+          provisioningMode: efs-ap
+          fileSystemId: <File System ID>  
+          directoryPerms: "755"
+        ```
+        
+    * EBS Block Storage
+
+        ```yaml
+        allowVolumeExpansion: true
+        apiVersion: storage.k8s.io/v1
+        kind: StorageClass
+        metadata:
+          name: ebs-sc
+        provisioner: ebs.csi.aws.com
+        reclaimPolicy: Delete
+        volumeBindingMode: WaitForFirstConsumer
+        ```
+
+4. Click **Create**.
+
+    **Note**: If the default storage classes don't meet requirements, create new storage classes following the above steps and modify parameters as needed. See [Available Storage Class Parameters](#configure-available-storage-class-parameters).
+
+### Modify Storage Class Project Assignment
+
+1. In the left navigation, click **Storage Management** > **Storage Classes**.
+
+2. Click the three dots next to the storage class named **efs-sc** or **ebs-sc** > **Update Project**.
+
+3. Select the **Project Assignment** method as needed and click **Update** to assign the storage class to projects.
+
+## Related Operations
+
+### Configure Available Storage Class Parameters
+
+* EFS File Storage Available Parameters
+
+    | Parameter | Optional Values | Default Value | Optional | Description |
+    |---|---|---|---|---|
+    | az | | "" | true | Used for cross-account mounting. If specified, uses the mount target associated with az for cross-account mounting; if not specified, randomly selects a mount target for cross-account mounting. |
+    | basePath | | | true | Path for creating dynamically provisioned access points. If not specified, access points are created under the file system root directory. |
+    | directoryPerms | | | false | Directory permissions for creating [Access Point root directory](https://docs.aws.amazon.com/zh_cn/efs/latest/ug/efs-access-points.html#enforce-root-directory-access-point). |
+    | uid | | | true | POSIX user ID for creating [Access Point root directory](https://docs.aws.amazon.com/zh_cn/efs/latest/ug/efs-access-points.html#enforce-root-directory-access-point). |
+    | gid | | | true | POSIX group ID for creating [Access Point root directory](https://docs.aws.amazon.com/zh_cn/efs/latest/ug/efs-access-points.html#enforce-root-directory-access-point). |
+    | gidRangeStart | | 50000 | true | Starting range of POSIX group IDs to apply when creating [access point root directory](https://docs.aws.amazon.com/zh_cn/efs/latest/ug/efs-access-points.html#enforce-root-directory-access-point). Not needed if uid/gid are set. |
+    | gidRangeEnd | | 7000000 | true | Ending range of POSIX group IDs. Not needed if uid/gid are set. |
+    | subPathPattern | |   | true | Template for constructing subpaths where each access point created under dynamic provisioning is located. Can consist of fixed strings and limited variables, similar to the "subPathPattern" variable in nfs-subdir-external-provisioner chart. Optional parameters are .PVC.name, .PVC.namespace, and .PV.name. |
+    | ensureUniqueDirectory | | true | true | Used when dynamic provisioning is enabled. When set to true, appends UID to the pattern specified in subPathPattern to ensure access points don't accidentally point to the same directory.**Note**: Only set to false if you're certain this is the desired behavior. |
+    | provisioningMode | efs-ap | | false | EFS volume type, currently supports access points. |
+    | fileSystemId | | | false | File system ID of the created access point. |
+
+* EBS Block Storage Available Parameters
+
+    **Note**: For performance parameters of different volume types, see [Amazon EBS Volume Types](https://docs.aws.amazon.com/zh_cn/AWSEC2/latest/UserGuide/ebs-volume-types.html).
+
+    | Parameter | Optional Values | Default Value | Description |
+    |---|---|---|---|
+    | "allowAutoIOPSPerGBIncrease" | true, false | false | When set to "true", the CSI driver increases volume IOPS when iopsPerGB * \<volume size\> is too low to meet AWS supported IOPS range. This ensures dynamic provisioning always succeeds even when user-specified PVC capacity or iopsPerGB values are too small, but may incur additional costs as such volumes have higher IOPS than required by iopsPerGB. |
+    | "blockExpress" | true, false | false | Creates io2 Block Express volumes by raising IOPS limits for io2 volumes to 256000, but volumes created with IOPS exceeding 64000 cannot be mounted on instances that don't support io2 Block Express. |
+    | "blockSize" | | | Block size used when formatting the underlying filesystem. Only applies to Linux nodes with ext2, ext3, ext4, or xfs filesystem types. |
+    | "bytesPerINode" | | | Bytes per inode used when formatting the underlying filesystem. Only applies to Linux nodes with ext2, ext3, or ext4 filesystem types. |
+    | "csi.storage.k8s.io/fstype" | xfs, ext2, ext3, ext4 | ext4 | Filesystem type to format when creating volumes. Case-sensitive. |
+    | "encrypted" | true, false | false | Whether the volume needs encryption. |
+    | "inodeSize" | | | Inode size used when formatting the underlying filesystem. Only applies to Linux nodes with ext2, ext3, ext4, or xfs filesystem types. Inodes are data structures in filesystems that store file and directory metadata. |
+    | "iops" | | | I/O operations per second, applicable to IO1, IO2, and GP3 volumes. |
+    | "iopsPerGB" | | | I/O operations per GiB per second, applicable to IO1, IO2, and GP3 volumes. |
+    | "kmsKeyId" | | | Full ARN of the key to use for encrypting volumes. If not specified, AWS uses the default KMS key for the volume's region and automatically generates a key named /aws/ebs. |
+    | "numberOfINodes" | | | Number of inodes specified when formatting the underlying filesystem. Only applies to Linux nodes with ext2, ext3, or ext4 filesystem types. |
+    | "throughput" | | 125 | Throughput in MiB/s. Only valid when specifying gp3 volume type. If empty, defaults to 125 MiB/s. See [Amazon EBS Volume Types](https://docs.aws.amazon.com/zh_cn/AWSEC2/latest/UserGuide/ebs-volume-types.html). |
+    | "type" | io1, io2, gp2, gp3, sc1, st1, standard, sbp1, sbg1 | gp3 | EBS volume type. |

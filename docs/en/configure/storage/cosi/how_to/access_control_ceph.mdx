@@ -1,0 +1,178 @@
+# Control Access & Quotas for COSI Buckets with CephObjectStoreUser (Ceph Driver)
+
+This guide shows Kubernetes administrators how to combine **CephObjectStoreUser (COSU)**, **BucketClass/BucketClaim**, and **BucketAccessClass/BucketAccess** to implement **least-privileged access** and **quota enforcement** for Ceph RGW-backed COSI buckets.
+
+> **What you'll build**
+>
+> 1. A CephObjectStoreUser with explicit capabilities and optional per-user quotas;
+> 2. A BucketClass that tells the Ceph COSI driver which COSU credentials to use;
+> 3. One or more BucketClaims to provision buckets;
+> 4. Fine-grained, per-workload credentials using BucketAccessClass/BucketAccess (read-only, write-only, read-write), with optional anonymous read.
+
+## Prerequisites
+
+* A healthy Ceph cluster with RGW and Rook installed.
+* COSI plugins installed.
+* Cluster admin privileges (to create cluster-scoped resources).
+
+## Step 1 — Create a CephObjectStoreUser (with capabilities & quotas)
+
+`CephObjectStoreUser` is the service account the driver uses to perform bucket operations in RGW. It must live in the **`rook-ceph`** namespace and target your `CephObjectStore`.
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephObjectStoreUser
+metadata:
+  name: user-for-cosi
+  namespace: rook-ceph
+spec:
+  # Target CephObjectStore
+  store: object-store
+  # Required capabilities for COSI bucket lifecycle
+  capabilities:
+    bucket: read, write
+    user: read, write
+  # Optional per-user quotas enforced by RGW
+  quotas:
+    maxBuckets: 50        # limit number of buckets this user can own
+    maxObjects: 500        # total objects across buckets (example)
+    maxSize: 100Gi       # total logical size across buckets
+  displayName: "User for COSI driver"
+```
+
+**Get the generated access keys** (Rook creates a Secret for this user):
+
+```bash
+kubectl get cephobjectstoreuser user-for-cosi -n rook-ceph -o yaml
+# Read status.info.secretName -> the Secret holding AccessKey/SecretKey
+```
+
+> These COSU credentials are consumed by the **driver** (not by your apps) to create/delete buckets on your behalf.
+
+
+## Step 2 — Define a BucketClass bound to the CephObjectStoreUser
+
+`BucketClass` instructs the driver which COSU Secret to use when provisioning buckets.
+
+```yaml
+apiVersion: objectstorage.k8s.io/v1alpha1
+kind: BucketClass
+metadata:
+  name: ceph-cosi-driver-class
+deletionPolicy: Delete
+# Must match the driver name
+driverName: ceph.objectstorage.k8s.io
+parameters:
+  # Reference the Secret created for the CephObjectStoreUser
+  objectStoreUserSecretName: <secret-name-from-step-1>
+  objectStoreUserSecretNamespace: rook-ceph
+```
+
+> `deletionPolicy` controls the bucket's physical lifecycle when a `BucketClaim` is deleted (`Delete` vs `Retain`).
+
+
+## Step 3 — Provision a bucket with BucketClaim
+
+Create the bucket in your application namespace by referencing the `BucketClass`.
+
+```yaml
+apiVersion: objectstorage.k8s.io/v1alpha1
+kind: BucketClaim
+metadata:
+  name: my-bucket-claim
+  namespace: app-a
+spec:
+  bucketClassName: ceph-cosi-driver-class
+```
+
+Wait until `status.bucketReady: true` and note `status.bucketName` for the actual RGW bucket name.
+
+
+## Step 4 — Issue least-privileged credentials with BucketAccessClass/BucketAccess
+
+Define policy templates with `BucketAccessClass` and mint credentials per workload via `BucketAccess`. Supported policies: **`readonly`**, **`writeonly`**, **`readwrite`**. Anonymous read is available by setting `parameters.anonymous: "true"` (string).
+
+### Example `BucketAccessClass` (read-only)
+
+```yaml
+apiVersion: objectstorage.k8s.io/v1alpha1
+kind: BucketAccessClass
+metadata:
+  name: ceph-readonly-access-class
+authenticationType: KEY
+driverName: ceph.objectstorage.k8s.io
+parameters:
+  policy: readonly
+  anonymous: "false"
+```
+
+### Mint credentials with `BucketAccess`
+
+```yaml
+apiVersion: objectstorage.k8s.io/v1alpha1
+kind: BucketAccess
+metadata:
+  name: my-bucket-readonly-access
+  namespace: app-a
+spec:
+  bucketAccessClassName: ceph-readonly-access-class
+  bucketClaimName: my-bucket-claim
+  credentialsSecretName: my-bucket-readonly-credentials
+```
+
+The driver writes a Secret named in `credentialsSecretName`. Decode `.data.BucketInfo` (base64) to get `secretS3.endpoint`, `accessKeyID`, and `accessSecretKey` for your S3 client.
+
+> **Tip**: Issue **distinct** credentials per Deployment/Job to simplify rotation and revocation without disrupting other workloads.
+
+
+## Step 5 — Anonymous public read (optional)
+
+If you need public static asset hosting:
+
+```yaml
+apiVersion: objectstorage.k8s.io/v1alpha1
+kind: BucketAccessClass
+metadata:
+  name: ceph-anonymous-readonly-class
+authenticationType: KEY
+driverName: ceph.objectstorage.k8s.io
+parameters:
+  policy: readonly
+  anonymous: "true"
+```
+
+Bind it with a `BucketAccess` to your `BucketClaim`. Once granted, objects are retrievable via unauthenticated HTTP `GET` (ensure network exposure as appropriate).
+
+
+## Step 6 — Quota control: where to enforce and how to change
+
+**Scope:** The `quotas` block on **CephObjectStoreUser** applies **per user** and is enforced by RGW across all buckets owned by that user.
+
+* `maxBuckets`: upper bound on buckets the user can create/own.
+* `maxObjects`: maximum number of objects the user can store (across buckets).
+* `maxSize`: total logical size permitted for the user.
+
+**Update quotas** by editing the COSU resource:
+
+```bash
+kubectl -n rook-ceph edit cephobjectstoreuser user-for-cosi
+# Modify spec.quotas.{maxBuckets,maxObjects,maxSize}; save and exit.
+# Rook reconciles and applies the new RGW user quotas.
+```
+
+> **Design choice:** Keep **COSU quotas** relatively tight to bound blast radius. Use **least-privilege policies** via BAC/BA to limit what a given set of application credentials can do **within** a bucket.
+
+
+## Operations & troubleshooting
+
+* **Namespace placement**: `CephObjectStoreUser` and its Secret must be in `rook-ceph`. App-level resources (`BucketClaim`, `BucketAccess`) should live in the app namespace.
+* **Policy not applied**: confirm `bucketAccessClassName` and `parameters.policy` in BAC (`readonly|writeonly|readwrite`).
+* **Anonymous read fails**: ensure `anonymous: "true"` is a **string**, not boolean; verify endpoint exposure and HTTP access path (`/<bucket>/<object>`).
+* **Can't find keys**: check the `BucketAccess` Secret and decode `.data.BucketInfo`.
+* **Rotation**: create a new `BucketAccess`, roll your workloads to the new Secret, then delete the old Secret/BA.
+
+
+## Cleanup
+
+* Remove a workload credential by deleting its `BucketAccess` and the referenced Secret.
+* Removing a bucket: delete the `BucketClaim` (behavior follows `BucketClass.deletionPolicy`).

@@ -28,7 +28,7 @@ You can install the Jaeger Operator from the Alauda Container Platform **Marketp
 
 **Steps**
 
-- In the **Platform Management** view of the Web Console, select the **cluster** where you want to deploy the Jaeger Operator, then navigate to **Marketplace** → **OperatorHub**.
+- In the **Administrator** view of the Web Console, select the **cluster** where you want to deploy the Jaeger Operator, then navigate to **Marketplace** → **OperatorHub**.
 
 - Use the search box to search for `Alauda build of Jaeger` in the catalog. Click on the **Alauda build of Jaeger** title.
 
@@ -76,6 +76,15 @@ Copy the installation script from **DETAILS**, log into the cluster where you wa
 
 set -euo pipefail
 
+CLUSTER_NAME=$(kubectl get configmap global-info -n kube-public -o jsonpath='{.data.clusterName}')
+echo "CLUSTER_NAME: ${CLUSTER_NAME}"
+
+# default values
+TARGET_NAMESPACE="cpaas-system"
+JAEGER_INSTANCE_NAME="jaeger-prod"
+JAEGER_BASEPATH_SUFFIX="/acp/jaeger"
+JAEGER_ES_INDEX_PREFIX=acp-tracing-$CLUSTER_NAME
+
 # get arg
 while [ "$#" -gt 0 ]; do
     case $1 in
@@ -87,6 +96,18 @@ while [ "$#" -gt 0 ]; do
             ;;
         --es-pass-base64=*)
             ES_PASS_BASE64="${1#*=}"
+            ;;
+        --target-namespace=*)
+            TARGET_NAMESPACE="${1#*=}"
+            ;;
+        --jaeger-instance-name=*)
+            JAEGER_INSTANCE_NAME="${1#*=}"
+            ;;
+        --jaeger-basepath-suffix=*)
+            JAEGER_BASEPATH_SUFFIX="${1#*=}"
+            ;;
+        --jaeger-es-index-prefix=*)
+            JAEGER_ES_INDEX_PREFIX="${1#*=}"
             ;;
         *)
             echo "unknown argument: $1"
@@ -100,10 +121,12 @@ done
 echo "ES_URL: $ES_URL"
 echo "ES_USER_BASE64: $ES_USER_BASE64"
 echo "ES_PASS_BASE64: $ES_PASS_BASE64"
+echo "TARGET_NAMESPACE: $TARGET_NAMESPACE"
+echo "JAEGER_INSTANCE_NAME: $JAEGER_INSTANCE_NAME"
+echo "JAEGER_BASEPATH_SUFFIX: $JAEGER_BASEPATH_SUFFIX"
+echo "JAEGER_ES_INDEX_PREFIX: $JAEGER_ES_INDEX_PREFIX"
 
 # get global-info from ConfigMap
-CLUSTER_NAME=$(kubectl get configmap global-info -n kube-public -o jsonpath='{.data.clusterName}')
-echo "CLUSTER_NAME: ${CLUSTER_NAME}"
 ISSUER_URL=$(kubectl get configmap global-info -n kube-public -o jsonpath='{.data.oidcIssuer}')
 CLIENT_ID=$(kubectl get configmap global-info -n kube-public -o jsonpath='{.data.oidcClientID}')
 CLIENT_SECRET=$(kubectl get configmap global-info -n kube-public -o jsonpath='{.data.oidcClientSecret}')
@@ -111,8 +134,7 @@ CLIENT_SECRET_BASE64=$(echo -n "${CLIENT_SECRET}" | base64 -w0)
 PLATFORM_URL=$(kubectl get configmap global-info -n kube-public -o jsonpath='{.data.platformURL}')
 echo "PLATFORM_URL: ${PLATFORM_URL}"
 
-TARGET_NAMESPACE="cpaas-system"
-JAEGER_BASEPATH="clusters/$CLUSTER_NAME/acp/jaeger"
+JAEGER_BASEPATH="clusters/$CLUSTER_NAME$JAEGER_BASEPATH_SUFFIX"
 
 _apply_resource() {
   if [ -z "$1" ]; then
@@ -144,7 +166,7 @@ data:
   OAUTH2_PROXY_UPSTREAMS: http://127.0.0.1:16686
 kind: ConfigMap
 metadata:
-  name: jaeger-oauth2-proxy
+  name: $JAEGER_INSTANCE_NAME-oauth2-proxy
   namespace: $TARGET_NAMESPACE
 EOF
 )
@@ -159,7 +181,7 @@ data:
   OAUTH2_PROXY_COOKIE_SECRET: $CLIENT_SECRET_BASE64
 kind: Secret
 metadata:
-  name: jaeger-oauth2-proxy
+  name: $JAEGER_INSTANCE_NAME-oauth2-proxy
   namespace: $TARGET_NAMESPACE
 type: Opaque
 ---
@@ -169,7 +191,7 @@ data:
   ES_USERNAME: $ES_USER_BASE64
 kind: Secret
 metadata:
-  name: jaeger-elasticsearch-basic-auth
+  name: $JAEGER_INSTANCE_NAME-es-basic-auth
   namespace: $TARGET_NAMESPACE
 type: Opaque
 EOF
@@ -182,13 +204,13 @@ _install_sa() {
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: jaeger-prod-acp
+  name: $JAEGER_INSTANCE_NAME-sa
   namespace: $TARGET_NAMESPACE
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: jaeger-prod-acp
+  name: $JAEGER_INSTANCE_NAME-role
   namespace: $TARGET_NAMESPACE
 rules:
 - apiGroups: [""]
@@ -198,15 +220,15 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: jaeger-prod-acp
+  name: $JAEGER_INSTANCE_NAME-rb
   namespace: $TARGET_NAMESPACE
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: jaeger-prod-acp
+  name: $JAEGER_INSTANCE_NAME-role
 subjects:
 - kind: ServiceAccount
-  name: jaeger-prod-acp
+  name: $JAEGER_INSTANCE_NAME-sa
   namespace: $TARGET_NAMESPACE
 EOF
 )
@@ -218,7 +240,7 @@ _install_jaeger() {
 apiVersion: jaegertracing.io/v1
 kind: Jaeger
 metadata:
-  name: jaeger-prod
+  name: $JAEGER_INSTANCE_NAME
   namespace: $TARGET_NAMESPACE
 spec:
   collector:
@@ -227,7 +249,7 @@ spec:
         requiredDuringSchedulingIgnoredDuringExecution:
           - labelSelector:
               matchLabels:
-                app.kubernetes.io/name: jaeger-prod-collector
+                app.kubernetes.io/name: $JAEGER_INSTANCE_NAME-collector
             topologyKey: kubernetes.io/hostname
     replicas: 1
     resources:
@@ -249,13 +271,13 @@ spec:
         requiredDuringSchedulingIgnoredDuringExecution:
           - labelSelector:
               matchLabels:
-                app.kubernetes.io/name: jaeger-prod-query
+                app.kubernetes.io/name: $JAEGER_INSTANCE_NAME-query
             topologyKey: kubernetes.io/hostname
     annotations:
       oauth2-proxy.github.io/image: ""
       oauth2-proxy.github.io/inject: "true"
-      oauth2-proxy.github.io/oidc-configmap: jaeger-oauth2-proxy
-      oauth2-proxy.github.io/oidc-secret: jaeger-oauth2-proxy
+      oauth2-proxy.github.io/oidc-configmap: $JAEGER_INSTANCE_NAME-oauth2-proxy
+      oauth2-proxy.github.io/oidc-secret: $JAEGER_INSTANCE_NAME-oauth2-proxy
       oauth2-proxy.github.io/proxyCPULimit: 100m
       oauth2-proxy.github.io/proxyMemoryLimit: 128Mi
     options:
@@ -278,7 +300,7 @@ spec:
       memory: 300Mi
   sampling:
     options: {}
-  serviceAccount: jaeger-prod-acp
+  serviceAccount: $JAEGER_INSTANCE_NAME-sa
   storage:
     dependencies:
       enabled: false
@@ -297,9 +319,9 @@ spec:
       resources: {}
       schedule: 0 0 * * *
     options:
-      es.asm.cname: jaeger-elasticsearch-basic-auth
+      es.asm.cname: $JAEGER_INSTANCE_NAME-es-basic-auth
       es.asm.cnamespace: $TARGET_NAMESPACE
-      es.index-prefix: acp-tracing-$CLUSTER_NAME
+      es.index-prefix: $JAEGER_ES_INDEX_PREFIX
       es.max-span-age: 168h0m0s
       es.server-urls: $ES_URL
       es.tls.enabled: true
@@ -331,7 +353,7 @@ metadata:
   labels:
     monitoring: pods
     prometheus: kube-prometheus
-  name: jaeger-monitor
+  name: $JAEGER_INSTANCE_NAME-monitor
   namespace: $TARGET_NAMESPACE
 spec:
   jobLabel: app.kubernetes.io/name
@@ -344,7 +366,7 @@ spec:
       port: admin-http
   selector:
     matchLabels:
-      app.kubernetes.io/instance: jaeger-prod
+      app.kubernetes.io/instance: $JAEGER_INSTANCE_NAME
 EOF
 )
   _apply_resource "$yaml_content"
@@ -368,7 +390,7 @@ EOF
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: jaeger-query
+  name: $JAEGER_INSTANCE_NAME-query
   namespace: $TARGET_NAMESPACE
   annotations:
     nginx.ingress.kubernetes.io/enable-cors: "true"
@@ -382,7 +404,7 @@ $ingress_class
             pathType: ImplementationSpecific
             backend:
               service:
-                name: jaeger-prod-query
+                name: $JAEGER_INSTANCE_NAME-query
                 port:
                   number: 4180
 EOF
@@ -398,6 +420,7 @@ _install_jaeger
 _install_pod_monitor
 _install_ingress
 
+echo "Jaeger UI access address: $PLATFORM_URL/$JAEGER_BASEPATH"
 echo "Jaeger installation completed"
 ```
 
@@ -412,22 +435,25 @@ echo "Jaeger installation completed"
 **Script output example**:
 
 ```bash
+CLUSTER_NAME: <cluster>
 ES_URL: https://xxx
 ES_USER_BASE64: xxx
 ES_PASS_BASE64: xxx
-CLUSTER_NAME: cluster-xxx
+TARGET_NAMESPACE: cpaas-system
+JAEGER_INSTANCE_NAME: jaeger-prod
+JAEGER_BASEPATH_SUFFIX: /acp/jaeger
+JAEGER_ES_INDEX_PREFIX: acp-tracing-<cluster>
 PLATFORM_URL: https://xxx
-INSTALLED_CSV: jaeger-operator.vx.x.x
-OAUTH2_PROXY_IMAGE: build-harbor.alauda.cn/3rdparty/oauth2-proxy/oauth2-proxy:vx.x.x
-configmap/jaeger-oauth2-proxy created
-secret/jaeger-oauth2-proxy created
-secret/jaeger-elasticsearch-basic-auth created
-serviceaccount/jaeger-prod-acp created
-role.rbac.authorization.k8s.io/jaeger-prod-acp created
-rolebinding.rbac.authorization.k8s.io/jaeger-prod-acp created
+configmap/jaeger-prod-oauth2-proxy created
+secret/jaeger-prod-oauth2-proxy created
+secret/jaeger-prod-es-basic-auth created
+serviceaccount/jaeger-prod-sa created
+role.rbac.authorization.k8s.io/jaeger-prod-role created
+rolebinding.rbac.authorization.k8s.io/jaeger-prod-rb created
 jaeger.jaegertracing.io/jaeger-prod created
-podmonitor.monitoring.coreos.com/jaeger-monitor created
-ingress.networking.k8s.io/jaeger-query created
+podmonitor.monitoring.coreos.com/jaeger-prod-monitor created
+ingress.networking.k8s.io/jaeger-prod-query created
+Jaeger UI access address: <platform-url>/clusters/<cluster>/acp/jaeger
 Jaeger installation completed
 ```
 
@@ -439,7 +465,7 @@ You can install the OpenTelemetry Operator from the Alauda Container Platform **
 
 **Steps**
 
-- In the **Platform Management** view of the Web Console, select the **cluster** where you want to deploy the OpenTelemetry Operator, then navigate to **Marketplace** → **OperatorHub**.
+- In the **Administrator** view of the Web Console, select the **cluster** where you want to deploy the OpenTelemetry Operator, then navigate to **Marketplace** → **OperatorHub**.
 
 - Use the search box to search for `Alauda build of OpenTelemetry` in the catalog. Click on the **Alauda build of OpenTelemetry** title.
 
@@ -773,7 +799,7 @@ kubectl -n cpaas-system delete serviceaccount otel-collector
 
 ### Uninstalling OpenTelemetry Operator
 
-You can uninstall the OpenTelemetry Operator using the **Platform Management** view in the Web Console.
+You can uninstall the OpenTelemetry Operator using the **Administrator** view in the Web Console.
 
 **Steps**
 
@@ -787,20 +813,20 @@ You can uninstall the OpenTelemetry Operator using the **Platform Management** v
 Log into the installed cluster and execute the following commands to delete the Jaeger instance and its related resources.
 
 ```bash
-kubectl -n cpaas-system delete ingress jaeger-query
-kubectl -n cpaas-system delete podmonitor jaeger-monitor
+kubectl -n cpaas-system delete ingress jaeger-prod-query
+kubectl -n cpaas-system delete podmonitor jaeger-prod-monitor
 kubectl -n cpaas-system delete jaeger jaeger-prod
-kubectl -n cpaas-system delete rolebinding jaeger-prod-acp
-kubectl -n cpaas-system delete role jaeger-prod-acp
-kubectl -n cpaas-system delete serviceaccount jaeger-prod-acp
-kubectl -n cpaas-system delete secret jaeger-oauth2-proxy
-kubectl -n cpaas-system delete secret jaeger-elasticsearch-basic-auth
-kubectl -n cpaas-system delete configmap jaeger-oauth2-proxy
+kubectl -n cpaas-system delete rolebinding jaeger-prod-rb
+kubectl -n cpaas-system delete role jaeger-prod-role
+kubectl -n cpaas-system delete serviceaccount jaeger-prod-sa
+kubectl -n cpaas-system delete secret jaeger-prod-oauth2-proxy
+kubectl -n cpaas-system delete secret jaeger-prod-es-basic-auth
+kubectl -n cpaas-system delete configmap jaeger-prod-oauth2-proxy
 ```
 
 ### Uninstalling Jaeger Operator
 
-You can uninstall the Jaeger Operator using the **Platform Management** view in the Web Console.
+You can uninstall the Jaeger Operator using the **Administrator** view in the Web Console.
 
 **Steps**
 
