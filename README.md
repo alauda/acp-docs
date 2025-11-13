@@ -15,3 +15,7 @@ $ yarn install
 * `yarn build`: Build production environment code, static files will be generated in the `dist` directory after build completion
 * `yarn serve`: Preview the built static files locally
 * `yarn up @alauda/doom`: Upgrade doom
+
+---
+
+hello pr
