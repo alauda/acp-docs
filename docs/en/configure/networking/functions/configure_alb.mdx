@@ -1,0 +1,550 @@
+---
+weight: 20
+sourceSHA: 4b6d6d95941be139632ff27eb567032122c9aef040f69cfe170cb27c0597def5
+---
+
+# Configure ALB
+
+:::warning
+ALB has been deprecated. Please use the [ingress-nginx-operator](/networking/operators/ingress_nginx_operator.mdx) or [envoy-gateway](/networking/operators/envoy_gateway_operator.mdx) instead.
+:::
+
+## ALB
+
+ALB is a custom resource that represents a load balancer. The alb-operator, which is embedded by default in all clusters, watches for create/update/delete operations on ALB resources and creates corresponding deployments and services in response.
+
+For each ALB, a corresponding Deployment watches all Frontends and Rules attached to that ALB and routes requests to backends based on those configurations.
+
+### Prerequisites
+
+The high availability of the **Load Balancer** requires a VIP. Please refer to [Configure VIP](/networking/operators/alb_operator/deploy_high_available_vip_for_alb.mdx).
+
+### Configure ALB \{#alb}
+
+There are three parts to an ALB configuration.
+
+```yaml
+# test-alb.yaml
+apiVersion: crd.alauda.io/v2beta1
+kind: ALB2
+metadata:
+  name: alb-demo
+  namespace: cpaas-system
+spec:
+  address: 192.168.66.215
+  config:
+    vip:
+      enableLbSvc: false
+      lbSvcAnnotations: {}
+    networkMode: host
+    nodeSelector:
+      cpu-model.node.kubevirt.io/Nehalem: 'true'
+    replicas: 1
+    resources:
+      alb:
+        limits:
+          cpu: 200m
+          memory: 256Mi
+        requests:
+          cpu: 200m
+          memory: 256Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+      requests:
+        cpu: 200m
+        memory: 256Mi
+    projects:
+      - ALL_ALL
+  type: nginx
+```
+
+#### Resource-Related Configuration
+
+resource related field describes the deployment configuration for the alb.
+| Field | Type | Description |
+|-------|------|-------------|
+| `.spec.config.nodeSelector` |map[string]string | the node selector for the alb |
+| `.spec.config.replicas` | int,optional default 3 | the number of replicas for the alb |
+| `.spec.config.resources.limits` | k8s container-resource,optional | limit of nginx container of alb |
+| `.spec.config.resources.requests` | k8s container-resource,optional | request of nginx container of alb |
+| `.spec.config.resources.alb.limits` | k8s container-resource,optional | limit of alb container of alb |
+| `.spec.config.resources.alb.requests` | k8s container-resource,optional | request of alb container of alb |
+| `.spec.config.antiAffinityKey` | string,optional default local | k8s antiAffinityKey |
+
+#### Networking Configuration \{#alb_networking_configuration}
+
+Networking fields describe how to access the ALB. For example, in `host` mode, alb will use hostnetwork, and you can access the ALB via the node IP.
+| Field | Type | Description |
+|-------|------|-------------|
+| `.spec.config.networkMode` | string: `host` or `container`, optional, default `host` | In `container` mode, the operator creates a LoadBalancer Service and uses its address as the ALB address. |
+| `.spec.address` | string,required | you could manually specify the address of alb |
+| `.spec.config.vip.enableLbSvc` | bool, optional | Automatically true in `container` mode. |
+| `.spec.config.vip.lbSvcAnnotations` | map[string]string, optional | Extra annotations for the LoadBalancer Service. |
+
+#### project configuration
+
+| Field                            | Type              |
+| -------------------------------- | ----------------- |
+| `.spec.config.projects`          | []string,required |
+| `.spec.config.portProjects`      | string,optional   |
+| `.spec.config.enablePortProject` | bool,optional     |
+
+Adding an ALB to a project means:
+
+1. In the web UI, only users in the given project can find and configure this ALB.
+2. This ALB will handle ingress resources belonging to this project. Please refer to [ingress-sync](#alb_ingress_sync).
+3. In the web UI, rules created in project X cannot be found or configured under project Y.
+
+If you enable port project and assign a port range to a project, this means:
+
+1. You cannot create ports that do not belong to the port range assigned to the project.
+
+#### tweak configuration
+
+there are some global config which can be tweaked in alb cr.
+
+- [Bind NIC](/networking/operators/alb_operator/bind_nic_in_alb.mdx)
+- [Ingress sync](#alb_ingress_sync)
+
+### Operation On ALB
+
+#### Creating
+
+##### Using the web console.
+
+![](../assets/create_alb_via_web.png)
+Some common configuration is exposed in the web UI. Follow these steps to create a load balancer:
+
+1. Navigate to **Administrator**.
+2. In the left sidebar, click on **Network Management** > **Load Balancer**.
+3. Click on **Create Load Balancer**.
+
+Each input item in the web UI corresponds to a field of the CR:
+
+| Parameter        | Description                                                                                                                                   |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| Assigned Address | `.spec.address`                                                                                                                               |
+| Allocated By     | `Instance` means project mode, and you could select project below, port means port-project mode, you could assign port-range after create alb |
+
+##### Using the CLI.
+
+```shell
+kubectl apply -f test-alb.yaml -n cpaas-system
+```
+
+#### Update
+
+##### Using the web console
+
+:::note
+Updating the load balancer will cause a service interruption for 3 to 5 minutes. Please choose an appropriate time for this operation!
+:::
+
+1. Enter **Administrator**.
+
+2. In the left navigation bar, click **Network Management** > **Load Balancer**.
+
+3. Click ⋮ > **Update**.
+
+4. Update the network and resource configuration as needed.
+   - Please set specifications reasonably according to business needs. You can also refer to the relevant [How to properly allocate CPU and memory resources](/networking/operators/alb_operator/decision_making_for_performance_selection_of_alb.mdx) for guidance.
+
+   - **Internal routing** only supports updating from **Disabled** state to **Enabled** state.
+
+5. Click **Update**.
+
+#### Delete
+
+##### Using the web console
+
+:::note
+After deleting the load balancer, the associated ports and rules will also be deleted and cannot be restored.
+:::
+
+1. Enter **Administrator**.
+
+2. In the left navigation bar, click **Network Management** > **Load Balancer**.
+
+3. Click ⋮ > **Delete**, and confirm.
+
+##### Using the CLI
+
+```shell
+kubectl delete alb2 alb-demo -n cpaas-system
+```
+
+## Frontend \{#alb_frontend}
+
+Frontend is a custom resource that defines the listener port and protocol for an ALB.
+Supported protocols: L7 (http|https|grpc|grpcs) and L4 (tcp|udp).
+
+- In L4 Proxy use frontend to configure backend service directly.
+- In L7 Proxy use frontend to configure listener ports, and use [rule](#alb_add_rule) to configure backend service.
+
+If you need to add an HTTPS listener port, you should also contact the administrator to assign a TLS certificate to the current project for encryption.
+{/* lint ignore no-duplicate-headings-in-section */}
+
+### Prerequisites
+
+Create a ALB first.
+
+### Configure Frontend
+
+```yaml
+# alb-frontend-demo.yaml
+apiVersion: crd.alauda.io/v1
+kind: Frontend
+metadata:
+  labels:
+    alb2.cpaas.io/name: alb-demo # [!code callout]
+  name: alb-demo-00080 # [!code callout]
+  namespace: cpaas-system
+spec:
+  port: 80 # [!code callout]
+  protocol: http # [!code callout]
+  certificate_name: '' # [!code callout]
+  backendProtocol: 'http' # [!code callout]
+  serviceGroup: # [!code callout]
+    session_affinity_policy: '' # [!code callout]
+    services:
+      - name: hello-world
+        namespace: default
+        port: 80
+        weight: 100
+```
+
+<Callouts>
+
+1. alb label: Required, indicate the ALB instance to which this `Frontend` belongs to.
+2. frontend name: Format as `$alb_name-$port`.
+3. port: which port which listen on.
+4. protocol: what protocol this port uses.
+   - L7 protocol https|http|grpcs|grpc and L4 protocol tcp|udp.
+   - When selecting HTTPS, a certificate must be added; adding a certificate is optional for the gRPC protocol.
+   - When selecting the gRPC protocol, the backend protocol defaults to gRPC, which does not support session persistence.If a certificate is set for the gRPC protocol, the load balancer will unload the gRPC certificate and forward the unencrypted gRPC traffic to the backend service.
+   - If using a Google GKE cluster, a load balancer of the same **container network type** cannot have both TCP and UDP listener protocols simultaneously.
+
+5. certificate_name: for grpcs and https protocol which the default cert used, Format as `$secret_ns/$secret_name`.
+6. backendProtocol: what protocol the backend service uses.
+7. Default `serviceGroup`:
+   - L4 proxy: required. ALB forwards traffic to the default service group directly.
+   - L7 proxy: optional. ALB first matches Rules on this Frontend; if none match, it falls back to the default `serviceGroup`.
+8. [session_affinity_policy](/networking/operators/alb_operator/load_balancing_session_affinity_policy_in_alb.mdx)
+
+</Callouts>
+
+### Operation On Frontend
+
+#### Creating
+
+##### using the web console
+
+![](../assets/create_ft_via_web.png)
+
+1. Go to **Container Platform**.
+
+2. In the left navigation bar, click **Network** > **Load Balancing**.
+
+3. Click the name of the load balancer to enter the details page.
+
+4. Click **Add Port**.
+
+Each input item on the web UI corresponds to a field of the CR
+
+| Parameter        | Description                                  |
+| ---------------- | -------------------------------------------- |
+| Session Affinity | `.spec.serviceGroup.session_affinity_policy` |
+
+##### using the CLI
+
+```shell
+kubectl apply -f alb-frontend-demo.yaml -n cpaas-system
+```
+
+### Subsequent Actions
+
+For traffic from HTTP, gRPC, and HTTPS ports, in addition to the default internal routing group, you can set more varied back-end service matching [rules](#alb_add_rule). The load balancer will initially match the corresponding backend service according to the set rules; if the rule match fails, it will then match the backend services corresponding to the aforementioned internal routing group.
+
+### Related Operations
+
+You can click the ⋮ icon on the right side of the list page or click **Actions** in the upper right corner of the details page to update the default route or delete the listener port as needed.
+
+:::note
+If the resource allocation method of the load balancer is **Port**, only administrators can delete the related listener ports in the **Administrator** view.
+:::
+
+## Rule \{#alb_add_rule}
+
+Rule is a Custom Resource(CR) that defines how incoming requests are matched and processed by the ALB.
+
+Ingresses handled by ALB can be [auto-translated to rules](#alb_ingress).
+
+### Prerequisites
+
+- [Configure ALB](#alb)
+- [Configure Frontend](#alb_frontend)
+
+Here is a demo rule to give you a quick first impression of how to use rules.
+
+:::note
+rule must be attached to a frontend and alb via label.
+:::
+
+```yaml
+apiVersion: crd.alauda.io/v1
+kind: Rule
+metadata:
+  labels:
+    alb2.cpaas.io/frontend: alb-demo-00080 # [!code callout]
+    alb2.cpaas.io/name: alb-demo # [!code callout]
+  name: alb-demo-00080-test
+  namespace: cpaas-system
+spec:
+  backendProtocol: 'https' # [!code callout]
+  certificate_name: 'a/b' # [!code callout]
+  dslx: # [!code callout]
+    - type: URL
+      values:
+        - - STARTS_WITH
+          - /
+  priority: 4 # [!code callout]
+  serviceGroup: # [!code callout]
+    services:
+      - name: hello-world
+        namespace: default
+        port: 80
+        weight: 100
+```
+
+<Callouts>
+
+1. Required, indicate the `Frontend` to which this rule belongs.
+2. Required, indicate the ALB to which this rule belongs.
+3. [backendProtocol](#backend_protocol)
+4. [certificate_name](#certificate_name)
+5. [dslx](#dslx)
+6. The lower the number, the higher the priority.
+7. [serviceGroup](#service_group)
+
+</Callouts>
+
+### match request with dslx and priority
+
+#### dslx
+
+DSLX is a domain-specific language used to describe the matching criteria.
+For example, the rule below matches a request that satisfies **all** the following criteria:
+
+- url starts with /app-a **or** /app-b
+- method is post
+- url param's group is vip
+- host is \*.app.com
+- header's location is east-1 or east-2
+- has a cookie name is uid
+- source IPs come from 1.1.1.1-1.1.1.100
+
+{/* lint ignore code-block-split-list */}
+
+```yaml
+dslx:
+  - type: METHOD
+    values:
+      - - EQ
+        - POST
+  - type: URL
+    values:
+      - - STARTS_WITH
+        - /app-a
+      - - STARTS_WITH
+        - /app-b
+  - type: PARAM
+    key: group
+    values:
+      - - EQ
+        - vip
+  - type: HOST
+    values:
+      - - ENDS_WITH
+        - .app.com
+  - type: HEADER
+    key: LOCATION
+    values:
+      - - IN
+        - east-1
+        - east-2
+  - type: COOKIE
+    key: uid
+    values:
+      - - EXIST
+  - type: SRC_IP
+    values:
+      - - RANGE
+        - '1.1.1.1'
+        - '1.1.1.100'
+```
+
+#### priority
+
+Priority is an integer ranging from 0 to 10, where lower values indicate higher priority. To configure the priority of a rule in ingress, you can use the following annotation format:
+
+```yaml
+# alb.cpaas.io/ingress-rule-priority-$rule_index-$path_index
+alb.cpaas.io/ingress-rule-priority-0-0: '10'
+```
+
+For rules, simply set the priority directly in `.spec.priority` using an integer value.
+
+### Action
+
+After a request matches a rule, you can apply the following actions to the request
+
+| Feature             | Description                                                          | Link                                                                              |
+| ------------------- | -------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| Timeout             | Configures the timeout settings for requests.                        | [timeout](/networking/operators/alb_operator/l4_l7_timeout.mdx)                   |
+| Redirect            | Redirects incoming requests to a specified URL.                      | [redirect](/networking/operators/alb_operator/http_redirect.mdx)                  |
+| CORS                | Enables Cross-Origin Resource Sharing (CORS) for the application.    | [cors](/networking/operators/alb_operator/cors.mdx)                               |
+| Header Modification | Allows modification of request or response headers.                  | [header modification](/networking/operators/alb_operator/header_modification.mdx) |
+| URL Rewrite         | Rewrites the URL of incoming requests before forwarding them.        | [url-rewrite](/networking/operators/alb_operator/url_rewrite.mdx)                 |
+| WAF                 | Integrates Web Application Firewall (WAF) for enhanced security.     | [waf](/networking/operators/alb_operator/modsecurity.mdx)                         |
+| OTEL                | Enables OpenTelemetry (OTEL) for distributed tracing and monitoring. | [otel](/networking/operators/alb_operator/otel.mdx)                               |
+| Keepalive           | Enables or disables the keepalive feature for the application.       | [keepalive](/networking/operators/alb_operator/tcp_http_keepalive.mdx)            |
+
+### Backend
+
+#### backend protocol \{#backend_protocol}
+
+By default, the backend protocol is set to HTTP. If you want to use TLS re-encryption, you can configure it as HTTPS.
+
+#### Service Group and Session Affinity Policy \{#service_group}
+
+You can configure one or more services within a rule.
+
+By default, the ALB uses a round-robin (RR) algorithm to distribute requests among backend services. However, you can assign weights to individual services or choose a different load-balancing algorithm.
+
+For more details, refer to [Balance Algorithm](/networking/operators/alb_operator/load_balancing_session_affinity_policy_in_alb.mdx).
+
+### Operation On Rule
+
+#### Using web console
+
+![](../assets/create_rule_via_web.png)
+
+1. Go to **Container Platform**.
+2. Click on **Network** > **Load Balancing** in the left navigation bar.
+3. Click on the name of the load balancer.
+4. Select the listener port name.
+5. Click **Add Rule**.
+6. Refer to the following descriptions to configure the relevant parameters.
+7. Click **Add**.
+
+Each input item on the webui corresponds to a field of the CR
+
+#### using the CLI
+
+```shell
+kubectl apply -f alb-rule-demo.yaml -n cpaas-system
+```
+
+### Https
+
+If the frontend protocol (ft) is HTTPS or GRPCS, the rule can also be configured to use HTTPS.
+
+You can specify the certificate either in the rule or in the ingress to match the certificate for that specific port.
+
+Termination is supported, and re-encryption is possible if the backend protocol is HTTPS. However, you **cannot** specify a certificate for communication with the backend service.
+
+#### Certificate Annotation in Ingress
+
+Certificates can be referenced across namespaces via annotation.
+
+```yaml
+alb.networking.cpaas.io/tls: qq.com=cpaas-system/dex.tls,qq1.com=cpaas-system/dex1.tls
+```
+
+#### Certificate in Rule \{#certificate_name}
+
+In `.spec.certificate_name`, the format is `$secret_namespace/$secret_name`
+
+#### TLS Mode
+
+##### Edge Mode
+
+In edge mode, the client communicates with the ALB using HTTPS, and ALB communicates with backend services using HTTP protocol.
+To achieve this:
+
+1. create ft use https protocol
+2. create rule with backend protocol http, and specify cert via `.spec.certificate_name`
+
+##### Re-encrypt Mode
+
+In re-encrypt mode, the client communicates with the ALB using HTTPS, and ALB communicates with backend services using HTTPS protocol.
+To achieve this:
+
+1. create ft use https protocol
+2. create rule with backend protocol https, and specify cert via `.spec.certificate_name`
+
+### Ingress \{#alb_ingress}
+
+#### Ingress sync \{#alb_ingress_sync}
+
+Each ALB creates an IngressClass with the same name and handles ingresses within the same project.
+
+When an ingress namespace has a label like `cpaas.io/project: demo`, it indicates that the ingress belongs to the `demo` project.
+
+ALBs that have the project name `demo` in their `.spec.config.projects` configuration will automatically translate these ingresses into rules.
+
+:::note
+ALB listens to ingress and automatically creates a `Frontend` or Rule. `source` field is defined as follows:
+
+1. `spec.source.type` currently only supports `ingress`.
+2. `spec.source.name` is ingress name.
+3. `spec.source.namespace` is ingress namespace.
+   :::
+
+##### SSL strategy \{#alb_ingress_ssl_strategy}
+
+For ingresses that do not have certificates configured, ALB provides a strategy to use a default certificate.
+
+You can configure the ALB custom resource with the following settings:
+
+- `.spec.config.defaultSSLStrategy`: Defines the SSL strategy for ingresses without certificates
+- `.spec.config.defaultSSLCert`: Sets the default certificate in the format `$secret_ns/$secret_name`
+
+Available SSL strategies:
+
+- **Never**: Do not create rules on HTTPS ports (default behavior)
+- **Always**: Create rules on HTTPS ports using the default certificate
+
+## Logs and Monitoring
+
+By combining logs and monitoring data, you can quickly identify and resolve load balancer issues.
+
+### Viewing Logs
+
+1. Go to **Administrator**.
+
+2. In the left navigation bar, click on **Network Management** > **Load Balancer**.
+
+3. Click on **_Load Balancer Name_**.
+
+4. In the **Logs** tab, view the logs of the load balancer's runtime from the container's perspective.
+
+### Monitoring Metrics
+
+:::note
+The cluster where the load balancer is located must deploy monitoring services.
+:::
+
+1. Go to **Administrator**.
+
+2. In the left navigation bar, click on **Network Management** > **Load Balancer**.
+
+3. Click on **_Load Balancer Name_**.
+
+4. In the **Monitoring** tab, view the metric trend information of the load balancer from the node's perspective.
+   - **Usage Rate**: The real-time usage of CPU and memory by the load balancer on the current node.
+
+   - **Throughput**: The overall incoming and outgoing traffic of the load balancer instance.
+
+For more detailed information about monitoring metrics please refer to [ALB Monitoring](/networking/operators/alb_operator/alb_monitoring.mdx).
