@@ -1,0 +1,254 @@
+---
+weight: 10
+---
+
+# Ingress and Load Balancing with Envoy Gateway
+
+## Overview
+
+Envoy Gateway provides Layer 7 (L7) ingress and load balancing for Kubernetes clusters.
+It is based on the Kubernetes Gateway API and built atop Envoy Proxy, allowing advanced HTTP, HTTPS, gRPC, and TCP routing with full observability and policy control.
+
+Envoy Gateway unifies the ingress traffic management model by defining GatewayClass, Gateway, and `Route` resources,
+offering a standard, portable alternative to legacy Ingress objects.
+
+## Network Flow Architecture
+
+```text
+External Client (Browser / curl) https://www.example.com
+   │
+   ▼
+DNS Resolution (https://www.example.com) → External IP (e.g. 34.23.88.11)
+   │
+   ▼
+External Load Balancer [L4]
+   │
+   ▼
+Envoy Gateway (Gateway API) [L7]
+   │
+   ▼
+Kubernetes Service (ClusterIP) [L4]
+   │
+   ▼
+Pod (Application)
+```
+
+- External LoadBalancer provides an external IP that maps traffic into the cluster.
+
+- Envoy Gateway terminates TLS, applies routing rules, and forwards to backend services.
+
+- Service (ClusterIP) distributes traffic to Pods across nodes.
+
+This architecture replaces the “Ingress Controller” with a fully Gateway-API-compliant data plane.
+
+## Configuring Routes
+
+### Defining a GatewayClass
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: envoy
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+```
+
+### Creating a Gateway
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: public-gateway
+  namespace: gateway-system
+spec:
+  gatewayClassName: envoy
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: Same
+    - name: https
+      protocol: HTTPS
+      port: 443
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: site-cert
+```
+
+Learn more [Configure Gateway API Gateway](/configure/networking/functions/configure_gatewayapi_gateway.mdx#configure_gatewayapi_gateway).
+
+### Creating HTTP Routes
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: web-route
+  namespace: default
+spec:
+  parentRefs:
+    - name: public-gateway
+      namespace: gateway-system
+  hostnames:
+    - 'app.example.com'
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: web-service
+          port: 8080
+```
+
+Learn more [Configure Gateway API Route](/configure/networking/functions/configure_gatewayapi_route.mdx#configure_gatewayapi_route).
+
+Explanation
+
+- The Gateway exposes ports 80 and 443 for HTTP/S traffic.
+
+- The HTTPRoute defines routing rules based on hostname and path.
+
+- Multiple HTTPRoute objects can share the same Gateway.
+
+## Configuring Ingress Cluster Traffic
+
+Envoy Gateway supports various external traffic entry modes, depending on your infrastructure.
+
+| Environment     | Entry Type                            | Example                          |
+| --------------- | ------------------------------------- | -------------------------------- |
+| Cloud           | `Service type=LoadBalancer`           | Cloud provider assigns public IP |
+| Bare Metal      | MetalLB + `Service type=LoadBalancer` | MetalLB allocates external IP    |
+| Edge / Internal | NodePort or hostNetwork               | For local or private access      |
+
+Example Service exposing Envoy Gateway:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: envoy-gateway
+  namespace: gateway-system
+spec:
+  type: LoadBalancer
+  selector:
+    app: envoy
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+    - name: https
+      port: 443
+      targetPort: 8443
+```
+
+You can verify the external IP assigned by running:
+
+```shell
+kubectl get svc envoy-gateway -n gateway-system
+```
+
+## Load Balancing Strategies
+
+Envoy Gateway provides flexible load-balancing methods through its backend references.
+
+### Default Round-Robin
+
+```yaml
+backendRefs:
+  - name: app-v1
+    port: 8080
+  - name: app-v2
+    port: 8080
+```
+
+### Weighted Load Balancing
+
+```yaml
+backendRefs:
+  - name: app-v1
+    port: 8080
+    weight: 80
+  - name: app-v2
+    port: 8080
+    weight: 20
+```
+
+### Session Affinity (Sticky Sessions)
+
+Envoy supports cookie-based or source-IP-based session affinity via policy configuration:
+
+```yaml
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: web-policy
+  namespace: default
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: web-route
+  sessionAffinity:
+    type: Cookie
+    cookie:
+      name: session_id
+      ttl: 3600s
+```
+
+Learn more about [BackendTrafficPolicy](/configure/networking/how_to/tasks_for_envoy_gateway.mdx#policyattachment-via-targetrefs).
+
+## TLS and Security
+
+### TLS Termination
+
+Handled at the Gateway listener level:
+
+```yaml
+tls:
+  mode: Terminate
+  certificateRefs:
+    - kind: Secret
+      name: site-cert
+```
+
+### TLS Passthrough
+
+For end-to-end encryption where Envoy forwards encrypted traffic:
+
+```yaml
+tls:
+  mode: Passthrough
+```
+
+### mTLS Between Gateways and Services
+
+Advanced policy CRDs can enable mTLS or client certificate validation.
+
+## Integration with MetalLB
+
+In bare-metal clusters without cloud load balancers:
+
+1. Configure a [MetalLB IPAddressPool](/configure/networking/functions/configure_metallb.mdx#configure_ip_pool) and L2Advertisement.
+
+2. Ensure the Envoy Gateway Service is of type LoadBalancer.
+
+3. MetalLB assigns an external IP automatically.
+
+4. DNS records can then map domains (e.g., app.example.com) to the assigned IP.
+
+## Troubleshooting
+
+| Issue                      | Possible Cause        | Resolution                                  |
+| -------------------------- | --------------------- | ------------------------------------------- |
+| Gateway has no external IP | MetalLB misconfigured | Check `Service` type and MetalLB controller |
+| HTTPRoute ignored          | `parentRefs` mismatch | Ensure correct `Gateway` and namespace      |
+| TLS not working            | Secret not found      | Verify `certificateRefs` path               |
+| 404 from Gateway           | No matching host/path | Confirm `HTTPRoute` rules                   |
+| Latency spikes             | Overloaded proxy      | Scale Envoy Gateway replicas                |
