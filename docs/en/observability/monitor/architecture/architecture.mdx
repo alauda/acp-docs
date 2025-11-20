@@ -7,111 +7,38 @@ sourceSHA: b35fbcb727b116fbb53e49ac210b3a2e7781c6b45677db49c4fd23b1cf971c90
 
 ![](../assets/visio_for_monitor.png)
 
-## Overall Architecture Explanation
+## Alert Rule CRUD
 
-The monitoring system consists of the following core functional modules:
+- The browser forwards HTTP requests for alert rule CRUD (Create, Read, Update, Delete) to the erebus component via the global cluster ALB (request address: `/kubernetes/cluster_name`). Erebus is responsible for forwarding these requests to the kube-apiserver of the corresponding monitoring cluster.
+- The prometheus/vm operator validates the correctness of the rules. If the rules are valid, it performs operations on the PrometheusRule Custom Resource.
+- Nevermore is responsible for watching the PrometheusRule CR and generating monitoring metrics for log alerts.
+- Warlock is responsible for watching the Event CR and generating monitoring metrics for event alerts.
 
-1. Monitoring System
-   - Data Collection and Storage: Collecting and persisting monitoring metrics from multiple sources
-   - Data Query and Visualization: Providing flexible query and visualization capabilities for monitoring data
-2. Alerting System
-   - Alert Rule Management: Configuring and managing alert policies
-   - Alert Triggering and Notification: Evaluating alert rules and dispatching notifications
-   - Real-time Alert Status: Providing a real-time view of the current alert status of the system
-3. Notification System
-   - Notification Configuration: Managing notification templates, contact groups, and policies
-   - Notification Server: Managing the configuration of various notification channels
+## Monitoring Collection and Storage
 
-## Monitoring System
+- The prometheus/vm operator is responsible for loading monitoring collection and alert rule configurations, synchronizing them to the prometheus/vm instances.
+- Nevermore generates log metrics, and the warlock component watches events to generate event metrics.
+- The prometheus/vm instances discover target exporters that need to be scraped through servicemonitor (matching based on namespace and service), and scrape log metrics and event metrics. The scraped data is ultimately stored in the prometheus and vm instances.
 
-### Data Collection and Storage
+## Monitoring Query
 
-1. Prometheus/VictoriaMetrics Operator Responsibilities:
-   - Load and validate monitoring collection configurations
-   - Load and validate alert rule configurations
-   - Synchronize configurations to Prometheus/VictoriaMetrics instances
-2. Sources of Monitoring Data:
-   - Nevermore: Generates log-related metrics
-   - Warlock: Generates event-related metrics
-   - Prometheus/VictoriaMetrics: Discovers and collects various exporters' metrics via ServiceMonitor
+- The browser sends monitoring requests (request address: `/platform/monitoring.alauda.io/v1beta1`) to the ALB, which ultimately forwards them to the courier-api component (which retrieves the monitoring address based on the feature monitoring). The courier-api then sends the request to port 11780 of the ALB in the corresponding monitoring cluster to query monitoring data from the prometheus/vm instances.
+- For built-in monitoring metrics, courier-api queries the corresponding PromQL expressions for the metrics through the indicators interface (all built-in indicators can be obtained via `kubectl -n cpaas-system get cm | grep indicators`). It sends requests to the monitoring components of each cluster to retrieve data, parses the results, and returns them to the requester. For custom metrics, it directly passes the expressions through to the monitoring components of each cluster, retrieves the data, parses the results, and returns them to the requester.
 
-### Data Query and Visualization
+## Alert Notification
 
-1. Monitoring Data Query Process:
-   - The browser initiates a query request (Path: `/platform/monitoring.alauda.io/v1beta1`)
-   - ALB forwards the request to the Courier component
-   - Courier API processes the query:
-     - Built-in Metrics: Obtains PromQL through the indicators interface and queries
-     - Custom Metrics: Directly forwards PromQL to the monitoring component
-   - The monitoring dashboard retrieves data and displays it
+- The PrometheusRule resource serves as the carrier for alert policies. The global front-end UI component `ops-core-plugin` performs create, query, update, and delete operations on alert policies, which correspond to operations on the PrometheusRule resources in each cluster. Silence configurations are stored in the annotations of the PrometheusRule.
+- Warlock converts the corresponding PrometheusRule into a VMRule, primarily to adapt to scenarios where the underlying monitoring components use VictoriaMetrics. Warlock reads the alert interval configuration from the ConfigMap `alert-repeat-config` (which stores the sending intervals for different alert severity levels).
+- The Prometheus-Operator/VictoriaMetrics-Operator watches the PrometheusRule/VMRule resources and synchronizes the content of the alert policies to Prometheus/VictoriaMetrics (in the case of VM, Warlock watches the alert policies of the vmagent cluster and synchronizes them to the VM storage cluster).
+- Prometheus/VictoriaMetrics (specifically vmalert) periodically evaluates the alert rules. When an alert is triggered, the alert information is sent to Alertmanager.
+- Alertmanager sends the notifications to the ALB, and finally, the courier-api component dispatches the notifications. Alert history is recorded in Elasticsearch or ClickHouse and can be queried via the courier-api.
 
-2. Monitoring Dashboard Management Process:
-   - Users access the `global` cluster ALB (Path: `/kubernetes/cluster_name/apis/ait.alauda.io/v1alpha2/MonitorDashboard`)
-   - ALB forwards the request to the Erebus component
-   - Erebus routes the request to the target monitoring cluster
-   - The Warlock component is responsible for:
-     - Validating the legality of the monitoring dashboard configuration
-     - Managing the MonitorDashboard CR resource
+## Real-time Alerts
 
-## Alerting System
+- Real-time alert information is derived from the metrics `cpaas_active_alerts` and `cpaas_active_silences`  generated by the courier-api in the Global cluster. The metrics from courier-api are collected by the Global Prometheus (collected every 15 seconds), then queried, parsed, and displayed via the courier-api's query API.
 
-### Alert Rule Management
+- `cpaas_active_alerts` is primarily obtained by fetching data from the Alert API of each cluster's Alertmanager and then transforming it.
 
-The alert rule configuration process:
+- `cpaas_active_silences` is primarily obtained by fetching data from the Silence API of each cluster's Alertmanager and then transforming it.
 
-1. Users access the `global` cluster ALB (Path: `/kubernetes/cluster_name/apis/monitoring.coreos.com/v1/prometheusrules`)
-2. The request passes through ALB -> Erebus -> target cluster kube-apiserver
-3. Responsibilities of each component:
-   - Prometheus/VictoriaMetrics Operator:
-     - Validating the legality of alert rules
-     - Managing PrometheusRule CR
-   - Nevermore: Listening for and processing log alert metrics
-   - Warlock: Listening for and processing event alert metrics
-
-### Alert Processing Workflow
-
-1. Alert Evaluation:
-   - PrometheusRule/VMRule defines alert rules
-   - Prometheus/VictoriaMetrics evaluates rules periodically
-2. Alert Notification:
-   - Alerts are sent to Alertmanager once triggered
-   - Alertmanager -> ALB -> Courier API
-   - Courier API is responsible for dispatching notifications
-3. Alert Storage:
-   - Alert history is stored in ElasticSearch/ClickHouse
-
-### Real-time Alert Status
-
-1. Status Collection:
-   - The `global` cluster Courier generates metrics:
-     - cpaas_active_alerts: Current active alerts
-     - cpaas_active_silences: Current silence configurations
-   - Global Prometheus collects every 15 seconds
-2. Status Display:
-   - The front-end queries and displays real-time status via Courier API
-
-## Notification System
-
-### Notification Configuration Management
-
-The management process for notification templates, notification contact groups, and notification policies is as follows:
-
-1. Users access the standard API of the `global` cluster via a browser
-   - Access path: `/apis/ait.alauda.io/v1beta1/namespaces/cpaas-system`
-2. Managing related resources:
-   - Notification Template: apiVersion: "ait.alauda.io/v1beta1", kind: "NotificationTemplate"
-   - Notification Contact Group: apiVersion: "ait.alauda.io/v1beta1", kind: "NotificationGroup"
-   - Notification Policy: apiVersion: "ait.alauda.io/v1beta1", kind: "Notification"
-3. Courier is responsible for:
-   - Validating the legality of notification templates
-   - Validating the legality of notification contact groups
-   - Validating the legality of notification policies
-
-### Notification Server Management
-
-1. Users access the `global` cluster's ALB via a browser
-   - Access path: `/kubernetes/global/api/v1/namespaces/cpaas-system/secrets`
-2. Managing and submitting notification server configurations
-   - Resource name: platform-email-server
-3. Courier is responsible for:
-   - Validating the legality of the notification server configuration
+- The Global Prometheus collects the metrics from courier-api. The front-end UI component uses the monitoring API of courier-api to query these two metrics from the Global Prometheus and displays the real-time alert data based on the metric data.
