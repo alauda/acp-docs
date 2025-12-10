@@ -1,32 +1,38 @@
-# Kube-OVN Underlay + MetalLB LoadBalancer Service 配置
-
+---
+weight: 14
 ---
 
-## 方案说明
+# Kube-OVN Underlay + MetalLB LoadBalancer Service Configuration
 
-该方案主要为了解决 MetalLB L2 模式下和 Kube-OVN Underlay 适配的场景。可以让用户使用 Underlay 子网下的 IP 作为 MetalLB 的 LoadBalancer Service 的 VIP，将流量直接转发到后端 Pod。
+## Overview
 
-### 流量路径
+This solution addresses the integration of MetalLB L2 mode with Kube-OVN Underlay networking. It allows users to utilize Underlay subnet IPs as MetalLB LoadBalancer Service VIPs, directly forwarding traffic to backend business Pods.
 
-访问 LB Service IP 的流量会直接走 Underlay 网络到业务 Pod
+## Prerequisites
 
-**流量示意图**：
+### Environment Requirements
+- **ACP version**: >= 4.3
+- **Network interface support**: VLAN sub-interfaces capability
+
+### Traffic Flow
+
+**Traffic Diagram**:
 ```mermaid
 flowchart TB
-    Client["💻 客户端"]
-    VIP["🔀 访问 underlay 子网的 VIP<br/>10.180.208.200"]
+    Client["💻 Client"]
+    VIP["🔀 Access Underlay Subnet VIP<br/>10.180.208.200"]
     Interface["underlay0.341"]
     BrProvider["br-provider"]
     LogicalSwitch["underlay<br/>logical<br/>switch"]
     BackendPod["backendpod(1...N)"]
 
-    Client -->|"访问 underlay 子网的 VIP"| VIP
+    Client -->|"Access Underlay Subnet VIP"| VIP
     VIP --> Interface
     Interface --> BrProvider
     BrProvider --> LogicalSwitch
-    LogicalSwitch -->|"直接 DNAT 到后端 Pod IP"| BackendPod
+    LogicalSwitch -->|"Direct DNAT to backend Pod IP"| BackendPod
 
-    subgraph Node["节点1"]
+    subgraph Node["Node 1"]
         BackendPod
         LogicalSwitch
         BrProvider
@@ -41,13 +47,13 @@ flowchart TB
 
 ---
 
-## 配置步骤
+## Configuration Steps
 
-### 1. 配置 ProviderNetwork 启用 VLAN 子网卡
+### 1. Configure ProviderNetwork with VLAN Sub-interfaces
 
-**注意**：必须使用 VLAN 子网卡。
+**Important**: VLAN sub-interfaces must be used.
 
-为 Kube-OVN 的 Underlay 网络配置自动创建 VLAN 子接口：
+Configure Kube-OVN Underlay network to automatically create VLAN sub-interfaces:
 ```yaml
 apiVersion: kubeovn.io/v1
 kind: ProviderNetwork
@@ -55,7 +61,7 @@ metadata:
   name: provider
 spec:
   defaultInterface: underlay0.341
-  autoCreateVlanSubinterfaces: true
+  autoCreateVlanSubinterfaces: true  # Automatically creates VLAN sub-interfaces (e.g., underlay0.341) if only parent interface (underlay0) exists
 
 ---
 apiVersion: kubeovn.io/v1
@@ -63,68 +69,85 @@ kind: Vlan
 metadata:
   name: ovn-vlan
 spec:
-  id: 0    # id 全部改为0，因为vlan子网卡会自动打上tag
+  id: 0    # Use 0 because autoCreateVlanSubinterfaces creates the VLAN sub-interface (underlay0.341) which handles VLAN tagging, not Kube-OVN directly
   provider: provider
 status:
   subnets:
   - ovn-default
 ```
 
-### 2. 修改 kube-ovn-controller 参数
+### 2. Configure Kube-OVN Controller Parameters
 
-调整 `kube-ovn-controller` 的启动参数，启用必要的特性：
+Configure the Kube-OVN controller with the required parameters for LoadBalancer functionality:
 
-```bash
---ls-ct-skip-dst-lport-ips=false        # 不允许跳过 conntrack
---enable-ovn-lb-prefer-local=true       # 启用本地优先的负载均衡
-```
+**Using Web Console:**
+1. Navigate to **Cluster Management** > **Clusters**
+2. Select your cluster and click **Settings**
+3. Find **Kube-OVN Configuration** section
+4. Add the following environment variables:
+   ```
+   LS_CT_SKIP_DST_LPORT_IPS=false
+   ENABLE_OVN_LB_PREFER_LOCAL=true
+   ```
 
-### 3. 配置 Underlay 子网的外部地址功能
+### 3. Configure Underlay Subnet External Address Feature
 
-编辑 Underlay 子网，预留一段 IP 地址供 LoadBalancer 使用：
+Edit the Underlay subnet to reserve an IP range for LoadBalancer usage:
 
-> **重要**：外部地址池的 IP 必须在 Underlay 的子网下。
+> **Important**: External address pool IPs must be within the Underlay subnet.
 
-修改 Underlay 子网参数 `spec.enableExternalLBAddress: true`：
+Modify the Underlay subnet parameter `spec.enableExternalLBAddress: true`:
 ```yaml
 apiVersion: kubeovn.io/v1
 kind: Subnet
 metadata:
   name: underlay-subnet
 spec:
-  enableExternalLBAddress: true       # 启用外部 LB 地址功能
+  enableExternalLBAddress: true       # Indicates this subnet has IP range for LB service VIP
+  excludeIps:
+  - 10.180.208.200..10.180.208.220    # Reserve IP range for external address pool
 ```
 
-### 4. 创建 MetalLB 外部地址池
+### 4. Create MetalLB External Address Pool
 
 ```yaml
 # underlay-ippool.yaml
-kind: IPAddressPool
 apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
 metadata:
   name: underlay-lb-pool
   namespace: metallb-system
+  labels:
+    app.kubernetes.io/name: metallb
+    app.kubernetes.io/component: addresspool
+    app.kubernetes.io/part-of: metallb-system
 spec:
   addresses:
-    - 10.180.208.200-10.180.208.250  # Underlay 子网 IP 范围
+    - 10.180.208.200-10.180.208.220  # Underlay subnet IP range
   avoidBuggyIPs: true
+  autoAssign: true
 ---
-kind: L2Advertisement
 apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
 metadata:
   name: underlay-lb-pool
   namespace: metallb-system
+  labels:
+    app.kubernetes.io/name: metallb
+    app.kubernetes.io/component: advertisement
+    app.kubernetes.io/part-of: metallb-system
 spec:
   ipAddressPools:
     - underlay-lb-pool
+  nodeSelectors: []  # Empty means all nodes are eligible
 ```
 
-部署地址池：
+Deploy the address pool:
 ```shell
 kubectl apply -f underlay-ippool.yaml
 ```
 
-### 创建 LoadBalancer Service
+### 5. Create Sample Application and LoadBalancer Service
 
 ```yaml
 # application-with-loadbalancer.yaml
@@ -132,6 +155,8 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: backend-app
+  labels:
+    app: backend
 spec:
   replicas: 3
   selector:
@@ -154,7 +179,7 @@ metadata:
   name: backend-lb-service
 spec:
   type: LoadBalancer
-  externalTrafficPolicy: Local  # 保持源 IP，直接路由到 Pod
+  externalTrafficPolicy: Local  # **IMPORTANT**: Required for preserving source IP and enabling direct Pod routing
   selector:
     app: backend
   ports:
@@ -162,65 +187,41 @@ spec:
       targetPort: 80
 ```
 
-部署应用：
+Deploy the application:
 ```shell
 kubectl apply -f application-with-loadbalancer.yaml
 ```
 
-### 验证配置
+## ⚠️ Important Configuration Requirements
 
-检查 Service 状态：
-```shell
-kubectl get svc backend-lb-service
-```
+### externalTrafficPolicy: Local
 
-期望输出：
-```shell
-NAME                TYPE           CLUSTER-IP      EXTERNAL-IP      PORT(S)        AGE
-backend-lb-service   LoadBalancer   10.96.123.45    10.180.208.200   80:30005/TCP   30s
-```
+**This setting is MANDATORY for the Underlay + MetalLB solution:**
 
-测试外部访问：
-```shell
+- **Source IP Preservation**: Ensures client IP addresses are preserved and visible to backend pods
+- **Direct Pod Routing**: Traffic flows directly from client to pod without additional network hops
+- **Network Efficiency**: Avoids routing through cluster nodes, reducing latency
+- **Security**: Maintains original client information for logging and access control
+
+**Without `externalTrafficPolicy: Local`:**
+- Traffic will be routed through cluster nodes
+- Client IP will be replaced with node IP
+- Network performance will be degraded
+- Underlay network benefits will be lost
+
+### 6. Verify Configuration
+
+```bash
+# Check service status
+kubectl get svc backend-lb-service -o wide
+
+# Test external access
 curl http://10.180.208.200
 ```
 
-### 配置要点
+### References and Further Reading
 
-- **externalTrafficPolicy: Local**: 确保源 IP 保持和直接 Pod 路由
-- **地址池**: IP 必须在 Underlay 子网范围内
-- **enableExternalLBAddress**: 必须在 Underlay 子网上启用此功能
-- **节点选择**: 确保选择的节点具有 Underlay 网络连接
-
-### 5. 验证配置
-
-检查 Service 状态：
-```shell
-kubectl get svc backend-lb-service
-```
-
-期望输出：
-```shell
-NAME                TYPE           CLUSTER-IP      EXTERNAL-IP      PORT(S)        AGE
-backend-lb-service   LoadBalancer   10.96.123.45    10.180.208.200   80:30005/TCP   30s
-```
-
-测试外部访问：
-```shell
-curl http://10.180.208.200
-```
-
-### 配置要点
-
-- **externalTrafficPolicy: Local**: 确保源 IP 保持和直接 Pod 路由
-- **地址池**: IP 必须在 Underlay 子网范围内
-- **enableExternalLBAddress**: 必须在 Underlay 子网上启用此功能
-- **节点选择**: 确保选择的节点具有 Underlay 网络连接
-
-## 总结
-
-通过以上配置步骤，可以实现：
-1. 流量直接走 Underlay 网络，避免绕路管理网络
-2. 使用标准的 LoadBalancer Service 直接暴露服务
-3. 保持源 IP 地址，实现直接 Pod 路由
-4. 简化网络架构，提升性能
+- [MetalLB Official Documentation](https://metallb.universe.tf/)
+- [Kube-OVN Documentation](https://kubeovn.github.io/docs/)
+- [Kubernetes LoadBalancer Service](https://kubernetes.io/docs/concepts/services-networking/service/#loadbalancer)
+- [Kubernetes Network Policies](https://kubernetes.io/docs/concepts/services-networking/network-policies/)
