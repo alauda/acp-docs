@@ -1,0 +1,125 @@
+---
+weight: 69
+---
+
+# Enabling D3N Cache for Ceph RGW
+
+D3N (Data Delivery Network) cache accelerates access to hot objects by using **local NVMe/SSD disks on RGW nodes as a cache layer**.
+It reduces frequent read operations to backend OSDs and significantly improves read performance for hot data.
+
+## Background
+
+The core idea of D3N is simple but effective:
+instead of fetching object data repeatedly from the Ceph backend storage, RGW serves hot data directly from a **local persistent cache** located on fast disks (NVMe/SSD) attached to RGW nodes.
+
+This design is especially beneficial for:
+- Large object downloads
+- Repeated reads of hot objects
+- Bandwidth-sensitive workloads
+
+## Prerequisites
+
+- A Ceph cluster is installed
+- Rook-Ceph is deployed
+- An Object Storage (RGW / CephObjectStore) is created
+- High-performance local disks (NVMe / SSD) are available on RGW nodes
+
+## Operation Overview
+
+1. Deploy Ceph and create an Object Storage
+2. Prepare a high-speed local disk on RGW nodes and mount it to a directory
+3. Configure `CephObjectStore` to:
+   - Mount the directory via `hostPath`
+   - Enable D3N-related RGW parameters
+
+## Prepare Local Filesystem for Cache
+
+Mount a directory on each node hosting the RGW service. It is recommended to use a high-performance dedicated disk (rather than a partition), formatted with the **XFS** file system, and to configure `/etc/fstab` to ensure the mount persists after a reboot. Replace `</path/to/cache/dir>` in the subsequent documentation with the actual directory path you have configured.
+
+
+## Enable D3N Cache in CephObjectStore
+
+Edit the `CephObjectStore` resource:
+
+```bash
+kubectl edit cephobjectstore object-store -n rook-ceph
+```
+
+Add the following configuration under `gateway`:
+
+```yaml
+gateway:
+  additionalVolumeMounts:
+  - subPath: cache
+    volumeSource:
+      hostPath:
+        path: </path/to/cache/dir>
+  rgwConfig:
+    rgw_d3n_l1_datacache_persistent_path: /var/rgw/cache/
+    rgw_d3n_l1_datacache_size: "10737418240"
+    rgw_d3n_l1_local_datacache_enabled: "true"
+```
+
+### Parameters
+
+| Parameter | Description |
+|:---|:---|
+| `rgw_d3n_l1_local_datacache_enabled` | Enable D3N local cache |
+| `rgw_d3n_l1_datacache_persistent_path` | Cache directory inside the RGW container |
+| `rgw_d3n_l1_datacache_size` | Maximum cache size in bytes |
+
+## Verify D3N Configuration
+
+### Check RGW Configuration via Ceph Tools
+
+In the `rook-ceph-tools` pod, run:
+
+```bash
+ceph config dump | grep d3n
+```
+
+Example output:
+
+```text
+client.rgw.obj.a  advanced  rgw_cache_enabled                    true
+client.rgw.obj.a  advanced  rgw_d3n_l1_datacache_persistent_path /var/rgw/cache/
+client.rgw.obj.a  advanced  rgw_d3n_l1_datacache_size            10737418240
+client.rgw.obj.a  advanced  rgw_d3n_l1_local_datacache_enabled   true
+```
+
+### Verify RGW Logs
+
+After the RGW pod restarts, D3N initialization logs should appear:
+
+```bash
+kubectl logs -n rook-ceph rook-ceph-rgw-object-store-a-xxxx | grep -i d3n
+```
+
+Example output:
+
+```text
+rgw_d3n: rgw_d3n_l1_local_datacache_enabled=1
+rgw_d3n: rgw_d3n_l1_datacache_persistent_path='/var/rgw/cache/'
+rgw_d3n: rgw_d3n_l1_datacache_size=10737418240
+rgw_d3n: rgw_d3n_l1_evict_cache_on_start=1
+rgw_d3n: rgw_d3n_l1_eviction_policy=lru
+```
+
+## Validate Cache Behavior
+
+When downloading objects through RGW, cached files will appear in the host cache directory:
+
+```bash
+ls </path/to/cache/dir>
+```
+
+Example output:
+
+```text
+40b934ab-6c7e-45e7-9fed-a35bc143ce95...multipart_v2v-demo.mkv.1
+40b934ab-6c7e-45e7-9fed-a35bc143ce95...multipart_v2v-demo.mkv.2
+40b934ab-6c7e-45e7-9fed-a35bc143ce95...shadow_v2v-demo.mkv.3_1
+...
+```
+
+The presence of these files confirms that RGW is serving data from the local D3N cache.
