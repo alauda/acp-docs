@@ -1,0 +1,339 @@
+---
+weight: 50
+---
+
+# Migrating VMware Virtual Machines to Alauda Container Platform Virtualization
+
+This document describes how to migrate virtual machines from a VMware cluster to **Alauda Container Platform Virtualization with KubeVirt** using **Alauda Build of Forklift Operator**.
+
+---
+
+## Background
+
+Customers can follow this guide to migrate existing virtual machines running in a VMware cluster into ACP.
+
+Forklift supports multiple source platforms:
+- VMware
+- OpenShift Virtualization (OCP)
+- Red Hat Virtualization (RHV)
+- OpenStack
+- ACP (default destination provider, named `host`)
+
+---
+
+## Terminology
+
+- **Provider**
+  Represents the source or destination virtualization platform.
+  Supported types: `vmware`, `ocp`, `rhv`, `openstack`, `acp`.
+  A default destination provider named **host** is automatically created for the current ACP cluster.
+
+- **StorageMap**
+  Maps storage classes used in the source environment to storage classes in the destination ACP cluster.
+
+- **NetworkMap**
+  Maps source subnets/networks to destination subnets/networks.
+
+- **Plan**
+  A migration plan describing which virtual machines to migrate.
+  References a `StorageMap` and a `NetworkMap`.
+
+- **Migration**
+  Triggers the execution of a `Plan` and provides real-time status updates.
+
+---
+
+## Version Compatibility
+
+| Component | Requirement |
+|---------|-------------|
+| Forklift version| `v2.9.0-alauda.3` |
+| ACP version | >= 3.18 (contact R&D for other versions) |
+| ESXi version | 8.0.0 |
+
+---
+
+## High-Level Workflow
+
+1. Upload and deploy the operator
+2. Deploy Forklift Controller
+3. Add VMware Provider
+4. Create `StorageMap` and `NetworkMap`
+5. Create a `Plan`
+6. Create a `Migration` to trigger execution
+
+---
+
+## Prerequisites
+
+- ACP cluster with virtualization enabled
+- Download Alauda Build of Forklift Operator from alauda cloud
+- Multus CNI installed
+  *Platform Management → Cluster Management → Cluster Plugins → Install Multus CNI*
+- VMware requirements:
+  - ESXi hostname must be resolvable (DNS or CoreDNS override)
+  - SSH service enabled on ESXi
+  - VMware Tools installed in the guest VM
+
+Forklift builds migration pods using ESXi hostnames to construct `V2V_libvirtURL` and connects via `esx://` over SSH to retrieve disk images.
+
+---
+
+## Step 1: Upload Forklift Operator Using Violet
+
+```bash
+export PLATFORM_URL=https://<platform-address>/
+export PLATFORM_USER=<platform-user>
+export PLATFORM_PASSWORD=<platform-password>
+
+violet create kubev2v --artifact=build-harbor.alauda.cn/acp/kubev2v-operator-bundle:<version>
+
+cd kubev2v
+
+violet package ./
+violet push ./forklift-operator.tgz   --platform-address $PLATFORM_URL   --platform-username $PLATFORM_USER   --platform-password $PLATFORM_PASSWORD
+```
+
+---
+
+## Step 2: Deploy the Operator
+
+Navigate to:
+**App Store Management → Operators → forklift-operator → Deploy**
+
+---
+
+## Step 3: Create ForkliftController Instance
+
+Create a `ForkliftController` under **Deployed Operators → Resource Instances**.
+
+Verify all pods are running:
+
+```bash
+kubectl get pod -n konveyor-forklift
+```
+
+Expected pods include:
+- forklift-api
+- forklift-controller
+- forklift-operator
+- forklift-validation
+- forklift-volume-populator-controller
+
+A destination provider named **host** will be auto-created.
+
+---
+
+## Step 4: Prepare VDDK Init Image
+
+Download the matching VMware VDDK Linux package from VMware.
+
+```bash
+tar xf VMware-vix-disklib-<vddk-version>.x86_64.tar.gz
+```
+
+Dockerfile:
+
+```Dockerfile
+FROM registry.access.redhat.com/ubi8/ubi-minimal
+USER 1001
+COPY vmware-vix-disklib-distrib /vmware-vix-disklib-distrib
+RUN mkdir -p /opt
+ENTRYPOINT ["cp", "-r", "/vmware-vix-disklib-distrib", "/opt"]
+```
+
+Build and push:
+
+```bash
+podman build -t registry.example.com/kubev2v/vddk:8.0 .
+podman push registry.example.com/kubev2v/vddk:8.0
+```
+
+---
+
+## Step 5: Add VMware Provider
+
+Create the secret:
+
+```bash
+export VMWARE_URL=https://<vmware-url>/sdk
+export VMWARE_USER=<vmware-user>
+export VMWARE_PASSWORD=<vmware-password>
+
+kubectl -n konveyor-forklift create secret generic vmware   --from-literal=url=$VMWARE_URL   --from-literal=user=$VMWARE_USER   --from-literal=password=$VMWARE_PASSWORD   --from-literal=insecureSkipVerify=true
+
+kubectl label secret vmware -n konveyor-forklift   createdForProviderType=vsphere   createdForResourceType=providers
+```
+
+Create provider:
+
+```bash
+export VDDKIMAGE=registry.example.com/kubev2v/vddk:8.0
+
+kubectl apply -f - <<EOF
+apiVersion: forklift.konveyor.io/v1beta1
+kind: Provider
+metadata:
+  name: vmware
+  namespace: konveyor-forklift
+spec:
+  type: vsphere
+  url: $VMWARE_URL
+  secret:
+    name: vmware
+    namespace: konveyor-forklift
+  settings:
+    sdkEndpoint: esxi
+    vddkInitImage: $VDDKIMAGE
+EOF
+```
+
+Verify provider status is `Ready`.
+
+---
+
+## Step 6: Create NetworkMap
+
+Open a VM in vmware →
+Edit Settings → Network Adapter → Network → click the connected network.
+
+The browser URL will look like: `https://<vcenter-or-esxi>/ui/#/host/networking/portgroups/HaNetwork-data`
+
+Use the last part of the URL as the ID:  `HaNetwork-data`
+
+```bash
+export VMWARE_NET=HaNetwork-data
+
+kubectl apply -f - <<EOF
+apiVersion: forklift.konveyor.io/v1beta1
+kind: NetworkMap
+metadata:
+  name: vmware-networkmap
+  namespace: konveyor-forklift
+spec:
+  map:
+    - source:
+        id: $VMWARE_NET
+      destination:
+        type: pod
+  provider:
+    source:
+      name: vmware
+      namespace: konveyor-forklift
+    destination:
+      name: host
+      namespace: konveyor-forklift
+EOF
+```
+
+---
+
+## Step 7: Create StorageMap
+
+```bash
+export SC_NAME=topolvm
+export VMWARE_DATA_ID=<datastore-uuid>
+
+kubectl apply -f - <<EOF
+apiVersion: forklift.konveyor.io/v1beta1
+kind: StorageMap
+metadata:
+  name: vmware-storagemap
+  namespace: konveyor-forklift
+spec:
+  map:
+    - source:
+        id: $VMWARE_DATA_ID
+      destination:
+        storageClass: $SC_NAME
+  provider:
+    source:
+      name: vmware
+      namespace: konveyor-forklift
+    destination:
+      name: host
+      namespace: konveyor-forklift
+EOF
+```
+
+---
+
+## Step 8: Create Migration Plan
+
+```bash
+export TARGET_NS=demo-space
+export VM_NAME=vm-test
+
+kubectl apply -f - <<EOF
+apiVersion: forklift.konveyor.io/v1beta1
+kind: Plan
+metadata:
+  name: example-plan
+  namespace: konveyor-forklift
+  annotations:
+    populatorLabels: "True"
+spec:
+  provider:
+    source:
+      name: vmware
+      namespace: konveyor-forklift
+    destination:
+      name: host
+      namespace: konveyor-forklift
+  map:
+    network:
+      name: vmware-networkmap
+      namespace: konveyor-forklift
+    storage:
+      name: vmware-storagemap
+      namespace: konveyor-forklift
+  targetNamespace: $TARGET_NS
+  migrateSharedDisks: true
+  pvcNameTemplateUseGenerateName: true
+  warm: true
+  vms:
+    - name: $VM_NAME
+EOF
+```
+
+Ensure `READY=True` before proceeding.
+
+---
+
+## Step 9: Create Migration
+
+```bash
+kubectl apply -f - <<EOF
+apiVersion: forklift.konveyor.io/v1beta1
+kind: Migration
+metadata:
+  name: example-migration
+  namespace: konveyor-forklift
+spec:
+  plan:
+    name: example-plan
+    namespace: konveyor-forklift
+EOF
+```
+
+For **warm migration**, incremental snapshots run hourly.
+Set the `cutover` timestamp in the Migration resource when ready to finalize.
+
+---
+
+## Step 10: Add Disk Labels
+
+```bash
+export VM_PVC=<pvc-name>
+
+kubectl label pvc -n $TARGET_NS $VM_PVC vm.cpaas.io/used-by=$VM_NAME
+kubectl label pvc -n $TARGET_NS $VM_PVC vm.cpaas.io/reclaim-policy=Delete
+```
+
+The virtual disks will now be visible in the VM details page.
+
+---
+
+## Summary
+
+This guide covers end-to-end migration of VMware virtual machines to **Alauda Container Platform Virtualization with KubeVirt** using **Alauda Build of Forklift Operator**, including preparation, mapping, planning, execution, and troubleshooting.
