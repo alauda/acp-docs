@@ -1,0 +1,141 @@
+---
+weight: 15
+i18n:
+  title:
+    zh: Alauda Container Platform Registry 数据备份和恢复
+---
+
+# Alauda Container Platform Registry Data Backup and Recovery
+
+## Overview
+This solution provides guidance for backing up and recovering data of `Alauda Container Platform Registry` that uses S3-compatible object storage in Alauda Container Platform (ACP).
+
+Core Concept: Decouple the management of the image data itself (stored in S3) from the `cluster plugin` configuration (defined in the Kubernetes `ModuleInfo` custom resource).
+
+* **Backup**: Retrieve S3 configuration from the `ModuleInfo` resource and backup data from the specified storage `bucket`.
+* **Recovery**: After installing the `cluster plugin` in a new cluster, update its S3 configuration in the `ModuleInfo` resource to point to the bucket containing the restored data, thereby completing data integration.
+
+Advantages:
+
+* **Decoupled Operations**: Data backup/recovery is independent of ACP `cluster plugin` deployment and upgrade processes.
+* **Configuration-Driven**: All connection information is managed through the declarative `ModuleInfo` resource, ensuring safe and reliable changes.
+* **Extensible**: This pattern can be extended to other storage backends (e.g., Local filesystem, StorageClass, NAS).
+
+## Prerequisites
+
+* Have `kubectl` access and appropriate permissions to operate the target Kubernetes cluster.
+* Have credentials and client tools (e.g., awscli, rclone, minio-client) to access and operate the S3-compatible storage used for image data.
+* The `Alauda Container Platform Registry` cluster plugin is installed and configured, and its `ModuleInfo` resource exists and is in a healthy state.
+* Have independent, sufficient storage capacity prepared for backup data (e.g., another S3 bucket).
+
+## Data Backup
+The goal of this phase is to obtain the current production S3 configuration and perform a full backup of the image data within the storage bucket.
+
+### Step 1: Obtain Current S3 Configuration
+Extract the S3 storage configuration from the `ModuleInfo` resource that manages the `Alauda Container Platform Registry` cluster plugin. 
+This information is the basis for the backup operation.
+
+You should run the following commands on the `global` cluster of ACP:
+```bash
+# 1. Identify the ModuleInfo resource name for the image-registry module
+MODULE_INFO_NAME=$(kubectl get moduleinfo -l cpaas.io/module-name=image-registry -o jsonpath='{.items[0].metadata.name}')
+echo "Target ModuleInfo Resource: $MODULE_INFO_NAME"
+
+# 2. Extract key S3 configuration information
+S3_BUCKET=$(kubectl get moduleinfo $MODULE_INFO_NAME -o jsonpath='{.spec.config.s3storage.bucket}')
+S3_ENDPOINT=$(kubectl get moduleinfo $MODULE_INFO_NAME -o jsonpath='{.spec.config.s3storage.regionEndpoint}')
+S3_REGION=$(kubectl get moduleinfo $MODULE_INFO_NAME -o jsonpath='{.spec.config.s3storage.region}')
+S3_SECRET_NAME=$(kubectl get moduleinfo $MODULE_INFO_NAME -o jsonpath='{.spec.config.s3storage.secretName}')
+
+# 3. Obtain access keys from the Secret (typically access-key-id and secret-access-key)
+# Note: The output is Base64 encoded and needs to be decoded accordingly.
+kubectl get secret -n cpaas-system $S3_SECRET_NAME -o jsonpath='{.data}'
+```
+
+**Key Variable Descriptions**:
+
+- `S3_BUCKET`: The source bucket name where image data is actually stored.
+- `S3_ENDPOINT`: The endpoint URL to connect to the S3-compatible service.
+- `S3_REGION`: The region identifier for the S3 service.
+- `S3_SECRET_NAME`: The Kubernetes Secret name storing the authentication keys.
+
+### Step 2: Perform S3 Bucket Data Backup
+Using your S3 client tool of choice, leverage the configuration obtained in the previous step to perform a full backup of the source bucket's data.
+
+**Operational Logic**:
+
+* Configure your client with the endpoint ($S3_ENDPOINT), region ($S3_REGION), and the decoded access key and secret key from the Secret.
+* Execute a sync or copy command to back up all data from the source bucket ($S3_BUCKET) to your prepared independent backup location (e.g., another S3 bucket or path).
+* Record the backup timestamp, the bucket name and endpoint used, and archive this information with the backup files.
+
+## Data Recovery
+This phase assumes the `Alauda Container Platform Registry` cluster plugin has been successfully installed in the target environment (new cluster or repaired cluster) via the platform. The goal is to modify its configuration to access the restored image data.
+
+### Step 1: Prepare Backup Data
+Using your S3 client tool of choice, restore the backed-up image data into a **target S3 storage `bucket` that is definitively accessible**. For example, restore it into a new bucket named `registry-bucket-restored`. Ensure you have write permissions to this target bucket.
+
+### Step 2: Update ModuleInfo Configuration
+The key to recovery is updating the `ModuleInfo` resource of the new `cluster plugin` to point its S3 configuration to the target bucket containing the backup data.
+
+1. **Determine New S3 Connection Information**:
+  - `NEW_BUCKET`: The **target bucket name** where the backup data has been restored (e.g., registry-bucket-restored).
+  - `NEW_ENDPOINT`: The **endpoint of the target S3 service**. This remains unchanged if the S3 service address is the same as during backup.
+  - `NEW_REGION`: The **region of the target S3 service**.
+  - `NEW_SECRET_NAME`: The name of the Kubernetes Secret with read/write permissions to the **target bucket**. If the access keys are unchanged, this is still `$S3_SECRET_NAME`.
+
+2. **Update ModuleInfo Resource**:
+Use the kubectl patch command to directly update the S3 configuration section of the `ModuleInfo`. The platform controller will automatically synchronize this change to all relevant Deployment, Pod, and other resources.
+
+   ```bash
+   # Execute the configuration update
+    kubectl patch moduleinfo $MODULE_INFO_NAME --type=merge -p '{
+      "spec": {
+        "config": {
+          "s3storage": {
+            "bucket": "'"$NEW_BUCKET"'",
+            "regionEndpoint": "'"$NEW_ENDPOINT"'",
+            "region": "'"$NEW_REGION"'",
+            "secretName": "'"$NEW_SECRET_NAME"'"
+          }
+        }
+      }
+    }'
+    ```
+**Key Point**: This operation triggers a rolling update of the `Alauda Container Platform Registry` related Pods. The newly started Pods will use the new configuration to connect to the specified target storage bucket.
+
+## Verification
+After the update is complete, follow these steps to verify successful data recovery and normal service operation.
+
+### Check Module Status(in global cluster)
+  ```bash
+  # Check if Pods have successfully restarted and are running with the new configuration
+  kubectl get pods -n cpaas-system -l app=image-registry
+  # Observe Pod logs to confirm no S3 connection errors
+  kubectl logs -n cpaas-system -l app=image-registry -c registry --tail=50
+  ```
+
+### Verify Data Access (API Test)
+Use the Registry's API interface to directly verify it can read the restored image data.
+
+  ```bash
+  # Obtain the Registry Service access address (assuming ClusterIP type)
+  REGISTRY_SVC_IP=$(kubectl get svc -n cpaas-system image-registry -o jsonpath='{.spec.clusterIP}')
+  
+  # Test 1: Query the catalog of repositories
+  curl -s http://$REGISTRY_SVC_IP/v2/_catalog | jq .
+  # Expected success return: {"repositories":["image1","image2",...]}
+  
+  # Test 2: Query the tag list for a specific image (e.g., an image named `myns/nginx`)
+  curl -s http://$REGISTRY_SVC_IP/v2/myns/nginx/tags/list | jq .
+  # Expected success return: {"name":"myns/nginx","tags":["v1.0","latest",...]}
+  ```
+
+### Functionality Test
+Attempt to pull a known image from the restored registry or push a new image to it to fully verify read/write functionality.
+
+## Solution Generality
+While this solution uses S3 storage as an example, its **design pattern applies to various storage backends** supported by Registry (e.g., Local filesystem, StorageClass, NAS).
+
+**General Principle**: Regardless of storage type, the core backup and recovery process remains the same. First, extract storage connection parameters from the corresponding configuration block (e.g., `s3storage`, `persistence`) in the `ModuleInfo` resource, then use the appropriate storage tools to back up data. For recovery, after restoring data to the target location, simply update the corresponding configuration fields in `ModuleInfo`. The platform will automatically direct the newly deployed instance to this location.
+
+**Core Value**: By utilizing a **unified configuration abstraction layer** (`ModuleInfo`), this solution decouples the data backup/recovery process from specific storage implementations and Kubernetes application deployments, achieving standardized management and extensibility.
