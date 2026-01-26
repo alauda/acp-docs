@@ -80,3 +80,126 @@ please refer to [default-ssl-certificate](https://kubernetes.github.io/ingress-n
 ### Add Pod Annotation in IngressNginx
 
 [Add pod annotation](./configure_endpoint_health_checker.mdx#add_pod_annotation_in_ingress_nginx)
+## Preserve Source IP
+
+When traffic passes through load balancers or proxies, the original client IP address can be lost due to NAT (Network Address Translation). Preserving the source IP is important for:
+- Access control and security policies
+- Accurate logging and analytics
+- Rate limiting per client
+- Geolocation-based routing
+
+### Via HAProxy Proxy Protocol
+
+#### How it works
+
+The [PROXY protocol](https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt) is a network protocol for preserving client connection information when proxying TCP connections. It works by prepending a header to the TCP connection that contains the original source IP and port.
+
+**Traffic flow:**
+1. Client connects to HAProxy load balancer
+2. HAProxy prepends PROXY protocol header with original client IP to the connection
+3. Ingress-Nginx receives the connection and parses the PROXY protocol header
+4. Ingress-Nginx extracts the real client IP from the header
+5. Backend applications receive the correct client IP in `X-Forwarded-For` and `X-Real-IP` headers
+
+**Advantages:**
+- Works with any load balancer that supports PROXY protocol (HAProxy, AWS NLB, etc.)
+- Preserves source IP across multiple proxy layers
+- No impact on routing or node selection
+
+**Considerations:**
+- Both the load balancer and Ingress-Nginx must be configured to use PROXY protocol
+- All traffic to Ingress-Nginx must use PROXY protocol once enabled (mixing PROXY and non-PROXY traffic will cause connection failures)
+
+#### How to configure
+
+Configure your HAProxy load balancer to send PROXY protocol headers, then deploy an ingress-nginx with proxy-protocol support enabled:
+
+```yaml
+apiVersion: ingress-nginx.alauda.io/v1
+kind: IngressNginx
+metadata:
+  name: demo
+  namespace: ingress-nginx-operator
+spec:
+  controller:
+    config:
+      use-proxy-protocol: "true" # enable proxy-protocol support
+```
+
+```
+frontend tcp_front_80
+    bind *:80
+    mode tcp
+    default_backend ingress_tcp_80
+    
+frontend tcp_front_443
+    bind *:443
+    mode tcp
+    default_backend ingress_tcp_443
+    
+backend ingress_tcp_80
+    mode tcp
+    balance roundrobin
+    server node1 192.168.133.46:80 check send-proxy-v2
+    
+backend ingress_tcp_443
+    mode tcp
+    balance roundrobin
+    server node1 192.168.133.46:443 check send-proxy-v2
+```
+
+For more details, see [PROXY protocol documentation](https://kubernetes.github.io/ingress-nginx/user-guide/nginx-configuration/configmap/#use-proxy-protocol).
+
+**Note**: HAProxy can use TCP mode to forward traffic without handling TLS certificates. Since the PROXY protocol works at the TCP layer, you can let Ingress-Nginx handle HTTPS termination and certificate management directly, eliminating the need to configure certificates in HAProxy.
+
+### Via MetalLB with externalTrafficPolicy=Local
+
+#### How it works
+
+When using a Kubernetes Service with `type: LoadBalancer`, the default behavior (`externalTrafficPolicy: Cluster`) performs source NAT, which replaces the client IP with the node's IP. Setting `externalTrafficPolicy: Local` preserves the source IP by:
+
+1. **Direct routing**: Traffic is only routed to pods on the same node that received the traffic
+2. **No SNAT**: The kube-proxy does not perform source NAT, preserving the original client IP
+3. **Health checks**: Only nodes with healthy local pods are included in the load balancer pool
+
+**Traffic flow:**
+1. Client connects to MetalLB virtual IP
+2. MetalLB routes traffic directly to a node with Ingress-Nginx pods
+3. Traffic goes directly to the local Ingress-Nginx pod without SNAT
+4. Ingress-Nginx sees the real client IP
+5. Backend applications receive the correct client IP in headers
+
+**Advantages:**
+- Simple configuration, no additional protocol required
+- Native Kubernetes feature
+- Lower latency (no extra proxy hop)
+
+**Considerations:**
+- **Uneven load distribution**: Traffic can only go to nodes with local pods, potentially causing imbalanced load
+- **Pod scheduling**: Ingress-Nginx pods must be scheduled on nodes that MetalLB can route to (use nodeSelector to ensure alignment)
+- **Health check behavior**: If all local pods are unhealthy, the node is removed from load balancing entirely
+
+#### How to configure
+
+Deploy an ingress-nginx with `externalTrafficPolicy: Local` and ensure pod placement aligns with MetalLB configuration:
+
+```yaml
+apiVersion: ingress-nginx.alauda.io/v1
+kind: IngressNginx
+metadata:
+  name: demo
+  namespace: ingress-nginx-operator
+spec:
+  controller:
+    service:
+      type: LoadBalancer                    # Use MetalLB to provision a LoadBalancer service
+      externalTrafficPolicy: Local          # Preserve source IP by routing traffic only to local pods
+      annotations:
+        metallb.universe.tf/address-pool: demo-pool  # Specify the MetalLB IP address pool to use
+    nodeSelector:                           # Schedule pods only on nodes matching these labels. This selector must match the MetalLB address pool's node selector
+      ingress-nginx: "true"  
+```
+
+**Important**: The `nodeSelector` must match the nodes in your MetalLB address pool configuration to ensure Ingress-Nginx pods are scheduled on nodes that can receive traffic from MetalLB.
+
+For more details, see [externalTrafficPolicy documentation](https://kubernetes.io/docs/tasks/access-application-cluster/create-external-load-balancer/#preserving-the-client-source-ip).
