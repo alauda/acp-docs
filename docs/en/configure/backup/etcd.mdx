@@ -24,8 +24,6 @@ After installation, an EtcdBackupConfiguration resource is automatically created
 - Supports both local storage and S3-compatible object storage
 - For clusters running on Immutable OS, S3 storage is **required** (local storage is not supported)
 
-**Restore**: Contact technical support for etcd restore operations.
-
 ## Limitations
 
 In some extreme cases, if your cluster has three control plane nodes, you may encounter the situation where all three control plane nodes are down at the same time. If you encounter this situation, contact technical support to ensure full recovery of the cluster.
@@ -39,6 +37,186 @@ To view etcd backup records:
 2. Click **Switch** in the upper right corner of the page.
 
 3. Click **Cluster** → **etcd backup** to view the etcd backup records.
+
+## S3 Backup Configuration
+
+To enable S3 storage for etcd backups, follow these steps:
+
+### Prerequisites
+
+- Alauda Container Platform Cluster Enhancer is installed on the cluster.
+
+### Step 1: Create S3 Secret
+
+Prepare your S3 access credentials and create a Kubernetes secret in the `cpaas-system` namespace:
+
+```bash
+export ACCESS_KEY="your-access-key"
+export SECRET_KEY="your-secret-key"
+
+kubectl create secret generic etcd-backup-s3-secret \
+  --from-literal=ACCESS_KEY="$ACCESS_KEY" \
+  --from-literal=SECRET_KEY="$SECRET_KEY" \
+  --dry-run=client -n cpaas-system -o yaml | kubectl apply -f -
+```
+
+### Step 2: Configure EtcdBackupConfiguration
+
+Modify the `EtcdBackupConfiguration` resource to add the `remoteStorage` field with S3 configuration:
+
+```yaml
+spec:
+  remoteStorage:
+    s3:
+      endpoint: "your-s3-endpoint"  # e.g.: https://s3.bucket.com
+      region: "your-s3-region"
+      bucket: "your-s3-bucket"
+      dir: "your-s3-bucket-dir"
+      skipTLSVerify: true
+      secretRef: etcd-backup-s3-secret
+```
+
+### Step 3: Verify Backup
+
+Trigger a manual etcd backup to verify the configuration:
+
+```bash
+# Set environment variables
+token="your-platform-token"
+platform_url="your-platform-url"
+cluster_name="your-cluster-name"
+
+# Trigger backup
+curl $platform_url/kubernetes/$cluster_name/apis/enhancement.cluster.alauda.io/v1/etcdbackupconfigurations/etcd-backup-default/exec \
+  -k -H "Authorization: Bearer $token"
+```
+
+After the backup completes, verify that backup files exist in your S3 bucket.
+
+## etcd Restore
+
+### Prerequisites
+
+- The Kubernetes cluster is deployed using hostnames (`kubectl get node` shows hostnames as node names)
+- An etcd backup snapshot is available
+- Two or more etcd nodes in the cluster have failed, causing cluster malfunction
+
+### Step 1: Backup Original Data and Modify etcd Configuration
+
+Execute the following commands on **all master nodes**:
+
+```bash
+# Create backup directory
+mkdir -p /root/backup_$(date +%Y%m%d%H)/old-etcd/
+
+# Stop kubelet
+systemctl stop kubelet
+
+# Backup etcdctl binary
+cp $(find /var/lib/containerd/ -name etcdctl | tail -1) /root/etcdctl
+
+# Remove etcd containers
+crictl ps -a | grep etcd | awk '{print $1}' | xargs crictl rm -f
+
+# Backup etcd data and kubernetes configuration
+mv /var/lib/etcd/* /root/backup_$(date +%Y%m%d%H)/old-etcd/
+cp -r /etc/kubernetes/ /root/backup_$(date +%Y%m%d%H)/old-etcd/
+
+# Modify etcd.yaml to use existing cluster state
+sed -i /initial-cluster-state=/d /etc/kubernetes/manifests/etcd.yaml
+sed -i '/initial-cluster=/a\    - --initial-cluster-state=existing' /etc/kubernetes/manifests/etcd.yaml
+```
+
+**Note**: Verify the indentation of `--initial-cluster-state=existing` in `/etc/kubernetes/manifests/etcd.yaml`.
+
+### Step 2: Copy Backup Snapshot
+
+Copy the latest etcd backup snapshot to the `/tmp` directory on the **first master node** and name it `snapshot.db`.
+
+### Step 3: Restore etcd
+
+Execute the following script on the **first master node** to restore the snapshot:
+
+```bash
+#!/usr/bin/env bash
+
+# Set etcd node IPs
+export ETCD_1=1.1.1.1
+export ETCD_2=2.2.2.2
+export ETCD_3=3.3.3.3
+
+# Set corresponding node hostnames
+export ETCD_1_HOSTNAME=etcd-1
+export ETCD_2_HOSTNAME=etcd-2
+export ETCD_3_HOSTNAME=etcd-3
+
+export ETCDCTL_API=3
+
+for n in 1 2 3; do
+  ip_var=ETCD_${n}
+  host_var=ETCD_${n}_HOSTNAME
+
+  ip=${!ip_var}
+  host=${!host_var}
+  rm -rf /tmp/etcd
+  /root/etcdctl snapshot restore /tmp/snapshot.db \
+    --cert=/etc/kubernetes/pki/etcd/server.crt \
+    --key=/etc/kubernetes/pki/etcd/server.key \
+    --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+    --skip-hash-check=true \
+    --data-dir=/tmp/etcd \
+    --name "${host}" \
+    --initial-cluster \
+      ${ETCD_1_HOSTNAME}=https://${ETCD_1}:2380,\
+${ETCD_2_HOSTNAME}=https://${ETCD_2}:2380,\
+${ETCD_3_HOSTNAME}=https://${ETCD_3}:2380 \
+    --initial-advertise-peer-urls https://"${ip}":2380 && \
+    mv /tmp/etcd /root/etcd_"${host}"
+done
+```
+
+After the script completes, three directories (`etcd_$host`) are generated in the `/root` directory.
+
+### Step 4: Distribute Restored Data
+
+Copy the `member` subdirectory from each generated directory to the corresponding master node:
+
+```bash
+# On etcd-1 (1.1.1.1):
+cp -r /root/etcd_etcd-1/member/* /var/lib/etcd/
+
+# On etcd-2 (2.2.2.2):
+cp -r /root/etcd_etcd-2/member/* /var/lib/etcd/
+
+# On etcd-3 (3.3.3.3):
+cp -r /root/etcd_etcd-3/member/* /var/lib/etcd/
+```
+
+### Step 5: Restart Cluster Components
+
+Execute the following commands on **all three master nodes**:
+
+```bash
+# Remove Kubernetes control plane containers
+crictl ps -a | grep -E "kube-api|kube-sche|kube-contro" | awk '{print $1}' | xargs crictl rm -f
+
+# Restart kubelet
+systemctl restart kubelet
+```
+
+### Step 6: Verify Recovery
+
+Check if `kubectl` commands work and if etcd pods are running:
+
+```bash
+kubectl get po -n kube-system
+```
+
+Finally, restart kubelet on **all nodes** (both master and worker nodes):
+
+```bash
+systemctl restart kubelet
+```
 
 ## Configuration Management
 
