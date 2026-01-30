@@ -1,0 +1,822 @@
+# Configuring Disaster Recovery For Persistent Volume Claims
+
+To achieve cross-cluster disaster recovery for Application PVCs, use **Alauda Build of VolSync**.
+
+## Overview
+**Alauda Build of VolSync** is an operator that performs asynchronous replication of persistent volumes within or across clusters. The replication provided by VolSync is independent of the storage system. This allows replication to and from storage types that don't normally support remote replication. Additionally, it can replicate across different types (and vendors) of storage.
+
+## Terminology
+
+| Term                  | Explanation                                       |
+| :-------------------- | :------------------------------------------------ |
+| **Primary Cluster**   | Active production site. |
+| **Secondary Cluster** | Standby recovery site; remains on standby, ready to take over during a disaster. |
+| **Stateful Application** | Applications that use PVCs for data persistence. |
+| **ReplicationSource** | A ReplicationSource is a VolSync resource that you can use to define the source PVC and replication mover type, enabling you to replicate or synchronize PVC data to a remote location |
+| **ReplicationDestination** | A ReplicationDestination is a VolSync resource that you can use to define the destination of a VolSync replication or synchronization. |
+| **Data Movers** | VolSync's data movers are responsible for copying the data from one location to the other. <br></br><br></br>Supported movers: <ul><li>Rclone</li><li>Restic</li><li>Rsync</li></ul> | 
+
+## Prerequisites
+
+- **Download** the **Alauda Build of VolSync** installation package corresponding to your platform architecture.
+- **Upload** the **Alauda Build of VolSync** installation package using the Upload Packages mechanism to both Primary and Secondary clusters.
+- **Alauda Container Platform Snapshot Management** has been deployed on both Primary and Secondary cluster.
+- The storage used by the PVC must be provisioned by the **CSI** and support **snapshot** functionality.
+
+## Deploy Alauda Build of VolSync
+
+1. Login, go to the **Administrator** page.
+
+2. Click **Marketplace** > **OperatorHub** to enter the **OperatorHub** page.
+
+3. Find the **Alauda Build of VolSync**, click **Install**, and navigate to the **Install Alauda Build of VolSync** page.
+
+    Configuration Parameters:
+    | **Parameter**   | **Recommended Configuration**                          |
+    | :-------------- | :----------------------------------------------------- |
+    | **Channel**     | The default channel is `stable`.                       |
+    | **Installation Mode**  | `Cluster`: All namespaces in the cluster share a single Operator instance for creation and management, resulting in lower resource usage. |
+    | **Installation Place** | Select `Recommended`, Namespace only support **volsync-system**.|
+    | **Upgrade Strategy**   | `Manual`: When there is a new version in the Operator Hub, manual confirmation is required to upgrade the Operator to the latest version. |
+
+## Configuring a Scheduled Synchronization
+
+After configuring Scheduled Synchronization for a PVC, VolSync will automatically synchronize the data from the `ReplicationSource` to the `ReplicationDestination` at the specified interval.
+
+This section outlines the configuration steps for synchronizing data from the primary cluster to the secondary cluster. For synchronization from the secondary to the primary, adapt the example below by swapping the cluster roles (primary and secondary)
+
+<Steps>
+
+### Create a rsync-tls Data Mover Secret <a id="secret"></a>
+
+    Create the Secret on both **Primary** and **Secondary** clusters; skip this step if the Secret already exists.
+
+    <Tabs>
+    <Tab label="Command">
+    ```yaml
+    apiVersion: v1
+    data:
+      psk.txt: <psk>
+    kind: Secret
+    metadata:
+      name: <name>
+      namespace: <namespace>
+    type: Opaque
+    ```
+    </Tab>
+    <Tab label="Example">
+    ```yaml
+    apiVersion: v1
+    data:
+      # echo -n 1:23b7395fafc3e842bd8ac0fe142e6ad1 | base64
+      psk.txt: MToyM2I3Mzk1ZmFmYzNlODQyYmQ4YWMwZmUxNDJlNmFkMQ==
+    kind: Secret
+    metadata:
+      name: volsync-rsync-tls
+      namespace: default
+    type: Opaque
+    ```
+    </Tab>
+    </Tabs>
+
+    **Parameters**:
+    | **Parameter** | **Explanation** |
+    |:--|:--|
+    | **name** | The name of secret |
+    | **namespace** | The namespace of secret, should same as application |
+    | **psk**| This field adheres to the format expected by stunnel: `<id>:<at least 32 hex digits>`. <br></br>for example, `1:23b7395fafc3e842bd8ac0fe142e6ad1`. |
+
+### Create ReplicationDestination Resource
+
+    Create `ReplicationDestination` on **Secondary** cluster
+
+    <Tabs>
+    <Tab label="Command">
+	```yaml
+    cat << EOF | kubectl create -f -
+	apiVersion: volsync.backube/v1alpha1
+	kind: ReplicationDestination
+	metadata:
+	  name: rd-<pvc-name>
+	  namespace: <namespace>
+	spec:
+	  rsyncTLS:
+	    copyMethod: Snapshot
+	    destinationPVC: <pvc-name>
+	    keySecret: <key-secret>
+	    serviceType: <service-type>
+	    storageClassName: <storageclass-name>
+	    volumeSnapshotClassName: <volumesnapshotclass-name>
+	    moverSecurityContext:
+	      fsGroup: 65534
+	      runAsGroup: 65534
+	      runAsNonRoot: true
+	      runAsUser: 65534
+	      seccompProfile:
+	        type: RuntimeDefault
+    EOF
+	```
+    </Tab>
+    <Tab label="Example">
+	```yaml
+    cat << EOF | kubectl create -f -
+	apiVersion: volsync.backube/v1alpha1
+	kind: ReplicationDestination
+	metadata:
+	  name: rd-pvc-01
+	  namespace: default
+	spec:
+	  rsyncTLS:
+	    copyMethod: Snapshot
+	    destinationPVC: pvc-01
+	    keySecret: volsync-rsync-tls
+	    serviceType: NodePort
+	    storageClassName: sc-cephfs
+	    volumeSnapshotClassName: csi-cephfs-snapshotclass
+	    moverSecurityContext:
+	      fsGroup: 65534
+	      runAsGroup: 65534
+	      runAsNonRoot: true
+	      runAsUser: 65534
+	      seccompProfile:
+	        type: RuntimeDefault
+    EOF
+	```
+    </Tab>
+    </Tabs>
+
+    **Parameters**:
+    | **Parameter** | **Explanation** |
+    | :-- | :-- |
+    | **namespace** | Namespace same as application |
+    | **pvc-name** | The name of a **pre-existing** PVC, which application used |
+    | **key-secret** | This is the name of a Secret that contains the TLS-PSK key for authenticating the connection with the source, create at [Step 1](#secret) |
+    | **service-type** | VolSync creates a Service to allow the source to connect to the destination. This field determines the type of that Service. Allowed values are `ClusterIP` or `LoadBalancer` or `NodePort`. |
+    | **storageclass-name** | The name of storageclass which application pvc used |
+    | **volumesnapshotclass-name** | The name of volumesnapshotclass, corresponding to the application pvc |
+
+    :::note
+    **About service type**
+
+    If `ClusterIP` is specified, the Service will receive an IP address allocated from the “cluster network” address pool. By default, this collection of addresses are not accessible from outside the cluster, making it a poor choice for cross-cluster replication. However, various networking addons such as Submariner bridge the cluster networks, making this a good option.
+    
+    If `LoadBalancer` is specified, an externally accessible IP address will be allocated. This requires cluster support for load balancers such as those provided by the various cloud providers or MetalLB in the case of physical clusters. While this is the easiest method for allocating an accessible address in cloud environments, load balancers tend to incur additional costs and be limited in number.
+    :::
+
+### Create ReplicationSource Resource <a id="source"></a>
+
+    Create `ReplicationSource` on **Primary** cluster
+
+    <Tabs>
+    <Tab label="Command">
+	```yaml
+    cat << EOF | kubectl create -f -
+	apiVersion: volsync.backube/v1alpha1
+	kind: ReplicationSource
+	metadata:
+	  name: rs-<pvc-name>
+	  namespace: <namespace>
+	spec:
+	  rsyncTLS:
+	    address: <address>
+	    copyMethod: Snapshot
+	    keySecret: <key-secret>
+	    port: <port>
+	    storageClassName: <storageclass-name>
+	    volumeSnapshotClassName: <volumesnapshotclass-name>
+	    moverSecurityContext:
+	      fsGroup: 65534
+	      runAsGroup: 65534
+	      runAsNonRoot: true
+	      runAsUser: 65534
+	      seccompProfile:
+	        type: RuntimeDefault
+	  sourcePVC: <pvc-name>
+	  trigger:
+	    schedule: <schedule>
+    EOF
+	```
+    </Tab>
+    <Tab label="Example">
+	```yaml
+    cat << EOF | kubectl create -f -
+	apiVersion: volsync.backube/v1alpha1
+	kind: ReplicationSource
+	metadata:
+	  name: rs-pvc-01
+	  namespace: default
+	spec:
+	  rsyncTLS:
+	    address: 192.168.129.201
+	    copyMethod: Snapshot
+	    keySecret: volsync-rsync-tls
+	    port: 30532
+	    storageClassName: sc-cephfs
+	    volumeSnapshotClassName: csi-cephfs-snapshotclass
+	    moverSecurityContext:
+	      fsGroup: 65534
+	      runAsGroup: 65534
+	      runAsNonRoot: true
+	      runAsUser: 65534
+	      seccompProfile:
+	        type: RuntimeDefault
+	  sourcePVC: pvc-01
+	  trigger:
+	    schedule: "*/10 * * * *"
+    EOF
+	``` 
+    </Tab>
+    </Tabs>
+
+    **Parameters**:
+    | **Parameter** | **Explanation** |
+    | :-- | :-- |
+    | **namespace** | The name of Namespace, same as application |
+    | **pvc-name** | The name of the application pvc |
+    | **key-secret** | The name of volsync secret create at [Step 1](#secret) |
+    | **address** | This specifies the address of the replication destination's ssh server. It can be taken directly from the ReplicationDestination's `.status.rsync.address` field. |
+    | **port** | service port to connect to the destination |
+    | **storageclass-name** | The name of storageclass which application pvc used |
+    | **volumesnapshotclass-name** | The name of volumesnapshotclass, corresponding to the application pvc |
+    | **schedule** | The synchronization schedule, is defined by a cronspec, making the schedule very flexible. Both intervals as well as specific times and/or days can be specified. |
+
+### Check Synchronization Status
+
+    Check synchronization from `ReplicationSource`
+
+    <Tabs>
+    <Tab label="Command">
+    ```bash
+    kubectl -n <namespace> get ReplicationSource <rs-name> -o jsonpath='{.status}'
+    ```
+    </Tab>
+    <Tab label="Example">
+    ```bash
+    kubectl -n default get ReplicationSource rs-pvc-01 -o jsonpath='{.status}'
+    ```
+    </Tab>
+    </Tabs>
+    
+    The last synchronization was completed at `.status.lastSyncTime` and took `.status.lastSyncDuration` seconds.
+    
+    The next scheduled synchronization is at `.status.nextSyncTime`.
+
+</Steps>
+
+## Configuring a One-Time Synchronization
+
+One-Time Synchronization is initiated manually. This is controlled by setting a unique string for the manual field under the trigger specification in a ReplicationSource resource. The synchronization job runs once immediately upon applying the configuration.
+
+<Steps>
+
+### Create One-Time ReplicationSource Resource
+
+    <Tabs>
+    <Tab label="Command">
+    ```yaml
+    cat << EOF | kubectl create -f -
+    apiVersion: volsync.backube/v1alpha1
+    kind: ReplicationSource
+    metadata:
+      name: rs-<pvc-name>-latest
+      namespace: <namespace>
+    spec:
+      rsyncTLS:
+        address: <address>
+        copyMethod: Snapshot
+        keySecret: <key-secret>
+        port: <port>
+        storageClassName: <storageclass-name>
+        volumeSnapshotClassName: <volumesnapshotclass-name>
+        moverSecurityContext:
+          fsGroup: 65534
+          runAsGroup: 65534
+          runAsNonRoot: true
+          runAsUser: 65534
+          seccompProfile:
+            type: RuntimeDefault
+      sourcePVC: <pvc-name>
+      trigger:
+        manual: <manual-id>
+    EOF
+    ```
+    </Tab>
+    <Tab label="Example">
+    ```yaml
+    cat << EOF | kubectl create -f -
+    apiVersion: volsync.backube/v1alpha1
+    kind: ReplicationSource
+    metadata:
+      name: rs-pvc-01-latest
+      namespace: default
+    spec:
+      rsyncTLS:
+        address: 192.168.129.201
+        copyMethod: Snapshot
+        keySecret: volsync-rsync-tls
+        port: 30532
+        storageClassName: sc-cephfs
+        volumeSnapshotClassName: csi-cephfs-snapshotclass
+        moverSecurityContext:
+          fsGroup: 65534
+          runAsGroup: 65534
+          runAsNonRoot: true
+          runAsUser: 65534
+          seccompProfile:
+            type: RuntimeDefault
+      sourcePVC: pvc-01
+      trigger:
+        manual: latest
+    ```
+    </Tab>
+    </Tabs>
+
+    The only difference from [Scheduled Synchronization](#source) is `.spec.trigger` should set to **manual**.
+
+### Check Synchronization Status
+
+    <Tabs>
+    <Tab label="Command">
+    ```bash
+    kubectl -n <namespace> get ReplicationSource <rs-name> -o jsonpath='{.status.lastManualSync}'
+    ```
+    </Tab>
+    <Tab label="Example">
+    ```bash
+    kubectl -n default get ReplicationSource rs-pvc-01-latest -o jsonpath='{.status.lastManualSync}'
+    ```
+    </Tab>
+    </Tabs>
+
+    If the output matches `<manual-id>`, the synchronization is complete.
+
+</Steps>
+
+## Enable Disaster Recovery for the Application PVC
+
+<Steps>
+
+### Deploy stateful application
+
+1. Deploy stateful applications on **Primary** cluster
+
+<details>
+    <summary>Click to view</summary>
+
+    ```yaml
+    cat << EOF | kubectl create -f -
+	---
+	apiVersion: v1
+	kind: PersistentVolumeClaim
+	metadata:
+	  name: pvc-01
+	  namespace: default
+	spec:
+	  accessModes:
+	    - ReadWriteMany
+	  resources:
+	    requests:
+	      storage: 10Gi
+	  storageClassName: sc-cephfs
+	  volumeMode: Filesystem
+
+	---
+	apiVersion: apps/v1
+	kind: Deployment
+	metadata:
+	  name: ubuntu
+	  namespace: default
+	spec:
+	  progressDeadlineSeconds: 600
+	  replicas: 1
+	  revisionHistoryLimit: 10
+	  selector:
+	    matchLabels:
+	      app: ubuntu
+	  strategy:
+	    rollingUpdate:
+	      maxSurge: 1
+	      maxUnavailable: 1
+	    type: RollingUpdate
+	  template:
+	    metadata:
+	      creationTimestamp: null
+	      labels:
+	        app: ubuntu
+	    spec:
+	      affinity: {}
+	      containers:
+	        - command:
+	            - sleep
+	            - infinity
+	          image: registry.alauda.cn:60070/ops/ubuntu:latest
+	          imagePullPolicy: Always
+	          name: ubuntu
+	          resources: {}
+	          securityContext:
+	            allowPrivilegeEscalation: false
+	            capabilities:
+	              drop:
+	                - ALL
+	          terminationMessagePath: /dev/termination-log
+	          terminationMessagePolicy: File
+	          volumeMounts:
+	            - mountPath: /data
+	              name: data
+	      dnsPolicy: ClusterFirst
+	      restartPolicy: Always
+	      schedulerName: default-scheduler
+	      securityContext:
+	        runAsNonRoot: true
+	        seccompProfile:
+	          type: RuntimeDefault
+	      terminationGracePeriodSeconds: 30
+	      volumes:
+	        - name: data
+	          persistentVolumeClaim:
+	            claimName: pvc-01
+    EOF
+    ```
+
+</details>
+
+2. Create application pvc on **Secondary** cluster
+
+    ```yaml
+    cat << EOF | kubectl create -f -
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: pvc-01
+      namespace: default
+    spec:
+      accessModes:
+        - ReadWriteMany
+      resources:
+        requests:
+          storage: 10Gi
+      storageClassName: sc-cephfs
+      volumeMode: Filesystem
+    EOF
+    ```
+
+### Configuring PVC Disaster Recovery
+
+    Set up `Primary-to-Secondary` Synchronization
+
+    refers to [Configuring a Scheduled Synchronization](./configuring_pvc_dr.mdx#configuring-a-scheduled-synchronization)
+
+</Steps>
+
+## Planned Migration
+
+**User Scenario**: 
+
+Relocate business services from the Primary cluster to the Secondary cluster while both clusters are operating normally.
+
+### Procedures
+
+<Steps>
+
+1. **Scale down application pods**
+
+    Scale down all the application pods which are using the dr PVC on the **Primary** cluster.
+
+2. **Delete ReplicationSource Resource**
+
+    Delete `ReplicationSource` on **Primary** cluster
+
+    <Tabs>
+    <Tab label="Command">
+    ```bash
+    kubectl -n <namespace> delete ReplicationSource <rs-name>
+    ```
+    </Tab>
+    <Tab label="Example">
+    ```bash
+    kubectl -n default delete ReplicationSource rs-pvc-01
+    ```
+    </Tab>
+    </Tabs>
+
+3. **Create One-Time Synchronization**
+
+    Initiate a synchronization task from the **Primary** cluster to guarantee that the data in the **Secondary** cluster is `up-to-date`.
+
+    Create `ReplicationSource` on **Primary** cluster
+    
+    Refers to [Configuring a One-Time Synchronization](./configuring_pvc_dr.mdx#configuring-a-one-time-synchronization)
+
+4. **Delete One-Time Synchronization**
+
+    After One-Time synchronization completed, delete One-Time `ReplicationSource` resource
+
+    <Tabs>
+    <Tab label="Command">
+    ```bash
+    kubectl -n <namespace> delete ReplicationSource <rs-name>
+    ```
+    </Tab>
+    <Tab label="Example">
+    ```bash
+    kubectl -n default delete ReplicationSource rs-pvc-01-latest
+    ```
+    </Tab>
+    </Tabs>    
+
+5. **Delete ReplicationDestination Resource**
+
+    Delete `ReplicationDestination` on **Secondary** cluster
+
+    <Tabs>
+    <Tab label="Command">
+    ```bash
+    kubectl -n <namespace> delete ReplicationDestination <rd-name>
+    ```
+    </Tab>
+    <Tab label="Example">
+    ```bash
+    kubectl -n default delete ReplicationDestination rd-pvc-01
+    ```
+    </Tab>
+    </Tabs>
+
+6. **Scale up application pods**
+
+    Scale up all the application pods which are using the dr PVC on the **Secondary** cluster.
+
+7. **Set up secondary-to-primary Synchronization**
+
+    Set up the `Secondary-to-Primary` cluster synchronization for PVC disaster recovery by creating a `ReplicationDestination` on the **Primary** cluster and a `ReplicationSource` on the **Secondary** cluster.
+
+    Refers to [Configuring a Scheduled Synchronization](./configuring_pvc_dr.mdx#configuring-a-scheduled-synchronization)
+
+</Steps>
+
+## Failover
+
+**User Scenario**: 
+
+Switching services to the Secondary cluster after Primary cluster abrupt shutdown.
+
+### Procedures
+
+To ensure data integrity (in case the primary cluster experiences failures during synchronization), do a local synchronization on the **Secondary** cluster. Use the PVC restored from the last snapshot of the application's PVC as the source, and the application's current PVC as the destination to perform a data synchronization.
+
+<Steps>
+
+1. **Restore PVC**
+
+    Restore PVC from `ReplicationDestination` on **Secondary** cluster 
+
+    <Tabs>
+    <Tab label="Command">
+    ```yaml
+    cat << EOF | kubectl create -f -
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: restored-<pvc-name>
+      namespace: <namespace>
+    spec:
+      accessModes: [<access-modes>]
+      dataSourceRef:
+        kind: ReplicationDestination
+        apiGroup: volsync.backube
+        name: <rd-name>
+      resources:
+        requests:
+          storage: <pvc-size>
+      storageClassName: <storageclass-name>
+    EOF
+    ```
+    </Tab>
+    <Tab label="Example">
+    ```yaml
+    cat << EOF | kubectl create -f -
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: restored-pvc-01
+      namespace: default
+    spec:
+      accessModes: [ReadWriteMany]
+      dataSourceRef:
+        kind: ReplicationDestination
+        apiGroup: volsync.backube
+        name: rd-pvc-01
+      resources:
+        requests:
+          storage: 10Gi
+      storageClassName: sc-cephfs
+    EOF
+    ```
+    </Tab>
+    </Tabs>
+
+2. **Create local ReplicationSource Resource**
+
+    Create `ReplicationSource` Resource on **Secondary** cluster
+
+    <Tabs>
+    <Tab label="Command">
+    ```yaml
+    cat << EOF | kubectl create -f -    
+    apiVersion: volsync.backube/v1alpha1
+    kind: ReplicationSource
+    metadata:
+      name: rs-<pvc-name>-local
+      namespace: <namespace>
+    spec:
+      rsyncTLS:
+        address: <address>
+        copyMethod: Snapshot
+        keySecret: <key-secret>
+        port: <port>
+        storageClassName: <storageclass-name>
+        volumeSnapshotClassName: <volumesnapshotclass-name>
+        moverSecurityContext:
+          fsGroup: 65534
+          runAsGroup: 65534
+          runAsNonRoot: true
+          runAsUser: 65534
+          seccompProfile:
+            type: RuntimeDefault
+      sourcePVC: restored-<pvc-name>
+      trigger:
+        manual: <manual-id>
+    EOF
+    ```
+    </Tab>
+    <Tab label="Example">
+    ```yaml
+    cat << EOF | kubectl create -f -
+    apiVersion: volsync.backube/v1alpha1
+    kind: ReplicationSource
+    metadata:
+      name: rs-pvc-01-local
+      namespace: default
+    spec:
+      rsyncTLS:
+        address: 192.168.129.201
+        copyMethod: Snapshot
+        keySecret: volsync-rsync-tls
+        port: 30532
+        storageClassName: sc-cephfs
+        volumeSnapshotClassName: csi-cephfs-snapshotclass
+        moverSecurityContext:
+          fsGroup: 65534
+          runAsGroup: 65534
+          runAsNonRoot: true
+          runAsUser: 65534
+          seccompProfile:
+            type: RuntimeDefault
+      sourcePVC: restored-pvc-01
+      trigger:
+        manual: latest
+    EOF  
+    ```
+    </Tab>
+    </Tabs>
+
+    Parameters refers to [Configuring a One-Time Synchronization](./configuring_pvc_dr.mdx#configuring-a-one-time-synchronization)
+
+3. **Waiting for synchronization to complete**
+
+    <Tabs>
+    <Tab label="Command">
+    ```bash
+    kubectl -n <namespace> get ReplicationSource <rs-name> -o jsonpath='{.status.lastManualSync}'
+    ```
+    </Tab>
+    <Tab label="Example">
+    ```bash
+    kubectl -n default get ReplicationSource rs-pvc-01-local -o jsonpath='{.status.lastManualSync}'
+    ```
+    </Tab>
+    </Tabs>
+
+    If the output matches `<manual-id>`, the synchronization is complete.
+
+4. **Delete local ReplicationSource**
+
+    Delete local `ReplicationSource` on **Secondary** cluster
+
+    <Tabs>
+    <Tab label="Command">
+    ```bash
+    kubectl -n <namespace> delete ReplicationSource <rs-name>
+    ```
+    </Tab>
+    <Tab label="Example">
+    ```bash
+    kubectl -n default delete ReplicationSource rs-pvc-01-local
+    ```
+    </Tab>
+    </Tabs>
+
+5. **Delete ReplicationDestination**
+
+    Delete `ReplicationDestination` on **Secondary** cluster
+
+    <Tabs>
+    <Tab label="Command">
+    ```bash
+    kubectl -n <namespace> delete ReplicationDestination <rd-name>
+    ```
+    </Tab>
+    <Tab label="Example">
+    ```bash
+    kubectl -n default delete ReplicationDestination rd-pvc-01
+    ```
+    </Tab>
+    </Tabs>
+  
+6. **Scale up application pods**
+
+    Scale up all the application pods on **Secondary** cluster.
+
+</Steps>
+
+## Failback (post-disaster recovery)
+
+**User Scenario**: 
+
+The primary cluster has now been restored and is operational, necessitating a switchback of services to it.
+
+### Procedures
+
+<Steps>
+
+1. **Scale down application pods on Primary cluster**
+
+    When the primary cluster is back online, application pods will recover automatically. However, the service must first be scaled down to halt traffic. After synchronizing the latest data from the secondary cluster to the primary cluster, the application can then be scaled up to resume normal operation.
+
+2. **Delete ReplicationSource on Primary cluster**
+
+    The `ReplicationSource` created before the **Primary** cluster failed needs to be deleted first.
+
+    <Tabs>
+    <Tab label="Command">
+    ```bash
+    kubectl -n <namespace> delete ReplicationSource <rs-name>
+    ```
+    </Tab>
+    <Tab label="Example">
+    ```bash
+    kubectl -n default delete ReplicationSource rs-pvc-01
+    ```
+    </Tab>
+    </Tabs>
+
+3. **Syncing latest data from Secondary cluster**
+
+    Set up a `Secondary-to-Primary` One-Time Synchronization.
+
+    Create a `ReplicationDestination` on **Primary** cluster, and then create a one-time `ReplicationSource` on **Secondary** cluster
+
+    Refers to [Configuring a One-Time Synchronization](./configuring_pvc_dr.mdx#configuring-a-one-time-synchronization)
+
+4. **Delete ReplicationDestination and ReplicationSource**
+    
+    After data synchronization, delete one-time resources
+
+    Delete `ReplicationSource` on **Secondary** cluster
+    <Tabs>
+    <Tab label="Command">
+    ```bash
+    kubectl -n <namespace> delete ReplicationSource <rs-name>
+    ```
+    </Tab>
+    <Tab label="Example">
+    ```bash
+    kubectl -n default delete ReplicationSource rs-pvc-01-latest
+    ```
+    </Tab>
+    </Tabs>
+
+    Delete `ReplicationDestination` on **Primary** cluster
+    <Tabs>
+    <Tab label="Command">
+    ```bash
+    kubectl -n <namespace> delete ReplicationDestination <rd-name>
+    ```
+    </Tab>
+    <Tab label="Example">
+    ```bash
+    kubectl -n default delete ReplicationDestination rd-pvc-01
+    ```
+    </Tab>
+    </Tabs>
+
+5. **Migrate application**
+
+    Scale down application pods on **Secondary** cluster
+
+    Scale up application pods on **Primary** cluster
+
+6. **Set up Primary-to-Secondary Synchronization**
+
+    Refers to [Configuring a Scheduled Synchronization](./configuring_pvc_dr.mdx#configuring-a-scheduled-synchronization)
+
+</Steps>
