@@ -15,3 +15,9 @@ $ yarn install
 * `yarn build`: Build production environment code, static files will be generated in the `dist` directory after build completion
 * `yarn serve`: Preview the built static files locally
 * `yarn up @alauda/doom`: Upgrade doom
+
+## Updating AC CLI Documentation
+
+* `yarn update-ac-manual`: Update the AC CLI documentation in [docs/en/ui/cli_tools/ac/](docs/en/ui/cli_tools/ac/).
+
+**Important:** Do not manually edit files in [docs/en/ui/cli_tools/ac/](docs/en/ui/cli_tools/ac/) as they are managed by this update command.
