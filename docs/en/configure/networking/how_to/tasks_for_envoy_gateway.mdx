@@ -277,7 +277,7 @@ kubectl patch envoyproxy $NAME -n $NS --type='merge' -p '
 
 Using `hostNetwork: true` allows the Envoy proxy pods to use the host's network namespace directly. This can be useful for:
 - Achieving better network performance
-- Accessing gateway via node ip
+- Accessing gateway via node IP directly
 
 **Considerations:**
 - Pods using hostNetwork will bind directly to the host's network interfaces
@@ -285,9 +285,22 @@ Using `hostNetwork: true` allows the Envoy proxy pods to use the host's network 
 - Security isolation is reduced as pods share the host's network namespace
 - You should use `nodeSelector` or `affinity` rules to control pod placement and avoid port conflicts
 
-#### Configuration
+There are two approaches to configure hostNetwork mode, depending on whether you want to use privileged ports (< 1024) directly:
 
-Update the `EnvoyProxy` resource to enable hostNetwork:
+#### Approach 1: Using Port Offset (Default, Recommended)
+
+This is the default and recommended approach. Envoy Gateway automatically adds an offset of 10000 to privileged ports to avoid requiring special permissions.
+
+**Pros:**
+- No special permissions or capabilities required
+- More secure - runs as non-root user without additional privileges
+- Simpler configuration
+- Works out of the box
+
+**Cons:**
+- Clients must use offset ports (10080, 10443)
+
+**Configuration:**
 
 ```yaml
 apiVersion: gateway.envoyproxy.io/v1alpha1
@@ -307,14 +320,66 @@ spec:
               template:
                 spec:
                   hostNetwork: true                    # Enable host network mode
-                  dnsPolicy: ClusterFirstWithHostNet   # Required when using hostNetwork for proper DNS resolution
+                  dnsPolicy: ClusterFirstWithHostNet   # Required for proper DNS resolution
         pod:
-          nodeSelector:                                # Recommended: control pod placement to avoid port conflicts
-            gateway: "demo"
+          nodeSelector:                                # Recommended: control pod placement to avoid conflict
+            kubernetes.io/hostname: "demo"
 ```
-**Known Limitations:**
-- To avoid requiring privileged permissions, Envoy Gateway automatically adds an offset of 10000 to privileged ports (1-1023), e.g., 80 → 10080, 443 → 10443
-- When accessing the gateway via node IP in hostNetwork mode, you must use the offset port (e.g., `http://<node-ip>:10080` instead of port 80)
+
+**Access:**
+- Port 80 → Access via `http://<node-ip>:10080`
+- Port 443 → Access via `https://<node-ip>:10443`
+
+#### Approach 2: Using Privileged Ports Directly with useListenerPortAsContainerPort
+
+This approach allows Envoy to bind to privileged ports (< 1024) directly, such as port 80 and 443.
+
+**Pros:**
+- Can use standard ports (80, 443) directly
+- Better compatibility with clients expecting standard ports
+
+**Cons:**
+- Requires NET_BIND_SERVICE capability
+- Slightly reduced security compared to port offset approach
+- More complex configuration
+
+**Configuration:**
+
+```yaml
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: demo
+  namespace: demo
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      useListenerPortAsContainerPort: true  # Disable port offset
+      envoyDeployment:
+        patch:
+          type: StrategicMerge
+          value:
+            spec:
+              template:
+                spec:
+                  hostNetwork: true
+                  dnsPolicy: ClusterFirstWithHostNet
+                  containers:
+                  - name: envoy
+                    securityContext:
+                      capabilities:
+                        add:
+                        - NET_BIND_SERVICE  # Required for binding to privileged ports
+        pod:
+          nodeSelector:                                # Recommended: control pod placement to avoid conflict
+            kubernetes.io/hostname: "demo"
+```
+
+**Access:**
+- Port 80 → Access via `http://<node-ip>:80`
+- Port 443 → Access via `https://<node-ip>:443`
+
 
 
 ### How to Access LoadBalancer VIP from Within the Cluster
