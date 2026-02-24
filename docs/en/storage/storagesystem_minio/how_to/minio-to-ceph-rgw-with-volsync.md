@@ -191,13 +191,13 @@ spec:
 1. Create the operations namespace: `kubectl create ns migration-ops`
 2. Apply the Secret: `kubectl apply -f rclone-secret.yaml`
 3. Start the Job: `kubectl apply -f rclone-job.yaml`
-4. Monitor progress: `kubectl logs -f job/volsync-s3-sync-job`
+4. Monitor progress: `kubectl -n migration-ops logs -f job/volsync-s3-sync-job`
 
 ### Phase 2: Incremental Sync
 
 To catch up on newly generated data during full sync, repeat this step as needed.
 
-1. Delete the previous Job: `kubectl delete job volsync-s3-sync-job`
+1. Delete the previous Job: `kubectl -n migration-ops delete job volsync-s3-sync-job`
 2. Recreate the Job: `kubectl apply -f rclone-job.yaml`
 
 *Mechanism note: By default, Rclone compares Size and ModTime to decide whether transfer is needed. Existing unmodified files are skipped.*
@@ -206,7 +206,7 @@ To catch up on newly generated data during full sync, repeat this step as needed
 
 1. **Stop writes**: Stop writes to MinIO at the application layer, or block write traffic via load balancer/Ingress.
 2. **Strict sync validation**:
-* Delete the current Job: `kubectl delete job volsync-s3-sync-job`
+* Delete the current Job: `kubectl -n migration-ops delete job volsync-s3-sync-job`
 * Update `rclone-job.yaml`: remove `- "--ignore-errors"` for the final cutover run, then append `- "--checksum"` to `args`. This avoids masking failed objects and prioritizes Size+Checksum (when available) for difference detection.
 * **Consistency recommendation (Required)**: Do not rely on object counts or ETag alone. Before cutover, run `rclone check source-minio: dest-ceph: --download --checksum` (or perform sampled downloads of critical objects and compute SHA256) to reduce false positives caused by multipart/ETag differences.
 * Re-apply the Job: `kubectl apply -f rclone-job.yaml`
