@@ -206,7 +206,7 @@ To catch up on newly generated data during full sync, repeat this step as needed
 1. **Stop writes**: Stop writes to MinIO at the application layer, or block write traffic via load balancer/Ingress.
 2. **Strict sync validation**:
 * Delete the current Job: `kubectl delete job volsync-s3-sync-job`
-* Update `rclone-job.yaml` and append `- "--checksum"` to `args`. This prioritizes Size+Checksum (when available) for difference detection.
+* Update `rclone-job.yaml`: remove `- "--ignore-errors"` for the final cutover run, then append `- "--checksum"` to `args`. This avoids masking failed objects and prioritizes Size+Checksum (when available) for difference detection.
 * **Consistency recommendation (Required)**: Do not rely on object counts or ETag alone. Before cutover, run `rclone check source-minio: dest-ceph: --download --checksum` (or perform sampled downloads of critical objects and compute SHA256) to reduce false positives caused by multipart/ETag differences.
 * Re-apply the Job: `kubectl apply -f rclone-job.yaml`
 
