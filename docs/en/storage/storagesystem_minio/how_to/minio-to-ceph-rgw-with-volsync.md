@@ -69,6 +69,12 @@ kubectl -n rook-ceph get secret rook-ceph-object-user-object-store-volsync-migra
 
 It is recommended to deploy migration tasks in the destination-side namespace (Ceph RGW) or in a dedicated operations namespace.
 
+Create the namespace used by both manifests before applying them:
+
+```bash
+kubectl create ns migration-ops
+```
+
 > **Deployment location recommendation (Important)**
 >
 > During migration, Rclone reads data locally for processing and then uploads it to the target S3 cluster. Therefore, the network location of the cluster running the migration task directly impacts bandwidth and completion time. It is recommended to deploy the VolSync Operator/migration Job in the **MinIO or Ceph cluster** to reduce cross-cluster network overhead and improve transfer stability.
@@ -181,9 +187,10 @@ spec:
 
 ### Phase 1: Initial Full Sync
 
-1. Apply the Secret: `kubectl apply -f rclone-secret.yaml`
-2. Start the Job: `kubectl apply -f rclone-job.yaml`
-3. Monitor progress: `kubectl logs -f job/volsync-s3-sync-job`
+1. Create the operations namespace: `kubectl create ns migration-ops`
+2. Apply the Secret: `kubectl apply -f rclone-secret.yaml`
+3. Start the Job: `kubectl apply -f rclone-job.yaml`
+4. Monitor progress: `kubectl logs -f job/volsync-s3-sync-job`
 
 ### Phase 2: Incremental Sync
 
