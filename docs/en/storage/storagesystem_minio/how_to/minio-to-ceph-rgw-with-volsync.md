@@ -49,9 +49,10 @@ spec:
   displayName: "VolSync Migration Admin"
   capabilities:
     bucket: "*"
-    user: "*"
 
 ```
+
+For least privilege, keep only bucket-level permissions for this migration account and do not grant `user` management capability.
 
 Extract and decode Ceph credentials for later use:
 
