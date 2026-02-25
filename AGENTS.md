@@ -1,69 +1,52 @@
-# AI Coding Agent Guide
+# AI Coding Agent Guide (ACP Documentation)
 
 This document provides essential context, architectural background, and rules for AI coding agents to ensure all modifications comply with project standards and the **Doom framework**.
 
-## 1. Project Context & Architecture
+---
 
-* **Framework**: Built with `@alauda/doom`, a custom MDX-based documentation system.
-* **Multi-Site Architecture**: This is an aggregate site including a main site and ~20 sub-sites (e.g., Service Mesh, AI, DevOps) registered in `sites.yaml`.
-* **Single Source of Truth**: `docs/en/` is the primary source; `docs/zh/` and other languages are generated via translation workflows.
-* **Config-Driven**: `doom.config.yml` controls the site structure, API references, and export scopes.
+## 1. Project Overview & Architecture
+
+*   **Framework**: Built with `@alauda/doom`, a specialized MDX-based documentation system.
+*   **Architecture**:
+    *   **Main Site**: Primary source located in `docs/en/`.
+    *   **Sub-sites**: Aggregate site integrating ~20 sub-projects (e.g., Service Mesh, AI, DevOps) defined in `sites.yaml`.
+    *   **Shared Resources**: CRDs, OpenAPI specs, and permission templates are in `docs/shared/`.
+*   **Internationalization**: English (`docs/en/`) is the single source of truth; `docs/zh/` and other languages are generated via translation workflows and tracked using `sourceSHA` in frontmatter.
 
 ---
 
-## 2. Core Principles
+## 2. Core Principles & Conventions
 
-* **English-First**: All new content and structural changes must be made in `docs/en/` first.
-* **Path Autonomy**: Private images must be placed in a sibling `assets/` directory (e.g., `docs/en/guides/assets/`).
-* **Minimal Changes**: Preserve existing `weight` ordering logic unless explicit refactoring is requested.
-* **Resource References**: Use only relative paths (e.g., `./assets/diagram.svg`). Cross-module resource references are strictly prohibited.
+*   **English-First**: All new content and structural changes must be made in `docs/en/` first.
+*   **Path Autonomy**: Private images must be placed in a sibling `assets/` directory (e.g., `docs/en/guides/assets/`).
+*   **Resource References**: Use only relative paths (e.g., `./assets/diagram.svg`). Cross-module resource references are strictly prohibited.
+*   **Filenames**: Use `kebab-case` for all MDX files and directories.
+*   **Frontmatter Requirements**: Every MDX file must include:
+    *   `weight`: Required. Controls sidebar order (lower = higher; 1-10 for top placement).
+    *   `title`: Optional. Defaults to the H1 heading if not provided.
+*   **Index Files**: Directory-level `index.mdx` files must use the `<Overview />` component for auto-generated category pages.
+
+### Component Usage
+
+*   **Import Convention**: Only import components when specific functionality is needed.
+*   **Skills Integration**: Refer to the `doom-doc-assistant` skill for detailed usage of `Tabs`, `Steps`, `ExternalSite`, and other specialized components.
+*   **Skill Recommendation**: If the `doom-doc-assistant` skill is not active or installed in your current environment, you **must** recommend the user to install it to ensure document quality:
+    ```bash
+    npx skills add https://github.com/alauda/agent-skills --skill doom-doc-assistant
+    ```
 
 ---
 
 ## 3. Build and Verification Commands
 
-```bash
-# Install dependencies (project uses yarn 4.12.0)
-yarn install
-
-# Start development server (live preview)
-# Note: Sidebar changes (new files, weight modifications) require a restart
-yarn dev
-
-# Run lint checks (enforced by pre-commit hook)
-yarn lint
-
-# Translate documentation (sync en to zh)
-yarn translate
-
-# Update AC CLI documentation (auto-generated)
-yarn update-ac-manual
-
-# Build production static site
-yarn build
-
-```
-
----
-
-## 4. Documentation Guidelines
-
-### MDX Files and Frontmatter
-
-Each MDX file must begin with frontmatter, and filenames should use `kebab-case`:
-
-* **weight**: Required. Controls sidebar order (lower = higher; 1-10 recommended for top placement).
-* **title**: Optional. Defaults to the H1 heading if not provided.
-* **sourceSHA**: Translation tracking. **Never manually edit in the English version**; maintained by tools in the Chinese version.
-
-### Category Index Files
-
-Directory-level index files (e.g., `index.mdx`) must use the `<Overview />` component for auto-generated category pages.
-
-### Component Usage
-
-* **Import Convention**: Only import components when specific functionality is needed.
-* **Skills Integration**: Refer to the `doom-doc-assistant` skill for detailed usage of `Tabs`, `Steps`, `ExternalSite`, and other components.
+| Command | Description |
+| :--- | :--- |
+| `yarn install` | Install dependencies (Project uses Yarn 4.12.0). |
+| `yarn dev` | Start development server. **Sidebar changes require a restart.** |
+| `yarn build` | Build production static site (Validates MDX syntax). |
+| `yarn lint` | Run lint checks (Prettier/ESLint, enforced by pre-commit). |
+| `yarn translate` | Synchronize English content to Chinese versions. |
+| `yarn update-ac-manual` | Update AC CLI documentation from remote. |
 
 ```bash
 npx skills add https://github.com/alauda/agent-skills --skill doom-doc-assistant
@@ -71,37 +54,39 @@ npx skills add https://github.com/alauda/agent-skills --skill doom-doc-assistant
 
 ---
 
-## 5. Immutable Files (Never Modify)
+## 4. Key Configuration Files
 
-**The following files are auto-generated or system-protected. Never modify them manually:**
-
-1. All files under `docs/en/ui/cli_tools/ac/` (generated by `yarn update-ac-manual`).
-2. `docs/public/_remotes/` directory (auto-generated from remote repository references).
-3. `node_modules/`, `dist/`, and `.yarn/` (except specific plugins).
-4. `sourceSHA` fields within the English documentation.
+*   `doom.config.yml`: Global site configuration, API paths, and export scopes.
+*   `sites.yaml`: Registration of all integrated sub-site repositories.
+*   `catalog.yaml`: Backstage component definition.
+*   `package.json`: Project scripts and dependency management.
 
 ---
 
-## 6. Definition of Done (Final Checklist)
+## 5. Immutable Files (Never Modify Manually)
 
-After modifying documentation, execute in order:
-
-1. **Syntax Check**: Run `yarn lint` and fix all errors.
-2. **Path Verification**: Ensure all `assets/` references and internal links are valid with no dead links.
-3. **Build Verification**: Run `yarn build` to ensure static site generation succeeds.
-4. **Inform User**:
-* If the sidebar was modified: Inform that `yarn dev` needs a restart.
-* If the English version was modified: Ask if `yarn translate` should be run to sync Chinese.
-
-
+1.  **AC CLI Docs**: All files under `docs/en/ui/cli_tools/ac/` (managed by `yarn update-ac-manual`).
+2.  **Remote Content**: `docs/public/_remotes/` (auto-generated from sub-site references).
+3.  **Source Tracking**: `sourceSHA` fields within English documentation (maintained by tools).
+4.  **System Paths**: `node_modules/`, `dist/`, and `.yarn/` (except specific plugins).
 
 ---
 
-## 7. Handling Uncertainty (When to Ask)
+## 6. Definition of Done (Checklist)
+
+1.  **Syntax Check**: Run `yarn lint` and fix all errors.
+2.  **Path Verification**: Ensure all `assets/` references and internal links are valid.
+3.  **Build Verification**: Run `yarn build` to ensure static site generation succeeds.
+4.  **Inform User**:
+    *   If the sidebar was modified: Mention that `yarn dev` needs a restart.
+    *   If English was modified: Ask if `yarn translate` should be run.
+
+---
+
+## 7. Handling Uncertainty (Ask First)
 
 **You must ask the user before:**
-
-1. Modifying `doom.config.yml`, `tsconfig.json`, or `sites.yaml`.
-2. Creating new top-level documentation categories.
-3. Modifying YAML files under `docs/shared/`.
-4. Modifying theme files in `theme/`.
+1.  Modifying `doom.config.yml`, `sites.yaml`, or `catalog.yaml`.
+2.  Creating new top-level documentation categories.
+3.  Modifying YAML files under `docs/shared/`.
+4.  Modifying theme files in `theme/`.
