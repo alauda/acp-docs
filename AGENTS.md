@@ -6,7 +6,7 @@ This document provides essential context, architectural background, and rules fo
 
 ## 1. Project Overview & Architecture
 
-*   **Framework**: Built with `@alauda/doom` (v1.18.3), a specialized MDX-based documentation system.
+*   **Framework**: Built with `@alauda/doom`, a specialized MDX-based documentation system.
 *   **Architecture**:
     *   **Main Site**: Primary source located in `docs/en/`.
     *   **Sub-sites**: Aggregate site integrating ~20 sub-projects (e.g., Service Mesh, AI, DevOps) defined in `sites.yaml`.
@@ -30,10 +30,10 @@ This document provides essential context, architectural background, and rules fo
 
 *   **Import Convention**: Only import components when specific functionality is needed.
 *   **Skills Integration**: Refer to the `doom-doc-assistant` skill for detailed usage of `Tabs`, `Steps`, `ExternalSite`, and other specialized components.
-*   **Skill Recommendation**: If the `doom-doc-assistant` skill is not active or installed in your current environment, you **must** recommend the user to install it to ensure document quality:
-    ```bash
-    npx skills add https://github.com/alauda/agent-skills --skill doom-doc-assistant
-    ```
+
+```bash
+npx skills add https://github.com/alauda/agent-skills --skill doom-doc-assistant
+```
 
 ---
 
