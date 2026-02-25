@@ -65,6 +65,10 @@ Directory-level index files (e.g., `index.mdx`) must use the `<Overview />` comp
 * **Import Convention**: Only import components when specific functionality is needed.
 * **Skills Integration**: Refer to the `doom-doc-assistant` skill for detailed usage of `Tabs`, `Steps`, `ExternalSite`, and other components.
 
+```bash
+npx skills add https://github.com/alauda/agent-skills --skill doom-doc-assistant
+```
+
 ---
 
 ## 5. Immutable Files (Never Modify)
