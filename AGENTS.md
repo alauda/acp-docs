@@ -4,7 +4,7 @@ This document provides essential context, architectural background, and rules fo
 
 ## 1. Project Context & Architecture
 
-* **Framework**: Built with `@alauda/doom` (v1.18.3), a custom MDX-based documentation system.
+* **Framework**: Built with `@alauda/doom`, a custom MDX-based documentation system.
 * **Multi-Site Architecture**: This is an aggregate site including a main site and ~20 sub-sites (e.g., Service Mesh, AI, DevOps) registered in `sites.yaml`.
 * **Single Source of Truth**: `docs/en/` is the primary source; `docs/zh/` and other languages are generated via translation workflows.
 * **Config-Driven**: `doom.config.yml` controls the site structure, API references, and export scopes.
