@@ -6,7 +6,7 @@ This document provides essential context, architectural background, and rules fo
 
 ## 1. Project Overview & Architecture
 
-*   **Framework**: Built with `@alauda/doom` (v1.18.3), a specialized MDX-based documentation system.
+*   **Framework**: Built with `@alauda/doom`, a specialized MDX-based documentation system.
 *   **Architecture**:
     *   **Main Site**: Primary source located in `docs/en/`.
     *   **Sub-sites**: Aggregate site integrating ~20 sub-projects (e.g., Service Mesh, AI, DevOps) defined in `sites.yaml`.
@@ -47,6 +47,10 @@ This document provides essential context, architectural background, and rules fo
 | `yarn lint` | Run lint checks (Prettier/ESLint, enforced by pre-commit). |
 | `yarn translate` | Synchronize English content to Chinese versions. |
 | `yarn update-ac-manual` | Update AC CLI documentation from remote. |
+
+```bash
+npx skills add https://github.com/alauda/agent-skills --skill doom-doc-assistant
+```
 
 ---
 
