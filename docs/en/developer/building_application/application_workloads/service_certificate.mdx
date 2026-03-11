@@ -1,0 +1,309 @@
+---
+weight: 90
+i18n:
+  title:
+    en: Service Serving Certificate
+    zh: Service 服务端证书
+---
+
+# Service Serving Certificate
+
+## Overview
+
+Service serving certificates provide automated TLS certificate generation and management for Services in the container cloud platform. This capability enables secure HTTPS communication and encrypted traffic between internal components, ensuring data privacy and system security.
+
+## Features
+
+This automated certificate provisioning mechanism provides the following key features:
+
+- **Zero-touch Provisioning**: Developers do not need to manually generate Certificate Signing Requests (CSRs) or interact with certificate authorities. Certificate issuance is fully automated via standard Kubernetes annotations.
+- **Cross-namespace CA Synchronization**: Eliminates the hassle of manually copying the platform root CA to every business namespace. The root CA certificate is automatically synchronized, enabling services to easily verify each other's identities.
+- **Automated Lifecycle Management**: Leveraging `cert-manager` ensures that certificates are not only automatically issued but also seamlessly renewed before expiration, minimizing operational overhead and preventing outages due to expired certificates.
+- **Standardized Security**: Ensures that TLS certificates are generated using a unified, centrally managed `ClusterIssuer`, maintaining consistent security standards across all applications on the platform.
+
+## Configuration and Deployment (For Administrators)
+
+To implement the above functions, platform system administrators need to provision the related admission policies (`ClusterPolicy`) for `Kyverno` and the necessary RBAC permissions in advance.
+
+### Prerequisites
+
+Before proceeding, ensure that the **Alauda Container Platform Compliance with Kyverno** plugin is installed and enabled in your cluster. For installation details, please refer to [Install Compliance Plugin](../../../security/security_and_compliance/compliance/install.mdx).
+
+### 1. Configure RBAC Permissions
+
+To grant Kyverno the permissions to create corresponding resources and call related interfaces, aggregate the following permissions to the platform's background controller:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    rbac.kyverno.io/aggregate-to-background-controller: "true"
+    rbac.kyverno.io/aggregate-to-admission-controller: "true"
+    rbac.kyverno.io/aggregate-to-reports-controller: "true"
+  name: kyverno:serving-certs
+rules:
+  - apiGroups:
+      - cert-manager.io
+    resources:
+      - certificates
+    verbs:
+      - create
+      - update
+      - delete
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - create
+      - update
+      - delete
+      - get
+      - list
+      - watch
+```
+
+### 2. Create Certificate
+
+Create the following Certificate resource to act as the service root CA:
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: service-root-ca
+  namespace: cert-manager
+spec:
+  commonName: ServiceRootCA
+  isCA: true
+  issuerRef:
+    kind: ClusterIssuer
+    name: cpaas-ca
+  secretName: service-root-ca
+```
+
+### 3. Configure Kyverno Policies
+
+Create and apply the following three core `ClusterPolicy` resources:
+
+- **clone-ca-secret**: Listens to Namespace creation events and generates the `service-root-ca` Secret resource for new namespaces.
+- **sync-ca-rotation**: Listens to changes in `service-root-ca`, obtains the real CA certificate content via the API, and synchronizes the `ca.crt` value to the Secret in the target namespace.
+- **generate-service-cert**: Listens to Service resources with the `service.alauda.io/serving-cert-secret-name` annotation and generates a `Certificate` issuance request with wildcard domain support based on its name and namespace.
+
+Save the following YAML content as a file and execute the application (`kubectl apply -f`):
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: clone-ca-secret
+spec:
+  background: true
+  rules:
+  - name: generate-ca-secret-shell
+    match:
+      any:
+      - resources:
+          kinds:
+          - Namespace
+    exclude:
+      any:
+      - resources:
+          namespaces:
+          - kube-system
+          - cpaas-system
+          - cert-manager
+    generate:
+      apiVersion: v1
+      kind: Secret
+      name: service-root-ca
+      namespace: "{{request.object.metadata.name}}"
+      synchronize: true
+      generateExisting: true
+      data:
+        kind: Secret
+        type: Opaque
+        metadata:
+          labels:
+            app.kubernetes.io/managed-by: kyverno
+            generate.kyverno.io/policy-name: clone-ca-secret
+
+  - name: initial-sync-on-creation
+    match:
+      any:
+      - resources:
+          kinds:
+          - Secret
+          names:
+          - service-root-ca
+    exclude:
+      any:
+      - resources:
+          namespaces:
+          - cert-manager
+          - kube-system
+          - cpaas-system
+    context:
+    - name: cacrt
+      apiCall:
+        method: GET
+        urlPath: "/api/v1/namespaces/cert-manager/secrets/service-root-ca"
+        jmesPath: 'data."ca.crt"'
+    mutate:
+      patchStrategicMerge:
+        data:
+          ca.crt: "{{ cacrt }}"
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: sync-ca-rotation
+spec:
+  mutateExistingOnPolicyUpdate: true
+  background: true
+  rules:
+  - name: rotation-sync
+    match:
+      any:
+      - resources:
+          kinds:
+          - Secret
+          namespaces:
+          - cert-manager
+          names:
+          - service-root-ca
+    mutate:
+      targets:
+      - apiVersion: v1
+        kind: Secret
+        name: service-root-ca
+        selector:
+          matchLabels:
+            app.kubernetes.io/managed-by: kyverno
+            generate.kyverno.io/policy-name: clone-ca-secret
+      patchStrategicMerge:
+        data:
+          ca.crt: '{{ request.object.data."ca.crt" }}'
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: generate-service-cert
+spec:
+  background: true
+  rules:
+    - name: generate-cert
+      match:
+        any:
+          - resources:
+              kinds:
+                - Service
+              annotations:
+                service.alauda.io/serving-cert-secret-name: "?*"
+      generate:
+        apiVersion: cert-manager.io/v1
+        kind: Certificate
+        name: "{{request.object.metadata.name}}-cert"
+        namespace: "{{request.object.metadata.namespace}}"
+        synchronize: true
+        data:
+          spec:
+            secretName: '{{request.object.metadata.annotations."service.alauda.io/serving-cert-secret-name"}}'
+            issuerRef:
+              name: cpaas-ca
+              kind: ClusterIssuer
+            dnsNames:
+              - "{{request.object.metadata.name}}"
+              - "{{request.object.metadata.name}}.{{request.object.metadata.namespace}}"
+              - "{{request.object.metadata.name}}.{{request.object.metadata.namespace}}.svc"
+              - "{{request.object.metadata.name}}.{{request.object.metadata.namespace}}.svc.cluster.local"
+```
+
+
+## User Guide (For Developers)
+
+For application developers, once the underlying cluster policies are in place, there is no need to worry about the underlying certificate issuance logic. You only need to append an exclusive annotation when defining a business Service resource to achieve automatic certificate provisioning:
+
+1. **Add Annotation to the Service**
+
+Under the business namespace (e.g., `my-namespace`), create or update your Service, and add the `service.alauda.io/serving-cert-secret-name` annotation to specify the name of the generated certificate Secret. For example:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-secure-service
+  namespace: my-namespace
+  annotations:
+    service.alauda.io/serving-cert-secret-name: "my-secure-service-tls" # Will generate a certificate Secret named my-secure-service-tls for you
+spec:
+  ports:
+    - port: 443
+      targetPort: 8443
+  selector:
+    app: my-app
+```
+
+2. **Verify the Generated Certificate Secret**
+
+After applying the above Service:
+
+- Check if the auto-generated TLS certificate Secret exists in the namespace:
+  ```bash
+  kubectl get secret my-secure-service-tls -n my-namespace
+  ```
+- Check if the root CA certificate used for verification has also been automatically copied to the current namespace:
+  ```bash
+  kubectl get secret service-root-ca -n my-namespace
+  ```
+
+3. **Mount and Use the Certificate in Pods**
+
+Since the CA certificate Secret (`service-root-ca`) and the current application's TLS serving certificate Secret (`my-secure-service-tls`) are in place, you can mount them as data volumes in workloads such as your target application's `Deployment` or `StatefulSet`.
+
+Here is a specific `Deployment` YAML example demonstrating how to mount these certificates:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+  namespace: my-namespace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: my-app
+  template:
+    metadata:
+      labels:
+        app: my-app
+    spec:
+      containers:
+        - name: my-app-container
+          image: my-app-image:latest
+          volumeMounts:
+            # Mount the serving certificate
+            - name: tls-cert
+              mountPath: "/etc/tls/certs"
+              readOnly: true
+            # Mount the root CA certificate
+            - name: root-ca
+              mountPath: "/etc/tls/ca"
+              readOnly: true
+      volumes:
+        # Reference the automatically generated Service certificate Secret
+        - name: tls-cert
+          secret:
+            secretName: my-secure-service-tls
+        # Reference the automatically synchronized CA certificate Secret
+        - name: root-ca
+          secret:
+            secretName: service-root-ca
+```
+
+For more configuration details regarding workloads via the web console, refer to the [Configure Containers](./deployment_create.mdx#configurecontainers) section.
