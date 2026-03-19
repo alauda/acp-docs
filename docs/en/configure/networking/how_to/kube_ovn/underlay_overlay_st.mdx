@@ -23,3 +23,72 @@ To achieve automatic interconnection between Underlay and Overlay subnets, you c
 6. Click **Update**.
 
 **Note**: Existing compute components in the Underlay subnet need to be recreated for the changes to take effect.
+
+## Isolation Between Underlay Subnets with u2oInterconnection Enabled
+
+When multiple Underlay subnets have `u2oInterconnection: true` enabled, traffic between them no longer goes through the physical gateway but is routed directly via the internal OVN network.
+
+If you need to isolate two Underlay subnets while both have `u2oInterconnection` enabled, you must first configure the kube-ovn-controller parameter, then configure the subnet isolation.
+
+### Step 1: Configure kube-ovn-controller
+
+Modify the kube-ovn-controller Deployment to disable connection tracking skip for destination logical port IPs:
+
+```bash
+kubectl edit deployment kube-ovn-controller -n kube-system
+```
+
+Add or modify the following argument:
+
+```yaml
+spec:
+  template:
+    spec:
+      containers:
+      - name: kube-ovn-controller
+        args:
+        - --ls-ct-skip-dst-lport-ips=false
+```
+
+:::caution
+
+`--ls-ct-skip-dst-lport-ips` controls whether to skip connection tracking (conntrack) for traffic destined to logical port IPs. The default value is `true`, which skips conntrack to improve performance. Setting it to `false` does not affect functionality but may slightly impact performance.
+
+However, for Underlay subnets with ACL-based isolation, you **must** set it to `false`. Otherwise, gateway-to-Pod traffic will fail (e.g., ping requests reach the Pod but replies are dropped), because ACL isolation uses `allow-related` which requires conntrack state; without it, replies cannot be identified as "related" and get dropped.
+
+:::
+
+### Step 2: Configure Subnet Isolation
+
+Configure the subnet with the following parameters:
+
+```yaml
+spec:
+  u2oInterconnection: true
+  acls:
+  - action: drop
+    direction: to-lport  # Ingress direction (traffic entering the logical port)
+    match: ip4.src == 172.20.0.0/16
+    priority: 1002
+  - action: drop
+    direction: to-lport  # Ingress direction
+    match: ip4.src == 192.50.0.0/16
+    priority: 1002
+```
+
+**ACL Parameters**:
+
+| Parameter | Description |
+|-----------|-------------|
+| `action` | The action to take: `allow`, `drop`, or `allow-related` |
+| `direction` | Traffic direction: `to-lport` (ingress) or `from-lport` (egress) |
+| `match` | OVN match expression using L2-L4 fields and boolean operators |
+| `priority` | Rule priority (higher values are evaluated first; recommended range: 1002-1899) |
+
+:::note
+
+- The `acls` field provides priority-based rule evaluation, offering more flexibility than standard Kubernetes NetworkPolicy.
+- When using `to-lport` direction, `ip4.src` refers to the source IP of incoming traffic.
+- **Recommended priority range**: `1002` to `1899` to avoid conflicts with system default ACL rules.
+
+:::
