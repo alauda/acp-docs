@@ -1,0 +1,220 @@
+---
+weight: 70
+---
+
+# Configure in-transit encryption
+
+This topic describes how to enable or disable in-transit encryption based on `msgr2` for ACP distributed storage.
+
+## Overview
+
+Ceph `msgr2` is the second generation of the Ceph messenger protocol. It supports two connection modes:
+
+- `crc`: authenticates the peers and validates data integrity, but does not encrypt payload data.
+- `secure`: encrypts traffic on the wire and provides cryptographic integrity protection.
+
+In ACP distributed storage, in-transit encryption is controlled by `CephCluster.spec.network.connections.encryption.enabled`.
+
+## Limitations and prerequisites
+
+Before enabling this feature, pay attention to the following restrictions:
+
+1. Nodes that use Ceph kernel clients must support `msgr2 secure`: `kernel 5.11` or `CentOS 8.4` and later.
+
+2. If encryption is enabled and CephFS or RBD uses the kernel client, the node kernel must also meet the `5.11` requirement. Otherwise, mount operations may fail.
+
+3. If encryption is enabled, clients that do not support `msgr2 secure` cannot fall back to plaintext communication. These clients will fail to connect, map, or mount storage.
+
+4. Transport encryption increases CPU overhead and may reduce throughput or increase latency, especially on busy storage nodes or low-frequency CPUs. Evaluate the impact in a staging environment first.
+
+## Enable in-transit encryption for a new cluster
+
+If the storage cluster has not been created yet, add the following fields to the `CephCluster` manifest before creation:
+
+```yaml
+spec:
+  network:
+    connections:
+      encryption:
+        enabled: true
+```
+
+If the cluster provides CephFS storage:
+
+- in ACP `v4.3.0` and later, no additional CephFS mount option is required
+- in versions earlier than ACP `v4.3.0`, you must also configure `csi.cephfs.kernelMountOptions: ms_mode=secure`
+
+Example for ACP versions earlier than `v4.3.0`:
+
+```yaml
+spec:
+  network:
+    connections:
+      encryption:
+        enabled: true
+  csi:
+    cephfs:
+      kernelMountOptions: ms_mode=secure
+```
+
+After the cluster is created, verify that:
+
+- CephFS PVCs can still be mounted successfully
+- RBD and CephFS workloads on all nodes use supported kernel versions
+
+## Enable in-transit encryption after deployment
+
+If the cluster is already running, changing only the encryption switch is the lowest-risk approach.
+
+### Step 1. Confirm node kernel versions
+
+Run the following command on all Kubernetes nodes that mount Ceph volumes and confirm that the kernel version meets the prerequisite:
+
+```bash
+uname -r
+```
+
+If some worker nodes do not meet the requirement, do not enable transport encryption on a production cluster until those nodes are upgraded.
+
+### Step 2. Enable encryption in `CephCluster`
+
+```bash
+kubectl patch cephcluster ceph-cluster -n rook-ceph --type merge -p '
+spec:
+  network:
+    connections:
+      encryption:
+        enabled: true
+'
+```
+
+### Step 3. Configure CephFS kernel mounts for earlier ACP versions
+
+If the cluster provides CephFS storage and the ACP version is earlier than `v4.3.0`, patch the `CephCluster` resource:
+
+```bash
+kubectl patch cephcluster ceph-cluster -n rook-ceph --type merge -p '
+spec:
+  csi:
+    cephfs:
+      kernelMountOptions: ms_mode=secure
+'
+```
+
+### Step 4. Wait for the configuration to take effect
+
+After the configuration is updated:
+
+- Check whether related Pods restart normally
+- Recreate a test Pod that mounts a CephFS or RBD PVC
+- Confirm I/O works as expected
+
+## Disable transport encryption
+
+### Disable encryption on an existing cluster
+
+To disable only transport encryption and keep `msgr2` available:
+
+```bash
+kubectl patch cephcluster ceph-cluster -n rook-ceph --type merge -p '
+spec:
+  network:
+    connections:
+      encryption:
+        enabled: false
+'
+```
+
+If CephFS is used and `ms_mode=secure` was configured only for this feature in an ACP version earlier than `v4.3.0`, remove the mount option:
+
+```bash
+kubectl patch cephcluster ceph-cluster -n rook-ceph --type merge -p '
+spec:
+  csi:
+    cephfs:
+      kernelMountOptions: ""
+'
+```
+
+## Verification
+
+After enabling the feature, verify the cluster from both the Kubernetes side and the Ceph side.
+
+### Check the `CephCluster` settings
+
+```bash
+kubectl get cephcluster ceph-cluster -n rook-ceph -o yaml
+```
+
+Confirm that the output contains:
+
+```yaml
+spec:
+  network:
+    connections:
+      encryption:
+        enabled: true
+```
+
+If the ACP version is earlier than `v4.3.0` and CephFS is used, also confirm:
+
+```yaml
+  csi:
+    cephfs:
+      kernelMountOptions: ms_mode=secure
+```
+
+### Check client compatibility
+
+After in-transit encryption is enabled:
+
+- clients using `msgr2 secure` should connect normally
+- clients configured with non-encrypted modes such as `legacy` or `crc` will fail to connect
+- in ACP versions earlier than `v4.3.0`, CephFS kernel mounts must use `ms_mode=secure`
+
+### Check workload mounts
+
+Create or restart a test workload that mounts:
+
+- a CephFS PVC
+- an RBD PVC
+
+Then verify:
+
+- the Pod starts successfully
+- the filesystem can be read and written
+- no mount-related errors appear in CSI or workload logs
+
+## Troubleshooting suggestions
+
+If enabling encryption causes mount failures or service interruptions, check the following items first:
+
+1. Node kernel version does not satisfy the requirement.
+2. In ACP versions earlier than `v4.3.0`, CephFS is still using kernel mounts, but `ms_mode=secure` was not configured.
+3. Some nodes or external clients do not support `msgr2 secure`, or are still configured with `ms_mode=legacy` or `ms_mode=crc`.
+4. Network policies, firewalls, or security groups do not allow port `3300`.
+5. CPU resources are insufficient after encryption is enabled.
+
+If the change affects production workloads, disable encryption first and then investigate compatibility and performance bottlenecks.
+
+## Performance impact
+
+ACP cannot provide a fixed percentage for the overhead of `msgr2 secure`. The actual impact depends on CPU model, whether the CPU provides AES acceleration, network bandwidth, I/O size, and whether the workload is CPU-bound or network-bound.
+
+In practice:
+
+- latency usually increases slightly, and the increase is often more visible on small I/O or latency-sensitive workloads
+- CPU usage usually increases on both clients and Ceph daemons because traffic must be encrypted and integrity-protected
+- the impact is typically more noticeable on high-throughput workloads, slower CPUs, or environments without strong AES acceleration
+
+As an operational estimate, when modern x86 CPUs with AES-NI are used, a reasonable starting expectation is:
+
+- average latency increase: about `5%` to `15%`
+- CPU usage increase on storage and client nodes handling heavy I/O: about `10%` to `30%`
+
+These values are an engineering estimate rather than a product guarantee. Before enabling encryption in production, benchmark a representative workload in a staging environment and compare at least the following metrics:
+
+- average and P99 read/write latency
+- client node CPU usage
+- OSD node CPU usage
+- throughput and IOPS
