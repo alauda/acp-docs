@@ -1,7 +1,7 @@
 ---
 title: Planning Your Deployment
 weight: 12
-author: dev@alauda.io
+author: chengli@alauda.io
 category: concept
 queries:
   - ceph distributed storage planning guide
@@ -29,18 +29,19 @@ Before deployment, decide whether your environment should use storage services f
 
 You can plan ACP distributed storage in one of the following ways:
 
-| Deployment model | Description | Typical use case |
-| :--- | :--- | :--- |
-| Internal deployment | Ceph components run in the same ACP cluster that consumes the storage service. | Small to medium environments, simpler management, faster rollout |
-| External deployment | ACP consumes block, file, or object storage from an external Ceph cluster. | Storage and business isolation, large-scale storage environments, centralized storage operations |
+| Deployment pattern | Where storage services run | Who manages the storage cluster | Best fit | Key tradeoff |
+| :--- | :--- | :--- | :--- | :--- |
+| Internal, co-resident | Ceph components run on the same ACP worker nodes that also run business workloads | The ACP platform team or cluster admin | Early-stage environments, bare metal clusters, or situations where storage requirements are not fully clear yet | Simpler rollout, but resource contention between apps and storage is more likely |
+| Internal, dedicated nodes | Ceph components run on dedicated storage or infrastructure nodes inside the same ACP cluster | The ACP platform team or cluster admin | Production environments with predictable storage demand and stricter isolation requirements | Better operational isolation and sizing control, but requires more reserved nodes and capacity planning |
+| External | ACP consumes storage classes from an external Ceph environment | A separate storage team, SRE team, or an existing external storage owner | Large-scale environments, multiple consumer clusters, or organizations that already operate a separate Ceph cluster | Clear ownership boundary, but more cross-cluster networking, authentication, and dependency management |
 
-Internal deployment is easier to roll out and manage because storage services and the consuming workloads are planned within the same ACP environment. External deployment is better when you need stronger separation between storage and application clusters or when multiple business clusters need to share the same storage backend.
+Internal deployment is easier to roll out and manage because storage services and the consuming workloads are planned within the same ACP environment. Within internal deployment, the first design choice is whether storage should share nodes with business workloads or use dedicated nodes. External deployment is better when you need stronger separation between storage and application clusters or when multiple business clusters need to share the same storage backend.
 
-ACP already provides detailed procedures for both directions:
+The main planning decision points are:
 
-- To create a local cluster, see [Create Standard Type Cluster](./installation/create_service_stand.mdx).
-- To plan a stretch deployment, see [Create Stretch Type Cluster](./installation/create_service_extend.mdx).
-- To consume external or cross-cluster storage services, see [Accessing Storage Services](./functions/access_storage_service.mdx).
+- Choose co-resident deployment when you want faster rollout and can tolerate storage and application workloads sharing the same worker pool.
+- Choose dedicated-node deployment when storage demand is known and you want clearer capacity control, fault isolation, and maintenance boundaries.
+- Choose external deployment when storage is already managed elsewhere or when a single external cluster must serve multiple ACP clusters.
 
 ### Node Roles
 
@@ -96,6 +97,19 @@ As a baseline:
 
 If your design uses dedicated storage nodes, resource planning is more predictable. If storage runs together with business workloads, reserve extra headroom to absorb contention during peak load and node failures.
 
+### Aggregate Cluster Planning Budget
+
+For early sizing, start from an aggregate cluster budget rather than from per-component values alone. The following table is intended as a planning reference for a three-node highly available cluster before workload-specific tuning:
+
+| Deployment pattern | Aggregate CPU to reserve for storage | Aggregate memory to reserve for storage | Notes |
+| :--- | :--- | :--- | :--- |
+| Internal, minimum baseline | 24 logical CPUs | 72 GiB | Entry-level three-node planning baseline when only the minimum deployment target is being met |
+| Internal, standard baseline | 30 logical CPUs | 72 GiB | Better starting point for general production planning and future expansion |
+| Internal, performance-oriented baseline | 45 logical CPUs | 96 GiB | Suitable when higher throughput or lower latency is required from the beginning |
+| External consumer cluster | Size for connectivity and client access only | Size for connectivity and client access only | Storage daemons run outside the ACP cluster, so the ACP cluster mainly needs network reachability, credentials, and client-side capacity |
+
+These values should be treated as cluster-level planning targets, not exact scheduler reservations. To estimate per-node budget for a three-node cluster, divide the aggregate numbers evenly across the participating storage nodes.
+
 The following recommendations are suitable for early planning:
 
 | Component | Recommended CPU | Recommended memory |
@@ -107,6 +121,18 @@ The following recommendations are suitable for early planning:
 | OSD | 4 cores | 8 GiB |
 
 These values are planning references rather than hard scheduling guarantees. Actual requirements depend on the number of devices, enabled services, and workload intensity.
+
+### How to Estimate Cluster Size
+
+Use the following order when sizing a cluster:
+
+1. Choose the deployment pattern: co-resident, dedicated-node, or external.
+2. Determine the minimum node count and failure-domain layout.
+3. Decide whether block, file, object, or mixed storage services are required.
+4. Start from the aggregate cluster planning budget.
+5. Add headroom for additional device sets, recovery, monitoring, and expected growth.
+
+If file and object services are both required, or if the cluster will host heavy business workloads at the same time, size above the minimum baseline rather than directly at it.
 
 ### Pod Placement
 
@@ -144,13 +170,15 @@ Use the following planning principles:
 - Expand storage in a balanced way across nodes and failure domains so that new capacity does not create skewed utilization
 - Review both current utilization and projected growth before adding new workloads to the cluster
 
-The following examples can be used as early planning references for a three-node cluster with one device per node:
+The following examples can be used as early planning references for a three-node cluster with one device per node and a 3-replica data protection policy:
 
 | Device size per node | Raw cluster capacity | Approximate usable capacity with 3 replicas |
 | :--- | :--- | :--- |
 | 0.5 TiB | 1.5 TiB | 0.5 TiB |
 | 2 TiB | 6 TiB | 2 TiB |
 | 4 TiB | 12 TiB | 4 TiB |
+
+These values are examples only. Usable capacity varies with the actual data protection policy and should not be treated as a general rule for every cluster design.
 
 In day-two operations, capacity should be reviewed before the cluster reaches warning levels. If growth is predictable, expand early rather than waiting for a near-full or full condition.
 
@@ -202,14 +230,16 @@ For implementation details, see [Disaster Recovery](./how_to/disaster_recovery/i
 A stretch cluster is appropriate only when the latency between sites is tightly controlled and the topology is designed specifically for this pattern. In general, plan for:
 
 - Two data sites and one quorum or arbiter site
+- A minimum of five nodes across three zones
 - Manual and explicit failure-domain labels before cluster creation
 - Sufficient nodes in each data site to preserve storage service availability
+- Inter-zone latency that remains within a low-latency design envelope, typically no more than 10 ms RTT between the data sites
 
 :::warning
 Do not treat a stretch cluster as a general solution for long-distance, high-latency, multi-datacenter deployment. If inter-site latency is not tightly controlled, use a dedicated disaster recovery architecture instead.
 :::
 
-For ACP-specific stretch cluster deployment guidance, see [Create Stretch Type Cluster](./installation/create_service_extend.mdx). For Regional-DR procedures by storage type, see [Disaster Recovery](./how_to/disaster_recovery/index.mdx). For a dedicated storage-cluster pattern, see [Configure a Dedicated Cluster for Distributed Storage](./how_to/dedicated_cluster.mdx).
+For ACP-specific stretch cluster deployment guidance, see [Create Stretch Type Cluster](./installation/create_service_extend.mdx).
 
 ## Performance Planning
 
@@ -223,11 +253,19 @@ Also confirm whether special tuning or feature-specific design is required. For 
 
 ## Next Steps
 
-After the planning phase is complete, continue with the ACP documents that match your chosen design:
+After you complete planning, proceed to the deployment guide that matches your selected deployment model:
 
-- [Introduction](./intro.mdx)
-- [Architecture](./architecture.mdx)
-- [Create Standard Type Cluster](./installation/create_service_stand.mdx)
-- [Create Stretch Type Cluster](./installation/create_service_extend.mdx)
-- [Accessing Storage Services](./functions/access_storage_service.mdx)
-- [Configure in-transit encryption](./how_to/in-transit-encryption.mdx)
+### Internal deployment
+
+- For a co-resident deployment, see [Create Standard Type Cluster](./installation/create_service_stand.mdx).
+- For a stretch-cluster deployment, see [Create Stretch Type Cluster](./installation/create_service_extend.mdx).
+- For a dedicated-node deployment, see [Configure a Dedicated Cluster for Distributed Storage](./how_to/dedicated_cluster.mdx).
+
+### External deployment
+
+- To consume storage services from another cluster or an external Ceph environment, see [Accessing Storage Services](./functions/access_storage_service.mdx).
+
+### Related follow-up configuration
+
+- To enable encrypted network traffic for deployed storage services, see [Configure in-transit encryption](./how_to/in-transit-encryption.mdx).
+- To configure disaster recovery after deployment, see [Disaster Recovery](./how_to/disaster_recovery/index.mdx).
