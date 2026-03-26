@@ -4,100 +4,213 @@ weight: 30
 
 # Upgrade the global cluster
 
-<Term name="productShort" /> consists of a **global cluster** and one or more **workload clusters**. The global cluster **must** be upgraded before any workload clusters.
+<Term name="productShort" /> consists of a **global** cluster and one or more workload clusters. To move the platform to a new ACP Distribution Version, upgrade the global tier to the target Distribution Version first, and then upgrade workload clusters to that same Distribution Version.
 
-This document walks you through the upgrade procedure for the global cluster.
+ACP 4.3 uses a CVO-based workflow for cluster upgrades. A typical `global` cluster upgrade includes artifact preparation, preflight checks, upgrade request, and status observation.
 
-If the global cluster is configured with the **global DR (Disaster Recovery)** solution, follow the [global DR procedure](#global_dr) strictly. Otherwise, follow the [Standard procedure](#standard) .
+Before upgrading the `global` cluster to ACP 4.3, verify that every workload cluster is on a compatible Kubernetes version. For ACP 4.3, the compatible versions are 1.34, 1.33, 1.32, and 1.31. This prerequisite is separate from the broader third-party cluster management range.
 
-## Standard procedure \{#standard}
+This Compatible Versions prerequisite applies whether or not the environment uses global DR. Global DR changes the procedure used to upgrade the global tier, but it does not change the requirement that workload clusters must remain within the compatible Kubernetes version range before the global tier is upgraded to the target Distribution Version.
+
+Global cluster upgrades follow the validated `upgrade.sh`-based procedure documented on this page. ACP CLI upgrade commands are intended for workload cluster upgrades and are not used to request upgrades for the `global` cluster.
+
+If the environment uses **global DR**, follow the [Global DR Procedure](#global-dr-procedure). Otherwise, follow the standard workflow below.
+
+## Standard Workflow
 
 <Steps>
 
-### Upload images
+### Prepare upgrade artifacts
 
-Copy the core package to **any control plane node** of the global cluster. Extract the package and `cd` into the extracted directory.
+Run `bash upgrade.sh` from the extracted core package directory.
 
-- If the global cluster uses the **built-in registry**, run:
+`upgrade.sh` prepares the resources required by the CVO-based workflow, including:
 
-  ```bash
-  bash upgrade.sh --only-sync-image=true
-  ```
+| Type | Content | Purpose |
+| --- | --- | --- |
+| Product images | `product-image` | Used to resolve the target version and image in `ProductManifest` and CVO. |
+| CVO image | `cluster-version-operator` | Used to deploy or update the cluster version operator. |
+| Plugin artifacts | `plugins/*.tgz` | Used by the upgrade plan when plugin artifacts are required. |
 
-- If the global cluster uses an **external registry**, you also need to provide the registry address:
+Registry behavior depends on how the environment is configured:
 
-  ```bash
-  bash upgrade.sh --only-sync-image=true --registry <registry-address> --username <username> --password <password>
-  ```
+| Scenario | Behavior |
+| --- | --- |
+| `--registry` is specified | Use the provided registry directly. |
+| `--registry` is not specified | Read the registry address from `ProductBase.spec.registry.address`. |
+| Built-in platform registry | Rebuild the access address by using the global VIP. |
+| External registry | Automatically set `SKIP_SYNC_IMAGE=true` and skip image synchronization. |
+| Image upload required but credentials omitted | Read `username` and `password` from the `cpaas-system/registry-admin` Secret. |
 
-If you plan to upgrade the **Operator** and **Cluster Plugin** while upgrading the global cluster, please push the corresponding packages to the corresponding cluster's registry in advance.
-For bulk upload instructions, see [Push all packages at once](../extend/upload_package.mdx#push_all_packages).
+Common parameters:
 
-<Directive type="info" title="INFO">
-Uploading images typically takes about 2 hours, depending on your network and disk performance.
-
-If your platform is configured for global disaster recovery (DR), remember that the **standby global cluster also requires image upload**. Be sure to plan your maintenance window accordingly.
-
-</Directive>
-
-For details of the `violet push` subcommand, please refer to [Upload Packages](../extend/upload_package.mdx#violet_push_usage).
-
-### Trigger the upgrade
-
-After the image upload is complete, run the following command to start the upgrade process:
+| Parameter | Purpose |
+| --- | --- |
+| `--registry` | Specify the target registry address. |
+| `--username` / `--password` | Specify registry credentials. |
+| `--only-sync-image` | Synchronize images and plugin artifacts only. |
+| `--skip-sync-image` | Skip image and plugin synchronization. |
+| `--skip-check-artifacts` | Skip artifact validation. |
+| `--cvo` | Prepare for command-line retargeting through CVO without adding compatibility `ResourcePatch` objects. |
 
 ```bash
-bash upgrade.sh --skip-sync-image
+cd ../platform-installer/src
+bash upgrade.sh
 ```
 
-Wait for the script to finish before proceeding. It will take about **10–15 minutes** for the upgrade button of the _Functional Components_ tab to be available. You will then be able to upgrade the **Operator** and **Cluster Plugin** in the following upgrade instructions.
+If you plan to request the upgrade by modifying `cvsh.spec.desiredUpdate` directly, add `--cvo` during the preparation phase:
+
+```bash
+cd ../platform-installer/src
+bash upgrade.sh --cvo
+```
 
 :::warning
-**Known Issue in ACP 4.2.1:**
-
-This issue only affects upgrades from **ACP 4.2.0 to 4.2.1** and will be fixed in **ACP 4.2.2**. It only applies to **cluster plugins**, not the **Operator**.
-
-After running `bash upgrade.sh --skip-sync-image`, when the **Upgrade** button becomes available in the **Functional Components** tab, you may see that the **Target** version for cluster plugins such as **Alauda Container Platform Base** is displayed as a lower version.
-
-**Action Required:**
-You must manually change the **Target** to **Do not upgrade** for these cluster plugins. Failing to do so may result in cluster plugins being downgraded to an older version.
+- Do not continue to the next step until image and plugin synchronization is complete.
+- Use `--only-sync-image` only when you want artifact synchronization without further preparation.
+- Use `--skip-sync-image` only when the required images and plugin artifacts have already been uploaded.
+- When the upgrade will be requested from the Web Console, do not add `--cvo`.
 :::
 
-### Upgrade the global cluster
+### Run preflight checks
 
-1. Log in to the Web Console of the global cluster and switch to **Administrator** view.
-2. Navigate to **Clusters > Clusters**.
-3. Click on the `global` cluster to open its detail view.
-4. Go to the **Functional Components** tab.
-5. Click the **Upgrade** button.
+Run preflight before requesting the upgrade:
 
-Review the available component updates in the dialog, and confirm to proceed.
+```bash
+cd ../platform-installer/src
+bash upgrade.sh --preflight
+```
 
-<Directive type="info" title="INFO">
-* If the **Alauda Container Platform GitOps** plugin is installed in the global cluster and its pods are running abnormally after the upgrade, refer to <ExternalSiteLink name="gitops" href="/upgrade/upgrade_gitops_plugin.html#procedure" children="Upgrading Alauda Container Platform GitOps" />.
-</Directive>
+Preflight returns two parts:
 
-:::warning
-**Known Issue in ACP 4.2.1:**
+| Output | Purpose |
+| --- | --- |
+| `Summary` | Shows the overall result, current version, desired version, and desired image. |
+| `Checks` | Shows the result of each individual validation item. |
 
-This issue only affects upgrades from **ACP 4.2.0 to 4.2.1** and will be fixed in **ACP 4.2.2**. It only applies to **cluster plugins**, not the **Operator**.
+The default check set includes:
 
-After completing the upgrade in the **Functional Components** tab, the **Upgrade** button may still appear clickable for cluster plugins.
+* `ResourcePatchUpgradeable`
+* `ClusterVersionUpgradeable`
+* `VersionUpgradePath`
+* `KubernetesVersionSupported`
+* `DockerRuntimeUnsupported`
+* `ClusterRunning`
+* `ClusterModuleStable`
+* `ControlPlaneStaticPodsPresent`
+* `CustomEtcdBackupCronJobsAbsent`
+* `CRIUpgradePodsAbsent`
+* `ModuleInfoStable`
+* `PlatformLicense`
 
-**Do NOT click the Upgrade button again for cluster plugins.** If you click it, you will see that the **Target** for cluster plugins that have already been upgraded to the new patch version is displayed as a lower version. Upgrading again will cause these cluster plugins to be downgraded to an older version.
-:::
+### Handle preflight blocks when needed
 
-### Install Alauda Container Platform Cluster Enhancer Plugin
+If `ResourcePatchUpgradeable` fails with `reason=UnexemptResourcePatches`, inspect the blocking `ResourcePatch` and add the required exemption annotation:
 
-:::info
-This step is only to ensure that the cluster enhancer plugin is installed. If you found this cluster plugin already installed, nothing needs to be done.
-:::
+```bash
+kubectl -n cpaas-system get cvsh global \
+  -o jsonpath='{range .status.preflight.checks[?(@.name=="ResourcePatchUpgradeable")]}{.state}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
 
-1. Navigate to **Administrator**.
+kubectl get resourcepatches <rp-name> -o yaml
+```
 
-2. In the left sidebar, click **Marketplace** > **Cluster Plugins** and select the `global` cluster.
+The default annotation key is `config.cpaas.io/exempt-for-ver`.
 
-3. Locate the **Alauda Container Platform Cluster Enhancer** plugin and click **Install**.
+```bash
+kubectl annotate resourcepatches <rp-name> \
+  config.cpaas.io/exempt-for-ver=4.3.0 \
+  --overwrite
+```
+
+If temporary troubleshooting requires specific checks to be disabled, configure `cpaas-system/cvo-config`:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cvo-config
+  namespace: cpaas-system
+data:
+  preflight: |
+    disabled:
+      - ResourcePatchUpgradeable
+      - VersionUpgradePath
+```
+
+### Request the upgrade
+
+After the preparation phase completes, choose one of the following entry points:
+
+* Use the Web Console after the target version appears in `availableUpdates`.
+* Patch `ClusterVersionShadow.spec.desiredUpdate` directly when you need to operate the underlying CVO resource.
+
+`kubectl` example:
+
+```bash
+kubectl patch cvsh global -n cpaas-system --type merge -p '{
+  "spec": {
+    "desiredUpdate": {
+      "version": "4.3.0"
+    }
+  }
+}'
+```
+
+You can also edit the resource directly:
+
+```bash
+kubectl edit cvsh global -n cpaas-system
+```
+
+Minimum configuration:
+
+```yaml
+spec:
+  desiredUpdate:
+    version: 4.3.0
+```
+
+### Observe execution
+
+Use the following command to inspect the overall status:
+
+```bash
+kubectl get cvsh -n cpaas-system
+```
+
+Important status fields:
+
+| Field | Purpose |
+| --- | --- |
+| `status.conditions` | Overall status entry point. |
+| `status.preflight.observedAt` | Time of the latest preflight run. |
+| `status.preflight.checks` | Detailed result of each preflight item. |
+| `status.current` | Current applied version and image. |
+| `status.desired` | Target version and image being reconciled. |
+| `status.history` | Upgrade history, newest first. |
+| `status.stages` | Upgrade stages and per-stage execution state. |
+
+Focus on these conditions first:
+
+| Condition | Interpretation |
+| --- | --- |
+| `PreflightReady` | `True` means preflight passed. |
+| `Ready` | `True` means the cluster has reached the desired version. |
+| `Reconciling` | `True` means the upgrade is still running. |
+| `Stalled` | `True` means the upgrade is blocked and requires intervention. |
+
+Useful diagnostics:
+
+```bash
+kubectl -n cpaas-system get cvsh global \
+  -o jsonpath='{range .status.conditions[*]}{.type}{"\t"}{.status}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
+
+kubectl -n cpaas-system get cvsh global \
+  -o jsonpath='{.status.preflight.observedAt}{"\n"}{range .status.preflight.checks[*]}{.name}{"\t"}{.policy}{"\t"}{.state}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
+
+kubectl -n cpaas-system get cvsh global \
+  -o jsonpath='{range .status.history[*]}{.version}{"\t"}{.state}{"\t"}{.startedTime}{"\t"}{.completionTime}{"\n"}{end}'
+```
 
 ### (Conditional) Upgrade <Term name="company" /> Service Mesh Essentials
 
@@ -119,46 +232,43 @@ If **Service Mesh v1** is installed, refer to the <ExternalSiteLink name="servic
     children="Upgrade Alauda DevOps"
   />
 
-## global DR procedure \{#global_dr}
+## Global DR Procedure
+
+Use this procedure when the environment includes both a primary global cluster and a standby global cluster. The DR-specific steps below are in addition to the standard CVO workflow.
 
 <Steps>
 
-### Verify data consistency
+### Verify the DR environment before upgrading
 
-Follow your regular global DR inspection procedures to ensure that data in the **standby global cluster** is consistent with the **primary global cluster**.
+Follow your regular global DR inspection procedures to ensure that data in the **standby global cluster** is consistent with the **primary global cluster**. For background on the DR topology and synchronization workflow, see [Global Cluster Disaster Recovery](/install/global_dr.mdx).
 
-If inconsistencies are detected, **contact technical support** before proceeding.
+If inconsistencies are detected, contact technical support before proceeding.
 
-On **both** clusters, run the following command to ensure no `Machine` nodes are in a non-running state:
+On **both** global clusters, run the following command to ensure no `Machine` nodes are in a non-running state:
 
 ```bash
 kubectl get machines.platform.tkestack.io
 ```
 
-If any such nodes exist, contact technical support to resolve them before continuing.
+If any such nodes exist, resolve them before continuing.
 
-### Uninstall the etcd sync plugin
+### Uninstall the etcd synchronization plugin from the standby global cluster
 
-1. Access the Web Console of the **standby cluster** via its IP or VIP.
-2. Switch to the **Administrator** view.
-3. Navigate to **Marketplace > Cluster Plugins**.
-4. MAKE SURE you have switched to the `global` cluster.
-5. Find the **Alauda Container Platform etcd Synchronizer** plugin and **Uninstall** it. Wait for the uninstallation to complete.
+1. Access the Web Console of the **standby global cluster** through its IP or VIP.
+2. Switch to **Administrator** view.
+3. Navigate to **Marketplace > Cluster Plugins** and select the `global` cluster.
+4. Find **<Term name="product" /> etcd Synchronizer** and uninstall it.
+5. Wait for the uninstallation to complete before proceeding.
 
-### Upload images
+### Prepare upgrade artifacts on both global clusters
 
-Perform the **Upload images** step on **both** the standby cluster and the primary cluster.
+Complete **Prepare upgrade artifacts** in the standard workflow on **both** the standby global cluster and the primary global cluster.
 
-See [Upload images in Standard procedure](#standard) for details.
+Use the same preparation mode on both clusters. If you plan to request the upgrade by patching `cvsh.spec.desiredUpdate`, prepare both clusters with `--cvo`.
 
-### Upgrade the standby cluster
+### Upgrade the standby global cluster
 
-<Directive type="info" title="INFO">
-Accessing the **standby cluster** Web Console is required to perform the upgrade.
-
-Before proceeding, verify that the **ProductBase** resource of the standby cluster is correctly configured with the cluster VIP under `spec.alternativeURLs`.
-
-If not, update the configuration as follows:
+If you will use the Web Console on the standby global cluster, verify that the standby cluster `ProductBase` includes the standby VIP in `spec.alternativeURLs`:
 
 ```yaml
 apiVersion: product.alauda.io/v1alpha2
@@ -170,49 +280,72 @@ spec:
     - https://<standby-cluster-vip>
 ```
 
-</Directive>
+After preparation completes, run the remaining steps from the standard workflow on the **standby global cluster**:
 
-On the **standby cluster**, follow the steps in the [Standard procedure](#standard) to complete the upgrade.
+1. **Run preflight checks**
+2. **Request the upgrade**
+3. **Observe execution** until the standby global cluster reaches the desired version
 
-### Upgrade the primary cluster
+### Upgrade the primary global cluster
 
-After the standby cluster has been upgraded, proceed with the [Standard procedure](#standard) on the **primary cluster**.
+After the standby global cluster has reached the desired version, run the remaining steps from the standard workflow on the **primary global cluster**:
 
-### Reinstall the etcd sync plugin
+1. **Run preflight checks**
+2. **Request the upgrade**
+3. **Observe execution** until the primary global cluster reaches the desired version
 
-Before reinstalling, verify that port `2379` is properly forwarded from both global cluster VIPs to their control plane nodes.
+### Reinstall the etcd synchronization plugin and verify sync status
 
-To reinstall:
+Before reinstalling the plugin, verify that port `2379` is forwarded correctly from both global-cluster VIPs to their control plane nodes when that forwarding mode is used. Port forwarding through a load balancer is not required if the standby global cluster can access the active global cluster directly.
 
-1. Access the Web Console of the **standby global cluster** via its IP or VIP.
-2. Switch to **Administrator** view.
-3. Go to **Marketplace > Cluster Plugins**.
-4. Select the `global` cluster.
-5. Locate **Alauda Container Platform etcd Synchronizer**, click **Install**, and provide the required parameters.
+To reinstall the plugin:
 
-To verify installation:
+1. Access the **standby global cluster** Web Console through its VIP and switch to **Administrator** view.
+2. Navigate to **Marketplace > Cluster Plugins** and select the `global` cluster.
+3. Find **<Term name="product" /> etcd Synchronizer**, click **Install**, and configure the required parameters.
 
-```bash
-kubectl get po -n cpaas-system -l app=etcd-sync  # Ensure pod is 1/1 Running
+When you configure the plugin:
 
-kubectl logs -n cpaas-system $(kubectl get po -n cpaas-system -l app=etcd-sync --no-headers | awk '{print $1}' | head -1) | grep -i "Start Sync update"
-# Wait until the logs contain "Start Sync update"
+* When port `2379` is not forwarded through a load balancer, set **Active Global Cluster ETCD Endpoints** correctly.
+* Use the default value of **Data Check Interval**.
+* Leave **Print detail logs** disabled unless you are troubleshooting.
 
-# Recreate the pod to trigger synchronization of resources with ownerReferences
-kubectl delete po -n cpaas-system $(kubectl get po -n cpaas-system -l app=etcd-sync --no-headers | awk '{print $1}' | head -1)
-```
-
-### Check Synchronization Status
-
-Run the following to verify the synchronization status:
+Verify the sync Pod is running on the standby global cluster:
 
 ```bash
-curl "$(kubectl get svc -n cpaas-system etcd-sync-monitor -ojsonpath='{.spec.clusterIP}')/check"
+kubectl get po -n cpaas-system -l app=etcd-sync
+kubectl logs -n cpaas-system $(kubectl get po -n cpaas-system -l app=etcd-sync --no-headers | head -1) | grep -i "Start Sync update"
 ```
 
-**Explanation of output:**
+Once `Start Sync update` appears, recreate one of the Pods to trigger synchronization of resources with ownerReference dependencies:
 
-- `"LOCAL ETCD missed keys:"` – Keys exist in the **primary cluster** but are missing in the standby. This often resolves after a pod restart.
-- `"LOCAL ETCD surplus keys:"` – Keys exist in the **standby cluster** but not in the primary. Review these with your operations team before deletion.
+```bash
+kubectl delete po -n cpaas-system $(kubectl get po -n cpaas-system -l app=etcd-sync --no-headers | head -1)
+```
+
+Check sync status:
+
+```bash
+mirror_svc=$(kubectl get svc -n cpaas-system etcd-sync-monitor -o jsonpath='{.spec.clusterIP}')
+ipv6_regex="^[0-9a-fA-F:]+$"
+if [[ $mirror_svc =~ $ipv6_regex ]]; then
+  export mirror_new_svc="[$mirror_svc]"
+else
+  export mirror_new_svc=$mirror_svc
+fi
+curl $mirror_new_svc/check
+```
+
+Output interpretation:
+
+* `LOCAL ETCD missed keys`: Keys exist in the primary global cluster but are missing from the standby. This often resolves after restarting one `etcd-sync` Pod.
+* `LOCAL ETCD surplus keys`: Keys exist in the standby global cluster but not in the primary. Review these with your operations team before deleting them.
 
 </Steps>
+
+## Related Documentation
+
+- [Overview](./overview.mdx)
+- [Pre-upgrade](./pre-upgrade.mdx)
+- [Upgrade workload clusters](./upgrade_workload_cluster.mdx)
+- [Global Cluster Disaster Recovery](/install/global_dr.mdx)
