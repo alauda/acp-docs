@@ -1395,6 +1395,12 @@ ac login https://example.com --name prod --cluster=my-cluster --namespace=my-nam
 
 # Login with custom kubeconfig file
 ac login https://example.com --name prod --kubeconfig=/path/to/kubeconfig
+
+# Login with workload cluster LDAP identity provider
+ac login https://192.168.1.2:11780 --idp ldap-test --workload --auth-type ldap --username 'xx' --password 'xx'
+
+# Login with workload cluster OIDC identity provider
+ac login https://192.168.1.2:11780 --idp oidc --workload --auth-type oidc
 ```
 
 ## ac logout

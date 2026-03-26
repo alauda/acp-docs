@@ -22,7 +22,7 @@ async function checkGitAvailable() {
   }
 }
 
-async function cloneACRepo(branch = 'main') {
+async function cloneACRepo(branch = 'release-1.0') {
   console.log(`Cloning AC repository from ${AC_REPO_URL} (branch: ${branch})...`);
   
   // Ensure local directory exists
@@ -163,7 +163,7 @@ async function cleanup() {
 }
 
 async function main() {
-  const branch = process.argv[2] || 'main';
+  const branch = process.argv[2] || 'release-1.0';
   
   try {
     console.log('Starting AC manual update process...');
