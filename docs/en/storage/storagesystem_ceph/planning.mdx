@@ -1,0 +1,271 @@
+---
+title: Planning Your Deployment
+weight: 12
+author: chengli@alauda.io
+category: concept
+queries:
+  - ceph distributed storage planning guide
+  - acp ceph deployment requirements
+  - plan distributed storage deployment
+---
+
+# Planning Your Deployment
+
+This topic provides a planning checklist for deploying Ceph distributed storage on Alauda Container Platform (ACP). It summarizes architecture choices, security options, infrastructure sizing, network constraints, and disaster recovery considerations so that you can decide on a deployment model before performing the actual installation.
+
+For product background, see [Introduction](./intro.mdx) and [Architecture](./architecture.mdx). For deployment procedures, see the documents under [Install](./installation/index.mdx) and [How To](./how_to/index.mdx).
+
+## Deployment Architecture
+
+ACP distributed storage is based on Ceph and Rook. At a high level, the platform combines the following layers:
+
+- Ceph daemons such as MON, MGR, OSD, MDS, and RGW to provide block, file, and object storage capabilities
+- Rook and CSI components to automate deployment, provisioning, expansion, and lifecycle management
+- ACP platform integration to expose storage pools, observability, and operational entry points
+
+Before deployment, decide whether your environment should use storage services from the local cluster or consume storage from an external Ceph environment.
+
+### Internal and External Deployment Models
+
+You can plan ACP distributed storage in one of the following ways:
+
+| Deployment pattern | Where storage services run | Who manages the storage cluster | Best fit | Key tradeoff |
+| :--- | :--- | :--- | :--- | :--- |
+| Internal, co-resident | Ceph components run on the same ACP worker nodes that also run business workloads | The ACP platform team or cluster admin | Early-stage environments, bare metal clusters, or situations where storage requirements are not fully clear yet | Simpler rollout, but resource contention between apps and storage is more likely |
+| Internal, dedicated nodes | Ceph components run on dedicated storage or infrastructure nodes inside the same ACP cluster | The ACP platform team or cluster admin | Production environments with predictable storage demand and stricter isolation requirements | Better operational isolation and sizing control, but requires more reserved nodes and capacity planning |
+| External | ACP consumes storage classes from an external Ceph environment | A separate storage team, SRE team, or an existing external storage owner | Large-scale environments, multiple consumer clusters, or organizations that already operate a separate Ceph cluster | Clear ownership boundary, but more cross-cluster networking, authentication, and dependency management |
+
+Internal deployment is easier to roll out and manage because storage services and the consuming workloads are planned within the same ACP environment. Within internal deployment, the first design choice is whether storage should share nodes with business workloads or use dedicated nodes. External deployment is better when you need stronger separation between storage and application clusters or when multiple business clusters need to share the same storage backend.
+
+The main planning decision points are:
+
+- Choose co-resident deployment when you want faster rollout and can tolerate storage and application workloads sharing the same worker pool.
+- Choose dedicated-node deployment when storage demand is known and you want clearer capacity control, fault isolation, and maintenance boundaries.
+- Choose external deployment when storage is already managed elsewhere or when a single external cluster must serve multiple ACP clusters.
+
+### Node Roles
+
+When planning node placement, separate the responsibilities of control plane nodes, infrastructure nodes, and worker nodes:
+
+- Control plane nodes maintain cluster management functions and should not be treated as general-purpose storage nodes unless the deployment model explicitly supports it.
+- Infrastructure nodes are suitable when you want to isolate storage platform components from business workloads.
+- Worker nodes can host storage services in co-resident deployments, but this increases resource contention between applications and storage daemons.
+
+For production use, plan at least three failure domains for highly available storage services. Spread storage nodes across racks, zones, or host groups wherever possible.
+
+## Security Considerations
+
+Before deployment, confirm whether encryption in transit is required for the storage design and validate the operational impact before enabling it.
+
+### Encryption in Transit
+
+ACP currently supports encryption in transit for Ceph distributed storage. This feature protects traffic between Ceph components and clients and is typically planned around Ceph `msgr2` and the cluster networking model.
+
+Before enabling in-transit encryption, verify:
+
+- Kernel and operating system support on storage and client nodes
+- Expected CPU overhead on busy storage nodes
+- Throughput and latency impact on the target hardware
+
+For implementation details, see [Configure in-transit encryption](./how_to/in-transit-encryption.mdx).
+
+## Infrastructure Requirements
+
+### Minimum and Recommended Configuration
+
+Plan node count, storage devices, and available resources before creating the cluster.
+
+| Item | Minimum configuration | Recommended configuration |
+| :--- | :--- | :--- |
+| Storage nodes | 3 nodes | 3 or more nodes distributed across failure domains |
+| Storage devices | 1 available storage device per node | Multiple dedicated devices per node, with consistent type and size |
+| Node distribution | 3 nodes available to host Ceph services | 3 failure domains such as racks or zones |
+| Device usage | Separate system disk and storage disk | Dedicated raw disks for Ceph data and future expansion headroom |
+
+At minimum, the cluster should have three nodes and one usable storage device on each node. For production use, deploy the cluster across at least three failure domains and reserve enough free resources to absorb rebalance, repair, and future growth.
+
+### Resource Sizing
+
+Ceph storage services consume CPU, memory, and device capacity continuously. Plan resources for storage daemons first, then reserve additional headroom for recovery, rebalance, upgrades, and background tasks.
+
+As a baseline:
+
+- Start with at least three storage nodes for a highly available cluster
+- Reserve enough CPU and memory for MON, MGR, OSD, and any enabled MDS or RGW services
+- Keep growth headroom for new pools, additional devices, and cluster recovery events
+- Avoid planning a cluster that is already near saturation at day one
+
+If your design uses dedicated storage nodes, resource planning is more predictable. If storage runs together with business workloads, reserve extra headroom to absorb contention during peak load and node failures.
+
+### Aggregate Cluster Planning Budget
+
+For early sizing, start from an aggregate cluster budget rather than from per-component values alone. The following table is intended as a planning reference for a three-node highly available cluster before workload-specific tuning:
+
+| Deployment pattern | Aggregate CPU to reserve for storage | Aggregate memory to reserve for storage | Notes |
+| :--- | :--- | :--- | :--- |
+| Internal, minimum baseline | 24 logical CPUs | 72 GiB | Entry-level three-node planning baseline when only the minimum deployment target is being met |
+| Internal, standard baseline | 30 logical CPUs | 72 GiB | Better starting point for general production planning and future expansion |
+| Internal, performance-oriented baseline | 45 logical CPUs | 96 GiB | Suitable when higher throughput or lower latency is required from the beginning |
+| External consumer cluster | Size for connectivity and client access only | Size for connectivity and client access only | Storage daemons run outside the ACP cluster, so the ACP cluster mainly needs network reachability, credentials, and client-side capacity |
+
+These values should be treated as cluster-level planning targets, not exact scheduler reservations. To estimate per-node budget for a three-node cluster, divide the aggregate numbers evenly across the participating storage nodes.
+
+The following recommendations are suitable for early planning:
+
+| Component | Recommended CPU | Recommended memory |
+| :--- | :--- | :--- |
+| MON | 2 cores | 3 GiB |
+| MGR | 3 cores | 4 GiB |
+| MDS | 3 cores | 8 GiB |
+| RGW | 2 cores | 4 GiB |
+| OSD | 4 cores | 8 GiB |
+
+These values are planning references rather than hard scheduling guarantees. Actual requirements depend on the number of devices, enabled services, and workload intensity.
+
+### How to Estimate Cluster Size
+
+Use the following order when sizing a cluster:
+
+1. Choose the deployment pattern: co-resident, dedicated-node, or external.
+2. Determine the minimum node count and failure-domain layout.
+3. Decide whether block, file, object, or mixed storage services are required.
+4. Start from the aggregate cluster planning budget.
+5. Add headroom for additional device sets, recovery, monitoring, and expected growth.
+
+If file and object services are both required, or if the cluster will host heavy business workloads at the same time, size above the minimum baseline rather than directly at it.
+
+### Pod Placement
+
+Pod placement rules directly affect resilience. Plan the cluster so that:
+
+- Highly available components can be spread across different failure domains
+- Every failure domain has accessible storage devices and enough allocatable resources
+- New device sets or future expansion can still follow the same placement pattern
+
+In practice, this means that simply having three nodes is not enough. The nodes also need to be distributed in a way that avoids a single rack, host group, or zone becoming a single point of failure.
+
+### Storage Device Planning
+
+When selecting storage devices, standardize device size and class as much as possible. Mixed devices complicate performance tuning and capacity planning.
+
+Use the following principles:
+
+- Reserve one system disk for the operating system and separate storage devices for Ceph data
+- Prefer raw disks or dedicated devices instead of partitioning shared disks
+- Keep device counts per node at a manageable level so that recovery and maintenance remain practical
+- Track usable capacity rather than raw capacity because replication reduces effective storage space
+
+Capacity planning should also include alert thresholds and expansion policy. Plan expansion before the cluster reaches a near-full state. Running close to full capacity increases rebalance pressure and makes recovery harder.
+
+For related operational guidance, see [Managing Storage Pools](./functions/pool_management.mdx) and [Adding Devices/Device Classes](./functions/device_class.mdx).
+
+### Capacity Planning
+
+When planning cluster capacity, calculate usable capacity rather than raw disk capacity. In a replicated Ceph deployment, a portion of raw storage is always consumed by data protection.
+
+Use the following planning principles:
+
+- Keep available capacity ahead of expected business growth instead of expanding only after the cluster is almost full
+- Reserve additional headroom for recovery, rebalance, snapshots, and temporary bursts in data usage
+- Expand storage in a balanced way across nodes and failure domains so that new capacity does not create skewed utilization
+- Review both current utilization and projected growth before adding new workloads to the cluster
+
+The following examples can be used as early planning references for a three-node cluster with one device per node and a 3-replica data protection policy:
+
+| Device size per node | Raw cluster capacity | Approximate usable capacity with 3 replicas |
+| :--- | :--- | :--- |
+| 0.5 TiB | 1.5 TiB | 0.5 TiB |
+| 2 TiB | 6 TiB | 2 TiB |
+| 4 TiB | 12 TiB | 4 TiB |
+
+These values are examples only. Usable capacity varies with the actual data protection policy and should not be treated as a general rule for every cluster design.
+
+In day-two operations, capacity should be reviewed before the cluster reaches warning levels. If growth is predictable, expand early rather than waiting for a near-full or full condition.
+
+## Network Requirements
+
+Ceph is sensitive to network quality. Before deployment, validate the following:
+
+- The cluster network can provide stable throughput for replication and recovery traffic
+- Latency between failure domains is within the supported range for the selected deployment model
+- Required ports are open between storage nodes and consuming clusters
+- Any dedicated network design, such as Multus-based separation, is decided in advance
+
+If you plan to isolate storage traffic from general application traffic, confirm the network interfaces, routing policy, and operational ownership before deployment. Network isolation improves security and performance, but it also increases design complexity.
+
+### IPv6 Support
+
+ACP distributed storage planning must follow the cluster network stack selected for the platform.
+
+- IPv6 is supported in single-stack IPv6 environments.
+- Dual-stack planning must be validated against the ACP cluster network design before storage deployment.
+- Storage nodes and client nodes should use the same address family strategy to avoid connectivity and service discovery issues.
+
+If your environment uses IPv6, confirm the following before installation:
+
+- The ACP cluster network is already configured for IPv6 operation
+- All storage nodes can communicate over the required IPv6 routes
+- Monitoring, alerting, and external integrations that access storage endpoints also support IPv6
+
+IPv6 should be treated as an installation-time architecture decision. Do not assume that an existing IPv4-oriented storage design can be converted later without revalidation.
+
+## Disaster Recovery Planning
+
+ACP distributed storage can be planned with different recovery objectives. Choose a model based on your recovery point objective (RPO), recovery time objective (RTO), and site topology.
+
+### Regional-DR
+
+ACP supports Regional-DR for cross-region or cross-site disaster recovery scenarios where asynchronous replication and a small amount of potential data loss are acceptable.
+
+When planning Regional-DR, confirm the following items in advance:
+
+- The source and destination clusters have compatible storage and network designs
+- Replication latency and failover expectations match the business recovery objectives
+- The protected workload type is clear, such as block, file system, or object data
+
+For implementation details, see [Disaster Recovery](./how_to/disaster_recovery/index.mdx).
+
+### Stretch Cluster
+
+A stretch cluster is appropriate only when the latency between sites is tightly controlled and the topology is designed specifically for this pattern. In general, plan for:
+
+- Two data sites and one quorum or arbiter site
+- A minimum of five nodes across three zones
+- Manual and explicit failure-domain labels before cluster creation
+- Sufficient nodes in each data site to preserve storage service availability
+- Inter-zone latency that remains within a low-latency design envelope, typically no more than 10 ms RTT between the data sites
+
+:::warning
+Do not treat a stretch cluster as a general solution for long-distance, high-latency, multi-datacenter deployment. If inter-site latency is not tightly controlled, use a dedicated disaster recovery architecture instead.
+:::
+
+For ACP-specific stretch cluster deployment guidance, see [Create Stretch Type Cluster](./installation/create_service_extend.mdx).
+
+## Performance Planning
+
+Performance should be planned from workload characteristics rather than from raw device counts alone. Before deployment, identify:
+
+- Whether the primary workloads are block, file, or object oriented
+- Whether the workload is latency sensitive, throughput sensitive, or capacity heavy
+- Whether hot data, backup traffic, or analytics jobs will dominate the cluster
+
+Also confirm whether special tuning or feature-specific design is required. For example, object workloads may need separate planning for gateway capacity, and some environments may require cache-oriented or dedicated-cluster designs.
+
+## Next Steps
+
+After you complete planning, proceed to the deployment guide that matches your selected deployment model:
+
+### Internal deployment
+
+- For a co-resident deployment, see [Create Standard Type Cluster](./installation/create_service_stand.mdx).
+- For a stretch-cluster deployment, see [Create Stretch Type Cluster](./installation/create_service_extend.mdx).
+- For a dedicated-node deployment, see [Configure a Dedicated Cluster for Distributed Storage](./how_to/dedicated_cluster.mdx).
+
+### External deployment
+
+- To consume storage services from another cluster or an external Ceph environment, see [Accessing Storage Services](./functions/access_storage_service.mdx).
+
+### Related follow-up configuration
+
+- To enable encrypted network traffic for deployed storage services, see [Configure in-transit encryption](./how_to/in-transit-encryption.mdx).
+- To configure disaster recovery after deployment, see [Disaster Recovery](./how_to/disaster_recovery/index.mdx).
