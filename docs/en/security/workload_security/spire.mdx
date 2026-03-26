@@ -1,0 +1,358 @@
+---
+weight: 10
+title: SPIRE
+---
+
+# Alauda Build of SPIRE
+
+SPIRE (the SPIFFE Runtime Environment) is a toolchain for establishing trust between software systems across a wide variety of hosting platforms. SPIRE exposes the [SPIFFE](https://spiffe.io/) (Secure Production Identity Framework for Everyone) API, which allows workloads to securely authenticate each other without the need for shared secrets or hardcoded credentials.
+
+In the Alauda Container Platform (ACP), SPIRE is provided as a cluster plugin to enhance workload security by providing cryptographically verifiable identities (SVIDs) for all workloads.
+
+## Core Components
+
+The SPIRE plugin includes several components to manage identities:
+
+- **SPIRE Server**: The central authority that manages trust and issues identities.
+- **SPIRE Agent**: Runs on every node and delivers identities to local workloads.
+- **SPIFFE CSI Driver**: A Container Storage Interface driver that mounts SVIDs as volumes into Pods.
+- **SPIRE Controller Manager**: Automates the registration of Kubernetes workloads.
+- **OIDC Discovery Provider**: Exposes an OIDC discovery document for SPIRE's trust domain.
+
+## Workflow
+
+The SPIRE plugin operates based on a zero-trust model. The following high-level workflow describes how identities are established and delivered:
+
+1. **Deployment**: The SPIRE Server, Agent, and CSI Driver are deployed as cluster plugins.
+2. **Node Attestation**: When a node starts, the SPIRE Agent connects to the SPIRE Server and identifies the node (e.g., using Kubernetes node labels and security tokens).
+3. **Agent SVID Issuance**: The SPIRE Server evaluates the node's identity against its policies and issues an **Agent SVID** and a Trust Bundle (CA Certificate) to the Agent.
+4. **Workload Request**: A workload (such as a Pod) starts on the node and requests a secure identity from the local SPIRE Agent's Workload API (exposed via the SPIFFE CSI Driver).
+5. **Workload Attestation**: The SPIRE Agent gathers metadata about the workload (e.g., namespace, service account, labels) and sends it to the SPIRE Server.
+6. **Workload SVID Issuance**: The SPIRE Server verifies the workload information against its registration entries and issues a **Workload SVID**.
+7. **SVID Delivery**: The SPIRE Agent receives the SVID and delivers it to the workload. The SPIFFE CSI Driver mounts this identity as a volume into the Pod.
+8. **Secure Communication**: The workload now has a cryptographically verifiable identity and can use it to perform mTLS-authenticated communication with other SPIFFE-aware services.
+
+## Installation
+
+### Prerequisites
+
+- A running Alauda Container Platform cluster.
+- An available **StorageClass** in the cluster for persistent storage.
+- Sufficient resources for the SPIRE stack.
+
+### Install via Console
+
+1. Log in to the ACP console and navigate to **Administrator**.
+2. Click **Marketplace** > **Cluster Plugins**.
+3. Select the target cluster in the top navigation bar.
+4. Search for **Alauda Build of SPIRE** and click to view its details.
+5. Click **Install**.
+6. In the configuration step, update the following parameters:
+   - **Cluster Name**: The unique identifier for your cluster (e.g., `dce-cluster`).
+   - **Trust Domain**: The trust domain name (e.g., `example.org`).
+   - **Common Name**: The common name for the SPIRE CA.
+   - **Storage Class**: Select an available storage class for SPIRE Server data storage.
+7. Click **Confirm** to complete the installation.
+
+## Usage
+
+### Using SPIFFE IDs in Workloads
+
+Once SPIRE is installed, workloads can obtain their SVIDs using the SPIFFE CSI Driver.
+
+1. **Enable SPIFFE for a Pod**: Add the SPIFFE CSI volume to your Pod specification.
+
+   ```yaml
+   apiVersion: v1
+   kind: Pod
+   metadata:
+     name: example-workload
+   spec:
+     containers:
+       - name: app
+         image: alpine
+         volumeMounts:
+           - name: spiffe-workload-api
+             mountPath: /run/spiffe.io/public
+             readOnly: true
+     volumes:
+       - name: spiffe-workload-api
+         csi:
+           driver: 'csi.spiffe.io'
+           readOnly: true
+   ```
+
+2. **Workload Authentication**: Your application can now use the SPIFFE Workload API at `/run/spiffe.io/public` to retrieve its identity and certificates.
+
+### Workload Registration
+
+By default, the **SPIRE Controller Manager** automatically creates SPIRE entries for Kubernetes workloads based on their labels or service accounts. You can customize this behavior using annotations on your workloads.
+
+### End-to-End Implementation Example
+
+The following example demonstrates a complete SPIRE deployment showing how to set up mutual TLS (mTLS) authentication between workloads using SPIFFE identities.
+
+<Steps>
+
+### Implementation Goals and Architecture
+
+This example shows how to:
+
+- Deploy SPIRE Server and Agent in a single Kubernetes cluster
+- Complete Node Attestation using k8s_psat
+- Automatically issue SPIFFE IDs and X.509 SVIDs for example workloads
+- Verify that authorized workloads can successfully obtain identities while unauthorized workloads cannot
+
+The architecture consists of:
+
+- **Server Workload**: SPIFFE ID `spiffe://example.org/ns/example/sa/server-sa`, retrieves certificates via Workload API, enables mTLS trusting only specific Client SPIFFE ID
+- **Client Workload**: SPIFFE ID `spiffe://example.org/ns/example/sa/client-sa`, retrieves certificates via Workload API, accesses Server using mTLS
+- Both communicate with **SPIRE Agent** which talks to **SPIRE Server**
+
+### Prerequisites
+
+Before starting, ensure you have:
+
+- A running Kubernetes cluster with storage component deployed
+- Kubelet API listening on 127.0.0.1
+- The `example` namespace created: `kubectl create namespace example`
+
+### SPIRE Deployment
+
+Deploy SPIRE using the official Helm chart with production-ready configuration:
+
+1. Create a `values.yaml` file with the following content:
+
+   ```yaml
+   global:
+     openshift: false
+     spire:
+       recommendations:
+         enabled: true
+       namespaces:
+         create: true
+       ingressControllerType: ''
+       clusterName: example-cluster
+       trustDomain: example.org
+       caSubject:
+         country: CN
+         organization: Example
+         commonName: example.org
+       persistence:
+         storageClass: your-storage-class
+   ```
+
+2. Deploy SPIRE CRDs and main components:
+
+   ```bash
+   helm upgrade --install --create-namespace -n spire spire-crds spire-crds \
+     --repo https://spiffe.github.io/helm-charts-hardened/
+
+   helm upgrade --install -n spire spire spire \
+     --repo https://spiffe.github.io/helm-charts-hardened -f values.yaml
+   ```
+
+3. Verify all pods are running:
+
+   ```bash
+   kubectl get pods -n spire
+   ```
+
+   Expected output should show all SPIRE components in `Running` state:
+
+   ```
+   NAME                                                  READY   STATUS    RESTARTS   AGE
+   spire-agent-xxx                                       1/1     Running   0          17h
+   spire-server-0                                        2/2     Running   0          18h
+   spire-spiffe-csi-driver-xxx                           2/2     Running   0          19h
+   spire-spiffe-oidc-discovery-provider-xxx              2/2     Running   0          17h
+   ```
+
+### Example Workload Registration
+
+Register the client and server workloads with SPIRE:
+
+1. Register the client workload:
+
+   ```bash
+   kubectl exec -n spire spire-server-0 -- \
+     /opt/spire/bin/spire-server entry create \
+     -spiffeID spiffe://example.org/ns/example/sa/client-sa \
+     -parentID spiffe://example.org/ns/spire/sa/spire-agent \
+     -selector k8s:ns:example
+   ```
+
+2. Register the server workload:
+
+   ```bash
+   kubectl exec -n spire spire-server-0 -- \
+     /opt/spire/bin/spire-server entry create \
+     -spiffeID spiffe://example.org/ns/example/sa/server-sa \
+     -parentID spiffe://example.org/ns/spire/sa/spire-agent \
+     -selector k8s:ns:example
+   ```
+
+Both commands will return entry IDs confirming successful registration.
+
+### Workload Deployment
+
+Deploy the workloads that use ghostunnel to handle mTLS with SPIRE identities.
+
+#### Deploy Server Workload
+
+Create the server workload that exposes an HTTPS endpoint with mTLS:
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: server-sa
+  namespace: example
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: server-workload
+  namespace: example
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: server-workload
+  template:
+    metadata:
+      labels:
+        app: server-workload
+    spec:
+      containers:
+        - args:
+            - echo 'Authenticated SPIFFE Content' > index.html && python3 -m http.server 8080 --bind 127.0.0.1
+          command:
+            - /bin/sh
+            - -c
+          image: python:3.9-alpine
+          imagePullPolicy: IfNotPresent
+          name: my-app
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+        - args:
+            - server
+            - --listen
+            - :8443
+            - --use-workload-api-addr=unix:/run/spire/sockets/api.sock
+            - --target
+            - 127.0.0.1:8080
+            - --allow-uri
+            - spiffe://example.org/ns/example/sa/client-sa
+          image: docker-mirrors.alauda.cn/ghostunnel/ghostunnel:v1.9.0
+          imagePullPolicy: Always
+          name: ghostunnel
+          ports:
+            - containerPort: 8443
+              protocol: TCP
+          volumeMounts:
+            - mountPath: /run/spire/sockets
+              name: spiffe-socket
+      serviceAccount: server-sa
+      serviceAccountName: server-sa
+      volumes:
+        - hostPath:
+            path: /run/spire/agent-sockets
+            type: Directory
+          name: spiffe-socket
+```
+
+Apply with: `kubectl apply -f server-workload.yaml`
+
+#### Deploy Client Workload
+
+Create the client workload that connects to the server using mTLS:
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: client-sa
+  namespace: example
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: client-workload
+  namespace: example
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: client-workload
+  template:
+    metadata:
+      labels:
+        app: client-workload
+    spec:
+      serviceAccountName: client-sa
+      containers:
+        - args:
+            - client
+            - --listen
+            - 127.0.0.1:8080
+            - --target
+            - server-workload:8443
+            - --use-workload-api-addr=unix:/run/spire/sockets/api.sock
+            - --verify-uri
+            - spiffe://example.org/ns/example/sa/server-sa
+          image: ghostunnel/ghostunnel:v1.9.0
+          imagePullPolicy: IfNotPresent
+          name: ghostunnel
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+          volumeMounts:
+            - mountPath: /run/spire/sockets
+              name: spiffe-socket
+      volumes:
+        - hostPath:
+            path: /run/spire/agent-sockets
+            type: Directory
+          name: spiffe-socket
+```
+
+Apply with: `kubectl apply -f client-workload.yaml`
+
+### Verification
+
+Test the mTLS authentication with success and failure scenarios.
+
+#### Authentication Success
+
+Execute from the client workload pod:
+
+```bash
+kubectl exec -n example deploy/client-workload -c ghostunnel -- curl -s http://127.0.0.1:8080
+```
+
+**Expected Output:**
+
+```
+Authenticated SPIFFE Content
+```
+
+This confirms successful mTLS authentication.
+
+#### Authentication Failure
+
+To demonstrate proper security enforcement, modify the client's `--verify-uri` parameter to an incorrect URI (e.g., `spiffe://example.org/ns/example/sa/server` instead of `spiffe://example.org/ns/example/sa/server-sa`):
+
+```bash
+kubectl exec -n example deploy/client-workload -c ghostunnel -- curl -s http://127.0.0.1:8080
+```
+
+**Expected Result:**
+
+- Command terminates with exit code 56
+- Client logs show: `unauthorized: invalid principal, or principal not allowed`
+
+This demonstrates that SPIRE properly enforces authentication and rejects unauthorized connections.
+
+</Steps>
