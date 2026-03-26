@@ -40,7 +40,7 @@ This command runs:
 node scripts/update-ac-manual.js release-1.0
 ```
 
-By default, the repository sync pulls the `release-1.0` branch from `git@gitlab-ce.alauda.cn:alauda/ac.git`.
+When you use `yarn update-ac-manual`, the repository sync pulls the `release-1.0` branch from `git@gitlab-ce.alauda.cn:alauda/ac.git` because the project script explicitly passes that branch name.
 
 ### What the Sync Script Does
 
@@ -69,6 +69,8 @@ node scripts/update-ac-manual.js <branch>
 ```
 
 Replace `<branch>` with the branch name you want to pull from.
+
+If you run `node scripts/update-ac-manual.js` without a branch argument, the script itself defaults to `main`.
 
 ### Recommended Verification Steps
 
