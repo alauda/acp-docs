@@ -1,0 +1,652 @@
+---
+weight: 62
+title: Remove Disks, Device-Class Volume Groups, or Nodes from ACP TopoLVM Local Storage
+---
+
+# Remove Disks, Device-Class Volume Groups, or Nodes from ACP TopoLVM Local Storage
+
+This document describes how to remove failed disks, remove device-class volume groups from a device class, and remove storage nodes in ACP TopoLVM Local Storage.
+
+Depending on the failure scope, this document covers the following scenarios:
+
+- Remove a `volume group device` from a `device-class volume group`
+- Remove a `device-class volume group` from a `device class`
+- Remove a TopoLVM storage node
+
+<Directive type="warning" title="Risk Warning">
+- The procedure in this document directly deletes storage resources such as PVCs, PVs, and `logicalvolumes.topolvm.cybozu.com`. After these resources are deleted, data in the affected volumes is usually unrecoverable. Back up the data in advance.
+- Before you proceed, confirm that you have identified the correct disk, device-class volume group, or node, and schedule a maintenance window for the affected workloads.
+</Directive>
+
+## Terms
+
+| Term | Description |
+| :--- | :--- |
+| **device class** | A logical storage class composed of one or more device-class volume groups on different nodes. |
+| **device-class volume group** | An `LVM volume group` on a node that represents the storage resources of a device class on that node. |
+| **volume group device** | A disk on a node. In LVM, it corresponds to a physical volume. |
+
+## Choosing the Correct Scenario
+
+Use the following table to determine which scenario applies to your environment.
+
+| Condition | [Scenario 1: Remove a volume group device](#scenario-1-remove-a-volume-group-device-from-a-device-class-volume-group) | [Scenario 2: Remove a device-class volume group](#scenario-2-remove-a-device-class-volume-group-from-a-device-class) | [Scenario 3: Remove a TopoLVM storage node](#scenario-3-remove-a-topolvm-storage-node) |
+| :--- | :--- | :--- | :--- |
+| Node accessibility | The node is still accessible. | The node is still accessible. | The node is no longer recoverable, or you have decided to permanently remove it from TopolvmCluster. |
+| Volume group status | The target `LVM volume group` still exists and is still recognizable. | The target `LVM volume group` no longer exists or is no longer recognizable, but the node is still retained. | The node and all device-class volume groups on that node will be removed together. |
+| Scope of removal | Remove one or more failed disks from a volume group. | Remove one device-class volume group from a retained node. | Remove the entire node from TopolvmCluster. |
+| Retention plan | The node and the device-class volume group are retained. | The node is retained, but the target device-class volume group is not retained. | Neither the node nor any device-class volume group on that node is retained. |
+
+## Scenario 1: Remove a Volume Group Device from a Device-Class Volume Group
+
+### User Scenario
+
+- Use this procedure when a `device-class volume group` is not completely damaged, but one or more `volume group devices` in the volume group have failed and must be removed.
+
+### Prerequisites
+
+- The target node is still in the cluster and accessible.
+- The `Provision Type` of the target device class is `Thick`.
+- The target device-class volume group is not completely damaged, and at least one healthy volume group device remains in the volume group.
+
+### Check Whether the Device-Class Volume Group Is Still Recoverable
+
+Run the following command on the target node:
+
+```bash
+vgs <vg-name>
+```
+
+Parameters:
+
+- `<vg-name>`: The name of the target LVM volume group.
+
+If the command returns normal output, or only reports that some PVs are missing while the volume group still exists, the device-class volume group is not completely damaged and you can follow this procedure.
+
+Example output:
+
+```text
+WARNING: Couldn't find device with uuid VJes6j-2a8V-8Cxf-eW84-yEJK-K24A-yBc9OD.
+WARNING: VG hdd-2ab8f0a2-7d1d-42d7-ba6b-da94c6185c33 is missing PV VJes6j-2a8V-8Cxf-eW84-yEJK-K24A-yBc9OD (last written to /dev/vdb).
+WARNING: Couldn't find all devices for LV hdd-2ab8f0a2-7d1d-42d7-ba6b-da94c6185c33/b6b331f0-5242-420f-a531-df90628bef80 while checking used and assumed devices.
+```
+
+### Procedure
+
+<Steps>
+#### Step 1: Stop topolvm-operator
+
+Run the following command on the control-plane node to prevent the operator from reconciling resources during cleanup:
+
+```bash
+kubectl -n nativestor-system scale --replicas 0 deployment topolvm-operator
+```
+
+#### Step 2: Find the affected LVM logical volume
+
+Run the following command on the target node to find the logical volumes that use the failed disk(s):
+
+```bash
+lvs -a -o +devices <vg-name> | egrep "<path-to-disks>|unknown device" | awk '{print $1}'
+```
+
+Parameters:
+
+- `<vg-name>`: The name of the target LVM volume group.
+- `<path-to-disks>` : The device paths of the failed disks, such as `/dev/vdb`. If you need to match multiple disks, separate them with `|`.
+
+For example:
+
+```bash
+lvs -a -o +devices hdd-2ab8f0a2-7d1d-42d7-ba6b-da94c6185c33 2>/dev/null | egrep "/dev/vdb|unknown" | awk '{print $1}'
+```
+
+Example output:
+
+```text
+b6b331f0-5242-420f-a531-df90628bef80
+```
+
+#### Step 3: Find the affected PVC and PV
+
+Run the following command on the control-plane node to find the associated PV and PVC by logical volume name:
+
+```bash
+kubectl get pv -o json | jq -r --arg HANDLE <lv-name> '
+  .items[]
+  | select(.spec.csi.volumeHandle == $HANDLE)
+  | [.metadata.name, .spec.claimRef.namespace, .spec.claimRef.name]
+  | @tsv
+'
+```
+
+Parameters:
+
+- `<lv-name>`: The name of the affected LVM logical volume.
+
+Example output:
+
+```text
+pvc-e11f6c18-0e15-4c70-9a24-e7136fabfb2f	demo-space	pvc-topolvm
+```
+
+In the output:
+
+- Column 1 is the `PersistentVolume` name.
+- Column 2 is the namespace of the `PersistentVolumeClaim`.
+- Column 3 is the `PersistentVolumeClaim` name.
+
+#### Step 4: Stop workloads that use the affected PVC
+
+After you identify the affected PVCs, stop the workloads that use them and confirm that all related Pods have stopped before you continue.
+
+#### Step 5: Delete the affected Kubernetes storage resources
+
+Run the following commands on the control-plane node:
+
+```bash
+kubectl delete pvc -n <pvc-namespace> <pvc-name>
+kubectl delete pv <pv-name>
+kubectl delete logicalvolumes.topolvm.cybozu.com <logicalvolume-name>
+```
+
+Parameters:
+
+- `<pvc-namespace>`: The namespace of the affected PVC.
+- `<pvc-name>`: The name of the affected PVC.
+- `<pv-name>`: The name of the affected PV.
+- `<logicalvolume-name>`: The name of the TopoLVM `logicalvolumes.topolvm.cybozu.com` resource. It is the same as `<pv-name>`.
+
+If the query result contains multiple resources, delete them one by one according to the mapping.
+
+If a resource cannot be deleted normally, add `--force` as required.
+
+#### Step 6: Clean up residual LVM logical volumes
+
+Run the following command on the target node to check whether any logical volume still remains:
+
+```bash
+lvs -a -o +devices <vg-name> 2>/dev/null | egrep "<path-to-disks>|unknown device" | awk '{print $1}'
+```
+
+Parameters:
+
+- `<vg-name>`: The name of the target LVM volume group.
+- `<path-to-disks>` : The device paths of the failed disks, such as `/dev/vdb`. If you need to match multiple disks, separate them with `|`.
+
+If the command still returns output, delete the remaining logical volumes one by one:
+
+```bash
+lvremove <vg-name>/<lv-name>
+```
+
+Parameters:
+
+- `<vg-name>`: The name of the target LVM volume group.
+- `<lv-name>`: The name of the logical volume to remove.
+
+If needed, add `--force`.
+
+#### Step 7: Remove the missing physical volume from the LVM volume group
+
+Run the following command on the target node:
+
+```bash
+vgreduce --removemissing <vg-name>
+```
+
+Parameters:
+
+- `<vg-name>`: The name of the target LVM volume group.
+
+If needed, add `--force`.
+
+#### Step 8: Update the TopolvmCluster resource
+
+Run the following command on the control-plane node:
+
+```bash
+kubectl -n nativestor-system edit topolvmclusters.topolvm.cybozu.com topolvm
+```
+
+In the editor, remove the failed volume group device from the `devices` list of the target node. For example, remove `/dev/vdb` from the configuration for `nodeName: 192.168.133.50`.
+
+Before:
+
+```yaml
+spec:
+  storage:
+    deviceClasses:
+    - classes:
+      - className: hdd
+        default: true
+        devices:
+        - name: /dev/vdb
+          type: disk
+        - name: /dev/vdc
+          type: disk
+        volumeGroup: hdd-2ab8f0a2-7d1d-42d7-ba6b-da94c6185c33
+      nodeName: 192.168.133.50
+```
+
+After:
+
+```yaml
+spec:
+  storage:
+    deviceClasses:
+    - classes:
+      - className: hdd
+        default: true
+        devices:
+        - name: /dev/vdc
+          type: disk
+        volumeGroup: hdd-2ab8f0a2-7d1d-42d7-ba6b-da94c6185c33
+      nodeName: 192.168.133.50
+```
+
+#### Step 9: Update the lvmdconfig ConfigMap
+
+Run the following command on the control-plane node:
+
+```bash
+kubectl -n nativestor-system edit configmaps lvmdconfig-<node-name>
+```
+
+Parameters:
+
+- `<node-name>`: The name of the target node.
+
+In the editor, remove the status of the failed volume group device from `status.json`. For example, remove the `deviceStates` entry for `/dev/vdb`.
+
+Before:
+
+```yaml
+status.json: '{"node":"192.168.133.50","phase":"","failClasses":[],"successClasses":[{"className":"hdd","vgName":"hdd-2ab8f0a2-7d1d-42d7-ba6b-da94c6185c33","state":"Ready","message":"create successful","deviceStates":[{"name":"/dev/vdb","state":"Online"},{"name":"/dev/vdc","state":"Online"}]}],"loops":[],"raids":[]}'
+```
+
+After:
+
+```yaml
+status.json: '{"node":"192.168.133.50","phase":"","failClasses":[],"successClasses":[{"className":"hdd","vgName":"hdd-2ab8f0a2-7d1d-42d7-ba6b-da94c6185c33","state":"Ready","message":"create successful","deviceStates":[{"name":"/dev/vdc","state":"Online"}]}],"loops":[],"raids":[]}'
+```
+
+#### Step 10: Start topolvm-operator
+
+Run the following command on the control-plane node:
+
+```bash
+kubectl -n nativestor-system scale --replicas 1 deployment topolvm-operator
+```
+
+#### Step 11: Verify that the volume group device has been removed
+
+Run the following command on the control-plane node:
+
+```bash
+kubectl -n nativestor-system get topolvmclusters.topolvm.cybozu.com topolvm -o jsonpath="{.status.nodeStorageState}" | jq
+```
+
+Confirm that the removed volume group device no longer appears in the `deviceStates` of the target node.
+</Steps>
+
+## Scenario 2: Remove a Device-Class Volume Group from a Device Class
+
+### User Scenario
+
+- Use this procedure when a device-class volume group on a node is completely damaged and cannot be recovered by removing only a single volume group device.
+
+### Prerequisites
+
+- The target node is still in the cluster and accessible.
+- The target device-class volume group is completely damaged.
+- After the target device-class volume group is removed, at least one other device-class volume group remains on the node.
+
+### Check Whether the Device-Class Volume Group Is Completely Damaged
+
+Run the following command on the target node:
+
+```bash
+vgs
+```
+
+If the target `LVM volume group` no longer appears in the output, the device-class volume group is completely damaged and you can follow this procedure.
+
+<Directive type="info" title="Note">
+This scenario removes an entire device-class volume group from a node, not just a single volume group device in that volume group.
+</Directive>
+
+### Procedure
+
+<Steps>
+#### Step 1: Stop topolvm-operator
+
+Run the following command on the control-plane node:
+
+```bash
+kubectl -n nativestor-system scale --replicas 0 deployment topolvm-operator
+```
+
+#### Step 2: Find the affected PVC and PV
+
+Run the following command on the control-plane node to find the PVs, PVCs, and `logicalvolumes.topolvm.cybozu.com` resources associated with the specified storage class on the target node:
+
+```bash
+kubectl get pv -o json | jq -r --arg NODE <node-name> --arg SC <storageclass-name> '
+  .items[]
+  | select(.spec.nodeAffinity.required.nodeSelectorTerms[]?.matchExpressions[]? | select(.key=="topology.topolvm.cybozu.com/node") | .values[]? == $NODE)
+  | select(.spec.storageClassName == $SC)
+  | [.metadata.name, .spec.claimRef.namespace, .spec.claimRef.name]
+  | @tsv
+'
+```
+
+Parameters:
+
+- `<node-name>`: The name of the target node.
+- `<storageclass-name>`: The name of the storage class associated with the target device-class volume group. If multiple storage classes are involved, run the query separately for each storage class.
+
+Example output:
+
+```text
+pvc-e11f6c18-0e15-4c70-9a24-e7136fabfb2f	demo-space	pvc-topolvm
+```
+
+In the output:
+
+- Column 1 is the name of both the `PersistentVolume` and the `logicalvolumes.topolvm.cybozu.com` resource.
+- Columns 2 and 3 are the namespace and name of the `PersistentVolumeClaim`.
+
+If multiple storage classes are associated with the target device-class volume group, repeat this query and the subsequent cleanup steps for each storage class.
+
+#### Step 3: Stop workloads that use the affected PVC
+
+After you identify the affected PVCs, stop the workloads that use them and confirm that all related Pods have stopped before you continue.
+
+#### Step 4: Delete the affected Kubernetes storage resources
+
+Run the following commands on the control-plane node:
+
+```bash
+kubectl delete pvc -n <pvc-namespace> <pvc-name>
+kubectl delete pv <pv-name>
+kubectl delete logicalvolumes.topolvm.cybozu.com <logicalvolume-name>
+```
+
+Parameters:
+
+- `<pvc-namespace>`: The namespace of the affected PVC.
+- `<pvc-name>`: The name of the affected PVC.
+- `<pv-name>`: The name of the affected PV.
+- `<logicalvolume-name>`: The name of the TopoLVM `logicalvolumes.topolvm.cybozu.com` resource. It is the same as `<pv-name>`.
+
+If the query result contains multiple resources, delete them one by one according to the mapping.
+
+If a resource cannot be deleted normally, add `--force` as required.
+
+#### Step 5: Update the TopolvmCluster resource
+
+Run the following command on the control-plane node:
+
+```bash
+kubectl -n nativestor-system edit topolvmclusters.topolvm.cybozu.com topolvm
+```
+
+In the editor, remove the device-class volume group from the target node. For example, in the configuration for `nodeName: 192.168.140.13`, remove the `className: hdd` entry and its associated `volumeGroup` and `devices` configuration.
+
+Before:
+
+```yaml
+spec:
+  storage:
+    deviceClasses:
+    - classes:
+      - className: ssd
+        default: true
+        devices:
+        - name: /dev/vdc
+          type: disk
+        volumeGroup: ssd-4a8737fc-48d3-4c61-882d-0a5bcc6f77a1
+      - className: hdd
+        devices:
+        - name: /dev/vdb
+          type: disk
+        volumeGroup: hdd-97dc00f3-1df6-4f64-8ddc-7b0b6c5d6de5
+      nodeName: 192.168.140.13
+```
+
+After:
+
+```yaml
+spec:
+  storage:
+    deviceClasses:
+    - classes:
+      - className: ssd
+        default: true
+        devices:
+        - name: /dev/vdc
+          type: disk
+        volumeGroup: ssd-4a8737fc-48d3-4c61-882d-0a5bcc6f77a1
+      nodeName: 192.168.140.13
+```
+
+If the removed `className` entry has `default: true`, designate another remaining class as the default class.
+
+#### Step 6: Update the lvmdconfig ConfigMap
+
+Run the following command on the control-plane node:
+
+```bash
+kubectl -n nativestor-system edit configmaps lvmdconfig-<node-name>
+```
+
+Parameters:
+
+- `<node-name>`: The name of the target node.
+
+In the editor, remove the configuration that corresponds to the target device-class volume group from both `lvmd.yaml` and `status.json`. For example, remove the configuration for `className: hdd`.
+
+Before:
+
+```yaml
+lvmd.yaml: |
+  socket-name: /run/topolvm/lvmd.sock
+  device-classes:
+  - name: ssd
+    volume-group: ssd-4a8737fc-48d3-4c61-882d-0a5bcc6f77a1
+    default: true
+    type: thick
+  - name: hdd
+    volume-group: hdd-97dc00f3-1df6-4f64-8ddc-7b0b6c5d6de5
+    default: false
+    type: thick
+status.json: '{"node":"192.168.140.13","phase":"","failClasses":[],"successClasses":[{"className":"hdd","vgName":"hdd-97dc00f3-1df6-4f64-8ddc-7b0b6c5d6de5","state":"Ready","message":"create successful","deviceStates":[{"name":"/dev/vdb","state":"Online"}]},{"className":"ssd","vgName":"ssd-4a8737fc-48d3-4c61-882d-0a5bcc6f77a1","state":"Ready","message":"create successful","deviceStates":[{"name":"/dev/vdc","state":"Online"}]}],"loops":[],"raids":[]}'
+```
+
+After:
+
+```yaml
+lvmd.yaml: |
+  socket-name: /run/topolvm/lvmd.sock
+  device-classes:
+  - name: ssd
+    volume-group: ssd-4a8737fc-48d3-4c61-882d-0a5bcc6f77a1
+    default: true
+    type: thick
+status.json: '{"node":"192.168.140.13","phase":"","failClasses":[],"successClasses":[{"className":"ssd","vgName":"ssd-4a8737fc-48d3-4c61-882d-0a5bcc6f77a1","state":"Ready","message":"create successful","deviceStates":[{"name":"/dev/vdc","state":"Online"}]}],"loops":[],"raids":[]}'
+```
+
+If the removed `className` entry has `default: true`, designate another remaining class as the default class.
+
+#### Step 7: Start topolvm-operator
+
+Run the following command on the control-plane node:
+
+```bash
+kubectl -n nativestor-system scale --replicas 1 deployment topolvm-operator
+```
+
+#### Step 8: Verify that the device-class volume group has been removed
+
+Run the following command on the control-plane node:
+
+```bash
+kubectl -n nativestor-system get topolvmclusters.topolvm.cybozu.com topolvm -o jsonpath="{.status.nodeStorageState}" | jq
+```
+
+Confirm that the removed device-class volume group no longer appears on the target node and that the remaining device-class volume groups are healthy.
+</Steps>
+
+## Scenario 3: Remove a TopoLVM Storage Node
+
+### User Scenario
+
+- The target node is no longer recoverable, or you have decided to permanently remove it from TopolvmCluster.
+
+### Prerequisites
+
+- You have decided not to retain any device-class volume groups on the target node.
+- Workloads that use local volumes on the target node have been stopped or migrated to other nodes.
+- The remaining nodes can continue to host the required workloads after the target node is removed.
+
+### Procedure
+
+<Steps>
+#### Step 1: Stop topolvm-operator
+
+Run the following command on the control-plane node:
+
+```bash
+kubectl -n nativestor-system scale --replicas 0 deployment topolvm-operator
+```
+
+#### Step 2: Find the affected PVC and PV
+
+Run the following command on the control-plane node to find the PVs, PVCs, and `logicalvolumes.topolvm.cybozu.com` resources associated with the target node:
+
+```bash
+kubectl get pv -o json | jq -r --arg NODE <node-name> '
+  .items[]
+  | select(.spec.nodeAffinity.required.nodeSelectorTerms[]?.matchExpressions[]? | select(.key=="topology.topolvm.cybozu.com/node") | .values[]? == $NODE)
+  | [.metadata.name, .spec.claimRef.namespace, .spec.claimRef.name]
+  | @tsv
+'
+```
+
+Parameters:
+
+- `<node-name>`: The name of the target node.
+
+#### Step 3: Stop workloads that use the affected PVC
+
+After you identify the affected PVCs, stop the workloads that use them and confirm that all related Pods have stopped before you continue.
+
+#### Step 4: Delete the affected Kubernetes storage resources
+
+Run the following commands on the control-plane node:
+
+```bash
+kubectl delete pvc -n <pvc-namespace> <pvc-name>
+kubectl delete pv <pv-name>
+kubectl delete logicalvolumes.topolvm.cybozu.com <logicalvolume-name>
+```
+
+Parameters:
+
+- `<pvc-namespace>`: The namespace of the affected PVC.
+- `<pvc-name>`: The name of the affected PVC.
+- `<pv-name>`: The name of the affected PV.
+- `<logicalvolume-name>`: The name of the TopoLVM `logicalvolumes.topolvm.cybozu.com` resource. It is the same as `<pv-name>`.
+
+If the query result contains multiple resources, delete them one by one according to the mapping.
+
+If a resource cannot be deleted normally, add `--force` as required.
+
+#### Step 5: Update the TopolvmCluster resource
+
+Run the following command on the control-plane node:
+
+```bash
+kubectl -n nativestor-system edit topolvmclusters.topolvm.cybozu.com topolvm
+```
+
+In the editor, remove the entire configuration block for the target node. For example, remove the block for `nodeName: 192.168.140.13`.
+
+Before:
+
+```yaml
+spec:
+  storage:
+    deviceClasses:
+    - classes:
+      - className: hdd
+        default: true
+        devices:
+        - name: /dev/vdc
+          type: disk
+        volumeGroup: hdd-2ab8f0a2-7d1d-42d7-ba6b-da94c6185c33
+      nodeName: 192.168.133.50
+    - classes:
+      - className: ssd
+        default: true
+        devices:
+        - name: /dev/vdc
+          type: disk
+        volumeGroup: ssd-4a8737fc-48d3-4c61-882d-0a5bcc6f77a1
+      - className: hdd
+        devices:
+        - name: /dev/vdb
+          type: disk
+        volumeGroup: hdd-97dc00f3-1df6-4f64-8ddc-7b0b6c5d6de5
+      nodeName: 192.168.140.13
+```
+
+After:
+
+```yaml
+spec:
+  storage:
+    deviceClasses:
+    - classes:
+      - className: hdd
+        default: true
+        devices:
+        - name: /dev/vdc
+          type: disk
+        volumeGroup: hdd-2ab8f0a2-7d1d-42d7-ba6b-da94c6185c33
+      nodeName: 192.168.133.50
+```
+
+#### Step 6: Update the lvmdconfig ConfigMap
+
+Run the following command on the control-plane node:
+
+```bash
+kubectl -n nativestor-system edit configmaps lvmdconfig-<node-name>
+```
+
+Parameters:
+
+- `<node-name>`: The name of the target node.
+
+In the editor, delete the entire `lvmd.yaml` and `status.json` sections. Do not keep any configuration or status for the removed node.
+
+#### Step 7: Start topolvm-operator
+
+Run the following command on the control-plane node:
+
+```bash
+kubectl -n nativestor-system scale --replicas 1 deployment topolvm-operator
+```
+
+#### Step 8: Verify that the node has been removed
+
+Run the following command on the control-plane node:
+
+```bash
+kubectl -n nativestor-system get topolvmclusters.topolvm.cybozu.com topolvm -o jsonpath="{.status.nodeStorageState}" | jq
+```
+
+Confirm that the target node no longer appears in `status.nodeStorageState`. For example, `192.168.140.13` should no longer appear in the output.
+</Steps>
