@@ -172,6 +172,34 @@ Assign a kubernetes role to a user in current context cluster
 ac adm policy add-role-to-user view alice -n my-namespace
 ```
 
+## ac adm release
+
+Manage release metadata and related administrative workflows
+
+### Example usage
+
+```bash
+# Import a ProductManifest for a release version
+ac adm release import-manifest --version 4.20.0
+```
+
+## ac adm release import-manifest
+
+Import release metadata as a ProductManifest
+
+### Example usage
+
+```bash
+# Import release metadata for version 4.20.0
+ac adm release import-manifest --version 4.20.0
+
+# Import metadata and wait for the ProductManifest to become Ready
+ac adm release import-manifest --version 4.20.0 --wait
+
+# Override the wait timeout
+ac adm release import-manifest --version 4.20.0 --wait --timeout=10m
+```
+
 ## ac adm taint
 
 Update the taints on one or more nodes
@@ -205,4 +233,44 @@ Mark node as schedulable
 ```bash
 # Mark node "foo" as schedulable
 ac adm uncordon foo
+```
+
+## ac adm upgrade
+
+Review or request a cluster upgrade
+
+### Example usage
+
+```bash
+# View the update status and available cluster updates
+ac adm upgrade
+
+# View summary for a specific cluster
+ac adm upgrade --cluster=workload-a
+
+# Update to the latest version
+ac adm upgrade --to-latest
+
+# Update to a specific version from available updates
+ac adm upgrade --cluster=workload-a --to=4.15.0
+
+# Allow an explicit version outside available updates
+ac adm upgrade --to=4.15.0 --allow-explicit-upgrade
+```
+
+## ac adm upgrade status
+
+Review preflight and stage details for the target cluster upgrade
+
+### Example usage
+
+```bash
+# Review the status of the Cluster Version Operator for default cluster
+ac adm upgrade status
+
+# Review the status of a specific cluster
+ac adm upgrade status --cluster=workload-a
+
+# Review the full controller-reported details
+ac adm upgrade status --verbose
 ```
