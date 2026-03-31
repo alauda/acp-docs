@@ -1,0 +1,174 @@
+---
+weight: 10
+---
+
+# Replacing or Removing Devices
+
+This document describes how to remove a storage device (disk) from a Rook-Ceph cluster managed by the Container Platform. Depending on whether the remaining OSDs have sufficient capacity to absorb the data from the disk being removed, you may need to add a replacement disk first.
+
+## Prerequisites
+
+- All cluster components are functioning properly.
+
+- The storage cluster was **not** created with the "add all empty disks" option. Verify by running the following command; the output must show `useAllDevices: false`.
+
+  ```bash
+  kubectl get cephcluster -n rook-ceph ceph-cluster -o yaml | grep useAllDevices
+  ```
+
+- Applicable to platform version 3.8 and above.
+
+## Constraints and Limitations
+
+- During data rebalancing, cluster performance may be temporarily degraded. Avoid operating on multiple disks simultaneously unless absolutely necessary.
+
+- Do not proceed if the cluster is in `HEALTH_ERR` due to reasons **other than** the disk being removed. Proceeding in that state may further compromise data resilience.
+
+- If the disk being removed is the last disk of a particular device class, that device class will cease to exist. Any storage pools or policies that depend on it will be affected. Ensure no pools are tied exclusively to this device class before proceeding.
+
+## Procedure
+
+<Steps>
+### Check Cluster State and Capacity
+
+1. Verify overall cluster health.
+
+   ```bash
+   kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- ceph -s
+   ```
+
+2. Identify the OSD ID and usage of the disk to be removed.
+
+   ```bash
+   kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- ceph osd df
+   ```
+
+   Note the **USE** value of the target OSD. Then confirm that the sum of **AVAIL** across all remaining OSDs (excluding the target) is greater than the target OSD's **USE** value. This ensures the remaining OSDs have enough free space to absorb the data after removal.
+
+   If remaining capacity is insufficient, proceed to the next step to add a replacement disk first. Otherwise, skip to [Scale Down the Rook Operator](#scale-down-the-rook-operator).
+
+### Add a Replacement Disk (If Needed)
+
+If the remaining OSDs do not have enough free capacity, add a replacement disk before removing the old one. The Rook operator must be running during this step.
+
+1. Enter the **Container Platform**.
+
+2. In the left navigation bar, click **Storage Management** > **Distributed Storage** > **Device Classes**.
+
+3. Click **Add Device**, select the node where the replacement disk is installed, choose the new disk, and assign it to the same device class as the disk being removed.
+
+4. Wait for the new OSD to be created and for data rebalancing to complete. Monitor progress:
+
+   ```bash
+   kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- ceph -s
+   ```
+
+   Wait until the output shows `HEALTH_OK` with no misplaced or recovering PGs.
+
+### Scale Down the Rook Operator
+
+Scale down the Rook operator to prevent it from interfering with the removal process (for example, by recreating deleted OSD deployments mid-procedure).
+
+```bash
+kubectl -n rook-ceph scale deploy rook-ceph-operator --replicas=0
+```
+
+### Mark the OSD Out and Wait for Data Migration
+
+1. Enable the rook-ceph-tools pod if it is not already running.
+
+   ```bash
+   kubectl -n rook-ceph scale deploy rook-ceph-tools --replicas=1
+   ```
+
+2. Enter the tools pod.
+
+   ```bash
+   kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- bash
+   ```
+
+3. Mark the OSD as `out`. This instructs Ceph to migrate all data off the OSD onto the remaining OSDs.
+
+   ```bash
+   ceph osd out osd.<id>
+   ```
+
+4. Monitor rebalancing progress until the cluster returns to `HEALTH_OK` with no misplaced or recovering PGs.
+
+   ```bash
+   ceph -s
+   ```
+
+   **Do not proceed until data migration is fully complete.** Removing the OSD before migration finishes will result in data loss.
+
+### Remove the OSD
+
+1. Edit the CephCluster resource to remove the disk entry.
+
+   ```bash
+   kubectl edit cephcluster -n rook-ceph ceph-cluster
+   ```
+
+   Locate the disk under `spec.storage.nodes` and delete its entry. Save and exit.
+
+2. Delete the OSD deployment.
+
+   ```bash
+   kubectl -n rook-ceph delete deploy rook-ceph-osd-<osd-id>
+   ```
+
+3. Enter the tools pod and permanently remove the OSD from the cluster. Replace `<id>` with the OSD ID.
+
+   ```bash
+   kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- bash
+   ```
+
+   Inside the tools pod:
+
+   ```bash
+   ceph osd purge osd.<id> --yes-i-really-mean-it
+   ```
+
+### Clean Up the Disk
+
+If the disk will remain physically attached to the node, wipe its metadata to prevent Rook from accidentally picking it up. Run the following commands **on the node** where the disk is located. Replace `/dev/vdb` with the actual device path.
+
+```bash
+# Remove any device-mapper entries left by Ceph
+dmsetup remove /dev/mapper/ceph--<vg-name>   # Replace with the actual mapper name if present
+
+# Wipe the partition table
+sgdisk --zap-all /dev/vdb
+
+# Zero the first 100 MB to clear residual Ceph metadata
+dd if=/dev/zero of=/dev/vdb bs=1M count=100 oflag=direct,dsync
+```
+
+### Scale Up the Rook Operator
+
+Once the cluster is healthy, restore the Rook operator.
+
+```bash
+kubectl -n rook-ceph scale deploy rook-ceph-operator --replicas=1
+```
+
+### Verify Cluster Health
+
+1. Confirm that the removed OSD no longer appears in the cluster.
+
+   ```bash
+   kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- ceph osd tree
+   ```
+
+2. Verify that the cluster has returned to a healthy state.
+
+   ```bash
+   kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- ceph -s
+   ```
+
+   The output should show `HEALTH_OK` with all PGs in the `active+clean` state.
+</Steps>
+
+## References
+
+- [Rook Ceph OSD Management](https://rook.io/docs/rook/latest/Storage-Configuration/Advanced/osd-management/)
