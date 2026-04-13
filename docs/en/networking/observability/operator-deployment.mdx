@@ -1,0 +1,286 @@
+---
+weight: 30
+---
+
+# Deploy with the Operator
+
+To enable continuous network flow collection, you need:
+
+1. A reachable ClickHouse server for storing flow logs
+2. The NetObserv Operator
+3. A FlowCollector instance
+
+The ClickHouse backend can be prepared in either of these ways:
+
+- Use an existing ClickHouse server and provide its connection information in the FlowCollector configuration
+- Deploy a new ClickHouse instance in the cluster by using the ClickHouse Operator
+
+## Choose a ClickHouse Deployment Option
+
+Choose one of the following approaches before you create the FlowCollector instance:
+
+- Existing ClickHouse server: Use this option if you already have a ClickHouse deployment that FlowCollector can access.
+- New in-cluster ClickHouse instance: Use this option if you want to deploy ClickHouse in the cluster with the ClickHouse Operator.
+
+If you use an existing ClickHouse server, prepare these values in advance:
+
+- ClickHouse service address in `host:port` format
+- Database name for flow logs
+- Username and password for ClickHouse authentication
+- The namespace that will be used in `.spec.namespace` of the FlowCollector
+
+## Optional: Deploy ClickHouse with the ClickHouse Operator
+
+If you already have a ClickHouse server for NetObserv, skip this section and go to [Install the NetObserv Operator](#install-the-netobserv-operator).
+
+### Install the ClickHouse Operator
+
+1. Navigate to __Administrator__ > __Marketplace__ > __OperatorHub__.
+
+2. Search for "ClickHouse" and locate the ClickHouse Operator provided by <Term name="company"/>.
+
+3. If the ClickHouse Operator status is _Absent_, upload the ClickHouse Operator package that you downloaded from the __<Term name="company"/> Customer Portal__.
+
+4. Click on the ClickHouse Operator to open the details page.
+
+5. On the operator details page, click __Install__.
+
+6. Fill in the configuration parameters as needed.
+
+7. Click __Install__ to start the installation.
+
+8. Confirm the installation by clicking __Confirm__ in the pop-up dialog.
+
+9. Wait for the installation to complete.
+
+:::note
+If the ClickHouse Operator provided by <Term name="company"/> is already installed, skip this section and go directly to creating a ClickHouse cluster for NetObserv.
+:::
+
+### Create a ClickHouseInstallation Instance
+
+1. In the ClickHouse Operator details page, navigate to the __All Instances__ page and click __Create__.
+
+2. In the pop-up dialog, click __Create__ in the __ClickHouseInstallation__ section.
+
+3. In the __Create ClickHouseInstallation__ page, click __YAML__ on the top right corner to switch to YAML editing mode.
+
+4. Edit the YAML file as needed and click __Create__ to create the ClickHouseInstallation instance.
+
+Example ClickHouseInstallation YAML:
+
+```yaml
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: netobserv
+  namespace: cpaas-system
+spec:
+  configuration:
+    files:
+      disable-trace-log: |
+        <clickhouse>
+          <trace_log remove="remove"/>
+          <query_thread_log remove="remove"/>
+          <query_log remove="remove"/>
+          <text_log remove="remove"/>
+          <metric_log remove="remove"/>
+          <asynchronous_metric_log remove="remove"/>
+          <part_log remove="remove"/>
+        </clickhouse>
+    clusters:
+      - layout:
+          replicasCount: 1
+          shardsCount: 1
+        name: replicated
+    users:
+      clickhouse_root/networks/ip:
+        - 127.0.0.1
+        - 0.0.0.0/0
+        - ::/0
+      clickhouse_root/password_sha256_hex: e29f217ddebbd1c5b180c09067a3a459df19ed217b4d8a77338d668c366c05c8
+  defaults:
+    templates:
+      dataVolumeClaimTemplate: default
+      logVolumeClaimTemplate: log-volume-template
+      podTemplate: clickhouse:25.8
+  templates:
+    podTemplates:
+      - name: clickhouse:25.8
+        podDistribution:
+          - type: ShardAntiAffinity
+        spec:
+          containers:
+            - command:
+                - clickhouse-server
+                - --config-file=/etc/clickhouse-server/config.xml
+              env:
+                - name: CLICKHOUSE_DO_NOT_CHOWN
+                  value: "1"
+              image: build-harbor.alauda.cn/middleware/clickhouse-server:v25.8.16.34-61a7880e
+              name: clickhouse-pod
+              resources:
+                limits:
+                  cpu: "2"
+                  memory: 4Gi
+                requests:
+                  cpu: "1"
+                  memory: 2Gi
+              securityContext:
+                readOnlyRootFilesystem: true
+          securityContext:
+            fsGroup: 101
+            runAsGroup: 101
+            runAsNonRoot: true
+            runAsUser: 101
+    volumeClaimTemplates:
+      - name: default
+        spec:
+          storageClassName: sc-topolvm
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 80Gi
+      - name: log-volume-template
+        spec:
+          storageClassName: sc-topolvm
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 15Gi
+```
+
+After the ClickHouse instance is ready, get the service endpoint by inspecting field `.status.endpoint` of the ClickHouseInstallation instance.
+You can also run the following command to get the endpoint:
+
+```bash
+kubectl -n cpaas-system get chi netobserv -o jsonpath="{.status.endpoint}"
+```
+
+`cpaas-system` and `netobserv` in the command must match the namespace and name of the ClickHouseInstallation instance respectively.
+If you use a different namespace or name, replace `cpaas-system` and `netobserv` in the command accordingly.
+
+Record the ClickHouse endpoint address and credentials for later use.
+You will need this information when you create the FlowCollector instance.
+
+<a id="install-the-netobserv-operator"></a>
+
+## Install the NetObserv Operator
+
+1. Navigate to __Administrator__ > __Marketplace__ > __OperatorHub__.
+
+2. Search for "__Alauda Container Platform Network Observability Operator__".
+
+3. Click __Install__ to open the installation configuration page.
+
+4. Fill in the configuration parameters as needed.
+
+5. Click __Install__ to start the installation.
+
+6. Confirm the installation by clicking __Confirm__ in the pop-up dialog.
+
+7. Wait for the installation to complete.
+
+## Create the ClickHouse Authentication Secret
+
+Before you create the FlowCollector instance, create a Kubernetes secret for ClickHouse authentication.
+
+This secret is referenced by `.spec.clickhouse.authSecret.name` in the FlowCollector configuration.
+
+1. Create a local file named _ck-auth.env_ with the following content:
+
+    ```ini
+    username=<USERNAME>
+    password=<PASSWORD>
+    ```
+
+2. Create the Kubernetes secret:
+
+    ```bash
+    # Create namespace if it does not exist
+    test ! -n "$(kubectl get ns netobserv --ignore-not-found -o name)" && kubectl create ns netobserv
+    # Create the secret from the environment file
+    kubectl -n netobserv create secret generic ck-auth --from-env-file=./ck-auth.env
+    ```
+
+In this command, `netobserv` must match the value of `.spec.namespace` in the FlowCollector configuration.
+
+If you use a different namespace in the FlowCollector configuration, replace `netobserv` in the command accordingly.
+
+## Create a FlowCollector Instance
+
+Before creating the FlowCollector instance, confirm that:
+
+- The ClickHouse server is reachable from the cluster
+- The `ck-auth` secret exists in the namespace specified by `.spec.namespace`
+- The ClickHouse address, database, and credentials are correct
+
+Then create the FlowCollector instance:
+
+1. Navigate to the __All Instances__ page and click __Create__.
+
+2. In the pop-up dialog, click __Create__ in the __FlowCollector__ section.
+
+3. In the __Create FlowCollector__ page, click __YAML__ on the top right corner to switch to YAML editing mode.
+
+4. Edit the YAML file as needed and click __Create__ to create the FlowCollector instance.
+
+Example FlowCollector YAML:
+
+```yaml
+apiVersion: flows.netobserv.io/v1beta2
+kind: FlowCollector
+metadata:
+  name: cluster
+spec:
+  agent:
+    ebpf:
+      features: # [!code callout]
+        - DNSTracking
+        - FlowRTT
+        - PacketTranslation
+        - TLSTracking
+      metrics:
+        enable: false
+      sampling: 50 # [!code callout]
+    type: eBPF
+  clickhouse:
+    addresses: # [!code callout]
+      - clickhouse-netobserv.cpaas-system.svc.cluster.local:9000
+    authSecret:
+      name: ck-auth # [!code callout]
+    database: netobserv # [!code callout]
+    enable: true
+    protocol: native
+    readTimeout: 30s
+    retention: 24h # [!code callout]
+    writeBatchSize: 128
+    writeBatchWait: 1s
+    writeTimeout: 10s
+  deploymentModel: Service
+  namespace: netobserv # [!code callout]
+  processor:
+    consumerReplicas: 1 # [!code callout]
+    logTypes: Flows
+    service:
+      tlsType: Disabled
+```
+
+<Callouts>
+
+1. Enabled features of the eBPF agent.
+2. Sampling interval of the eBPF probe. A value of 100 means that 1 out of every 100 packets is sampled. A value of 0 or 1 means that all packets are sampled.
+3. ClickHouse server addresses. Use the `host:port` format. These addresses can point to a ClickHouse instance created in the cluster or to an existing external ClickHouse server.
+4. ClickHouse authentication secret. The secret __MUST__ contain two keys: `username` and `password`. The secret must be created in the same namespace specified by `.spec.namespace`.
+5. Database name in ClickHouse for storing flow logs. If the database does not exist, it is created automatically.
+6. Data retention period in ClickHouse. Use a number followed by a time unit, for example `24h`. This setting takes effect only when the ClickHouse table is created.
+7. Namespace where the eBPF agents and the flow logs pipeline are deployed.
+8. Number of replicas for the flow logs pipeline.
+
+</Callouts>
+
+If you are using an existing ClickHouse server, make sure that the FlowCollector can reach the server address and that the referenced secret contains valid credentials.
+
+After the FlowCollector instance is created, the eBPF agents and the flow logs pipeline are deployed to the namespace specified by `.spec.namespace`.
