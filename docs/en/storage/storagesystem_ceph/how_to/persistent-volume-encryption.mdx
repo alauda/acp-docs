@@ -1,0 +1,570 @@
+---
+weight: 72
+---
+
+# Persistent volume encryption
+
+## Overview
+
+Persistent volume (PV) encryption helps protect data confidentiality and tenant isolation for stateful workloads.
+For ACP distributed storage, encryption at rest for CSI-provisioned PVs is implemented with an external Key Management System (KMS) and an encryption-enabled StorageClass.
+
+This chapter describes how to:
+
+- Configure KMS access credentials and connection details
+- Create an encryption-enabled StorageClass
+- Enable and disable key rotation policies
+
+:::warning
+Persistent volume encryption in this chapter applies to RBD-backed PVs. Object storage buckets are not covered by this workflow.
+:::
+
+## Access configuration for Key Management System (KMS)
+
+Configure KMS access first. StorageClass-based PV encryption depends on valid KMS credentials and connection metadata.
+
+The authentication and metadata model is different for each provider mode:
+
+| Mode | `encryptionKMSType` | Authentication material |
+| --- | --- | --- |
+| Vault token mode | `vaulttokens` | Static Vault token stored in a Secret |
+| Vault tenant service account mode | `vaulttenantsa` | Kubernetes ServiceAccount identity mapped to a Vault role |
+| Thales CipherTrust Manager mode | `kmip` | KMIP endpoint + client certificate chain + key UID |
+
+> **⚠️ IMPORTANT: Alpha Feature Disclaimer**
+> 
+> Accessing the KMS using `vaulttenantsa` is in the **Alpha stage**, provided strictly for early technical validation and evaluation. As the feature provider, we offer no warranties regarding its stability, reliability, or data integrity. By configuring and using this feature, you acknowledge and accept the following technical limitations:
+> 
+> * **Not for Production Use:** This feature lacks comprehensive system-level validation. Deploying it in production environments carries a high risk of process failure or data corruption.
+> * **No SLA Guarantee:** This feature falls outside standard Service Level Agreements (SLAs). We do not guarantee technical support response times or provide emergency hotfixes.
+> * **Breaking Changes & Deprecation:** API endpoints, configuration schemas, and core processing logic are subject to backwards-incompatible changes in future releases. The feature may also be deprecated entirely without prior notice.
+> * **No Smooth Upgrade Path:** We do not provide upgrade scripts or data migration tools between versions. Upgrading to subsequent versions typically requires completely purging existing resources and performing a fresh deployment. Any resulting loss of state or data is the sole responsibility of the user.
+
+### Configuring access using `vaulttokens`
+
+**Prerequisites**
+
+- The ACP distributed storage cluster is in `Ready` state.
+- You have `cluster-admin` privileges.
+- Vault is reachable from cluster nodes.
+- You have a valid Vault token with access to the target backend path.
+
+**Procedure**
+
+1. Create a Secret that stores the Vault token.
+
+   ```bash
+   kubectl -n rook-ceph create secret generic ceph-csi-kms-token \
+     --from-literal=token='<vault_token>'
+   ```
+
+2. Create or update the KMS connection `ConfigMap` entry.
+
+   ```yaml
+   apiVersion: v1
+   kind: ConfigMap
+   metadata:
+     name: csi-kms-connection-details
+     namespace: rook-ceph
+   data:
+     vault-token-kms: |
+       {
+          "encryptionKMSType": "vaulttokens",
+          "vaultAddress": "<https://hostname_or_ip_of_vault_server:port>",
+          "vaultBackend": "<vault backend>",
+          "vaultBackendPath": "<vault backend path name>",
+          "vaultTLSServerName": "<vault TLS server name>",
+          "vaultCAVerify": "true",
+          "vaultCAFromSecret": "<secret containing CA cert>",
+          "vaultClientCertFromSecret": "<secret containing client cert>",
+          "vaultClientCertKeyFromSecret": "<secret containing client private key>"
+       }
+   ```
+
+   **Parameters**
+
+   | Parameter | Description | Required |
+   | --- | --- | --- |
+   | `encryptionKMSType` | KMS provider mode. Use `vaulttokens` for static Vault token authentication. | Yes |
+   | `vaultAddress` | Vault service endpoint, including scheme and port. | Yes |
+   | `vaultBackend` | Vault secret engine, default: kv-v2 | No |
+   | `vaultBackendPath` | Vault secret engine path used for data-encryption keys (DEKs). default: secret/| No |
+   | `vaultTLSServerName` | TLS server name for SNI and certificate hostname verification. | No |
+   | `vaultCAVerify` | Is CA authentication required when connecting to the vault server, default: true | No | 
+   | `vaultCAFromSecret` | Secret name that stores the Vault CA certificate. | No |
+   | `vaultClientCertFromSecret` | Secret name that stores the Vault client certificate. | No |
+   | `vaultClientCertKeyFromSecret` | Secret name that stores the Vault client private key. | No |
+
+**Verification steps**
+
+1. Verify the token Secret:
+
+   ```bash
+   kubectl -n rook-ceph get secret ceph-csi-kms-token
+   ```
+
+2. Verify the `ConfigMap` entry and confirm `encryptionKMSType: vaulttokens`:
+
+   ```bash
+   kubectl -n rook-ceph get configmap csi-kms-connection-details -o yaml
+   ```
+
+### Configuring access using `vaulttenantsa`
+
+**Prerequisites**
+
+- The ACP distributed storage cluster is in `Ready` state.
+- On the external key management system (KMS),
+  - Ensure that a policy exists and the key value backend path in Vault is enabled.
+  - Ensure that you are using signed certificates on your Vault servers.
+
+**Procedure**
+
+You need to configure the Kubernetes authentication method before ACP distributed storage can authenticate with and start using `Vault`. The following instructions create and configure `serviceAccount`, `ClusterRole`, and `ClusterRoleBinding` required to allow ACP distributed storage to authenticate with `Vault`.
+
+1. Create a tenant ServiceAccount in the workload namespace.
+
+   ```bash
+   kubectl -n <tenant_namespace> create serviceaccount ceph-csi-vault-sa
+   ```
+
+2. Apply RBAC resources for Vault token review in the storage namespace.
+
+   ```yaml
+   cat << EOF | kubectl create -f -
+   apiVersion: v1
+   kind: ServiceAccount
+   metadata:
+     name: rbd-csi-vault-token-review
+     namespace: rook-ceph
+   ---
+   kind: ClusterRole
+   apiVersion: rbac.authorization.k8s.io/v1
+   metadata:
+     name: rbd-csi-vault-token-review
+   rules:
+     - apiGroups: ["authentication.k8s.io"]
+       resources: ["tokenreviews"]
+       verbs: ["create", "get", "list"]
+   ---
+   kind: ClusterRoleBinding
+   apiVersion: rbac.authorization.k8s.io/v1
+   metadata:
+     name: rbd-csi-vault-token-review
+   subjects:
+     - kind: ServiceAccount
+       name: rbd-csi-vault-token-review
+       namespace: rook-ceph
+   roleRef:
+     kind: ClusterRole
+     name: rbd-csi-vault-token-review
+     apiGroup: rbac.authorization.k8s.io
+   EOF
+   ```
+
+3. Create a service-account-token Secret for the token reviewer ServiceAccount.
+
+   ```yaml
+   cat << EOF | kubectl create -f -
+   apiVersion: v1
+   kind: Secret
+   metadata:
+     name: rbd-csi-vault-token-review-token
+     namespace: rook-ceph
+     annotations:
+       kubernetes.io/service-account.name: rbd-csi-vault-token-review
+   type: kubernetes.io/service-account-token
+   EOF
+   ```
+
+4. Read the reviewer JWT, cluster CA, and API endpoint.
+
+   ```bash
+   SA_JWT_TOKEN=$(kubectl -n rook-ceph get secret rbd-csi-vault-token-review-token \
+     -o jsonpath="{.data['token']}" | base64 --decode; echo)
+   SA_CA_CRT=$(kubectl -n rook-ceph get secret rbd-csi-vault-token-review-token \
+     -o jsonpath="{.data['ca\.crt']}" | base64 --decode; echo)
+   ACP_HOST=$(kubectl config view --minify --flatten -o jsonpath="{.clusters[0].cluster.server}")
+   ```
+
+5. Configure Kubernetes authentication in Vault.
+
+   ```bash
+   vault auth enable kubernetes
+   vault write auth/kubernetes/config \
+     token_reviewer_jwt="$SA_JWT_TOKEN" \
+     kubernetes_host="$ACP_HOST" \
+     kubernetes_ca_cert="$SA_CA_CRT"
+   ```
+
+6. Create the Vault role for the tenant namespace.
+
+   ```bash
+   vault write "auth/kubernetes/role/csi-kubernetes" \
+     bound_service_account_names="ceph-csi-vault-sa" \
+     bound_service_account_namespaces="<tenant_namespace>" \
+     policies="<policy_name_in_vault>"
+   ```
+   
+   :::note
+   - `csi-kubernetes` is the default role name that ACP distributed storage looks for in Vault. 
+   - The default service account name in the tenant namespace in the ACP distributed storage cluster is `ceph-csi-vault-sa`. 
+   - These default values can be overridden by creating a ConfigMap in the tenant namespace.
+   :::
+
+7. Create or update the KMS connection entry with `encryptionKMSType: vaulttenantsa`.
+
+   ```yaml
+   apiVersion: v1
+   kind: ConfigMap
+   metadata:
+     name: csi-kms-connection-details
+     namespace: rook-ceph
+   data:
+     vault-tenant-sa-kms: |
+       {
+          "encryptionKMSType": "vaulttenantsa",
+          "vaultAddress": "<https://hostname_or_ip_of_vault_server:port>",
+          "vaultTLSServerName": "<vault TLS server name>",
+          "vaultAuthPath": "/v1/auth/kubernetes/login",
+          "vaultAuthNamespace": "<vault auth namespace name>"
+          "vaultNamespace": "<vault namespace name>",
+          "vaultBackendPath": "<vault backend path name>",
+          "vaultCAFromSecret": "<secret containing CA cert>",
+          "vaultClientCertFromSecret": "<secret containing client cert>",
+          "vaultClientCertKeyFromSecret": "<secret containing client private key>",
+          "tenantSAName": "<service account name in the tenant namespace>"
+       }
+   ```
+
+   **Parameters**
+
+   | Parameter | Description | Required |
+   | --- | --- | --- |
+   | `encryptionKMSType` | Set to vaulttenantsa to use service accounts for authentication with vault. | Yes |
+   | `vaultAddress` | The hostname or IP address of the vault server with the port number. | Yes |
+   | `vaultBackendPath` | The backend path in Vault where the encryption keys will be stored. | No |
+   | `vaultTLSServerName` | TLS server name used to validate the Vault certificate hostname. | No |
+   | `vaultAuthPath` | The path where kubernetes auth method is enabled in Vault. The default path is `kubernetes`. If the auth method is enabled in a different path other than `kubernetes`, this variable needs to be set as `/v1/auth/<path>/login`. | No |
+   | `vaultAuthNamespace` | The Vault namespace where kubernetes auth method is enabled. | No |
+   | `vaultNamespace` | The Vault namespace where the backend path being used to store the keys exists. | No |
+   | `vaultCAFromSecret` | Secret containing Vault CA certificate used by CSI. | No |
+   | `vaultClientCertFromSecret` | Secret containing client certificate for mTLS to Vault. | No |
+   | `vaultClientCertKeyFromSecret` | Secret containing private key matching `vaultClientCertFromSecret`. | No |
+   | `vaultRole` | Vault Kubernetes auth role bound to tenant ServiceAccount and policy. | No |
+   | `tenantSAName` | Tenant ServiceAccount name used by workloads, typically `ceph-csi-vault-sa`. | No |
+
+**Verification steps**
+
+1. Verify ServiceAccount creation:
+
+   ```bash
+   kubectl -n <tenant_namespace> get sa ceph-csi-vault-sa
+   kubectl -n rook-ceph get sa rbd-csi-vault-token-review
+   ```
+
+2. Verify token review permission:
+
+   ```bash
+   kubectl auth can-i create tokenreviews.authentication.k8s.io \
+     --as=system:serviceaccount:rook-ceph:rbd-csi-vault-token-review
+   ```
+
+3. Verify the `ConfigMap` entry and confirm `encryptionKMSType: vaulttenantsa` and `tenantSAName`.
+4. Create a test encrypted PVC in `<tenant_namespace>` and verify that it binds successfully.
+
+### Configuring access using Thales CipherTrust Manager (`kmip`)
+
+**Prerequisites**
+
+- You have access to Thales CipherTrust Manager with KMIP enabled.
+- You have the KMIP endpoint (`<kmip_address>:5696`), client certificate chain, and key unique identifier (UID).
+- You have permissions to create Secrets and ConfigMaps in `rook-ceph`.
+
+**Procedure**
+
+1. In Thales CipherTrust Manager, create a KMIP client profile and register a client.
+2. Download the client certificate, private key, and CA certificate from the profile.
+3. Create a Secret for KMIP client credentials.
+
+   ```bash
+   kubectl -n rook-ceph create secret generic thales-kmip-client \
+     --from-file=client.crt=<client_crt_path> \
+     --from-file=client.key=<client_key_path> \
+     --from-file=ca.crt=<ca_crt_path>
+   ```
+
+4. Create or update the KMS connection `ConfigMap` entry.
+
+   ```yaml
+   apiVersion: v1
+   kind: ConfigMap
+   metadata:
+     name: csi-kms-connection-details
+     namespace: rook-ceph
+   data:
+     thales-kmip-kms: |
+       {
+         "encryptionKMSType": "kmip",
+         "kmipAddress": "<kmip_address>",
+         "kmipPort": 5696,
+         "kmipCAPath": "/etc/ceph-csi-kms-config/ca.crt",
+         "keyIdentifier": "<thales_key_uid>"
+       }
+   ```
+
+**Verification steps**
+
+1. Verify KMIP credential Secret:
+
+   ```bash
+   kubectl -n rook-ceph get secret thales-kmip-client
+   ```
+
+2. Verify the `ConfigMap` entry and confirm `encryptionKMSType: kmip`.
+3. Confirm the key UID in the KMS entry matches the key generated in Thales CipherTrust Manager.
+
+:::note
+For `kmip`, the critical difference is that encryption keys are resolved using the KMIP key UID and mutual TLS trust chain, not a Vault token.
+:::
+
+## Creating a StorageClass for persistent volume encryption
+
+After KMS access is configured, create a StorageClass with encryption parameters.
+
+### Prerequisites
+
+- You have permission to create StorageClasses.
+- You know the target KMS configuration ID (`<kms_config_id>`).
+
+### Procedure
+
+1. Go to **Administrator**.
+
+2. In the left navigation bar, click **Storage** > **StorageClasses**.
+
+3. Click **Create Storage Class**.
+
+   **Note**: The following content is an example in form format, you can also choose YAML to complete the operation.
+
+4. Select **CephRBD Block Storage**, and click **Next**.
+
+5. Switch to YAML view
+
+6. Enable encryption in parameters:
+   - `encrypted: "true"`
+   - `encryptionKMSID: "<kms_config_id>"`
+
+7. Click **Create**.
+
+### Verification steps
+
+1. Verify StorageClass parameters:
+
+   ```bash
+   kubectl get sc encrypted-rbd-sc -o yaml
+   ```
+
+2. Confirm `encrypted: "true"` and the expected `encryptionKMSID` are present.
+3. Create a test PVC with this StorageClass and confirm it reaches `Bound` state:
+
+   ```yaml
+   apiVersion: v1
+   kind: PersistentVolumeClaim
+   metadata:
+     name: encrypted-rbd-pvc
+   spec:
+     accessModes:
+       - ReadWriteOnce
+     resources:
+       requests:
+         storage: 1Gi
+     storageClassName: encrypted-rbd-sc
+   ```
+
+   ```bash
+   kubectl apply -f <encrypted-rbd-pvc.yaml>
+   kubectl get pvc encrypted-rbd-pvc
+   ```
+
+## Overriding Vault connection details using tenant ConfigMap
+
+The Vault connections details can be reconfigured per tenant by creating a ConfigMap in the ACP namespace with configuration options that differ from the values set in the `csi-kms-connection-details` ConfigMap in the `rook-ceph` namespace. The ConfigMap needs to be located in the tenant namespace. The values in the ConfigMap in the tenant namespace will override the values set in the `csi-kms-connection-details` ConfigMap for the encrypted Persistent Volumes created in that namespace.
+
+**Procedure**
+
+1. In the ACP console, navigate to **Alauda Container Platform** -> **Configuration** -> **ConfigMaps**.
+2. Switch to the target tenant project/namespace.
+3. Click **Create ConfigMap**, and enter `ceph-csi-kms-config` as the name.
+4. Add tenant-specific Vault override values:
+
+   ```yaml
+   apiVersion: v1
+   kind: ConfigMap
+   metadata:
+     name: ceph-csi-kms-config
+     namespace: <tenant_namespace>
+   data:
+     vaultAddress: "<vault_address:port>"
+     vaultBackendPath: "<backend_path>"
+     vaultTLSServerName: "<vault_tls_server_name>"
+     vaultNamespace: "<vault_namespace>"
+   ```
+
+6. Click **Create**.
+
+**Verification steps**
+
+1. Verify the tenant override ConfigMap:
+
+   ```bash
+   kubectl -n <tenant_namespace> get configmap ceph-csi-kms-config -o yaml
+   ```
+
+2. Create a new encrypted PVC in the same namespace and confirm it reaches `Bound`.
+3. If key access fails, check namespace events and CSI provisioner logs for Vault endpoint and auth-path mismatch.
+
+## Enabling and disabling key rotation(Optional)
+
+Key rotation supports periodic refresh of encryption keys used by encrypted PVs.
+
+### Prerequisites
+
+- Please ensure that the following two images have been uploaded to the platform's private image repository:
+  - `quay.io/csiaddons/k8s-controller:v0.14.0` -> `<registry>/csiaddons/k8s-controller:v0.14.0`
+  - `quay.io/csiaddons/k8s-sidecar:v0.14.0` -> `<registry>/csiaddons/k8s-sidecar:v0.14.0`
+
+### Setup Environment For Volume Replication
+
+1. **Setup CsiAddons Controller**
+
+    Execute the following commands on Control nodes:
+
+    ```bash
+    kubectl create -f https://raw.githubusercontent.com/csi-addons/kubernetes-csi-addons/v0.14.0/deploy/controller/crds.yaml
+    kubectl create -f https://raw.githubusercontent.com/csi-addons/kubernetes-csi-addons/v0.14.0/deploy/controller/setup-controller.yaml
+    kubectl create -f https://raw.githubusercontent.com/csi-addons/kubernetes-csi-addons/v0.14.0/deploy/controller/rbac.yaml
+    kubectl create -f https://raw.githubusercontent.com/csi-addons/kubernetes-csi-addons/v0.14.0/deploy/controller/csi-addons-config.yaml
+
+    kubectl -n csi-addons-system set image deployment/csi-addons-controller-manager manager=<registry>/csiaddons/k8s-controller:v0.14.0
+    ```
+
+    **Parameters**:
+    - `<registry>`: Registry address of platform.
+
+2. **Enable CsiAddons sidecar**
+
+    Execute the following commands on Control nodes:
+
+    ```bash
+    kubectl patch cm rook-ceph-operator-config -n rook-ceph --type json --patch \
+    '[
+      {
+        "op": "add",
+        "path": "/data/CSI_ENABLE_CSIADDONS",
+        "value": "true"
+      },
+      {
+        "op": "add",
+        "path": "/data/ROOK_CSIADDONS_IMAGE",
+        "value": "<registry>/csiaddons/k8s-sidecar:v0.14.0"
+      }
+    ]'
+    ```
+
+    Wait for all csi pods to restart successfully
+    
+    ```bash
+    kubectl get po -n rook-ceph -w | grep csi
+    ```
+
+### (Optional)Enforcing precedence for key rotation
+
+In key rotation, precedence refers to the order in which the system checks for scheduled annotations. The default precedence is set to storage class (recommended). This means the system reads annotations only from the storage class.
+
+However, if you want the system to check the persistent volume claim (PVC) first and then fall back to the storage class, you can configure this behavior by setting the schedule-precedence to PVC in the CSI-addons ConfigMap.
+
+You can define the ConfigMap for csi-addons as shown below:
+
+   ```yaml
+   apiVersion: v1
+   kind: ConfigMap
+   metadata:
+     name: csi-addons-config
+     namespace: rook-ceph
+   data:
+     schedule-precedence: "pvc"
+   ```
+
+Restart the csi-addons operator pod for the changes to take effect:
+
+   ```bash
+   kubectl apply -f <csi-addons-config.yaml>
+   kubectl -n rook-ceph delete pod -l app.kubernetes.io/name=csi-addons
+   ```
+
+### Enabling key rotation
+
+To enable key rotation, add the annotation `keyrotation.csiaddons.openshift.io/schedule: <value>` to PersistentVolumeClaims, Namespace, or StorageClass (in the decreasing order of precedence).
+
+`<value>` can be `@hourly`, `@daily`, `@weekly`, `@monthly`, or `@yearly`. If `<value>` is empty, the default is `@weekly`. The below examples use `@weekly`.
+
+**Annotating Namespace**
+
+   ```bash
+   kubectl annotate namespace <tenant_namespace> \
+     "keyrotation.csiaddons.openshift.io/schedule=@weekly"
+   ```
+
+**Annotating StorageClass**
+
+   ```bash
+   kubectl annotate storageclass encrypted-rbd-sc \
+     "keyrotation.csiaddons.openshift.io/schedule=@weekly"
+   ```
+
+**Annotating PersistentVolumeClaims**
+
+   ```bash
+   kubectl annotate pvc <encrypted_pvc_name> \
+     "keyrotation.csiaddons.openshift.io/schedule=@weekly"
+   ```
+
+### Disabling key rotation
+
+You can disable key rotation for the following:
+
+- All the persistent volume claims (PVCs) of storage class
+- A specific PVC
+
+**Disabling key rotation for all PVCs of a storage class**
+
+  ```bash
+  kubectl annotate storageclass encrypted-rbd-sc \
+    "keyrotation.csiaddons.openshift.io/enable=false" --overwrite
+  ```
+
+**Disabling key rotation for a specific persistent volume claim**
+
+1. Identify the `EncryptionKeyRotationCronJob` CR for the PVC you want to disable key rotation on:
+
+    ```bash
+    kubectl get encryptionkeyrotationcronjob -o jsonpath='{range .items[?(@.spec.jobTemplate.spec.target.persistentVolumeClaim=="<PVC_NAME>")]}{.metadata.name}{"\n"}{end}'
+    ```
+    Where `<PVC_NAME>` is the name of the PVC that you want to disable.
+
+2. Apply the following to the `EncryptionKeyRotationCronJob` CR from the previous step to disable the key rotation:
+
+    - Update the csiaddons.openshift.io/state annotation from managed to unmanaged:
+    
+        ```bash
+        kubectl annotate encryptionkeyrotationcronjob <encryptionkeyrotationcronjob_name> "csiaddons.openshift.io/state=unmanaged" --overwrite=true
+        ```
+        Where `<encryptionkeyrotationcronjob_name>` is the name of the `EncryptionKeyRotationCronJob` CR.
+
+    - Add suspend: true under the spec field:
+
+        ```bash
+        kubectl patch encryptionkeyrotationcronjob <encryptionkeyrotationcronjob_name> -p '{"spec": {"suspend": true}}' --type=merge.
+        ```
+3. Save and exit. The key rotation will be disabled for the PVC.
