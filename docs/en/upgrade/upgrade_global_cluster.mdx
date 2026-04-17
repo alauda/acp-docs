@@ -315,6 +315,16 @@ After the standby global cluster has reached the desired version, run the remain
 
 Before reinstalling the plugin, verify that port `2379` is forwarded correctly from both global-cluster VIPs to their control plane nodes when that forwarding mode is used. Port forwarding through a load balancer is not required if the standby global cluster can access the active global cluster directly.
 
+Before reinstalling the plugin, create or update the `etcd-sync-active-cluster-token` Secret in `cpaas-system`. The Secret must store a bearer token for accessing the active global cluster API server under the data key `token`. Use this Secret through **Active Global Cluster Token Secret**. Legacy plain-token configuration remains only as a compatibility fallback and is not the recommended operational path.
+
+```bash
+# Run this command on the standby cluster.
+ACTIVE_CLUSTER_TOKEN='<paste-your-token-here>'
+kubectl -n cpaas-system create secret generic etcd-sync-active-cluster-token \
+  --from-literal=token="${ACTIVE_CLUSTER_TOKEN}" \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
 To reinstall the plugin:
 
 1. Access the **standby global cluster** Web Console through its VIP and switch to **Administrator** view.
@@ -323,23 +333,40 @@ To reinstall the plugin:
 
 When you configure the plugin:
 
+- Set **Active Global Cluster VIP** to the VIP of the active global cluster.
 - When port `2379` is not forwarded through a load balancer, set **Active Global Cluster ETCD Endpoints** correctly.
+- Set **Standby Cluster ETCD Endpoints** to the standby cluster etcd address. Use the default value unless the local etcd service is exposed through a different endpoint.
+- Set **Active Global Cluster Token Secret** to `etcd-sync-active-cluster-token`.
 - Use the default value of **Data Check Interval**.
 - Leave **Print detail logs** disabled unless you are troubleshooting.
 
-Verify the sync Pod is running on the standby global cluster:
+During reinstallation, the system runs the `etcd-sync-bootstrap` Job before the `etcd-sync` Deployment starts. The release continues only after the Job prepares `remote-etcd-ca`, `remote-etcd-issuer`, and `remote-etcd-client`.
+
+Verify the bootstrap Job and runtime resources:
+
+```bash
+kubectl get job -n cpaas-system etcd-sync-bootstrap
+kubectl logs -n cpaas-system job/etcd-sync-bootstrap
+kubectl get secret -n cpaas-system remote-etcd-ca
+kubectl get issuer -n cpaas-system remote-etcd-issuer
+kubectl get certificate -n cpaas-system remote-etcd-client
+kubectl get secret -n cpaas-system remote-etcd-client
+```
+
+Verify the sync Pods are running on the standby global cluster and identify the current leader:
 
 ```bash
 kubectl get po -n cpaas-system -l app=etcd-sync
-etcd_sync_pod=$(kubectl get po -n cpaas-system -l app=etcd-sync -o jsonpath='{.items[0].metadata.name}')
-kubectl logs -n cpaas-system "$etcd_sync_pod" | grep -i "Start Sync update"
+kubectl get lease -n cpaas-system etcd-sync-mirror
+leader_pod=$(kubectl get lease -n cpaas-system etcd-sync-mirror -o jsonpath='{.spec.holderIdentity}')
+kubectl logs -n cpaas-system "$leader_pod" | grep -E "Acquired leader lease|Start Sync update"
 ```
 
-Once `Start Sync update` appears, recreate one of the Pods to trigger synchronization of resources with ownerReference dependencies:
+If resources with `ownerReference` dependencies need to be resynchronized, recreate the current leader Pod after `Start Sync update` appears:
 
 ```bash
-etcd_sync_pod=$(kubectl get po -n cpaas-system -l app=etcd-sync -o jsonpath='{.items[0].metadata.name}')
-kubectl delete po -n cpaas-system "$etcd_sync_pod"
+leader_pod=$(kubectl get lease -n cpaas-system etcd-sync-mirror -o jsonpath='{.spec.holderIdentity}')
+kubectl delete po -n cpaas-system "$leader_pod"
 ```
 
 Check sync status:
@@ -357,8 +384,12 @@ curl -g "http://${mirror_host}/check"
 
 Output interpretation:
 
-- `LOCAL ETCD missed keys`: Keys exist in the primary global cluster but are missing from the standby. This often resolves after restarting one `etcd-sync` Pod.
+- `LOCAL ETCD missed keys`: Keys exist in the primary global cluster but are missing from the standby. This often resolves after restarting the current `etcd-sync` leader Pod.
 - `LOCAL ETCD surplus keys`: Keys exist in the standby global cluster but not in the primary. Review these with your operations team before deleting them.
+
+After verification succeeds, remove any remaining legacy plain-token configuration from the plugin settings or release values.
+
+If the active-cluster token or the remote `etcd-ca` changes later, run the plugin upgrade or reinstall workflow again so that the `etcd-sync-bootstrap` hook refreshes the runtime credentials and certificates.
 
 </Steps>
 
