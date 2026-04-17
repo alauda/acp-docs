@@ -2,66 +2,82 @@
 weight: 16
 ---
 
-# Configuring Kube-OVN Network to Support Pod Multi-Network Interfaces (Alpha)
+# Configuring Kube-OVN Network to Support Pod Multi-Network Interfaces
 
-By using Multus CNI, you can add multiple network interfaces with different networks to Pods. Use Kube-OVN network's Subnet and IP CRDs for advanced IP management, implementing subnet management, IP reservation, random allocation, fixed allocation, and other features.
+This guide describes how to configure Kube-OVN so that a Pod can use multiple network interfaces.
+
+With Multus CNI and Kube-OVN, you can attach a secondary network to a Pod and manage IP addresses for that network through Kube-OVN Subnet and IPAM.
+
+:::tip
+- IPv4, IPv6 and dual-stack networks are all supported for both primary and secondary network interfaces.
+- Both underlay and overlay networks are supported as secondary networks.
+:::
+
+## Before You Begin
+
+Make sure the following conditions are met:
+
+- The cluster uses Kube-OVN as the network plugin.
+- You have permissions to install cluster plugins and create Kubernetes resources.
+- `kubectl` is configured and can access the target cluster.
 
 ## Installing Multus CNI
 
 ### Deploying the Multus CNI Plugin \{#deploying-the-multus-cni-plugin}
 
-1. Go to **Administrator**.
+1. Navigate to **Administrator** > **Marketplace** > **Cluster Plugins**.
 
-2. In the left navigation bar, click **Marketplace** > **Cluster Plugins**.
+2. Search "multus" and select **"Alauda Container Platform Networking for Multus"**.
 
-3. In the search bar, type "multus" to find the Multus CNI plugin.
+3. If the plugin is not installed, click the three dots (⋮) on the right and select **Install**.
 
-4. Locate the **"Alauda Container Platform Networking for Multus"** plugin in the list.
-
-5. Click the three dots (⋮) next to the plugin entry and select **Install**.
-
-6. The plugin will be deployed to your cluster. You can monitor the installation status in the **State** column.
+4. Wait for the plugin state to change to "Installed".
 
 :::note
 The Multus CNI plugin serves as middleware between other CNI plugins and Kubernetes, enabling Pods to have multiple network interfaces.
 :::
 
-## Creating Subnets
+## Create the Secondary Network
 
-Create an attachnet subnet according to the following example: `network-attachment-definition.yml`.
+To add a secondary network interface to a Pod, first create a NetworkAttachmentDefinition for that network.
+
+Example: `network-attachment-definition.yml`
 
 :::note
 The provider format in config is `<NAME>.<NAMESPACE>.ovn`, where `<NAME>` and `<NAMESPACE>` are the name and namespace of this NetworkAttachmentDefinition CR respectively.
+
+If you use an underlay secondary network, set `spec.vlan` in the Subnet to the target VLAN CR name.
 :::
 
 ```yaml
-apiVersion: 'k8s.cni.cncf.io/v1'
+apiVersion: k8s.cni.cncf.io/v1
 kind: NetworkAttachmentDefinition
 metadata:
   name: attachnet
   namespace: default
 spec:
-  config: '{
-    "cniVersion": "0.3.0",
-    "type": "kube-ovn",
-    "server_socket": "/run/openvswitch/kube-ovn-daemon.sock",
-    "provider": "attachnet.default.ovn"
-    }'
+  config: |-
+    {
+      "cniVersion": "0.3.0",
+      "type": "kube-ovn",
+      "server_socket": "/run/openvswitch/kube-ovn-daemon.sock",
+      "provider": "attachnet.default.ovn"
+    }
 ```
 
-After creation, apply the resource:
+Apply the resource:
 
 ```bash
 kubectl apply -f network-attachment-definition.yml
 ```
 
-Use the following example to create the Kube-OVN subnet for the second network interface: `subnet.yml`.
+Then create a Kube-OVN subnet for the secondary network interface.
+
+Example: `subnet.yml`
 
 :::note
-
-- `spec.provider` must be consistent with the provider in NetworkAttachmentDefinition.
-- If you need to use an Underlay subnet, set the `spec.vlan` of the subnet to the VLAN CR name you want to use. Configure other subnet parameters as needed.
-  :::
+`spec.provider` MUST be consistent with the provider in NetworkAttachmentDefinition.
+:::
 
 ```yaml
 apiVersion: kubeovn.io/v1
@@ -69,25 +85,24 @@ kind: Subnet
 metadata:
   name: subnet1
 spec:
-  cidrBlock: 172.170.0.0/16
+  cidrBlock: 172.22.0.0/16
   provider: attachnet.default.ovn
 ```
 
-After creation, apply the resource:
+Apply the resource:
 
 ```bash
 kubectl apply -f subnet.yml
 ```
 
-## Creating Pod with Multiple Network Interfaces
+## Create a Pod with Multiple Network Interfaces
 
-Create a pod according to the following example.
+After the secondary network is ready, create a Pod and reference the NetworkAttachmentDefinition in `metadata.annotations`.
 
 :::note
-
-- The `metadata.annotations` must contain a key-value pair `k8s.v1.cni.cncf.io/networks=default/attachnet`, where the value format is `<NAMESPACE>/<NAME>`, and `<NAMESPACE>` and `<NAME>` are the namespace and name of the NetworkAttachmentDefinition CR respectively.
-- If the Pod needs three network interfaces, configure the value of `k8s.v1.cni.cncf.io/networks` as `default/attachnet,default/attachnet2`.
-  :::
+- The annotation `k8s.v1.cni.cncf.io/networks` uses the format `<NAMESPACE>/<NAME>`, where `<NAMESPACE>` and `<NAME>` are the namespace and name of the corresponding NetworkAttachmentDefinition.
+- If the Pod needs more than two network interfaces, specify multiple values separated by commas, for example `default/attachnet,default/attachnet2`.
+:::
 
 ```yaml
 apiVersion: v1
@@ -104,14 +119,114 @@ spec:
         - containerPort: 80
 ```
 
-After the Pod is created successfully, use the command `kubectl exec pod1 -- ip a` to view the Pod's IP addresses.
+For workloads that require multiple network interfaces, you can also specify the network attachment annotation in the Pod template of a higher-level controller such as Deployment or StatefulSet. Example:
 
-## Verifying Dual Network Interface Creation
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-deployment
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+      annotations:
+        k8s.v1.cni.cncf.io/networks: default/attachnet
+    spec:
+      containers:
+        - name: web
+          image: nginx:latest
+          ports:
+            - containerPort: 80
+```
 
-Use the following command to verify that the dual network interfaces have been created successfully:
+## Verify the Network Interfaces
+
+After the Pod is running, verify the result by using the following methods.
+
+### Method 1: Check Pod Annotations
+
+Run the following command:
 
 ```bash
-kubectl exec pod1 -- ip a
+kubectl get pod pod1 -o yaml
+```
+
+Check the relevant annotations in the output:
+
+```yaml
+metadata:
+  annotations:
+    attachnet.default.ovn.kubernetes.io/allocated: "true"
+    attachnet.default.ovn.kubernetes.io/cidr: 172.22.0.0/16
+    attachnet.default.ovn.kubernetes.io/gateway: 172.22.0.1
+    attachnet.default.ovn.kubernetes.io/ip_address: 172.22.0.23
+    attachnet.default.ovn.kubernetes.io/logical_router: ovn-cluster
+    attachnet.default.ovn.kubernetes.io/logical_switch: subnet1
+    attachnet.default.ovn.kubernetes.io/mac_address: 02:66:77:88:99:aa
+    attachnet.default.ovn.kubernetes.io/pod_nic_type: veth-pair
+    attachnet.default.ovn.kubernetes.io/routed: "true"
+    k8s.v1.cni.cncf.io/network-status: |-
+      [{
+          "name": "kube-ovn",
+          "interface": "eth0",
+          "ips": [
+              "10.24.0.18/16"
+          ],
+          "mac": "02:11:22:33:44:55",
+          "default": true,
+          "dns": {},
+          "gateway": [
+              "10.24.0.1"
+          ]
+      },{
+          "name": "default/attachnet",
+          "interface": "net1",
+          "ips": [
+              "172.22.0.23"
+          ],
+          "mac": "02:66:77:88:99:aa",
+          "dns": {}
+      }]
+    k8s.v1.cni.cncf.io/networks: default/attachnet
+    ovn.kubernetes.io/allocated: "true"
+    ovn.kubernetes.io/cidr: 10.24.0.0/16
+    ovn.kubernetes.io/gateway: 10.24.0.1
+    ovn.kubernetes.io/ip_address: 10.24.0.18/16
+    ovn.kubernetes.io/logical_router: ovn-cluster
+    ovn.kubernetes.io/logical_switch: ovn-default
+    ovn.kubernetes.io/mac_address: 02:11:22:33:44:55
+    ovn.kubernetes.io/pod_nic_type: veth-pair
+    ovn.kubernetes.io/routed: "true"
+```
+
+Annotation `k8s.v1.cni.cncf.io/network-status` shows the status of all network interfaces of this Pod, including the primary interface and secondary interfaces.
+In this example, the Pod has two network interfaces: `eth0` is the primary interface, and `net1` is the secondary interface.
+
+### Method 2: Check Network Interfaces from Inside the Pod
+
+Run one of the following commands:
+
+```bash
+kubectl exec pod1 -- ifconfig
+```
+
+```bash
+kubectl exec pod1 -- ip addr show
+```
+
+:::note
+The command availability depends on the container image. If one command is not available in the image, use the other one.
+:::
+
+Example output of `ip addr show`:
+
+```txt
 1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN qlen 1000
     link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
     inet 127.0.0.1/8 scope host lo
@@ -119,48 +234,154 @@ kubectl exec pod1 -- ip a
     inet6 ::1/128 scope host
        valid_lft forever preferred_lft forever
 151: eth0@if152: <BROADCAST,MULTICAST,UP,LOWER_UP,M-DOWN> mtu 1400 qdisc noqueue state UP
-    link/ether a6:3c:d8:ae:83:06 brd ff:ff:ff:ff:ff:ff
-    inet 10.3.0.8/16 brd 10.3.255.255 scope global eth0
+    link/ether 02:11:22:33:44:55 brd ff:ff:ff:ff:ff:ff
+    inet 10.24.0.18/16 brd 10.24.255.255 scope global eth0
        valid_lft forever preferred_lft forever
-    inet6 fe80::a43c:d8ff:feae:8306/64 scope link
+    inet6 fe80::11:22ff:fe33:4455/64 scope link
        valid_lft forever preferred_lft forever
 153: net1@if154: <BROADCAST,MULTICAST,UP,LOWER_UP,M-DOWN> mtu 1400 qdisc noqueue state UP
-    link/ether 0a:36:08:01:dc:df brd ff:ff:ff:ff:ff:ff
-    inet 172.170.0.3/16 brd 172.170.255.255 scope global net1
+    link/ether 02:66:77:88:99:aa brd ff:ff:ff:ff:ff:ff
+    inet 172.22.0.23/16 brd 172.22.255.255 scope global net1
        valid_lft forever preferred_lft forever
-    inet6 fe80::836:8ff:fe01:dcdf/64 scope link
+    inet6 fe80::66:77ff:fe88:99aa/64 scope link
        valid_lft forever preferred_lft forever
 ```
 
-## Additional Features
+### Method 3: Check Kube-OVN IP Resources
+
+Run the following command to verify IP allocation records for both interfaces:
+
+```bash
+kubectl get ip | grep -w pod1.default
+```
+
+Example output:
+
+```txt
+NAME                                V4IP         V6IP  MAC                NODE    SUBNET
+pod1.default                        10.24.0.18         02:11:22:33:44:55  node-1  ovn-default
+pod1.default.attachnet.default.ovn  172.22.0.23        02:66:77:88:99:aa  node-1  subnet1
+```
+
+## Optional Configurations
 
 ### Fixed IP
 
-- **Primary Network Interface (First Interface)**: If you need to fix the IP of the primary network interface, the method is the same as using a fixed IP with a single network interface. Add the annotation `ovn.kubernetes.io/ip_address=<IP>` to the Pod.
+- **Primary network interface**: To assign a fixed IP address to the primary interface, add the annotation `ovn.kubernetes.io/ip_address=<IP>` to the Pod.
 
-- **Secondary Network Interface (Second Interface or Other Interfaces)**: The basic method is similar to the primary network interface, with the difference that the `ovn` in the Annotation Key is replaced with the corresponding NetworkAttachmentDefinition provider. Example: `attachnet.default.ovn.kubernetes.io/ip_address=172.170.0.101`.
+- **Secondary network interface**: To assign a fixed IP address to a secondary interface, replace `ovn` in the annotation key with the corresponding NetworkAttachmentDefinition provider. Example: `attachnet.default.ovn.kubernetes.io/ip_address=172.22.0.101`.
+
+:::tip
+For workloads such as Deployment or StatefulSet, you can specify the fixed IP annotation in the Pod template.
+:::
 
 ### Additional Routes
 
-Starting from version 1.8.0, Kube-OVN supports configuring additional routes for secondary network interfaces. When using this feature, add the `routers` field to the config in NetworkAttachmentDefinition and fill in the routes you need to configure. Example:
+You can configure additional routes for all Pods that reference the same NetworkAttachmentDefinition or a specific Pod/Workload.
+
+#### Configure Additional Routes for All Pods Referencing the Same NetworkAttachmentDefinition
+
+To configure additional routes for all secondary network interfaces that reference the same NetworkAttachmentDefinition, add the `routes` field in the NetworkAttachmentDefinition config. Example:
 
 ```yaml
-apiVersion: 'k8s.cni.cncf.io/v1'
+apiVersion: k8s.cni.cncf.io/v1
 kind: NetworkAttachmentDefinition
 metadata:
   name: attachnet
   namespace: default
 spec:
-  config: '{
-    "cniVersion": "0.3.0",
-    "type": "kube-ovn",
-    "server_socket": "/run/openvswitch/kube-ovn-daemon.sock",
-    "provider": "attachnet.default.ovn",
-    "routes": [{
-      "dst": "19.10.0.0/16"
-    }, {
-      "dst": "19.20.0.0/16",
-      "gw": "19.10.0.1"
-    }]
-  }'
+  config: |-
+    {
+      "cniVersion": "0.3.0",
+      "type": "kube-ovn",
+      "server_socket": "/run/openvswitch/kube-ovn-daemon.sock",
+      "provider": "attachnet.default.ovn",
+      "routes": [{
+        "dst": "192.168.10.0/24",
+        "gw": "172.22.0.101"
+      }, {
+        "dst": "192.168.20.0/24",
+        "gw": "172.22.0.102"
+      }]
+    }
 ```
+
+:::note
+Replace the route gateway values with valid addresses that are reachable from the secondary network in your environment.
+:::
+
+#### Configure Additional Routes for a Specific Pod/Workload
+
+To configure additional routes for a specific secondary network interface, add the annotation `attachnet.default.ovn.kubernetes.io/routes` to the Pod. Example:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod1
+  annotations:
+    k8s.v1.cni.cncf.io/networks: default/attachnet
+    attachnet.default.ovn.kubernetes.io/routes: |-
+      [{
+        "dst": "192.168.10.0/24",
+        "gw": "172.22.0.101"
+      }]
+spec:
+  containers:
+    - name: web
+      image: nginx:latest
+      ports:
+        - containerPort: 80
+```
+
+For workloads such as Deployment or StatefulSet, you can also specify the routes annotation in the Pod template. Example:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-deployment
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+      annotations:
+        k8s.v1.cni.cncf.io/networks: default/attachnet
+        attachnet.default.ovn.kubernetes.io/routes: |-
+          [{
+            "dst": "192.168.10.0/24",
+            "gw": "172.22.0.101"
+          }]
+    spec:
+      containers:
+        - name: web
+          image: nginx:latest
+          ports:
+            - containerPort: 80
+```
+
+### Verify Additional Routes in the Pod Route Table
+
+After configuring routes, verify the effective route entries inside the Pod:
+
+```bash
+kubectl exec pod1 -- route -n
+```
+
+Example output:
+
+```txt
+Kernel IP routing table
+Destination     Gateway         Genmask         Flags Metric Ref    Use Iface
+0.0.0.0         10.24.0.1       0.0.0.0         UG    0      0        0 eth0
+10.24.0.0       0.0.0.0         255.255.0.0     U     0      0        0 eth0
+172.22.0.0      0.0.0.0         255.255.0.0     U     0      0        0 net1
+192.168.10.0    172.22.0.101    255.255.255.0   UG    0      0        0 net1
+```
+
+If the corresponding destination and gateway route does not appear in the output, check the `routes` configuration in NetworkAttachmentDefinition or Pod annotations, and then recreate the Pod to re-apply CNI configuration.
