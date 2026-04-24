@@ -4,29 +4,58 @@ weight: 15
 
 # Configure Egress Gateway
 
-## About Egress Gateway
+## Overview
 
-Egress Gateway is used to control external network access for Pods with a group of static addresses and has the following features:
+Egress Gateway, also called VPC Egress Gateway, provides stable outbound addresses for Pods in an overlay network.
+It routes selected workloads through dedicated gateway Pods before the traffic leaves the cluster.
 
-- Achieves Active-Active high availability through ECMP, enabling horizontal throughput scaling
-- Implements fast failover \(\<1s\) via BFD
-- Supports IPv6 and dual-stack
-- Enables granular routing control through NamespaceSelector and PodSelector
-- Allows flexible scheduling of Egress Gateway through NodeSelector
+Use Egress Gateway when you need:
 
-At the same time, Egress Gateway has the following limitations:
+- Stable source IP addresses for specific workloads
+- Workload-level egress control instead of subnet-level control
+- Higher throughput through horizontal scaling
+- Faster failover for outbound traffic
 
-- Uses macvlan for underlying network connectivity, requiring Underlay support from the underlying network
-- In multi-instance Gateway mode, multiple Egress IPs are required
-- Currently, only supports SNAT; EIP and DNAT are not supported
-- Currently, recording source address translation relationships is not supported
+Main capabilities:
 
-### Implementation Details
+- Active-Active high availability through ECMP, with horizontal throughput scaling
+- Fast failover through BFD, typically in less than 1 second
+- Support for IPv4, IPv6, and dual-stack environments
+- Fine-grained traffic matching through NamespaceSelector and PodSelector
+- Flexible scheduling through node selectors and tolerations
 
-Each Egress Gateway consists of multiple Pods with multiple network interfaces.
-Each Pod has two network interfaces: one joins the virtual network for communication within the VPC,
-and the other connects to the underlying physical network via Macvlan for external network communication.
-Virtual network traffic ultimately accesses the external network through NAT within the Egress Gateway instances.
+Current limitations:
+
+- Multi-replica deployments require multiple egress IPs
+- Source NAT mapping records are not retained
+
+## Egress Gateway vs. Centralized Gateway
+
+Use this section to choose the gateway model that best fits your scenario.
+For centralized mode details, refer to [Configure Centralized Gateway](./configure_centralized_gateway).
+
+| Dimension | Egress Gateway | Centralized Gateway |
+| --- | --- | --- |
+| Granularity | Fine-grained control by `selectors` and `policies` (Namespace/Pod/Subnet/IPBlock). | Applied at subnet level (`gatewayType: centralized`). |
+| Egress Address Source | Uses dedicated gateway Pods with external subnet IPs. | Uses designated gateway nodes; with `natOutgoing: true`, egress uses node IPs. |
+| Data Path | Traffic is routed to VPC Egress Gateway Pods, then SNATed to the external network. | Traffic is routed to designated nodes (`ovn0`) and then forwarded by host routing/NAT rules. |
+| HA and Failover | Active-Active ECMP; supports BFD fast failover (sub-second). | Supports ECMP and primary-backup; failover is generally slower than BFD-based Egress Gateway. |
+| Scheduling Control | Supports node scheduling controls for gateway workloads (`nodeSelector`, `tolerations`). | Gateway nodes are selected by `gatewayNode` or `gatewayNodeSelectors`. |
+| Typical Use Cases | Tenant-level or workload-level egress isolation, fine-grained policy control, higher performance and faster failover. | Simpler subnet-level fixed-source egress, auditing, IP allowlists, and firewall source-IP management. |
+
+Selection guidance:
+
+- Choose **Egress Gateway** when you need workload-level policy control, scalable throughput, and fast failover.
+- Choose **Centralized Gateway** when subnet-level fixed egress and simple operations are sufficient.
+
+## How Egress Gateway Works
+
+An Egress Gateway runs as one or more Pods. Each Pod uses two network interfaces:
+
+- One interface connects to the overlay network inside the cluster.
+- The other interface connects to the external underlay network.
+
+Traffic from selected Pods is first forwarded to the gateway Pods and then sent to the external network through the underlay interface.
 
 <img
   style={{ display: 'block', marginLeft: 'auto', marginRight: 'auto' }}
@@ -34,90 +63,105 @@ Virtual network traffic ultimately accesses the external network through NAT wit
 />
 
 Each Egress Gateway instance registers its address in the OVN routing table.
-When a Pod within the VPC needs to access the external network,
-OVN uses source address hashing to forward traffic to multiple Egress Gateway instance addresses,
-achieving load balancing. As the number of Egress Gateway instances increases,
-throughput can also scale horizontally.
+When a Pod in the overlay network accesses the external network, OVN uses source-address hashing to distribute traffic across multiple gateway instances.
+This provides load balancing and lets throughput scale horizontally as more instances are added.
 
 <img
   style={{ display: 'block', marginLeft: 'auto', marginRight: 'auto' }}
   src="../../assets/egress-gateway-2.png"
 />
 
-OVN uses the BFD protocol to probe multiple Egress Gateway instances.
-When an Egress Gateway instance fails, OVN marks the corresponding route as unavailable,
-enabling rapid failure detection and recovery.
+OVN can use BFD to probe multiple gateway instances.
+If one instance fails, OVN marks the corresponding route as unavailable and quickly redirects traffic to a healthy instance.
 
 <img
   style={{ display: 'block', marginLeft: 'auto', marginRight: 'auto' }}
   src="../../assets/egress-gateway-3.png"
 />
 
-## Prerequisites
+## Before You Begin
 
-_Alauda Container Platform Networking for Multus_ __MUST__ be installed on the cluster before using Egress Gateway.
+Before you start, make sure the following prerequisites are met:
 
-To install _Alauda Container Platform Networking for Multus_, refer to [Installing Multus CNI](./multiple_networks#deploying-the-multus-cni-plugin).
+- _Multus CNI Plugin_ __MUST__ already be installed on the cluster.
+- The external underlay network, VLAN, and bridge network are already planned and available.
+- You have identified which workloads should use the gateway and whether they require SNAT.
 
-## Usage
+To install _Multus CNI Plugin_, refer to [Deploying the Multus CNI Plugin](./multiple_networks#deploying-the-multus-cni-plugin).
 
-### Creating a Network Attachment Definition
+## Configuration Workflow
 
-Egress Gateway uses multiple NICs to access both the internal network and the external network,
-so you need to create a Network Attachment Definition to connect to the external network.
-An example of using the macvlan plugin with IPAM provided by Kube-OVN is shown below:
+Configure Egress Gateway in the following order:
+
+1. Prepare the external network attachment, including the subnet and Network Attachment Definition.
+2. Create a VPC Egress Gateway resource and specify the external subnet and policies.
+3. Verify resource status, routes, and traffic forwarding.
+4. Optionally scale out replicas and enable BFD-based fast failover.
+
+### Step 1: Prepare the External Network Attachment
+
+Egress Gateway uses multiple interfaces to connect to both the internal and external networks.
+Before creating the gateway, prepare the following resources:
+
+- An external subnet
+- A Network Attachment Definition (NAD) for that subnet
+
+The following example uses a Kube-OVN underlay subnet as the external network.
+
+:::note
+  This example assumes that the bridge network and VLAN resource `external-vlan` have already been created for the underlay network.
+:::
 
 ```yaml
 apiVersion: k8s.cni.cncf.io/v1
 kind: NetworkAttachmentDefinition
 metadata:
-  name: eth1
+  name: underlay-ext
   namespace: default
 spec:
-  config: '{
-    "cniVersion": "0.3.0",
-    "type": "macvlan", [!code callout]
-    "master": "eth1",
-    "mode": "bridge",
-    "ipam": {
-      "type": "kube-ovn",
+  config: |-
+    {
+      "cniVersion": "0.3.0", [!code callout]
+      "type": "kube-ovn", [!code callout]
       "server_socket": "/run/openvswitch/kube-ovn-daemon.sock", [!code callout]
-      "provider": "eth1.default"
+      "provider": "underlay-ext.default.ovn"
     }
-  }'
 ---
 apiVersion: kubeovn.io/v1
 kind: Subnet
 metadata:
-  name: macvlan1
+  name: underlay-ext
 spec:
   protocol: IPv4
-  provider: eth1.default # [!code callout]
+  provider: underlay-ext.default.ovn # [!code callout]
   cidrBlock: 172.17.0.0/16 # [!code callout]
   gateway: 172.17.0.1 # [!code callout]
+  vlan: external-vlan # [!code callout]
   excludeIps: # [!code callout]
-    - 172.17.0.2..172.17.0.10
+    - 172.17.0.11..172.17.0.20
 ```
 
 <Callouts>
 
-1. Host interface that connects to the external network.
-2. Provider name with a format of `<network attachment definition name>.<namespace>`.
-3. Provider name used to identify the external network and MUST be consistent with the one in the NetworkAttachmentDefinition.
-4. CIDR of the external network.
-5. Gateway of the external network.
-6. IP range excluded from automatic allocation. For details, refer to [Example Subnet custom resource (CR) with Kube-OVN Overlay Network](../../functions/configure_subnet.mdx#kube-ovn_overlay_network).
+1. Use the Kube-OVN CNI plugin for the secondary network.
+2. Kube-OVN daemon socket used by the CNI plugin.
+3. Provider name in the format `<network attachment definition name>.<namespace>.ovn`.
+4. The provider used by the subnet. This value MUST match the provider in the NetworkAttachmentDefinition.
+5. CIDR of the external underlay network.
+6. Gateway of the external underlay network.
+7. VLAN resource used by the underlay subnet.
+8. IP range excluded from automatic allocation. For details, refer to [Example Subnet custom resource (CR) with Kube-OVN Underlay Network](../../functions/configure_subnet.mdx#kube_ovn_underlay_network).
 
 </Callouts>
 
 :::tip
-  You can create a Network Attachment Definition with any CNI plugin to access the corresponding network.
-  An alternative to the example above is to use a Kube-OVN underlay subnet instead of macvlan.
+  Before using an underlay subnet, make sure the physical network, VLAN, and bridge network are prepared correctly.
+  For environment planning details, refer to [Preparing Kube-OVN Underlay Physical Network](./kubeovn_underlay_py).
 :::
 
-### Creating a VPC Egress Gateway
+### Step 2: Create a VPC Egress Gateway
 
-Create a VPC Egress Gateway resource as shown in the example below:
+Create a VPC Egress Gateway resource and define which workloads should use it.
 
 ```yaml
 apiVersion: kubeovn.io/v1
@@ -127,7 +171,11 @@ metadata:
   namespace: default # [!code callout]
 spec:
   replicas: 1 # [!code callout]
-  externalSubnet: macvlan1 # [!code callout]
+  internalSubnet: ovn-default # [!code callout]
+  externalSubnet: underlay-ext # [!code callout]
+  externalIPs: # [!code callout]
+    - 172.17.0.11
+    - 172.17.0.12
   resources: # [!code callout]
     requests:
       cpu: 100m
@@ -141,8 +189,8 @@ spec:
         - key: kubernetes.io/hostname
           operator: In
           values:
-            - kube-ovn-worker
-            - kube-ovn-worker2
+            - node1
+            - node2
   tolerations: # [!code callout]
     - key: node-role.kubernetes.io/control-plane
       operator: Exists
@@ -150,7 +198,13 @@ spec:
   selectors: # [!code callout]
     - namespaceSelector:
         matchLabels:
-          kubernetes.io/metadata.name: default
+          kubernetes.io/metadata.name: ns1
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ns2
+      podSelector:
+        matchLabels:
+          app: myapp
   policies: # [!code callout]
     - snat: true # [!code callout]
       subnets: # [!code callout]
@@ -162,63 +216,79 @@ spec:
 
 <Callouts>
 
-1. Namespace where the VPC Egress Gateway instances is created.
-2. Replicas of the VPC Egress Gateway instances.
-3. External subnet that connects to the external network.
-4. Resource requests and limits for each VPC Egress Gateway instance. If not specified, the default resource requests and limits defined in the VPC Egress Gateway controller will be applied.
-5. Node selectors used for scheduling the VPC Egress Gateway instances.
-6. Tolerations used for scheduling the VPC Egress Gateway instances.
-7. Namespace selectors and Pod selectors used to select Pods that access the external network via the VPC Egress Gateway.
-8. Policies for the VPC Egress Gateway, including SNAT and subnets/ipBlocks to be applied.
-9. Whether to enable SNAT for the policy.
-10. Subnets to which the policy applies.
-11. IP blocks to which the policy applies.
+1. Namespace where the VPC Egress Gateway instances are created.
+2. Number of VPC Egress Gateway instances.
+3. Internal subnet that connects to the internal network. The subnet MUST be an overlay subnet in the same VPC and have enough free IPs for the gateway instances.
+If not specified, the gateway Pods will use the default internal subnet of the VPC.
+4. External subnet that connects to the external network.
+5. External IPs used by the gateway Pods on the underlay network. Each gateway instance is allocated one IP from this list.
+These IPs MUST be within the CIDR of the external subnet and should be included in the `excludeIps` range of the subnet.
+It's recommended to reserve _.spec.replicas + 1_ IPs so that a gateway Pod can still obtain an IP in edge cases.
+6. Resource requests and limits for each VPC Egress Gateway instance.
+If not specified, the default resource requests and limits defined in the VPC Egress Gateway controller will be applied.
+7. Node selectors used for scheduling the VPC Egress Gateway instances.
+8. Tolerations used for scheduling the VPC Egress Gateway instances.
+9. Namespace selectors and Pod selectors used to select Pods that access the external network via the VPC Egress Gateway.
+10. Policies for the VPC Egress Gateway, including SNAT and subnets/ipBlocks to be applied.
+11. Whether to enable SNAT for the policy.
+12. Subnets to which the policy applies.
+13. IP blocks to which the policy applies.
 
 </Callouts>
 
-The above resource creates a VPC Egress Gateway named _gateway1_ under the default namespace,
-and the following Pods will access the external network via the _macvlan1_ subnet:
+This example creates a VPC Egress Gateway named _gateway1_ in the `default` namespace.
+Traffic that matches the selectors and policies is forwarded through the external subnet _underlay-ext_.
+In this example, that includes:
 
-- Pods in the default namespace
-- Pods under the _subnet1_ subnet
-- Pods with IPs in the CIDR _10.18.0.0/16_
+- Pods in the _ns1_ namespace
+- Pods in the _ns2_ namespace with the label `app: myapp`
+- Traffic related to the _subnet1_ subnet
+- Traffic related to the CIDR _10.18.0.0/16_
 
 :::note
-  Pods matching _.spec.selectors_ will access the external network with SNAT enabled.
+  Pods matching _.spec.selectors_ are always SNATed by the gateway.
 :::
 
-After the creation is complete, check out the VPC Egress Gateway resource:
+### Step 3: Validate the Gateway
+
+After creating the gateway, confirm that it is ready and forwarding traffic as expected.
+
+#### 1. Check the resource status
+
+Start with the basic resource status:
 
 ```shell
 $ kubectl get veg gateway1
 NAME       VPC           REPLICAS   BFD ENABLED   EXTERNAL SUBNET   PHASE       READY   AGE
-gateway1   ovn-cluster   1          false         macvlan1          Completed   true    13s
+gateway1   ovn-cluster   1          false         underlay-ext      Completed   true    13s
 ```
 
-To view more information:
+Then check the detailed gateway information:
 
 ```shell
 kubectl get veg gateway1 -o wide
-NAME       VPC           REPLICAS   BFD ENABLED   EXTERNAL SUBNET   PHASE       READY   INTERNAL IPS     EXTERNAL IPS      WORKING NODES         AGE
-gateway1   ovn-cluster   1          false         macvlan1          Completed   true    ["10.16.0.12"]   ["172.17.0.11"]   ["kube-ovn-worker"]   82s
+NAME       VPC           REPLICAS   BFD ENABLED   EXTERNAL SUBNET   PHASE       READY   INTERNAL IPS     EXTERNAL IPS      WORKING NODES   AGE
+gateway1   ovn-cluster   1          false         underlay-ext      Completed   true    ["10.16.0.12"]   ["172.17.0.11"]   ["node1"]       82s
 ```
 
-To view the workload:
+Finally, verify that the gateway workloads are running:
 
 ```shell
-$ kubectl get deployment -l ovn.kubernetes.io/vpc-egress-gateway=gateway1
+$ kubectl get deployment -n default -l ovn.kubernetes.io/vpc-egress-gateway=gateway1
 NAME       READY   UP-TO-DATE   AVAILABLE   AGE
 gateway1   1/1     1            1           4m40s
 
-$ kubectl get pod -l ovn.kubernetes.io/vpc-egress-gateway=gateway1 -o wide
-NAME                       READY   STATUS    RESTARTS   AGE     IP           NODE              NOMINATED NODE   READINESS GATES
-gateway1-b9f8b4448-76lhm   1/1     Running   0          4m48s   10.16.0.12   kube-ovn-worker   <none>           <none>
+$ kubectl get pod -n default -l ovn.kubernetes.io/vpc-egress-gateway=gateway1 -o wide
+NAME                       READY   STATUS    RESTARTS   AGE     IP           NODE    NOMINATED NODE   READINESS GATES
+gateway1-b9f8b4448-76lhm   1/1     Running   0          4m48s   10.16.0.12   node1   <none>           <none>
 ```
 
-To view IP addresses, routes, and iptables rules in the Pod:
+#### 2. Inspect networking inside the gateway Pod
+
+Inspect IP addresses, routing entries, and iptables rules inside the gateway Pod:
 
 ```shell
-$ kubectl exec gateway1-b9f8b4448-76lhm -c gateway -- ip address show
+$ kubectl exec -n default gateway1-b9f8b4448-76lhm -c gateway -- ip address show
 1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000
     link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
     inet 127.0.0.1/8 scope host lo
@@ -238,7 +308,7 @@ $ kubectl exec gateway1-b9f8b4448-76lhm -c gateway -- ip address show
     inet6 fe80::347c:6bff:fec7:826b/64 scope link
        valid_lft forever preferred_lft forever
 
-$ kubectl exec gateway1-b9f8b4448-76lhm -c gateway -- ip rule show
+$ kubectl exec -n default gateway1-b9f8b4448-76lhm -c gateway -- ip rule show
 0:      from all lookup local
 1001:   from all iif eth0 lookup default
 1002:   from all iif net1 lookup 1000
@@ -247,17 +317,17 @@ $ kubectl exec gateway1-b9f8b4448-76lhm -c gateway -- ip rule show
 32766:  from all lookup main
 32767:  from all lookup default
 
-$ kubectl exec gateway1-b9f8b4448-76lhm -c gateway -- ip route show
+$ kubectl exec -n default gateway1-b9f8b4448-76lhm -c gateway -- ip route show
 default via 172.17.0.1 dev net1
 10.16.0.0/16 dev eth0 proto kernel scope link src 10.16.0.12
 10.17.0.0/16 via 10.16.0.1 dev eth0
 10.18.0.0/16 via 10.16.0.1 dev eth0
 172.17.0.0/16 dev net1 proto kernel scope link src 172.17.0.11
 
-$ kubectl exec gateway1-b9f8b4448-76lhm -c gateway -- ip route show table 1000
+$ kubectl exec -n default gateway1-b9f8b4448-76lhm -c gateway -- ip route show table 1000
 default via 10.16.0.1 dev eth0
 
-$ kubectl exec gateway1-b9f8b4448-76lhm -c gateway -- iptables -t nat -S
+$ kubectl exec -n default gateway1-b9f8b4448-76lhm -c gateway -- iptables -t nat -S
 -P PREROUTING ACCEPT
 -P INPUT ACCEPT
 -P OUTPUT ACCEPT
@@ -271,11 +341,12 @@ $ kubectl exec gateway1-b9f8b4448-76lhm -c gateway -- iptables -t nat -S
 -A VEG-MASQUERADE -j MASQUERADE --random-fully
 ```
 
-Capture packets in the Gateway Pod to verify network traffic:
+#### 3. Confirm traffic forwarding
+
+Capture packets in the gateway Pod to confirm that traffic is forwarded through the gateway:
 
 ```shell
-$ kubectl exec -ti gateway1-b9f8b4448-76lhm -c gateway -- bash
-nobody@gateway1-b9f8b4448-76lhm:/kube-ovn$ tcpdump -i any -nnve icmp and host 172.17.0.1
+$ kubectl exec -n default gateway1-b9f8b4448-76lhm -c gateway -- tcpdump -i any -nnve icmp and host 172.17.0.1
 tcpdump: data link type LINUX_SLL2
 tcpdump: listening on any, link-type LINUX_SLL2 (Linux cooked v2), snapshot length 262144 bytes
 06:50:58.936528 eth0  In  ifindex 17 92:26:b8:9e:f2:1c ethertype IPv4 (0x0800), length 104: (tos 0x0, ttl 63, id 30481, offset 0, flags [DF], proto ICMP (1), length 84)
@@ -288,7 +359,9 @@ tcpdump: listening on any, link-type LINUX_SLL2 (Linux cooked v2), snapshot leng
     172.17.0.1 > 10.17.0.9: ICMP echo reply, id 37989, seq 0, length 64
 ```
 
-Routing policies are automatically created on the OVN Logical Router:
+#### 4. Confirm OVN routing policies
+
+OVN Logical Router policies are created automatically for the selected traffic:
 
 ```shell
 $ kubectl ko nbctl lr-policy-list ovn-cluster
@@ -311,25 +384,31 @@ Routing Policies
 
 <Callouts>
 
-1. Logical Router Policy used by the VPC Egress Gateway to forward traffic from the Pods specified by _.spec.policies_.
-2. Logical Router Policy used by the VPC Egress Gateway to forward traffic from the Pods specified by _.spec.selectors_.
+1. Logical Router Policy used by the VPC Egress Gateway to forward traffic matched by _.spec.policies_.
+2. Logical Router Policy used by the VPC Egress Gateway to forward traffic matched by _.spec.selectors_.
 
 </Callouts>
 
-If you need to enable load balancing, modify _.spec.replicas_ as shown in the following example:
+### Optional: Enable Multi-Replica Load Balancing
+
+:::note
+Before scaling out replicas, make sure to prepare enough external IPs in the external subnet and specify them in _.spec.externalIPs_.
+:::
+
+To enable ECMP load balancing and scale throughput horizontally, increase _.spec.replicas_:
 
 ```shell
-$ kubectl scale veg gateway1 --replicas=2
+$ kubectl scale veg -n default gateway1 --replicas=2
 vpcegressgateway.kubeovn.io/gateway1 scaled
 
-$ kubectl get veg gateway1
+$ kubectl get veg -n default gateway1
 NAME       VPC           REPLICAS   BFD ENABLED   EXTERNAL SUBNET   PHASE       READY   AGE
-gateway1   ovn-cluster   2          false         macvlan           Completed   true    39m
+gateway1   ovn-cluster   2          false         underlay-ext      Completed   true    39m
 
-$ kubectl get pod -l ovn.kubernetes.io/vpc-egress-gateway=gateway1 -o wide
-NAME                       READY   STATUS    RESTARTS   AGE   IP           NODE               NOMINATED NODE   READINESS GATES
-gateway1-b9f8b4448-76lhm   1/1     Running   0          40m   10.16.0.12   kube-ovn-worker    <none>           <none>
-gateway1-b9f8b4448-zd4dl   1/1     Running   0          64s   10.16.0.13   kube-ovn-worker2   <none>           <none>
+$ kubectl get pod -n default -l ovn.kubernetes.io/vpc-egress-gateway=gateway1 -o wide
+NAME                       READY   STATUS    RESTARTS   AGE   IP           NODE    NOMINATED NODE   READINESS GATES
+gateway1-b9f8b4448-76lhm   1/1     Running   0          40m   10.16.0.12   node1   <none>           <none>
+gateway1-b9f8b4448-zd4dl   1/1     Running   0          64s   10.16.0.13   node2   <none>           <none>
 
 $ kubectl ko nbctl lr-policy-list ovn-cluster
 Routing Policies
@@ -349,11 +428,14 @@ Routing Policies
      29000            ip4.src == $subnet1.kube.ovn.worker_ip4  reroute  100.64.0.4
 ```
 
-### Enabling BFD-based High Availability
+### Optional: Enable BFD-based High Availability
 
-BFD-based high availability relies on the VPC BFD LRP function,
-so you need to modify the VPC resource to enable BFD Port.
-Here is an example to enable BFD Port for the default VPC:
+BFD-based failover depends on the VPC BFD LRP.
+Enable it in the following order.
+
+#### 1. Enable a BFD Port on the VPC
+
+First, enable a BFD Port on the VPC:
 
 ```yaml
 apiVersion: kubeovn.io/v1
@@ -373,11 +455,15 @@ spec:
 
 1. Whether to enable the BFD Port.
 2. IP address of the BFD Port, which MUST be a valid IP address that does not conflict with ANY other IPs/Subnets.
-3. Node selector used to select the nodes where the BFD Port is running in Active-Backup mode.
+3. Node selector used to select the nodes where the BFD Port runs in Active-Backup mode.
 
 </Callouts>
 
-After the BFD Port is enabled, an LRP dedicated to BFD is automatically created on the corresponding OVN Logical Router:
+:::tip
+  The Vpc resource _ovn-cluster_ exists by default. You can edit it directly to enable the BFD Port.
+:::
+
+After the BFD Port is enabled, a dedicated BFD LRP is automatically created on the OVN Logical Router:
 
 ```shell
 $ kubectl ko nbctl show ovn-cluster
@@ -402,9 +488,11 @@ router 0c1d1e8f-4c86-4d96-88b2-c4171c7ff824 (ovn-cluster)
 
 </Callouts>
 
-After that, set _.spec.bfd.enabled_ to _true_ in VPC Egress Gateway. An example is shown below:
+#### 2. Enable BFD on the VPC Egress Gateway
 
-```shell
+Then enable BFD on the VPC Egress Gateway by setting _.spec.bfd.enabled_ to _true_:
+
+```yaml
 apiVersion: kubeovn.io/v1
 kind: VpcEgressGateway
 metadata:
@@ -414,7 +502,11 @@ spec:
   vpc: ovn-cluster # [!code callout]
   replicas: 2
   internalSubnet: ovn-default # [!code callout]
-  externalSubnet: macvlan1 # [!code callout]
+  externalSubnet: underlay-ext # [!code callout]
+  externalIPs: # [!code callout]
+    - 172.17.0.11
+    - 172.17.0.12
+    - 172.17.0.13
   bfd:
     enabled: true # [!code callout]
     minRX: 100 # [!code callout]
@@ -431,36 +523,38 @@ spec:
 1. VPC to which the Egress Gateway belongs.
 2. Internal subnet to which the Egress Gateway instances are connected.
 3. External subnet to which the Egress Gateway instances are connected.
-4. Whether to enable BFD for the Egress Gateway.
-5. Minimum receive interval for BFD, in milliseconds.
-6. Minimum transmit interval for BFD, in milliseconds.
-7. Multiplier for BFD, which determines the number of missed packets before declaring a failure.
+4. External IPs assigned to the Egress Gateway instances.
+5. Whether to enable BFD for the Egress Gateway.
+6. Minimum receive interval for BFD, in milliseconds.
+7. Minimum transmit interval for BFD, in milliseconds.
+8. Multiplier for BFD, which determines the number of missed packets before declaring a failure.
 
 </Callouts>
 
-In this example, a VPC Egress Gateway named _gateway2_ is created with 2 replicas and BFD enabled.
-If one of the instances fails, the BFD session will go down and OVN will quickly detect the failure and stop forwarding traffic to the failed instance.
-Instead, all traffic will be forwarded to the healthy instance, ensuring uninterrupted access to the external network.
+This example creates a VPC Egress Gateway named _gateway2_ with two replicas and BFD enabled.
+If one instance fails, the BFD session goes down, OVN marks the route as unavailable, and redirects traffic to the healthy instance.
 
-The break time depends on the BFD configuration.
-You can calculate it using the formula: _break time = (multiplier + 1) * max(minRX, minTX)_.
-In this example, it will take about 500~600 milliseconds to detect the failure and reroute the traffic.
+Failover detection time depends on the BFD settings.
+Use the following formula: _break time = (multiplier + 1) * max(minRX, minTX)_.
+With this sample configuration, failover detection is approximately 500-600 ms.
 
 :::note
-  The existing connections may be interrupted during the failover, and reconnections are required. However, new connections will not be affected and can be established normally.
+  Existing connections may be interrupted during failover and require reconnection. New connections can still be established normally.
 :::
 
-To view VPC Egress Gateway information:
+#### 3. Verify BFD status
+
+Check the VPC Egress Gateway status:
 
 ```shell
-$ kubectl get veg gateway2 -o wide
-NAME       VPC    REPLICAS   BFD ENABLED   EXTERNAL SUBNET   PHASE       READY   INTERNAL IPS                    EXTERNAL IPS                    WORKING NODES                            AGE
-gateway2   vpc1   2          true          macvlan           Completed   true    ["10.16.0.102","10.16.0.103"]   ["172.17.0.13","172.17.0.14"]   ["kube-ovn-worker","kube-ovn-worker2"]   58s
+$ kubectl get veg -n default gateway2 -o wide
+NAME       VPC           REPLICAS   BFD ENABLED   EXTERNAL SUBNET   PHASE       READY   INTERNAL IPS                  EXTERNAL IPS                    WORKING NODES       AGE
+gateway2   ovn-cluster   2          true          underlay-ext      Completed   true    ["10.16.0.12","10.16.0.13"]   ["172.17.0.11","172.17.0.12"]   ["node1","node2"]   58s
 
-$ kubectl get pod -l ovn.kubernetes.io/vpc-egress-gateway=gateway2 -o wide
-NAME                       READY   STATUS    RESTARTS   AGE     IP            NODE               NOMINATED NODE   READINESS GATES
-gateway2-fcc6b8b87-8lgvx   1/1     Running   0          2m18s   10.16.0.103   kube-ovn-worker2   <none>           <none>
-gateway2-fcc6b8b87-wmww6   1/1     Running   0          2m18s   10.16.0.102   kube-ovn-worker    <none>           <none>
+$ kubectl get pod -n default -l ovn.kubernetes.io/vpc-egress-gateway=gateway2 -o wide
+NAME                       READY   STATUS    RESTARTS   AGE     IP           NODE    NOMINATED NODE   READINESS GATES
+gateway2-fcc6b8b87-8lgvx   1/1     Running   0          2m18s   10.16.0.13   node2   <none>           <none>
+gateway2-fcc6b8b87-wmww6   1/1     Running   0          2m18s   10.16.0.12   node1   <none>           <none>
 
 $ kubectl ko nbctl lr-policy-list ovn-cluster
 Routing Policies
@@ -470,8 +564,8 @@ Routing Policies
      30000                              ip4.dst == 172.18.0.2  reroute  100.64.0.4
      30000                              ip4.dst == 172.18.0.3  reroute  100.64.0.3
      30000                              ip4.dst == 172.18.0.4  reroute  100.64.0.2
-     29100                  ip4.src == $VEG.8ca38ae7da18.ipv4  reroute  10.16.0.102, 10.16.0.103  bfd
-     29100                   ip4.src == $VEG.8ca38ae7da18_ip4  reroute  10.16.0.102, 10.16.0.103  bfd
+     29100                  ip4.src == $VEG.8ca38ae7da18.ipv4  reroute  10.16.0.12, 10.16.0.13  bfd
+     29100                   ip4.src == $VEG.8ca38ae7da18_ip4  reroute  10.16.0.12, 10.16.0.13  bfd
      29090                  ip4.src == $VEG.8ca38ae7da18.ipv4     drop
      29090                   ip4.src == $VEG.8ca38ae7da18_ip4     drop
      29000 ip4.src == $ovn.default.kube.ovn.control.plane_ip4  reroute  100.64.0.3
@@ -484,7 +578,7 @@ Routing Policies
 $ kubectl ko nbctl list bfd
 _uuid               : 223ede10-9169-4c7d-9524-a546e24bfab5
 detect_mult         : 5
-dst_ip              : "10.16.0.102"
+dst_ip              : "10.16.0.12"
 external_ids        : {af="4", vendor=kube-ovn, vpc-egress-gateway="default/gateway2"}
 logical_port        : "bfd@ovn-cluster"
 min_rx              : 100
@@ -494,7 +588,7 @@ status              : up
 
 _uuid               : b050c75e-2462-470b-b89c-7bd38889b758
 detect_mult         : 5
-dst_ip              : "10.16.0.103"
+dst_ip              : "10.16.0.13"
 external_ids        : {af="4", vendor=kube-ovn, vpc-egress-gateway="default/gateway2"}
 logical_port        : "bfd@ovn-cluster"
 min_rx              : 100
@@ -503,397 +597,33 @@ options             : {}
 status              : up
 ```
 
-To view BFD connections:
+Then check the BFD sessions:
 
 ```shell
-$ kubectl exec gateway2-fcc6b8b87-8lgvx -c bfdd -- bfdd-control status
+$ kubectl exec -n default gateway2-fcc6b8b87-8lgvx -c bfdd -- bfdd-control status
 There are 1 sessions:
 Session 1
- id=1 local=10.16.0.103 (p) remote=10.255.255.255 state=Up
+ id=1 local=10.16.0.13 (p) remote=10.255.255.255 state=Up
 
-$ kubectl exec gateway2-fcc6b8b87-wmww6 -c bfdd -- bfdd-control status
+$ kubectl exec -n default gateway2-fcc6b8b87-wmww6 -c bfdd -- bfdd-control status
 There are 1 sessions:
 Session 1
- id=1 local=10.16.0.102 (p) remote=10.255.255.255 state=Up
+ id=1 local=10.16.0.12 (p) remote=10.255.255.255 state=Up
 ```
 
 :::note
-  If all the gateway instances are down, egress traffic to which the VPC Egress
-  Gateway is applied will be dropped.
+  If all gateway instances are down, egress traffic handled by the VPC Egress Gateway is dropped.
 :::
 
-## Configuration Parameters
+## Operations That May Interrupt Traffic
 
-### VPC BFD Port
+The following operations may briefly interrupt egress traffic because they delete or recreate gateway instances:
 
-<table>
-  <thead>
-    <tr>
-      <th colSpan={2}>Fields</th>
-      <th>Type</th>
-      <th>Optional</th>
-      <th>Default Value</th>
-      <th colSpan={2}>Description</th>
-      <th>Examples</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td colSpan={2}>enabled</td>
-      <td>boolean</td>
-      <td>Yes</td>
-      <td>false</td>
-      <td colSpan={2}>Whether to enable the BFD Port.</td>
-      <td>true</td>
-    </tr>
-    <tr>
-      <td colSpan={2} rowSpan={3}>ip</td>
-      <td rowSpan={3}>string</td>
-      <td rowSpan={3}>No</td>
-      <td rowSpan={3}>-</td>
-      <td colSpan={2} rowSpan={3}>The IP address used by the BFD Port.<br/>Must NOT conflict with other addresses. IPv4, IPv6 and dual-stack are supported.</td>
-      <td>169.255.255.255</td>
-    </tr>
-    <tr>
-      <td>{/*cspell:disable-line*/}fdff::1</td>
-    </tr>
-    <tr>
-      <td>{/*cspell:disable-line*/}169.255.255.255,fdff::1</td>
-    </tr>
-    <tr>
-      <td rowSpan={2}>nodeSelector</td>
-      <td>matchLabels</td>
-      <td>object</td>
-      <td>Yes</td>
-      <td>-</td>
-      <td rowSpan={2}>Label selectors used to select nodes that carries the BFD Port work.<br/>The BFD Port binds an OVN HA Chassis Group of selected nodes and works in Active/Backup mode.<br/>If this field is not specified, Kube-OVN automatically selects up to three nodes.<br/>You can view all OVN HA Chassis Group resources by executing _kubectl ko nbctl list ha_chassis_group_.</td>
-      <td>A map of \{key,value\} pairs.</td>
-      <td>-</td>
-    </tr>
-    <tr>
-      <td>matchExpressions</td>
-      <td>object array</td>
-      <td>Yes</td>
-      <td>-</td>
-      <td>A list of label selector requirements. The requirements are ANDed.</td>
-      <td>-</td>
-    </tr>
-  </tbody>
-</table>
+1. Changing the number of replicas
+2. Changing configuration such as internal or external IPs, node selectors, or BFD settings
+3. Upgrading or downgrading Kube-OVN if _.spec.image_ is not specified
+4. Manually deleting an Egress Gateway Pod
 
-### VPC Egress Gateway
+## Additional Resources
 
-<table>
-  <thead>
-    <tr>
-      <th colSpan={3}>Fields</th>
-      <th>Type</th>
-      <th>Optional</th>
-      <th>Default Value</th>
-      <th colSpan={3}>Description</th>
-      <th>Examples</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td colSpan={3}>vpc</td>
-      <td>string</td>
-      <td>Yes</td>
-      <td>Name of the default VPC (ovn-cluster)</td>
-      <td colSpan={3}>VPC name.</td>
-      <td>vpc1</td>
-    </tr>
-    <tr>
-      <td colSpan={3}>replicas</td>
-      <td>integer/int32</td>
-      <td>Yes</td>
-      <td>1</td>
-      <td colSpan={3}>Replicas.</td>
-      <td>2</td>
-    </tr>
-    <tr>
-      <td colSpan={3}>prefix</td>
-      <td>string</td>
-      <td>Yes</td>
-      <td>-</td>
-      <td colSpan={3}>Immutable prefix of the workload deployment name.</td>
-      <td>veg-</td>
-    </tr>
-    <tr>
-      <td colSpan={3}>image</td>
-      <td>string</td>
-      <td>Yes</td>
-      <td>-</td>
-      <td colSpan={3}>The image used by the workload deployment.</td>
-      <td>ghcr.io/kubeovn/kube-ovn:v1.14.19</td>
-    </tr>
-    <tr>
-      <td colSpan={3}>internalSubnet</td>
-      <td rowSpan={2}>string</td>
-      <td>Yes</td>
-      <td>Name of the default subnet within the VPC.</td>
-      <td colSpan={3} rowSpan={2}>Name of the subnet used to access the internal/external network.</td>
-      <td>subnet1</td>
-    </tr>
-    <tr>
-      <td colSpan={3}>externalSubnet</td>
-      <td>No</td>
-      <td>-</td>
-      <td>ext1</td>
-    </tr>
-    <tr>
-      <td colSpan={3}>internalIPs</td>
-      <td rowSpan={2}>string array</td>
-      <td rowSpan={2}>Yes</td>
-      <td rowSpan={2}>-</td>
-      <td colSpan={3} rowSpan={2}>
-        IP addresses used for accessing the internal/external network. IPv4, IPv6 and dual-stack are supported.<br/>
-        The number of IPs specified must NOT be less than _replicas_.<br/>
-        It is recommended to set the number to _\<replicas\> + 1_ to avoid extreme cases where the Pod is not created properly.
-      </td>
-      <td rowSpan={2} style={{overflow: "hidden", position: "relative"}}>
-        <div style={{height: "100%", width: "100%", position: "absolute", right: 0, top: 0}}>
-          <div style={{height: "33%", border: "0", paddingTop: ".5rem", paddingBottom: ".5rem", paddingLeft: "1rem", paddingRight: "1rem"}}>10.16.0.101</div>
-          <hr style={{height: 0, margin: 0, backgroundColor: "var(--rp-c-bg)", borderColor: "var(--rp-c-divider)", borderWidth: "1px"}}/>
-          <div style={{height: "33%", border: "0", paddingTop: ".5rem", paddingBottom: ".5rem", paddingLeft: "1rem", paddingRight: "1rem"}}>{/*cspell:disable-line*/}fdff::1</div>
-          <hr style={{height: 0, margin: 0, backgroundColor: "var(--rp-c-bg)", borderColor: "var(--rp-c-divider)", borderWidth: "1px"}}/>
-          <div style={{height: "33%", border: "0", paddingTop: ".5rem", paddingBottom: ".5rem", paddingLeft: "1rem", paddingRight: "1rem"}}>{/*cspell:disable-line*/}169.255.255.255,fdff::1</div>
-        </div>
-      </td>
-    </tr>
-    <tr>
-      <td colSpan={3}>externalIPs</td>
-    </tr>
-    <tr>
-      <td rowSpan={4}>bfd</td>
-      <td colSpan={2}>enabled</td>
-      <td>boolean</td>
-      <td>Yes</td>
-      <td>false</td>
-      <td rowSpan={4}>BFD Configuration.</td>
-      <td colSpan={2}>Whether to enable BFD for the Egress Gateway.</td>
-      <td>-</td>
-    </tr>
-    <tr>
-      <td colSpan={2}>minRX</td>
-      <td rowSpan={2}>integer/int32</td>
-      <td rowSpan={2}>Yes</td>
-      <td rowSpan={2}>1000</td>
-      <td colSpan={2} rowSpan={2}>BFD minRX/minTX in milliseconds.</td>
-      <td rowSpan={2}>500</td>
-    </tr>
-    <tr>
-      <td colSpan={2}>minTX</td>
-    </tr>
-    <tr>
-      <td colSpan={2}>multiplier</td>
-      <td>integer/int32</td>
-      <td>Yes</td>
-      <td>3</td>
-      <td colSpan={2}>BFD multiplier.</td>
-      <td>1</td>
-    </tr>
-    <tr>
-      <td rowSpan={6}>policies</td>
-      <td colSpan={2}>snat</td>
-      <td>boolean</td>
-      <td>Yes</td>
-      <td>false</td>
-      <td rowSpan={6}>Egress policies.</td>
-      <td colSpan={2}>Whether to enable SNAT/MASQUERADE.</td>
-      <td>true</td>
-    </tr>
-    <tr>
-      <td colSpan={2} rowSpan={4}>ipBlocks</td>
-      <td rowSpan={4}>string array</td>
-      <td rowSpan={4}>Yes</td>
-      <td rowSpan={4}>-</td>
-      <td colSpan={2} rowSpan={4}>
-        IP range segments to which the gateway is applied.<br/>
-        Both IPv4 and IPv6 are supported.
-      </td>
-      <td>192.168.0.1</td>
-    </tr>
-    <tr>
-      <td>192.168.0.0/24</td>
-    </tr>
-    <tr>
-      <td>fd00::1</td>
-    </tr>
-    <tr>
-      <td>fd00::/120</td>
-    </tr>
-    <tr>
-      <td colSpan={2}>subnets</td>
-      <td>string array</td>
-      <td>Yes</td>
-      <td>-</td>
-      <td colSpan={2}>
-        The VPC subnet name to which the gateway is applied.<br/>
-        IPv4, IPv6 and dual-stack subnets are supported.
-      </td>
-      <td>subnet1</td>
-    </tr>
-    <tr>
-      <td rowSpan={4}>selectors</td>
-      <td rowSpan={2}>namespaceSelector</td>
-      <td>matchLabels</td>
-      <td>object</td>
-      <td>Yes</td>
-      <td>-</td>
-      <td rowSpan={4}>
-        Configure Egress policies by namespace selectors and Pod selectors.<br/>
-        SNAT/MASQUERADE will be applied to the matched Pods.
-      </td>
-      <td rowSpan={2}>
-        Namespace selector. An empty label selector matches all namespaces.
-      </td>
-      <td>A map of \{key,value\} pairs.</td>
-      <td>-</td>
-    </tr>
-    <tr>
-      <td>matchExpressions</td>
-      <td>object array</td>
-      <td>Yes</td>
-      <td>-</td>
-      <td>A list of label selector requirements. The requirements are ANDed.</td>
-      <td>-</td>
-    </tr>
-    <tr>
-      <td rowSpan={2}>podSelector</td>
-      <td>matchLabels</td>
-      <td>object</td>
-      <td>Yes</td>
-      <td>-</td>
-      <td rowSpan={2}>
-        Pod selector. An empty label selector matches all Pods.
-      </td>
-      <td>A map of \{key,value\} pairs.</td>
-      <td>-</td>
-    </tr>
-    <tr>
-      <td>matchExpressions</td>
-      <td>object array</td>
-      <td>Yes</td>
-      <td>-</td>
-      <td>A list of label selector requirements. The requirements are ANDed.</td>
-      <td>-</td>
-    </tr>
-    <tr>
-      <td rowSpan={3}>nodeSelector</td>
-      <td colSpan={2}>matchLabels</td>
-      <td>object</td>
-      <td>Yes</td>
-      <td>-</td>
-      <td rowSpan={3}>
-        Node selector used to select nodes that carries the workload deployment.<br/>
-        The workload \(Deployment/Pod\) will run on the selected nodes.
-      </td>
-      <td colSpan={2}>A map of \{key,value\} pairs.</td>
-      <td>-</td>
-    </tr>
-    <tr>
-      <td colSpan={2}>matchExpressions</td>
-      <td>object array</td>
-      <td>Yes</td>
-      <td>-</td>
-      <td colSpan={2}>A list of label selector requirements. The requirements are ANDed.</td>
-      <td>-</td>
-    </tr>
-    <tr>
-      <td colSpan={2}>matchFields</td>
-      <td>object array</td>
-      <td>Yes</td>
-      <td>-</td>
-      <td colSpan={2}>A list of field selector requirements. The requirements are ANDed.</td>
-      <td>-</td>
-    </tr>
-    <tr>
-      <td rowSpan={5}>tolerations</td>
-      <td colSpan={2}>key</td>
-      <td>string</td>
-      <td>Yes</td>
-      <td>-</td>
-      <td rowSpan={5}>
-        Tolerations used for scheduling the VPC Egress Gateway instances.
-      </td>
-      <td colSpan={2}>
-        Key is the taint key that the toleration applies to. Empty means match all taint keys.<br/>
-        If the key is empty, operator must be Exists; this combination means to match all values and all keys.
-      </td>
-      <td>node-role.kubernetes.io/control-plane</td>
-    </tr>
-    <tr>
-      <td colSpan={2}>operator</td>
-      <td>string</td>
-      <td>Yes</td>
-      <td>Equal</td>
-      <td colSpan={2}>
-        Operator represents a key's relationship to the value. Valid operators are Exists and Equal.<br/>
-        Exists is equivalent to wildcard for value, so that a pod can tolerate all taints of a particular category.
-      </td>
-      <td>Exists</td>
-    </tr>
-    <tr>
-      <td colSpan={2}>value</td>
-      <td>string</td>
-      <td>Yes</td>
-      <td>-</td>
-      <td colSpan={2}>
-        Value is the taint value the toleration matches to.<br/>
-        If the operator is Exists, the value should be empty, otherwise just a regular string.
-      </td>
-      <td>-</td>
-    </tr>
-    <tr>
-      <td colSpan={2}>effect</td>
-      <td>string</td>
-      <td>Yes</td>
-      <td>-</td>
-      <td colSpan={2}>
-        Effect indicates the taint effect to match. Empty means match all taint effects.<br/>
-        When specified, allowed values are NoSchedule, PreferNoSchedule and NoExecute.
-      </td>
-      <td>NoSchedule</td>
-    </tr>
-    <tr>
-      <td colSpan={2}>tolerationSeconds</td>
-      <td>integer</td>
-      <td>Yes</td>
-      <td>-</td>
-      <td colSpan={2}>
-        TolerationSeconds represents the period of time the toleration (which must be of effect NoExecute, otherwise this field is ignored) tolerates the taint.<br/>
-        By default, it is not set, which means tolerate the taint forever (do not evict).<br/>
-        Zero and negative values will be treated as 0 (evict immediately) by the system.
-      </td>
-      <td>-</td>
-    </tr>
-    <tr>
-      <td colSpan={3}>trafficPolicy</td>
-      <td>string</td>
-      <td>Yes</td>
-      <td>Cluster</td>
-      <td colSpan={3}>
-        __Effective only when BFD is enabled__.<br/>
-        Available values: _Cluster_\/_Local_.<br/>
-        When set to _Local_, Egress traffic will be redirected to the VPC Egress Gateway instance running on the same node if available.<br/>
-        If the instance is down, Egress traffic will be redirected to other instances.
-      </td>
-      <td>Local</td>
-    </tr>
-  </tbody>
-</table>
-
-## Notes
-
-Any operation that causes the Egress Gateway instance to be deleted/recreated may trigger a temporary network failover of egress traffic, including but not limited to:
-
-1. Change replicas;
-2. Change some configurations, e.g. internal/external IPs, node selector, BFD configuration, etc.;
-3. Upgrade/downgrade Kube-OVN if _.spec.image_ is not specified;
-4. Manually delete the Egress Gateway instance Pod.
-
-## Additional resources
-
-- [Egress Gateway - Kube-OVN Document](https://kubeovn.github.io/docs/v1.14.x/en/vpc/vpc-egress-gateway/)
 - [RFC 5880 - Bidirectional Forwarding Detection \(BFD\)](https://datatracker.ietf.org/doc/rfc5880/)
