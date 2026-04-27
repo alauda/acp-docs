@@ -1,0 +1,318 @@
+
+# Handling Out of Resource Errors
+
+## Overview
+
+This guide describes how to prevent Alauda Container Platform nodes from running out of memory (OOM) or disk space. Stable node operation is critical, especially for non-compressible resources like memory and disk. Resource exhaustion can lead to node instability.
+
+Administrators can configure eviction policies to monitor nodes and reclaim resources before stability is compromised.
+
+This document covers how Alauda Container Platform handles out-of-resource scenarios, including resource reclamation, pod eviction, pod scheduling, and the Out of Memory Killer. Example configurations and best practices are also provided.
+
+:::note
+If swap memory is enabled on a node, memory pressure cannot be detected. Disable swap to enable memory-based evictions.
+:::
+
+## Configuring Eviction Policies
+
+Eviction policies allow nodes to terminate pods when resources are low, reclaiming needed resources. Policies combine eviction signals and threshold values, set in the node configuration or via command line. Evictions can be:
+
+- **Hard**: Immediate action when a threshold is exceeded.
+- **Soft**: Grace period before action is taken.
+
+Properly configured eviction policies help nodes proactively prevent resource exhaustion.
+
+:::note  
+When a pod is evicted, all containers in the pod are terminated, and the PodPhase transitions to Failed.
+:::
+
+For disk pressure, nodes monitor both `nodefs` (root filesystem) and `imagefs` (container image storage).
+
+- **nodefs/rootfs**: Used for local disk volumes, logs, and other storage (e.g., `/var/lib/kubelet`).
+- **imagefs**: Used by the container runtime for images and writable layers (e.g., `/var/lib/docker/overlay2` for Docker overlay2 driver, `/var/lib/containers/storage` for CRI-O).
+
+:::note  
+Without local storage isolation (ephemeral storage) or XFS quota (volumeConfig), pod disk usage cannot be limited.
+:::
+
+## Creating Eviction Policies in Node Configuration
+
+To set eviction thresholds, edit the node configuration map under `eviction-hard` or `eviction-soft`.
+
+**Hard Eviction Example:**
+```yaml
+kubeletArguments:
+  eviction-hard: # [!code callout]
+    - memory.available<100Mi # [!code callout]
+    - nodefs.available<10%
+    - nodefs.inodesFree<5%
+    - imagefs.available<15%
+    - imagefs.inodesFree<10%
+```
+
+<Callouts>
+1. The type of eviction: use `eviction-hard` for hard eviction thresholds.
+2. Each eviction threshold is defined as `<eviction_signal><operator><quantity>`, such as `memory.available<500Mi` or `nodefs.available<10%`.
+</Callouts>
+
+:::note
+Use percentage values for `inodesFree`. Other parameters accept percentages or numeric values.
+:::
+
+**Soft Eviction Example:**
+```yaml
+kubeletArguments:
+  eviction-soft: # [!code callout]
+    - memory.available<100Mi # [!code callout]
+    - nodefs.available<10%
+    - nodefs.inodesFree<5%
+    - imagefs.available<15%
+    - imagefs.inodesFree<10%
+  eviction-soft-grace-period: # [!code callout]
+    - memory.available=1m30s
+    - nodefs.available=1m30s
+    - nodefs.inodesFree=1m30s
+    - imagefs.available=1m30s
+    - imagefs.inodesFree=1m30s
+```
+
+<Callouts>
+1. The type of eviction: use `eviction-soft` for soft eviction thresholds.
+2. Each eviction threshold is defined as `<eviction_signal><operator><quantity>`, such as `memory.available<500Mi` or `nodefs.available<10%`.
+3. The grace period for the soft eviction. Leave the default values for optimal performance.
+</Callouts>
+
+Restart the kubelet service for changes to take effect:
+```console
+$ systemctl restart kubelet
+```
+
+## Eviction Signals
+
+Nodes can trigger evictions based on the following signals:
+
+<table>
+  <tr>
+    <th>Node Condition</th>
+    <th>Eviction Signal</th>
+    <th>Description</th>
+  </tr>
+  <tr>
+    <td>MemoryPressure</td>
+    <td>memory.available</td>
+    <td>Available memory below threshold</td>
+  </tr>
+  <tr>
+    <td rowspan="4">DiskPressure</td>
+    <td>nodefs.available</td>
+    <td>Node root filesystem space below threshold</td>
+  </tr>
+  <tr>
+    <td>nodefs.inodesFree</td>
+    <td>Free inodes below threshold</td>
+  </tr>
+  <tr>
+    <td>imagefs.available</td>
+    <td>Image filesystem space below threshold</td>
+  </tr>
+  <tr>
+    <td>imagefs.inodesFree</td>
+    <td>Free inodes in imagefs below threshold</td>
+  </tr>
+</table>
+
+- `inodesFree` must be specified as a percentage.
+- Memory calculations exclude reclaimable inactive file memory.
+- Do not use `free -m` in containers.
+
+Nodes monitor these filesystems every 10 seconds. Dedicated filesystems for volumes/logs are not monitored.
+
+:::note  
+Before evicting pods due to disk pressure, nodes perform container and image garbage collection.
+:::
+
+## Eviction Thresholds
+
+Eviction thresholds trigger resource reclamation. When a threshold is met, the node reports a pressure condition, preventing new pods from being scheduled until resources are reclaimed.
+
+- **Hard thresholds**: Immediate action.
+- **Soft thresholds**: Action after a grace period.
+
+Thresholds are configured as:
+```
+<eviction_signal><operator><quantity>
+```
+Example:
+- `memory.available<1Gi`
+- `memory.available<10%`
+
+Nodes evaluate thresholds every 10 seconds.
+
+### Hard Eviction Thresholds
+
+No grace period; immediate action is taken.
+
+**Example:**
+```yaml
+kubeletArguments:
+  eviction-hard:
+    - memory.available<500Mi
+    - nodefs.available<500Mi
+    - nodefs.inodesFree<5%
+    - imagefs.available<100Mi
+    - imagefs.inodesFree<10%
+```
+
+#### Default Hard Eviction Thresholds
+```yaml
+kubeletArguments:
+  eviction-hard:
+    - memory.available<100Mi
+    - nodefs.available<10%
+    - nodefs.inodesFree<5%
+    - imagefs.available<15%
+```
+
+### Soft Eviction Thresholds
+
+Soft thresholds require a grace period. Optionally, set a maximum pod termination grace period (`eviction-max-pod-grace-period`).
+
+**Example:**
+```yaml
+kubeletArguments:
+  eviction-soft:
+    - memory.available<500Mi
+    - nodefs.available<500Mi
+    - nodefs.inodesFree<5%
+    - imagefs.available<100Mi
+    - imagefs.inodesFree<10%
+  eviction-soft-grace-period:
+    - memory.available=1m30s
+    - nodefs.available=1m30s
+    - nodefs.inodesFree=1m30s
+    - imagefs.available=1m30s
+    - imagefs.inodesFree=1m30s
+```
+
+## Configuring Allocatable Resources for Scheduling
+
+Control how much node resource is available for scheduling by setting `system-reserved` for system daemons. Evictions occur only if pods exceed their requested resources.
+
+- **Capacity**: Total resource on the node.
+- **Allocatable**: Resource available for scheduling.
+
+**Example:**
+```yaml
+kubeletArguments:
+  eviction-hard:
+    - "memory.available<500Mi"
+  system-reserved:
+    - "memory=1.5Gi"
+```
+
+Determine appropriate values using the node summary API.
+
+Restart the kubelet for changes:
+```console
+$ systemctl restart kubelet
+```
+
+## Preventing Node Condition Oscillation
+
+To avoid oscillation above/below soft eviction thresholds, set `eviction-pressure-transition-period`:
+
+**Example:**
+```yaml
+kubeletArguments:
+  eviction-pressure-transition-period:
+    - 5m
+```
+Default is 5 minutes. Restart services for changes.
+
+## Reclaiming Node-level Resources
+
+When eviction criteria are met, nodes reclaim resources before evicting user pods.
+
+- **With imagefs**:
+  - If `nodefs` threshold is met: Delete dead pods/containers.
+  - If `imagefs` threshold is met: Delete unused images.
+- **Without imagefs**:
+  - If `nodefs` threshold is met: Delete dead pods/containers, then unused images.
+
+## Pod Eviction
+
+If a threshold and grace period are met, pods are evicted until the signal is below the threshold.
+
+Pods are ranked for eviction by quality of service (QoS) and resource consumption.
+
+| QoS Level   | Description |
+|-------------|-------------|
+| Guaranteed  | Highest resource consumers evicted first. |
+| Burstable   | Highest resource consumers relative to request evicted first. |
+| BestEffort  | Highest resource consumers evicted first. |
+
+Guaranteed pods are only evicted if system daemons exceed reserved resources or only guaranteed pods remain.
+
+Disk is a best-effort resource; pods are evicted one at a time to reclaim disk space, ranked by QoS and disk usage.
+
+## Quality of Service and Out of Memory Killer
+
+If a system OOM event occurs before memory can be reclaimed, the OOM killer responds.
+
+OOM scores are set based on QoS:
+
+| QoS Level   | oom_score_adj Value |
+|-------------|--------------------|
+| Guaranteed  | -998               |
+| Burstable   | min(max(2, 1000 - (1000 * memoryRequestBytes) / machineMemoryCapacityBytes), 999) |
+| BestEffort  | 1000               |
+
+OOM killer ends the container with the highest score. Containers with lowest QoS and highest memory usage are ended first. Containers may be restarted per node policy.
+
+## Scheduler and Out of Resource Conditions
+
+Scheduler considers node conditions when placing pods.
+
+| Node Condition   | Scheduler Behavior |
+|------------------|-------------------|
+| MemoryPressure   | BestEffort pods not scheduled. |
+| DiskPressure     | No additional pods scheduled. |
+
+## Example Scenario
+
+Operator wants:
+
+- Node with 10Gi memory.
+- Reserve 10% for system daemons.
+- Evict pods at 95% utilization.
+
+Calculation:
+- `capacity = 10Gi`
+- `system-reserved = 1Gi`
+- `allocatable = 9Gi`
+
+To trigger eviction below 10% available memory for 30s, or immediately below 5%:
+
+- `system-reserved = 2Gi`
+- `allocatable = 8Gi`
+
+**Configuration:**
+```yaml
+kubeletArguments:
+  system-reserved:
+    - "memory=2Gi"
+  eviction-hard:
+    - "memory.available<.5Gi"
+  eviction-soft:
+    - "memory.available<1Gi"
+  eviction-soft-grace-period:
+    - "memory.available=30s"
+```
+
+This prevents immediate memory pressure and eviction after scheduling.
+
+## Recommended Practices
+
+### Daemon Sets and Out of Resource Handling
+
+Pods created by daemon sets are immediately recreated if evicted. Daemon sets should avoid best-effort pods and use guaranteed QoS to reduce eviction risk.
