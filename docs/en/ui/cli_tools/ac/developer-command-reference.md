@@ -221,7 +221,9 @@ ac auth reconcile -f my-rbac-rules.yaml
 
 ## ac auth whoami
 
-Experimental: Check self subject attributes
+Display the current ACP CLI login identity and kubeconfig context.
+
+Use this command after `ac login`, cluster switching, or kubeconfig troubleshooting to confirm which user, cluster, namespace, and authentication method are currently active. This command reports the current session context from kubeconfig; it does not issue or print a temporary access token.
 
 ### Example usage
 
@@ -232,6 +234,14 @@ ac auth whoami
 # Get your subject attributes in JSON format
 ac auth whoami -o json
 ```
+
+The command output includes:
+
+- Current user
+- Active context
+- Current cluster and API server address
+- Current namespace, when set
+- Authentication method
 
 ## ac autoscale
 
