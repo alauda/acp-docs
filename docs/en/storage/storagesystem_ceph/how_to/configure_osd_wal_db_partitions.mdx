@@ -1,0 +1,191 @@
+---
+title: "Configuring OSD WAL and DB Partitions"
+weight: 73
+author: "chengli@alauda.io"
+category: "howto"
+queries:
+  - configure rook osd wal db partitions
+  - rook metadataDevice databaseSizeMB walSizeMB
+  - host based ceph osd bluestore metadata device
+---
+
+# Configuring OSD WAL and DB Partitions
+
+## Introduction
+
+This topic describes how to configure a fast metadata partition for host-based Rook-Ceph Object Storage Daemons (OSDs). In this configuration, the OSD stores user data on a data device, and BlueStore metadata such as the RocksDB database and write-ahead log (WAL) on a faster device or partition.
+
+Use this procedure when HDD-backed OSDs need lower latency for metadata operations and the storage node has an SSD or NVMe device reserved for OSD metadata.
+
+## Scenarios
+
+- Use an SSD or NVMe device as the shared metadata device for all selected OSD data devices on a node.
+- Use one metadata partition for one specific OSD data device.
+- Plan metadata partition capacity for newly created or re-created host-based OSDs.
+
+## Prerequisites
+
+Before you begin, ensure the following conditions are met:
+
+- You have `cluster-admin` access to the cluster.
+- You have shell access to each storage node where you need to inspect or prepare local devices.
+- The OSD data device and metadata device or partition do not contain mounted file systems or application data.
+- The `rook-ceph-tools` deployment is available in the `rook-ceph` namespace, or you are allowed to start it temporarily.
+
+## Constraints and Limitations
+
+:::warning
+Changing `metadataDevice`, `databaseSizeMB`, or `walSizeMB` does not move the WAL or DB of an existing OSD in place. To change the WAL/DB layout of an existing OSD, remove and re-create that OSD after confirming the cluster has enough capacity and healthy placement groups.
+:::
+
+- Use stable device paths such as `/dev/disk/by-id/...` when possible. Linux names such as `/dev/sdb` can change after a reboot or hardware replacement.
+- When `metadataDevice` is configured at `spec.storage.config` or `spec.storage.nodes[].config`, Alauda Build of Rook-Ceph shares that metadata device across OSDs on the same node and initializes OSDs with `lvm batch`. In this mode, do not use a partition path as `metadataDevice`.
+- When `metadataDevice` is configured under a specific `devices[].config`, Alauda Build of Rook-Ceph initializes the OSD with `lvm prepare`. In this mode, you can use a partition path as the metadata device for that specific OSD.
+
+## Plan WAL and DB Capacity
+
+BlueStore can use a separate `block.db` device for RocksDB metadata. If a DB device is configured and no explicit WAL device is configured, BlueStore colocates the WAL on the DB device. For this reason, when you assign one dedicated metadata partition to one HDD OSD, size the partition as the DB and WAL capacity for that OSD. You usually do not need to set `databaseSizeMB` or `walSizeMB` in the `CephCluster` CR for this pattern.
+
+Use the following guidelines to size each metadata partition:
+
+| Workload type | Suggested metadata partition size per HDD OSD |
+| :--- | :--- |
+| RBD-dominant block storage | 1% to 2% of the HDD data device capacity |
+| RGW object storage or heavy omap usage | At least 4% of the HDD data device capacity. Use a larger partition when fast-device capacity allows it. |
+| Mixed or uncertain workload | Use 4% of the HDD data device capacity as the starting baseline. Increase the size when the workload might create many omap keys or small objects. |
+
+Examples:
+
+| HDD capacity | RBD-dominant metadata partition | Minimum RGW metadata partition |
+| :--- | :--- | :--- |
+| 4 TB | 40 GB to 80 GB | 160 GB or larger |
+| 8 TB | 80 GB to 160 GB | 320 GB or larger |
+| 12 TB | 120 GB to 240 GB | 480 GB or larger |
+
+Treat the RGW values in the table as minimum planning baselines, not as upper limits. If the fast device has enough capacity, allocate more than 4% to reduce the chance that BlueStore metadata spills back to the HDD.
+
+When a whole fast device is shared by multiple HDD OSDs at the node level, calculate the total required fast-device capacity as:
+
+```text
+metadata capacity per OSD x number of HDD OSDs on the node
+```
+
+If the shared metadata device is smaller than the calculated capacity, reduce the number of HDD OSDs that share the fast device or use a smaller per-OSD target based on the workload. Avoid relying on a very small DB device, because BlueStore metadata can spill back to the HDD when the DB device is full.
+
+## Procedure
+
+<Steps>
+### Check host device paths
+
+Log in to each storage node and list the available block devices.
+
+```bash
+lsblk -o NAME,PATH,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL
+```
+
+List stable device links.
+
+```bash
+ls -l /dev/disk/by-id/
+```
+
+Record the data device and metadata device paths for each OSD. For example:
+
+| Purpose | Example path |
+| :--- | :--- |
+| OSD data device | `/dev/disk/by-id/ata-ST4000DM004-XXXX` |
+| Metadata partition | `/dev/disk/by-id/nvme-SAMSUNG_MZVL21T0-YYYY-part1` |
+
+### Configure one metadata partition for one OSD
+
+Use device-level `metadataDevice` when the metadata target is a partition. This pattern maps each OSD data device to its own WAL/DB partition. The partition capacity is the metadata capacity for that OSD, so `databaseSizeMB` and `walSizeMB` are not required in this configuration.
+
+```bash
+kubectl -n rook-ceph edit cephcluster ceph-cluster
+```
+
+Update `spec.storage` with a configuration similar to the following example.
+
+```yaml
+spec:
+  storage:
+    useAllNodes: false
+    useAllDevices: false
+    nodes:
+    - name: "worker-1"
+      devices:
+      - name: "/dev/disk/by-id/ata-ST4000DM004-XXXX"
+        config:
+          metadataDevice: "/dev/disk/by-id/nvme-SAMSUNG_MZVL21T0-YYYY-part1"
+      - name: "/dev/disk/by-id/ata-ST4000DM004-ZZZZ"
+        config:
+          metadataDevice: "/dev/disk/by-id/nvme-SAMSUNG_MZVL21T0-YYYY-part2"
+```
+
+In this example, each HDD data device uses a different NVMe partition for its BlueStore DB. The WAL is colocated with the DB on the same metadata partition.
+
+### Configure a shared metadata device for OSDs on a node
+
+Use node-level `metadataDevice` only when the metadata target is a whole device or logical volume. Rook shares the metadata target across the selected OSD data devices on that node. Set `databaseSizeMB` only when you need to cap the DB size that Rook allocates per OSD from the shared metadata device. In most deployments, do not set `walSizeMB`; the WAL can be colocated with the DB.
+
+```yaml
+spec:
+  storage:
+    useAllNodes: false
+    useAllDevices: false
+    nodes:
+    - name: "worker-1"
+      config:
+        metadataDevice: "/dev/disk/by-id/nvme-SAMSUNG_MZVL21T0-YYYY"
+        databaseSizeMB: "49152"
+      devices:
+      - name: "/dev/disk/by-id/ata-ST4000DM004-XXXX"
+      - name: "/dev/disk/by-id/ata-ST4000DM004-ZZZZ"
+```
+
+Use this pattern when the whole fast device is reserved for OSD metadata on the node.
+
+### Wait for OSD prepare jobs to finish
+
+Watch the OSD prepare jobs and OSD pods.
+
+```bash
+kubectl -n rook-ceph get jobs,pods -l app=rook-ceph-osd-prepare
+kubectl -n rook-ceph get pods -l app=rook-ceph-osd
+```
+
+If an OSD prepare job fails, inspect the job log.
+
+```bash
+kubectl -n rook-ceph logs job/rook-ceph-osd-prepare-<node-name>
+```
+
+</Steps>
+
+## Verification
+
+Start the tools pod if it is not running.
+
+```bash
+kubectl -n rook-ceph scale deploy rook-ceph-tools --replicas=1
+```
+
+Check the cluster health.
+
+```bash
+kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- ceph -s
+```
+
+Confirm that the OSDs are up and assigned to the expected hosts.
+
+```bash
+kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- ceph osd tree
+```
+
+To inspect the local BlueStore metadata layout, run `ceph-volume` from the OSD pod or on the storage node where the OSD was prepared.
+
+```bash
+kubectl -n rook-ceph exec -it deploy/rook-ceph-osd-<osd-id> -- ceph-volume lvm list
+```
+
+In the output, confirm that the OSD has `block.db` and, when configured separately by Ceph, `block.wal` entries that point to the expected metadata device or partition.
