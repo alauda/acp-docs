@@ -2020,4 +2020,5 @@ ac whoami --show-server
 
 # Print the token the current session is using
 ac whoami -t
+# Caution: the token printed by ac whoami -t is sensitive; do not expose it in logs, shell history, screenshots, or shared output.
 ```
