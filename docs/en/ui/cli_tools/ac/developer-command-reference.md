@@ -2001,3 +2001,23 @@ ac wait --for=create secret/busybox1 --timeout=30s
 ac delete pod/busybox1
 ac wait --for=delete pod/busybox1 --timeout=60s
 ```
+
+## ac whoami
+
+Show information about the current session
+
+### Example usage
+
+```bash
+# Display the currently authenticated user
+ac whoami
+
+# Print the current user context name
+ac whoami -c
+
+# Print the current server's REST API URL
+ac whoami --show-server
+
+# Print the token the current session is using
+ac whoami -t
+```
