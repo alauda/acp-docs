@@ -334,29 +334,83 @@ Before reinstalling the plugin, verify that port `2379` is forwarded correctly f
 
 To reinstall the plugin:
 
-1. Access the **standby global cluster** Web Console through its VIP and switch to **Administrator** view.
-2. Navigate to **Marketplace > Cluster Plugins** and select the `global` cluster.
-3. Find **<Term name="product" /> etcd Synchronizer**, click **Install**, and configure the required parameters.
+<Tabs>
+  <Tab label="4.3.1+">
 
-When you configure the plugin:
+  1. Create or update the `etcd-sync-active-cluster-token` Secret in `cpaas-system`. First, get the bearer token for accessing the active global cluster API server from the active global cluster. Then copy the command output and use it when creating the Secret. The Secret stores the token under the data key `token`. Use this Secret through **Active Global Cluster Token Secret**. Legacy plain-token configuration remains only as a compatibility fallback and is not the recommended operational path.
 
-- When port `2379` is not forwarded through a load balancer, set **Active Global Cluster ETCD Endpoints** correctly.
-- Use the default value of **Data Check Interval**.
-- Leave **Print detail logs** disabled unless you are troubleshooting.
+     ```bash
+     # Run this command on the active cluster.
+     kubectl -n cpaas-system get secret k8sadmin -o jsonpath='{.data.token}' | base64 -d
+     ```
 
-Verify the sync Pod is running on the standby global cluster:
+     Copy the output value, then run this command on the standby cluster:
+
+     ```bash
+     ACTIVE_CLUSTER_TOKEN='<paste-the-token-from-the-active-cluster>'
+     kubectl -n cpaas-system create secret generic etcd-sync-active-cluster-token \
+       --from-literal=token="${ACTIVE_CLUSTER_TOKEN}" \
+       --dry-run=client -o yaml | kubectl apply -f -
+     ```
+
+  2. Access the **standby global cluster** Web Console through its VIP and switch to **Administrator** view.
+  3. Navigate to **Marketplace > Cluster Plugins** and select the `global` cluster.
+  4. Find **<Term name="product" /> etcd Synchronizer**, click **Install**, and configure the required parameters.
+
+  When you configure the plugin:
+
+  - Set **Active Global Cluster VIP** to the VIP of the active global cluster.
+  - When port `2379` is not forwarded through a load balancer, set **Active Global Cluster ETCD Endpoints** correctly.
+  - Set **Standby Cluster ETCD Endpoints** to the standby cluster etcd address. Use the default value unless the local etcd service is exposed through a different endpoint.
+  - Set **Active Global Cluster Token Secret** to `etcd-sync-active-cluster-token`.
+  - Use the default value of **Data Check Interval**.
+  - Leave **Print detail logs** disabled unless you are troubleshooting.
+
+  During reinstallation, the system runs the `etcd-sync-bootstrap` Job before the `etcd-sync` Deployment starts. The release continues only after the Job prepares `remote-etcd-ca`, `remote-etcd-issuer`, and `remote-etcd-client`.
+
+  Verify the bootstrap Job and runtime resources:
+
+  ```bash
+  kubectl get job -n cpaas-system etcd-sync-bootstrap
+  kubectl logs -n cpaas-system job/etcd-sync-bootstrap
+  kubectl get secret -n cpaas-system remote-etcd-ca
+  kubectl get issuer -n cpaas-system remote-etcd-issuer
+  kubectl get certificate -n cpaas-system remote-etcd-client
+  kubectl get secret -n cpaas-system remote-etcd-client
+  ```
+
+  </Tab>
+  <Tab label="4.3.0">
+
+  1. Access the **standby global cluster** Web Console through its VIP and switch to **Administrator** view.
+  2. Navigate to **Marketplace > Cluster Plugins** and select the `global` cluster.
+  3. Find **<Term name="product" /> etcd Synchronizer**, click **Install**, and configure the required parameters.
+
+  When you configure the plugin:
+
+  - When port `2379` is not forwarded through a load balancer, set **Active Global Cluster ETCD Endpoints** correctly.
+  - Use the default value of **Data Check Interval**.
+  - Leave **Print detail logs** disabled unless you are troubleshooting.
+
+  </Tab>
+</Tabs>
+
+Wait until `kubectl get lease -n cpaas-system etcd-sync-mirror -o jsonpath='{.spec.holderIdentity}'` returns a non-empty value before continuing.
+
+Verify the sync Pods are running on the standby global cluster and identify the current leader:
 
 ```bash
 kubectl get po -n cpaas-system -l app=etcd-sync
-etcd_sync_pod=$(kubectl get po -n cpaas-system -l app=etcd-sync -o jsonpath='{.items[0].metadata.name}')
-kubectl logs -n cpaas-system "$etcd_sync_pod" | grep -i "Start Sync update"
+kubectl get lease -n cpaas-system etcd-sync-mirror
+leader_pod=$(kubectl get lease -n cpaas-system etcd-sync-mirror -o jsonpath='{.spec.holderIdentity}')
+kubectl logs -n cpaas-system "$leader_pod" | grep -E "Acquired leader lease|Start Sync update"
 ```
 
-Once `Start Sync update` appears, recreate one of the Pods to trigger synchronization of resources with ownerReference dependencies:
+If resources with `ownerReference` dependencies need to be resynchronized, recreate the current leader Pod after `Start Sync update` appears:
 
 ```bash
-etcd_sync_pod=$(kubectl get po -n cpaas-system -l app=etcd-sync -o jsonpath='{.items[0].metadata.name}')
-kubectl delete po -n cpaas-system "$etcd_sync_pod"
+leader_pod=$(kubectl get lease -n cpaas-system etcd-sync-mirror -o jsonpath='{.spec.holderIdentity}')
+kubectl delete po -n cpaas-system "$leader_pod"
 ```
 
 Check sync status:
@@ -374,7 +428,7 @@ curl -g "http://${mirror_host}/check"
 
 Output interpretation:
 
-- `LOCAL ETCD missed keys`: Keys exist in the primary global cluster but are missing from the standby. This often resolves after restarting one `etcd-sync` Pod.
+- `LOCAL ETCD missed keys`: Keys exist in the primary global cluster but are missing from the standby. This often resolves after restarting the current `etcd-sync` leader Pod.
 - `LOCAL ETCD surplus keys`: Keys exist in the standby global cluster but not in the primary. Review these with your operations team before deleting them.
 
 </Steps>
