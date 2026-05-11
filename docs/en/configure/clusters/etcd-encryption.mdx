@@ -3,8 +3,7 @@ weight: 91
 title: etcd Encryption
 ---
 
-{/* cspell:ignore master Master urandom */}
-{/* "master" here refers to the upstream chart parameter `master_secret_name`/`masterSecretRef` and the cryptography term "master key", not control-plane semantics. */}
+{/* cspell:ignore urandom */}
 
 # etcd Encryption
 
@@ -19,7 +18,7 @@ The plugin supports two key strategies. Pick the one that matches your cluster r
 | Strategy | When to use | How keys are produced |
 | --- | --- | --- |
 | `random` | Default for workload and DCS clusters running standalone (no etcd synchronization). | Each rotation generates a fresh random key locally. |
-| `deterministic` | **Required** for `global` clusters, especially when paired in a DR setup via the etcd Synchronizer. | Each key is derived deterministically from a shared master Secret and a shared SeedBundle, so the Active and Standby clusters always reach the same key for the same revision. |
+| `deterministic` | **Required** for `global` clusters, especially when paired in a DR setup via the etcd Synchronizer. | Each key is derived deterministically from a shared root Secret and a shared SeedBundle, so the Active and Standby clusters always reach the same key for the same revision. |
 
 In `deterministic` mode, the runtime Active / Standby role is detected automatically; it is not a manual install parameter.
 
@@ -41,7 +40,7 @@ See [Cluster Plugin](/extend/cluster_plugin.mdx) for the general plugin installa
 
 <Directive type="warning" title="DR pair requirements">
 
-For a Global DR pair, install the plugin **on both the Active and Standby clusters** in `deterministic` mode, and configure **identical** `replication_group_id` and `master_secret_name` (with matching master key material) on both sides. Asymmetric or mismatched configuration causes the Standby to derive different per-revision keys than the Active and breaks failover.
+For a Global DR pair, install the plugin **on both the Active and Standby clusters** in `deterministic` mode, and configure **identical** `replication_group_id` and `root_secret_name` (with matching root key material) on both sides. Asymmetric or mismatched configuration causes the Standby to derive different per-revision keys than the Active and breaks failover.
 
 </Directive>
 
@@ -63,16 +62,16 @@ The plugin form exposes the following parameters for deterministic installation.
 | --- | --- | --- | --- |
 | `key_strategy` | Yes | `random`; dynamically defaults to `deterministic` for `global` clusters. | Selects between random per-rotation key generation and deterministic derivation. |
 | `replication_group_id` | Yes | The plugin UI prefills the current cluster name (not recommended — see below). | Identifies the Active / Standby DR group and participates in HKDF domain separation. |
-| `master_secret_name` | Yes | `etcd-derivation-master` | Name of the Secret in `kube-system` that holds the deterministic master key material. |
+| `root_secret_name` | Yes | `etcd-derivation-root` | Name of the Secret in `kube-system` that holds the deterministic root key material. |
 
-The `masterSecretRef.namespace` is fixed to `kube-system` and is not exposed in the form.
+The `rootSecretRef.namespace` is fixed to `kube-system` and is not exposed in the form.
 
 ##### `key_strategy`
 
 | Value | Meaning |
 | --- | --- |
 | `random` | Single-cluster random rotation. |
-| `deterministic` | Derived keys based on a shared master Secret and SeedBundle. |
+| `deterministic` | Derived keys based on a shared root Secret and SeedBundle. |
 
 For `global` clusters this must be `deterministic`.
 
@@ -103,39 +102,39 @@ Generate the value **once**, then configure the same `replication_group_id` on t
 
 </Directive>
 
-##### `master_secret_name`
+##### `root_secret_name`
 
 | Property | Value |
 | --- | --- |
-| Purpose | Refers to the deterministic master key Secret. |
-| Default | `etcd-derivation-master` |
+| Purpose | Refers to the deterministic root key Secret. |
+| Default | `etcd-derivation-root` |
 | Fixed namespace | `kube-system` |
-| Cross-cluster requirement | All clusters in the same replication group must use the same master key material. |
+| Cross-cluster requirement | All clusters in the same replication group must use the same root key material. |
 
 The plugin form exposes only the Secret name; the namespace is always `kube-system` at render time.
 
-#### Preparing the Master Secret
+#### Preparing the Root Secret
 
-The deterministic master Secret must exist in `kube-system` before installing the plugin. Prepare it in two steps:
+The deterministic root Secret must exist in `kube-system` before installing the plugin. Prepare it in two steps:
 
-1. Generate 32 bytes of cryptographically strong random material into `./master-key.bin`. The bytes must come from a high-entropy source — typically the operating system CSPRNG. `openssl rand` is a safe default; equivalent OS-CSPRNG-backed commands such as `head -c 32 /dev/urandom > ./master-key.bin` also work. Do **not** use shell `$RANDOM`, language-level `rand()`, or any time-seeded generator.
+1. Generate 32 bytes of cryptographically strong random material into `./root-key.bin`. The bytes must come from a high-entropy source — typically the operating system CSPRNG. `openssl rand` is a safe default; equivalent OS-CSPRNG-backed commands such as `head -c 32 /dev/urandom > ./root-key.bin` also work. Do **not** use shell `$RANDOM`, language-level `rand()`, or any time-seeded generator.
 
    ```bash
-   openssl rand -out ./master-key.bin 32
+   openssl rand -out ./root-key.bin 32
    ```
 
 2. Create the Secret in `kube-system` from that file:
 
    ```bash
-   kubectl -n kube-system create secret generic etcd-derivation-master \
-     --from-file=master-key=./master-key.bin
+   kubectl -n kube-system create secret generic etcd-derivation-root \
+     --from-file=root-key=./root-key.bin
    ```
 
-If you use a different Secret name, replace `etcd-derivation-master` above with the value you will enter as `master_secret_name`.
+If you use a different Secret name, replace `etcd-derivation-root` above with the value you will enter as `root_secret_name`.
 
 <Directive type="warning" title="Use the same key material on both clusters">
 
-Generate `./master-key.bin` **once**, then transport the **same file** to every cluster in the replication group and run the `kubectl create secret` step on each. Do **not** regenerate the key material per cluster — different master key bytes will produce divergent encryption keys.
+Generate `./root-key.bin` **once**, then transport the **same file** to every cluster in the replication group and run the `kubectl create secret` step on each. Do **not** regenerate the key material per cluster — different root key bytes will produce divergent encryption keys.
 
 </Directive>
 
@@ -150,9 +149,9 @@ The following fields exist in the chart but are not surfaced as plugin install p
 | --- | --- | --- |
 | `etcdEncryption.deterministic.activationPolicy` | `timed-approval` | Controls how a new derived key becomes active. `timed-approval` waits for a delay before activation. |
 | `etcdEncryption.deterministic.approvalDelay` | `30m` | Delay applied under `timed-approval`. The plugin form maps this as `approval_delay_minutes` (integer minutes) internally. |
-| `etcdEncryption.deterministic.derivationAlgorithm` | `hkdf-sha512-v1` | Algorithm used to derive per-revision keys from the master Secret. |
+| `etcdEncryption.deterministic.derivationAlgorithm` | `hkdf-sha512-v1` | Algorithm used to derive per-revision keys from the root Secret. |
 | `etcdEncryption.deterministic.dimension` | `default` | Additional HKDF domain separator. Leave at the default unless you need to fork a key lineage on purpose. |
-| `etcdEncryption.deterministic.masterSecretRef.namespace` | `kube-system` | Fixed; not exposed by the form. |
+| `etcdEncryption.deterministic.rootSecretRef.namespace` | `kube-system` | Fixed; not exposed by the form. |
 
 </details>
 
@@ -174,7 +173,7 @@ When the plugin is installed in `deterministic` mode on a `global` DR pair, the 
 
 * Detects whether it is acting as **Active** or **Standby** at runtime — this is not a manual configuration.
 * On the Active side, generates the SeedBundle and lets the etcd Synchronizer replicate it to the Standby.
-* On the Standby side, derives the same per-revision keys from the shared SeedBundle and the master Secret, so a failover produces identical encryption keys without manual key copy.
+* On the Standby side, derives the same per-revision keys from the shared SeedBundle and the root Secret, so a failover produces identical encryption keys without manual key copy.
 
 ### Default Configuration
 
