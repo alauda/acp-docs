@@ -1,0 +1,389 @@
+---
+weight: 55
+queries:
+  - migrate virtual machine storage class
+  - move vm disk to another storage class
+  - kubevirt vm storage migration
+  - virtual machine datavolume clone storage class
+---
+
+# Migrate Virtual Machines Between Storage Classes
+
+This document describes how to migrate a virtual machine (VM) disk from one StorageClass to another. Use this procedure when you need to move VM storage to another backend, storage pool, or CSI driver, for example from Ceph RBD to CephFS, between two Ceph RBD pools, or from platform-provided storage to a customer-provided storage class.
+
+Two migration methods are available:
+
+| Method                          | VM status | Recommended scenario                                                                                                                                                                                |
+| ------------------------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Cold migration with a CDI clone | Stopped   | Use when the source or destination storage supports only `ReadWriteOnce`, when local or topology-aware storage is involved, or when maximum compatibility is more important than avoiding downtime. |
+| Live storage migration          | Running   | Use only when the VM, source storage, destination storage, network, and target node scheduling conditions are all live-migratable.                                                                  |
+
+## Prerequisites
+
+- ACP virtualization is enabled and includes live storage migration support.
+- You have permission to manage `VirtualMachine`, `VirtualMachineInstance`, `PersistentVolumeClaim`, and `DataVolume` resources in the VM namespace.
+- The source VM uses a CDI `DataVolume` or a PVC-backed disk.
+- The destination StorageClass has enough capacity and supports the required `accessModes` and `volumeMode`.
+- For cold migration, plan a maintenance window because the VM is stopped while the disk is cloned and the VM definition is updated.
+- For live storage migration, the running VMI must report both `LiveMigratable=True` and `StorageLiveMigratable=True`.
+
+## Prepare the Migration
+
+Set variables for the VM and destination storage:
+
+```bash
+NAMESPACE=<vm-namespace>
+VM=<vm-name>
+ROOT_VOLUME=<root-disk-volume-name>
+SRC_PVC=<source-pvc-name>
+DST_SC=<destination-storage-class>
+```
+
+Check the destination StorageProfile before creating the destination disk:
+
+```bash
+kubectl get storageprofile "$DST_SC" -o yaml
+```
+
+Choose `accessModes` and `volumeMode` from the claim property sets supported by the destination StorageProfile. For example, Ceph RBD is commonly used with `volumeMode: Block`, while CephFS is commonly used with `volumeMode: Filesystem`.
+
+For a `VirtualMachineStorageMigrationPlan`, you can also set `accessModes` or `volumeMode` to `Auto` and let the storage migration controller look up the value from the StorageProfile. For a manually created `DataVolume`, use explicit Kubernetes PVC values such as `ReadWriteOnce`, `ReadWriteMany`, `Block`, or `Filesystem`.
+
+If you plan to use live storage migration, check the running VMI conditions:
+
+```bash
+kubectl get vmi "$VM" -n "$NAMESPACE" \
+  -o jsonpath='{range .status.conditions[*]}{.type}={.status}{" "}{.reason}{"\n"}{end}'
+```
+
+Continue with live storage migration only when the output includes both of the following conditions:
+
+```text
+LiveMigratable=True
+StorageLiveMigratable=True
+```
+
+If either condition is missing or set to `False`, use cold migration or resolve the reported limitation before retrying live migration.
+
+## Cold Migration with a DataVolume Clone
+
+Cold migration is the most compatible method across CSI drivers. It stops the VM, clones the source PVC into a new DataVolume that uses the destination StorageClass, and then updates the VM to use the new DataVolume.
+
+### Stop the VM
+
+Stop the VM:
+
+```bash
+kubectl patch vm "$VM" -n "$NAMESPACE" --type=merge \
+  -p '{"spec":{"running":false}}'
+```
+
+<Directive type="info" title="Note">
+  Some VM API versions warn that `spec.running` is deprecated in favor of
+  `spec.runStrategy`. If the VM already uses `spec.running`, do not set
+  `spec.runStrategy` without first removing `spec.running`, because the two
+  fields are mutually exclusive.
+</Directive>
+
+Wait until the VMI is deleted:
+
+```bash
+kubectl wait vmi "$VM" -n "$NAMESPACE" --for=delete --timeout=10m
+```
+
+### Create the Destination DataVolume
+
+Create a DataVolume that clones the source PVC into the destination StorageClass:
+
+```yaml
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: <destination-datavolume-name>
+  namespace: <vm-namespace>
+spec:
+  source:
+    pvc:
+      namespace: <vm-namespace>
+      name: <source-pvc-name>
+  pvc:
+    accessModes:
+      - <destination-access-mode>
+    volumeMode: <Block-or-Filesystem>
+    resources:
+      requests:
+        storage: <destination-size>
+    storageClassName: <destination-storage-class>
+```
+
+Apply the manifest:
+
+```bash
+kubectl apply -f <destination-datavolume-file>.yaml
+```
+
+For a StorageClass with `volumeBindingMode: Immediate`, wait for the clone to complete:
+
+```bash
+kubectl wait dv <destination-datavolume-name> -n "$NAMESPACE" \
+  --for=jsonpath='{.status.phase}'=Succeeded --timeout=60m
+```
+
+For a StorageClass with `volumeBindingMode: WaitForFirstConsumer`, the DataVolume can remain in `PendingPopulation` until the VM starts and becomes the first consumer. This is expected for local or topology-aware storage. Continue with the VM update, start the VM, and monitor the DataVolume and VMI.
+
+<Directive type="info" title="Note">
+  When migrating from block mode to filesystem mode, request a destination size
+  larger than the source disk. A 5% to 10% increase is a practical starting
+  point because the destination filesystem and disk image file need additional
+  space.
+</Directive>
+
+### Update the VM Disk Reference
+
+Update the VM so the root disk volume points to the destination DataVolume.
+
+When editing arrays such as `spec.dataVolumeTemplates` and `spec.template.spec.volumes`, keep all required entries. If the VM has other disks, cloud-init volumes, secrets, or config maps, include them in the final VM specification so they are not removed.
+
+Example patch content:
+
+```yaml
+spec:
+  dataVolumeTemplates:
+    - metadata:
+        name: <destination-datavolume-name>
+      spec:
+        source:
+          pvc:
+            namespace: <vm-namespace>
+            name: <source-pvc-name>
+        pvc:
+          accessModes:
+            - <destination-access-mode>
+          volumeMode: <Block-or-Filesystem>
+          resources:
+            requests:
+              storage: <destination-size>
+          storageClassName: <destination-storage-class>
+  template:
+    spec:
+      volumes:
+        - name: <root-disk-volume-name>
+          dataVolume:
+            name: <destination-datavolume-name>
+        - name: <other-volume-name>
+          <other-volume-source>: {}
+```
+
+Apply the patch:
+
+```bash
+kubectl patch vm "$VM" -n "$NAMESPACE" --type=merge --patch-file=<vm-patch-file>.yaml
+```
+
+### Start and Verify the VM
+
+Start the VM:
+
+```bash
+kubectl patch vm "$VM" -n "$NAMESPACE" --type=merge \
+  -p '{"spec":{"running":true}}'
+```
+
+Check the VM, VMI, PVC, and DataVolume status:
+
+```bash
+kubectl get vm,vmi,pvc,dv -n "$NAMESPACE"
+```
+
+If the destination uses `WaitForFirstConsumer`, monitor the DataVolume and PVC until the VM starts:
+
+```bash
+kubectl get dv <destination-datavolume-name> -n "$NAMESPACE" -w
+kubectl describe pvc <destination-pvc-name> -n "$NAMESPACE"
+```
+
+After the VM is running and guest workload checks pass, delete the old DataVolume or PVC only after confirming that it is no longer referenced by the VM.
+
+```bash
+kubectl delete dv <old-datavolume-name> -n "$NAMESPACE"
+```
+
+## Live Storage Migration
+
+Use live storage migration only when the VM must stay running and all live migration prerequisites are met.
+
+### Confirm Live Migration Readiness
+
+Check the VMI conditions:
+
+```bash
+kubectl get vmi "$VM" -n "$NAMESPACE" \
+  -o jsonpath='{range .status.conditions[*]}{.type}={.status}{" "}{.reason}{"\n"}{end}'
+```
+
+Proceed only when the output includes `LiveMigratable=True` and `StorageLiveMigratable=True`.
+
+Also confirm the following requirements:
+
+- The destination StorageClass can create a PVC with the selected `accessModes` and `volumeMode`.
+- The VM can be scheduled on more than one node.
+- The VM does not report `RestartRequired=True` in `.status.conditions`. If the VM has pending changes that require a restart, restart the VM or resolve those pending changes before starting live storage migration.
+- If the cluster has mixed CPU models, the VM uses a CPU model supported by all candidate nodes.
+- If the VM uses bridge binding on the pod network, the VM has the following annotation:
+
+  ```yaml
+  kubevirt.io/allow-pod-bridge-network-live-migration: 'true'
+  ```
+
+### Create the Migration Objects
+
+The ACP console is the preferred entry point because it validates the VM and destination storage options before creating the migration resources.
+
+If you use Kubernetes manifests, create a `VirtualMachineStorageMigrationPlan` and a `VirtualMachineStorageMigration`:
+
+```yaml
+apiVersion: migrations.kubevirt.io/v1alpha1
+kind: VirtualMachineStorageMigrationPlan
+metadata:
+  name: <migration-plan-name>
+  namespace: <vm-namespace>
+spec:
+  virtualMachines:
+    - name: <vm-name>
+      targetMigrationPVCs:
+        - volumeName: <root-disk-volume-name>
+          destinationPVC:
+            name: <destination-pvc-name>
+            storageClassName: <destination-storage-class>
+            accessModes:
+              - <destination-access-mode>
+            volumeMode: <Block-Filesystem-or-Auto>
+---
+apiVersion: migrations.kubevirt.io/v1alpha1
+kind: VirtualMachineStorageMigration
+metadata:
+  name: <migration-name>
+  namespace: <vm-namespace>
+spec:
+  virtualMachineStorageMigrationPlanRef:
+    apiVersion: migrations.kubevirt.io/v1alpha1
+    kind: VirtualMachineStorageMigrationPlan
+    name: <migration-plan-name>
+    namespace: <vm-namespace>
+```
+
+Apply the manifest:
+
+```bash
+kubectl create -f <storage-migration-file>.yaml
+```
+
+Monitor progress:
+
+```bash
+kubectl get virtualmachinestoragemigration,virtualmachinestoragemigrationplan \
+  -n "$NAMESPACE" -w
+
+kubectl get vmim,pvc,dv -n "$NAMESPACE"
+```
+
+The expected flow is:
+
+1. ACP creates the destination PVC and DataVolume.
+2. ACP updates the VM disk reference to the destination DataVolume.
+3. KubeVirt performs a workload update through live migration.
+4. ACP cleans up the completed workload update resources.
+5. The `VirtualMachineStorageMigration` reaches `Completed`.
+
+When the migration reaches `Completed`, the VM specification references the destination DataVolume and the VM continues running on the migrated disk. Verify the VM, VMI, destination PVC, and destination DataVolume before deleting any old storage objects:
+
+```bash
+kubectl get vm "$VM" -n "$NAMESPACE" \
+  -o jsonpath='{range .spec.template.spec.volumes[*]}{.name}{" -> "}{.dataVolume.name}{"\n"}{end}'
+
+kubectl get vm,vmi,pvc,dv -n "$NAMESPACE"
+```
+
+After the migration succeeds and guest workload checks pass, remove the old DataVolume or PVC only if it is no longer referenced by the VM or by any rollback procedure.
+
+## Troubleshooting
+
+### No VM Is Ready for Live Storage Migration
+
+Describe the migration plan:
+
+```bash
+kubectl describe virtualmachinestoragemigrationplan <migration-plan-name> -n "$NAMESPACE"
+```
+
+If the plan reports `No virtual machines are ready for storage migration`, check whether the VM is running and whether the VMI reports both `LiveMigratable=True` and `StorageLiveMigratable=True`.
+
+If either condition is false, use cold migration or fix the underlying reason first. Also confirm that the target `accessModes` and `volumeMode` are supported by the destination StorageProfile, and that the VM does not report `RestartRequired=True`. Common causes include non-shared PVCs, local storage, unsupported network binding, unsupported target PVC properties, pending VM changes that require a restart, and node scheduling constraints.
+
+### Live Migration Is Stuck in Scheduling
+
+Describe the pending launcher pod or the `VirtualMachineInstanceMigration`:
+
+```bash
+kubectl get pod -n "$NAMESPACE" | grep virt-launcher
+kubectl describe vmim <vmim-name> -n "$NAMESPACE"
+```
+
+Common causes include:
+
+- The destination launcher pod cannot be scheduled on a node different from the source node.
+- The VM uses a CPU model or CPU feature set that exists only on the source node.
+- The destination PVC cannot be attached or mounted on the target node.
+
+Use a portable CPU model and confirm that the destination storage supports the required access mode.
+
+### Destination DataVolume Does Not Complete
+
+Inspect the DataVolume and PVC events:
+
+```bash
+kubectl describe dv <destination-datavolume-name> -n "$NAMESPACE"
+kubectl describe pvc <destination-pvc-name> -n "$NAMESPACE"
+```
+
+For `WaitForFirstConsumer` storage, `PendingPopulation` can be expected until a consumer pod is scheduled. For block-to-filesystem migration, increase the requested destination size and retry if CDI reports that the target PVC is too small.
+
+### Live Storage Migration Does Not Reach Completed
+
+If the `VirtualMachineStorageMigration` does not reach `Completed`, inspect both the storage migration resource and the underlying KubeVirt migration:
+
+```bash
+kubectl describe virtualmachinestoragemigration <migration-name> -n "$NAMESPACE"
+kubectl get vmim -n "$NAMESPACE"
+kubectl describe vmim <vmim-name> -n "$NAMESPACE"
+```
+
+If the `VirtualMachineInstanceMigration` is still running, continue troubleshooting it as a live migration issue. If the `VirtualMachineInstanceMigration` has already succeeded but the storage migration resource still does not complete, collect the migration resource, migration plan, VM, VMI, PVC, DataVolume, and controller logs before contacting support.
+
+### Migration Resources Are Stuck During Cleanup
+
+Delete the migration resources first:
+
+```bash
+kubectl delete virtualmachinestoragemigration <migration-name> -n "$NAMESPACE" --wait=false
+kubectl delete virtualmachinestoragemigrationplan <migration-plan-name> -n "$NAMESPACE" --wait=false
+```
+
+If a finalizer prevents deletion, remove it only after confirming that no active migration is still running:
+
+```bash
+kubectl patch virtualmachinestoragemigration <migration-name> -n "$NAMESPACE" --type=json \
+  -p='[{"op":"remove","path":"/metadata/finalizers"}]'
+
+kubectl patch virtualmachinestoragemigrationplan <migration-plan-name> -n "$NAMESPACE" --type=json \
+  -p='[{"op":"remove","path":"/metadata/finalizers"}]'
+```
+
+Before restarting the VM after an interrupted live storage migration, confirm which DataVolume the VM references:
+
+```bash
+kubectl get vm "$VM" -n "$NAMESPACE" \
+  -o jsonpath='{range .spec.template.spec.volumes[*]}{.name}{" -> "}{.dataVolume.name}{"\n"}{end}'
+```
+
+If the VM specification was updated but the migration did not complete, either finish the migration or restore the VM disk reference to the intended DataVolume before starting the VM.
