@@ -5,7 +5,7 @@ sourceSHA: 3e9fc8e2c198ab10112f85793aedbcdada662640198a0870a51009ff39d80fa2
 
 # Creating Linux Images Based on ISO Using KubeVirt
 
-This document describes a virtual machine solution implemented based on the open-source component KubeVirt. It utilizes KubeVirt virtualization technology to create a Linux operating system image from an ISO image file.
+This document describes a virtual machine solution implemented based on the open-source component KubeVirt. It utilizes KubeVirt virtualization technology to create a Linux operating system image from an ISO image file. The ISO is uploaded to the cluster via CDI DataVolume, eliminating the need to build and push container images to a registry.
 
 ## Prerequisites
 
@@ -13,7 +13,9 @@ This document describes a virtual machine solution implemented based on the open
 
 - A Linux image should be prepared in advance. This document uses the [Ubuntu operating system](https://mirrors.tuna.tsinghua.edu.cn/ubuntu-releases/) as an example.
 
-- A repository for storing images should be prepared in advance. This document uses the build-harbor.example.cn repository as an example; please replace it according to your actual environment.
+- The `kubectl` command-line tool is installed and configured to access the cluster.
+
+- A StorageClass that supports `ReadWriteOnce` (RWO) access mode is available in the cluster.
 
 ## Constraints and Limitations
 
@@ -23,37 +25,74 @@ This document describes a virtual machine solution implemented based on the open
 
 ## Procedure
 <Steps>
-### Convert Linux ISO Image into Container Image
+### Upload the Linux ISO to a DataVolume
 
-1. Navigate to the directory where the ISO image is stored and execute the following command in the terminal to rename the ISO image to ubuntu.iso.
+Upload the ISO file directly to the cluster storage using the CDI upload mechanism, without building a container image.
 
-   ```bash
-   mv <ISO image name> ubuntu.iso # Replace <ISO image name> with the actual image name, e.g., mv ubuntu-24.04-live-server-amd64.iso ubuntu.iso
+1. Create an upload-type DataVolume by saving the following YAML to a file named `dv-iso-upload.yaml`. Adjust the `storage` size based on the actual ISO file size.
+
+   ```yaml
+   apiVersion: cdi.kubevirt.io/v1beta1
+   kind: DataVolume
+   metadata:
+     name: iso-upload-dv
+     namespace: default
+     annotations:
+       cdi.kubevirt.io/storage.bind.immediate.requested: "true"
+   spec:
+     source:
+       upload: {}
+     storage:
+       accessModes:
+         - ReadWriteOnce
+       resources:
+         requests:
+           storage: 8Gi
+       storageClassName: vm-cephrbd  # Replace with your actual StorageClass
+       volumeMode: Block
    ```
 
-2. Create a Containerfile by executing the following command.
+2. Execute the following command to create the DataVolume.
 
    ```bash
-   touch Containerfile
+   kubectl apply -f dv-iso-upload.yaml
    ```
 
-3. Edit the Containerfile, add the following content, and save it.
-
-   ```dockerfile
-   FROM scratch
-   ADD --chown=107:107 ubuntu.iso /disk/
-   ```
-
-4. Build the container image by executing the following command.
+3. Wait for the DataVolume to enter the `UploadReady` phase.
 
    ```bash
-   podman build -t build-harbor.example.cn/3rdparty/vmdisks/ubuntu-iso:24.04 -f Containerfile . # Please replace the repository according to your actual environment
+   kubectl get dv iso-upload-dv -w
+   # The PHASE column should show UploadReady
    ```
 
-5. Push the image to the repository by executing the following command.
+4. Set up port-forwarding to the CDI upload proxy.
 
    ```bash
-   podman push build-harbor.example.cn/3rdparty/vmdisks/ubuntu-iso:24.04 # Please replace the repository according to your actual environment
+   kubectl port-forward -n cdi svc/cdi-uploadproxy 8443:443 &
+   ```
+
+5. Obtain an authentication token.
+
+   ```bash
+   TOKEN=$(kubectl create token default -n default)
+   ```
+
+6. Upload the ISO file using curl. Replace the file path with the actual path to your ISO.
+
+   ```bash
+   curl -v --insecure \
+     -H "Authorization: Bearer ${TOKEN}" \
+     --data-binary @/path/to/ubuntu-24.04-live-server-amd64.iso \
+     "https://localhost:8443/v1beta1/upload"
+   ```
+
+   **Note**: The `--insecure` flag is used to skip self-signed certificate verification. In a production environment, configure proper certificates. Large file uploads may take a long time; ensure network stability.
+
+7. Verify that the DataVolume status changes to `Succeeded`.
+
+   ```bash
+   kubectl get dv iso-upload-dv
+   # The PHASE column should show Succeeded
    ```
 
 ### Create Virtual Machine
@@ -74,7 +113,7 @@ This document describes a virtual machine solution implemented based on the open
 
 5. Switch to YAML.
 
-6. Replace the configuration under the spec.template.spec.domain.devices.disks field with the following content.
+6. Replace the configuration under the spec.template.spec.domain.devices.disks field with the following content. The ISO DataVolume is mounted as a CDROM with the highest boot priority, and the rootfs disk is used as the installation target.
 
    ```yaml
          domain:
@@ -83,7 +122,7 @@ This document describes a virtual machine solution implemented based on the open
                - bootOrder: 1
                  cdrom:
                    bus: sata
-                 name: containerdisk
+                 name: iso-disk
                - disk:
                    bus: virtio
                  name: cloudinitdisk
@@ -93,12 +132,27 @@ This document describes a virtual machine solution implemented based on the open
                  bootOrder: 10
    ```
 
-7. Add the following content under the spec.template.spec.volumes field.
+7. Replace the spec.template.spec.volumes field with the following content. The ISO is referenced as a DataVolume instead of a container image.
 
    ```yaml
-           - containerDisk:
-               image: registry.example.cn:60070/3rdparty/vmdisks/ubuntu-iso:24.04 # Please replace the image according to your actual environment
-             name: containerdisk
+         volumes:
+           - dataVolume:
+               name: iso-upload-dv
+             name: iso-disk
+           - cloudInitConfigDrive:
+               userData: |-
+                 #cloud-config
+                 disable_root: false
+                 ssh_pwauth: false
+                 users:
+                   - default
+                   - name: root
+                     lock_passwd: false
+                     hashed_passwd: "<hash>"  # Generate with: mkpasswd --method=SHA-512 --rounds=4096
+             name: cloudinitdisk
+           - dataVolume:
+               name: aa-rootfs
+             name: rootfs
    ```
 
 8. Review the YAML file; the complete YAML configuration after completion is as follows.
@@ -135,8 +189,7 @@ This document describes a virtual machine solution implemented based on the open
              storageClassName: vm-cephrbd
              volumeMode: Block
            source:
-             http:
-               url: http://192.168.254.12/kube-debian-12.2.0-x86-out.qcow2
+             blank: {}
      running: true
      template:
        metadata:
@@ -172,7 +225,7 @@ This document describes a virtual machine solution implemented based on the open
                - bootOrder: 1
                  cdrom:
                    bus: sata
-                 name: containerdisk
+                 name: iso-disk
                - disk:
                    bus: virtio
                  name: cloudinitdisk
@@ -180,7 +233,7 @@ This document describes a virtual machine solution implemented based on the open
                    bus: virtio
                  name: rootfs
                  bootOrder: 10
-              interfaces:
+             interfaces:
                - bridge: {}
                  name: default
            machine:
@@ -199,9 +252,9 @@ This document describes a virtual machine solution implemented based on the open
            kubernetes.io/arch: amd64
            vm.cpaas.io/baremetal: "true"
          volumes:
-           - containerDisk:
-               image: registry.example.cn:60070/3rdparty/vmdisks/ubuntu-iso:24.04 # Please replace the image according to your actual environment
-             name: containerdisk
+           - dataVolume:
+               name: iso-upload-dv
+             name: iso-disk
            - cloudInitConfigDrive:
                userData: |-
                  #cloud-config
@@ -211,7 +264,7 @@ This document describes a virtual machine solution implemented based on the open
                    - default
                    - name: root
                      lock_passwd: false
-                     hashed_passwd: ""
+                     hashed_passwd: "<hash>"  # Generate with: mkpasswd --method=SHA-512 --rounds=4096
              name: cloudinitdisk
            - dataVolume:
                name: aa-rootfs
@@ -222,7 +275,7 @@ This document describes a virtual machine solution implemented based on the open
 
 10. Click **Actions** > **VNC Login**.
 
-11. When prompted with **press any key boot from CD or DVD**, press any key to enter the Windows installation program; if you do not see the prompt, click **Send Remote Command** in the upper left corner of the page, and then click **Ctrl-Alt-Delete** from the dropdown menu to reboot the server.
+11. When prompted with **press any key boot from CD or DVD**, press any key to enter the installation program; if you do not see the prompt, click **Send Remote Command** in the upper left corner of the page, and then click **Ctrl-Alt-Delete** from the dropdown menu to reboot the server.
 
     **Note**: If a message appears at the top of the virtual machine detail page stating **Current virtual machine has configuration changes that require a restart to take effect. Please restart.**, you can ignore this message; a restart is not necessary.
 
@@ -254,21 +307,21 @@ This document describes a virtual machine solution implemented based on the open
 
 7. Confirm that the disk named **rootfs** under spec.template.spec.domain.devices.disks has a bootOrder of 1. If it is not 1, modify it to 1.
 
-8. Delete the relevant content for the disk named **containerdisk** under spec.template.spec.domain.devices.disks; the specific content to delete is as follows.
+8. Delete the relevant content for the ISO disk named **iso-disk** under spec.template.spec.domain.devices.disks; the specific content to delete is as follows.
 
    ```yaml
                - bootOrder: 1
                  cdrom:
                    bus: sata
-                 name: containerdisk
+                 name: iso-disk
    ```
 
-9. Delete the relevant content for the disk named **containerdisk** under spec.template.spec.volumes; the specific content to delete is as follows.
+9. Delete the relevant content for the volume named **iso-disk** under spec.template.spec.volumes; the specific content to delete is as follows.
 
    ```yaml
-           - containerDisk:
-               image: registry.example.cn:60070/3rdparty/vmdisks/ubuntu-iso:24.04
-             name: containerdisk
+           - dataVolume:
+               name: iso-upload-dv
+             name: iso-disk
    ```
 
 10. Click **Update**.

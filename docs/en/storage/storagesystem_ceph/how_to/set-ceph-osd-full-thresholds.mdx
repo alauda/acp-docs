@@ -1,0 +1,129 @@
+---
+weight: 71
+---
+
+# Setting Ceph OSD Full Thresholds
+
+This topic describes how to adjust Ceph OSD capacity thresholds for ACP distributed storage. You can change the thresholds directly in Ceph, or manage them declaratively in the `CephCluster` custom resource.
+
+Ceph uses three thresholds to control how the cluster behaves as OSD usage increases:
+
+| Threshold      | Purpose                                                                       |
+| -------------- | ----------------------------------------------------------------------------- |
+| `nearfull`     | Raises an early warning that the cluster is approaching full.                 |
+| `backfillfull` | Prevents Ceph from backfilling more data to an OSD that is already too full.  |
+| `full`         | Stops writes to protect the cluster when an OSD reaches the configured limit. |
+
+:::warning
+Always keep the thresholds in ascending order: `nearfull` < `backfillfull` < `full`. Setting values too close to `1.0` can leave the cluster with no room to recover.
+:::
+
+## Prerequisites
+
+- You have cluster-admin access to the ACP cluster.
+- The `rook-ceph-tools` deployment is available in the `rook-ceph` namespace, or you are allowed to start it temporarily.
+- You understand why the cluster is approaching full capacity and have a plan to add storage or remove data after the emergency adjustment.
+
+## Procedure
+
+<Steps>
+### Check the current cluster state
+
+If the `rook-ceph-tools` Pod is not running, start it first:
+
+```bash
+kubectl -n rook-ceph scale deploy rook-ceph-tools --replicas=1
+```
+
+Check overall cluster health:
+
+```bash
+kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- ceph -s
+```
+
+Check the current threshold values:
+
+```bash
+kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- \
+  ceph osd dump | egrep 'nearfull_ratio|backfillfull_ratio|full_ratio'
+```
+
+output example:
+
+```txt
+full_ratio 0.95
+backfillfull_ratio 0.9
+nearfull_ratio 0.85
+```
+
+### Seting the thresholds via ceph CLI
+
+Use Ceph commands to change the effective cluster values directly.
+
+For example, to raise the thresholds slightly:
+
+```bash
+kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- \
+  ceph osd set-nearfull-ratio 0.88
+
+kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- \
+  ceph osd set-backfillfull-ratio 0.92
+
+kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- \
+  ceph osd set-full-ratio 0.96
+```
+
+Use the smallest increase that restores cluster progress. After changing the values, continue with capacity expansion or data cleanup as soon as possible.
+
+If writes are blocked and OSDs remain stuck, pending, or cannot come back up, stop application I/O first, then raise only the `full` threshold by a small amount, wait for the rebalance to finish, and restore the threshold after the cluster returns to a stable state.
+
+### Setting the thresholds by updating the `CephCluster` CR
+
+You can set Ceph OSD full thresholds by updating the `CephCluster` CR, Use this procedure if you want to override the default settings.
+
+```bash
+kubectl patch cephcluster ceph-cluster -n rook-ceph --type merge -p \
+'{"spec":{"storage":{"nearFullRatio":0.88,"backfillFullRatio":0.92,"fullRatio":0.96}}}'
+```
+
+If you only need to change one threshold, patch only that field. For example:
+
+```bash
+kubectl patch cephcluster ceph-cluster -n rook-ceph --type merge -p \
+'{"spec":{"storage":{"fullRatio":0.96}}}'
+```
+
+### Verify the applied values
+
+Verify the persisted settings in Kubernetes:
+
+```bash
+kubectl get cephcluster ceph-cluster -n rook-ceph -o yaml
+```
+
+Verify the effective runtime values in Ceph:
+
+```bash
+kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- \
+  ceph osd dump | egrep 'nearfull_ratio|backfillfull_ratio|full_ratio'
+```
+
+Recheck cluster health and rebalance status:
+
+```bash
+kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- ceph -s
+```
+
+When these fields are set in `CephCluster`, that resource becomes the declarative source for the threshold values. If ACP or Rook reconciles the cluster configuration later, the values in `CephCluster` should be treated as the intended baseline.
+
+### Restore or rebaseline the thresholds
+
+After you add capacity, remove data, or complete rebalancing, decide whether to keep the new thresholds. If the higher values were used only as an emergency workaround, patch the `CephCluster` resource back to your standard baseline and confirm that the runtime values also return to the expected state.
+
+</Steps>
+
+## Recommendations
+
+- Treat threshold changes as a temporary mitigation, not as a substitute for capacity planning.
+- Review OSD utilization distribution if only a few OSDs are much fuller than the rest.
+- Record the original threshold values before making changes so you can restore them after the cluster stabilizes.

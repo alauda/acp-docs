@@ -5,7 +5,7 @@ sourceSHA: 3972eea242e76234a16348c658b1ad1feb4b6a601f8e7fd827ffd9f395c06799
 
 # Creating Windows Images Based on ISO using KubeVirt
 
-This document discusses a virtual machine solution based on the open-source component KubeVirt, using KubeVirt virtualization technology to create a Windows operating system image through an ISO image file.
+This document discusses a virtual machine solution based on the open-source component KubeVirt, using KubeVirt virtualization technology to create a Windows operating system image through an ISO image file. The ISO files are uploaded to the cluster via CDI DataVolume, eliminating the need to build and push container images to a registry.
 
 ## Prerequisites
 
@@ -13,79 +13,145 @@ This document discusses a virtual machine solution based on the open-source comp
 
 - Please prepare the Windows image and the [latest virtio-win-tools](https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/) in advance.
 
-- Please prepare the repository for storing the image. This document takes the build-harbor.example.cn repository as an example, and please replace it according to your actual environment.
+- The `kubectl` command-line tool is installed and configured to access the cluster.
+
+- A StorageClass that supports `ReadWriteOnce` (RWO) access mode is available in the cluster.
 
 ## Constraints and Limitations
 
 - When starting KubeVirt, the size of the custom image's filesystem will affect the speed of writing the image to the disk in PVC. If the filesystem is too large, it may result in extended creation times.
 
-- It is recommended to keep the Linux root partition or Windows C drive below 100G to minimize the initial size. Subsequent expansion can be done through cloud-init (for Windows systems, it must be expanded manually after creation).
+- It is recommended to keep the Windows C drive below 100G to minimize the initial size. Subsequent expansion must be done manually after creation for Windows systems.
 
 ## Procedure
 <Steps>
-### Create Image
+### Upload ISO Files to DataVolumes
 
-Create a container image from the prepared Windows and virtio-win ISO images, and push it to the repository. This document uses Windows Server 2019 as an example.
+Upload the Windows ISO and virtio-win ISO files directly to the cluster storage using the CDI upload mechanism.
 
-**Create a Container Image from the Windows ISO**
+**Set up the CDI Upload Proxy**
 
-1. Navigate to the directory where the ISO image is stored, and execute the following command in the terminal to rename the ISO image to win.iso.
-
-   ```bash
-   mv <ISO image name> win.iso # Replace <ISO image name> with the actual image name, e.g., mv en_windows_server_2019_x64_dvd_4cb967d8.iso win.iso
-   ```
-
-2. Execute the following command to create a Containerfile.
+1. Set up port-forwarding to the CDI upload proxy. This port-forward session will be used for uploading both ISO files.
 
    ```bash
-   touch Containerfile
+   kubectl port-forward -n cdi svc/cdi-uploadproxy 8443:443 &
    ```
 
-3. Edit the Containerfile, add the following content, and save it.
-
-   ```dockerfile
-   FROM scratch
-   ADD --chown=107:107 win.iso /disk/
-   ```
-
-4. Execute the following command to build the container image.
+2. Obtain an authentication token.
 
    ```bash
-   podman build -t build-harbor.example.cn/3rdparty/vmdisks/winiso:2019 -f Containerfile . # Replace the repository according to your actual environment
+   TOKEN=$(kubectl create token default -n default)
    ```
 
-5. Execute the following command to push the image to the repository.
+**Upload the Windows ISO**
+
+1. Create an upload-type DataVolume for the Windows ISO by saving the following YAML to a file named `dv-win-iso.yaml`. Adjust the `storage` size based on the actual ISO file size (Windows ISOs are typically 4–6 GB).
+
+   ```yaml
+   apiVersion: cdi.kubevirt.io/v1beta1
+   kind: DataVolume
+   metadata:
+     name: win-iso-dv
+     namespace: default
+     annotations:
+       cdi.kubevirt.io/storage.bind.immediate.requested: "true"
+   spec:
+     source:
+       upload: {}
+     storage:
+       accessModes:
+         - ReadWriteOnce
+       resources:
+         requests:
+           storage: 8Gi
+       storageClassName: vm-cephrbd  # Replace with your actual StorageClass
+       volumeMode: Block
+   ```
+
+2. Execute the following command to create the DataVolume.
 
    ```bash
-   podman push build-harbor.example.cn/3rdparty/vmdisks/winiso:2019 # Replace the repository according to your actual environment
+   kubectl apply -f dv-win-iso.yaml
    ```
 
-**Create a Container Image from the virtio-win ISO**
-
-1. Navigate to the directory where the ISO image is stored, and execute the following command in the terminal to create a Containerfile.
+3. Wait for the DataVolume to enter the `UploadReady` phase.
 
    ```bash
-   touch Containerfile
+   kubectl get dv win-iso-dv -w
+   # The PHASE column should show UploadReady
    ```
 
-2. Edit the Containerfile, add the following content, and save it.
-
-   ```dockerfile
-   FROM scratch
-   ADD --chown=107:107 virtio-win.iso  /disk/
-   ```
-
-3. Execute the following command to build the container image.
+4. Upload the Windows ISO file using curl. Replace the file path with the actual path to your ISO.
 
    ```bash
-   podman build -t build-harbor.example.cn/3rdparty/vmdisks/win-virtio:latest -f Containerfile . # Replace the repository according to your actual environment
+   curl -v --insecure \
+     -H "Authorization: Bearer ${TOKEN}" \
+     --data-binary @/path/to/en_windows_server_2019_x64_dvd_4cb967d8.iso \
+     "https://localhost:8443/v1beta1/upload"
    ```
 
-4. Execute the following command to push the image to the repository.
+5. Verify that the DataVolume status changes to `Succeeded`.
 
    ```bash
-   podman push build-harbor.example.cn/3rdparty/vmdisks/win-virtio:latest # Replace the repository according to your actual environment
+   kubectl get dv win-iso-dv
+   # The PHASE column should show Succeeded
    ```
+
+**Upload the virtio-win ISO**
+
+1. Create an upload-type DataVolume for the virtio-win ISO by saving the following YAML to a file named `dv-virtio-iso.yaml`.
+
+   ```yaml
+   apiVersion: cdi.kubevirt.io/v1beta1
+   kind: DataVolume
+   metadata:
+     name: virtio-iso-dv
+     namespace: default
+     annotations:
+       cdi.kubevirt.io/storage.bind.immediate.requested: "true"
+   spec:
+     source:
+       upload: {}
+     storage:
+       accessModes:
+         - ReadWriteOnce
+       resources:
+         requests:
+           storage: 1Gi
+       storageClassName: vm-cephrbd  # Replace with your actual StorageClass
+       volumeMode: Block
+   ```
+
+2. Execute the following command to create the DataVolume.
+
+   ```bash
+   kubectl apply -f dv-virtio-iso.yaml
+   ```
+
+3. Wait for the DataVolume to enter the `UploadReady` phase.
+
+   ```bash
+   kubectl get dv virtio-iso-dv -w
+   # The PHASE column should show UploadReady
+   ```
+
+4. Upload the virtio-win ISO file using curl.
+
+   ```bash
+   curl -v --insecure \
+     -H "Authorization: Bearer ${TOKEN}" \
+     --data-binary @/path/to/virtio-win.iso \
+     "https://localhost:8443/v1beta1/upload"
+   ```
+
+5. Verify that the DataVolume status changes to `Succeeded`.
+
+   ```bash
+   kubectl get dv virtio-iso-dv
+   # The PHASE column should show Succeeded
+   ```
+
+   **Note**: The `--insecure` flag is used to skip self-signed certificate verification. In a production environment, configure proper certificates. Large file uploads may take a long time; ensure network stability.
 
 ### Create Virtual Machine
 
@@ -99,11 +165,15 @@ Create a container image from the prepared Windows and virtio-win ISO images, an
 
 5. Switch to YAML.
 
-6. Replace the configuration under the spec.template.spec.domain.devices.disks field with the following content.
+6. Replace the configuration under the spec.template.spec.domain.devices field with the following content. The USB tablet input device is required for correct mouse positioning in the VNC console (see [kubevirt#2392](https://github.com/kubevirt/kubevirt/issues/2392), [kubevirt#3474](https://github.com/kubevirt/kubevirt/issues/3474)). Without it, the mouse pointer will be misaligned because VNC uses absolute coordinates while the default PS/2 mouse only supports relative coordinates.
 
    ```yaml
      domain:
        devices:
+         inputs:
+           - type: tablet
+             bus: usb
+             name: tablet
          disks:
            - disk:
                bus: virtio
@@ -111,25 +181,40 @@ Create a container image from the prepared Windows and virtio-win ISO images, an
            - bootOrder: 1
              cdrom:
                bus: sata
-             name: containerdisk
+             name: win-iso
            - cdrom:
                bus: sata
-             name: virtio
+             name: virtio-iso
            - disk:
                bus: sata
              name: rootfs
              bootOrder: 10
    ```
 
-7. Add the following content under the spec.template.spec.volumes field.
+7. Replace the spec.template.spec.volumes field with the following content. Both ISO files are referenced as DataVolumes instead of container images.
 
    ```yaml
-           - containerDisk:
-               image: registry.example.cn:60070/3rdparty/vmdisks/winiso:2019 # Replace the image according to your actual environment
-             name: containerdisk
-           - containerDisk:
-               image: registry.example.cn:60070/3rdparty/vmdisks/win-virtio # Replace the image according to your actual environment
-             name: virtio
+         volumes:
+           - cloudInitConfigDrive:
+               userData: >-
+                 #cloud-config
+                 disable_root: false
+                 ssh_pwauth: true
+                 users:
+                   - default
+                   - name: root
+                     lock_passwd: false
+                     hashed_passwd: "<hash>"  # Generate with: mkpasswd --method=SHA-512 --rounds=4096
+             name: cloudinitdisk
+           - dataVolume:
+               name: win-iso-dv
+             name: win-iso
+           - dataVolume:
+               name: virtio-iso-dv
+             name: virtio-iso
+           - dataVolume:
+               name: aa-test-rootfs
+             name: rootfs
    ```
 
 8. Check the YAML file. The complete YAML after finishing the configuration is as follows.
@@ -152,7 +237,7 @@ Create a container image from the prepared Windows and virtio-win ISO images, an
        virtualization.cpaas.io/image-supply-by: public
        vm.cpaas.io/name: aa-test
      name: aa-test
-     namespace: acp-service-self
+     namespace: default
    spec:
      dataVolumeTemplates:
        - metadata:
@@ -171,8 +256,7 @@ Create a container image from the prepared Windows and virtio-win ISO images, an
              storageClassName: vm-cephrbd
              volumeMode: Block
            source:
-             http:
-               url: http://192.168.254.12/kube-debian-12.2.0-x86-out.qcow2
+             blank: {}
      running: true
      template:
        metadata:
@@ -195,6 +279,10 @@ Create a container image from the prepared Windows and virtio-win ISO images, an
          architecture: amd64
          domain:
            devices:
+             inputs:
+               - type: tablet
+                 bus: usb
+                 name: tablet
              disks:
                - disk:
                    bus: virtio
@@ -202,15 +290,15 @@ Create a container image from the prepared Windows and virtio-win ISO images, an
                - bootOrder: 1
                  cdrom:
                    bus: sata
-                 name: containerdisk
+                 name: win-iso
                - cdrom:
                    bus: sata
-                 name: virtio
+                 name: virtio-iso
                - disk:
                    bus: sata
                  name: rootfs
                  bootOrder: 10
-              interfaces:
+             interfaces:
                - bridge: {}
                  name: default
            machine:
@@ -238,15 +326,15 @@ Create a container image from the prepared Windows and virtio-win ISO images, an
                    - default
                    - name: root
                      lock_passwd: false
-                     hashed_passwd: $6$0vlhl57e$0rawYwaeu9jL6hBf3XP9lk6XXaMUS9/W6LPbWRinUoXujo39lP3l98VOcOObtr.LDoAv/ylm85FLQmxwNlWFe/
+                     hashed_passwd: "<hash>"  # Generate with: mkpasswd --method=SHA-512 --rounds=4096
              name: cloudinitdisk
-           - containerDisk:
-               image: registry.example.cn:60070/3rdparty/vmdisks/winiso:2019 # Replace the image according to your actual environment
-             name: containerdisk
-             - containerDisk
-                image: registry.example.cn:60070/3rdparty/vmdisks/win-virtio # Replace the image according to your actual environment
-              name: virtio
-            - dataVolume:
+           - dataVolume:
+               name: win-iso-dv
+             name: win-iso
+           - dataVolume:
+               name: virtio-iso-dv
+             name: virtio-iso
+           - dataVolume:
                name: aa-test-rootfs
              name: rootfs
    ```
@@ -319,6 +407,10 @@ Please refer to [Export Virtual Machine Image](./vm_image_export.mdx) for the sp
        cpu:
          cores: 2
        devices:
+         inputs:
+           - type: tablet
+             bus: usb
+             name: tablet
          disks:
          - disk:
              bus: sata

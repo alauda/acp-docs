@@ -1,0 +1,284 @@
+---
+title: "Plan an In-Place OS Upgrade for ACP Nodes"
+description: "Use this reference guide to plan and verify an in-place operating system upgrade on ACP self-built cluster nodes."
+weight: 22
+author: dev@alauda.io
+category: howto
+queries:
+  - in-place OS upgrade for ACP nodes
+  - upgrade operating system on self-built cluster nodes
+  - verify ACP nodes after OS upgrade
+  - node OS upgrade checklist
+---
+
+# Plan an In-Place OS Upgrade for ACP Nodes
+
+This guide helps cluster administrators plan an in-place operating system upgrade for nodes in <Term name="productShort" /> self-built clusters. It focuses on the <Term name="productShort" /> checks that must be completed before and after the operating system changes.
+
+<Directive type="warning" title="Scope and support boundary">
+This guide is a reference checklist for maintenance windows. It does not replace the operating system vendor's upgrade documentation, and it does not guarantee that every operating system upgrade path is supported. Confirm the target operating system and kernel against the <Term name="productShort" /> support matrix before you upgrade any node.
+</Directive>
+
+## Scope and Limitations
+
+Use this guide only when all of the following conditions are met:
+
+- The cluster is an on-premises or self-built cluster managed by <Term name="productShort" />.
+- You can log in to the target nodes and manage the node operating system.
+- You have platform administrator permissions, `kubectl` administrator permissions, and SSH or console access to each target node.
+- You can drain workload Pods from the target node before the operating system upgrade.
+
+This guide does not apply to the following cluster types:
+
+- Clusters that use [Immutable Infrastructure](../immutable-infra.mdx). Apply operating system changes by replacing nodes with new images.
+- Managed cloud Kubernetes clusters where the cloud provider manages the node or control plane operating system.
+- Imported clusters where you cannot log in to nodes or control plane nodes.
+
+## Before You Upgrade
+
+Complete the following checks before changing the operating system on any node.
+
+<Steps>
+### Step 1: Confirm the target operating system and kernel
+
+Confirm that the target operating system version, kernel version, kernel source, and CPU architecture are within the supported range. For the current support matrix and known restrictions, see [Supported OS and Kernel Versions](../../../install/prepare/node_preprocessing.mdx#supported_os_and_kernels).
+
+Apply these rules before the maintenance window:
+
+- The operating system major and minor versions must match the supported matrix.
+- The core kernel version must match the supported matrix. Only the build suffix can differ.
+- The kernel must be the official kernel shipped by the operating system vendor.
+- Ubuntu HWE kernels and third-party or custom-compiled kernels are not supported.
+- If the target version is not in the supported matrix, contact technical support for compatibility confirmation before the upgrade.
+
+### Step 2: Check for conflicting packages
+
+During an in-place operating system upgrade, the operating system package manager might install or overwrite container runtime, Kubernetes, or container network binaries. Before the upgrade, check and resolve packages that conflict with <Term name="productShort" /> components. For the package lists and commands, see [Remove Conflicting Packages](../../../install/prepare/node_preprocessing.mdx#remove_conflicting_packages).
+
+If conflicting packages are found, prepare an application migration plan and back up the affected data before uninstalling them.
+
+### Step 3: Record the current runtime and node component versions
+
+Record the versions before the operating system upgrade. Use the records for comparison after the node is upgraded.
+
+```bash
+containerd --version
+runc --version
+crictl --version
+kubelet --version
+```
+
+Also record critical node configuration files that your operating system upgrade process might update, such as `/etc/resolv.conf`, `/etc/fstab`, systemd configuration files, and container runtime configuration files.
+
+### Step 4: Verify cluster capacity and drain the node
+
+Confirm that the remaining nodes have enough capacity to run the Pods evicted from the target node. Then drain the node before the operating system upgrade.
+
+You can use the <Term name="productShort" /> console to evict Pods from the node. For the console operation, see [Manage Nodes](./node-management.mdx).
+
+If you use `kubectl`, confirm the command options with your operations team before running it. For example:
+
+```bash
+kubectl cordon <node-name>
+kubectl drain <node-name> --ignore-daemonsets --delete-emptydir-data
+```
+
+Pods managed by DaemonSets are not evicted by the drain operation. Workloads that use local storage might lose local data after eviction. Confirm the workload impact before you proceed.
+</Steps>
+
+## Additional Checks for Control Plane Nodes
+
+Control plane nodes run components such as `kube-apiserver`, `etcd`, `kube-scheduler`, and `kube-controller-manager`. Upgrade control plane nodes one at a time, and verify cluster health after each node is upgraded.
+
+Before upgrading a control plane node:
+
+- Back up etcd data. For the supported backup mechanism and restore considerations, see [etcd Backup and Restore](../../backup/etcd.mdx).
+- Confirm that the etcd cluster is healthy and that quorum can be maintained while one control plane node is unavailable.
+- Confirm that the cluster has at least three control plane nodes when you are performing rolling maintenance on control plane nodes.
+- If possible, validate the procedure on compute nodes first, and then proceed with control plane nodes.
+
+You can use the following commands as references when checking control plane health:
+
+```bash
+kubectl get nodes
+kubectl get pods -n kube-system | grep -E "etcd|apiserver|scheduler|controller"
+```
+
+If you use `etcdctl` on a control plane node, use the certificate paths from your environment:
+
+```bash
+ETCDCTL_API=3 etcdctl member list \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  --write-out=table
+```
+
+## Perform the Operating System Upgrade
+
+Follow the operating system vendor's supported upgrade procedure for the target version. The exact package commands, repository configuration, and reboot requirements are determined by the operating system vendor and your organization's operating system maintenance policy.
+
+During the operating system upgrade:
+
+- Do not intentionally install container runtime, Kubernetes, or container network packages that conflict with <Term name="productShort" /> components.
+- Preserve node network configuration, DNS configuration, time synchronization configuration, and systemd service configuration unless the vendor procedure requires a change.
+- Reboot the node when the vendor procedure requires it.
+- Keep the node unschedulable until all post-upgrade checks pass.
+
+## After You Upgrade
+
+Run the following checks on each node after the operating system upgrade and reboot are complete.
+
+<Steps>
+### Step 1: Confirm the operating system and kernel
+
+Verify that the node is running the expected operating system and kernel versions.
+
+```bash
+cat /etc/os-release
+uname -r
+```
+
+Compare the output with the supported matrix and your approved maintenance plan.
+
+### Step 2: Verify base node configuration
+
+Verify that the operating system upgrade did not revert required node settings.
+
+```bash
+echo "=== Base node configuration check ==="
+
+# SELinux must be disabled on systems that use SELinux.
+getenforce 2>/dev/null || echo "SELinux command not available"
+
+# AppArmor must be disabled on systems that use AppArmor.
+systemctl status apparmor 2>/dev/null || echo "AppArmor service not installed"
+
+# Swap must be disabled.
+swapon --show
+free -h | grep Swap
+
+# Firewall services must be disabled according to your cluster network plan.
+systemctl status firewalld 2>/dev/null || echo "firewalld not installed"
+systemctl status ufw 2>/dev/null || echo "ufw not installed"
+
+# /tmp must not be mounted with noexec.
+mount | grep " /tmp "
+
+# DefaultTasksMax must be infinity or a sufficiently large value.
+systemctl show --property=DefaultTasksMax
+```
+
+If `swap` is enabled after the operating system upgrade, disable it and remove the swap entry from `/etc/fstab` according to your operating system policy.
+
+If SELinux or AppArmor is enabled after the operating system upgrade, disable it according to your operating system policy and the <Term name="productShort" /> node requirements.
+
+### Step 3: Verify runtime and node component versions
+
+Compare the runtime and node component versions with the pre-upgrade records.
+
+```bash
+containerd --version
+runc --version
+crictl --version
+kubelet --version
+```
+
+Then verify that `containerd` is running:
+
+```bash
+systemctl status containerd
+```
+
+If any binary was overwritten by an operating system package, stop the maintenance and contact technical support before you continue with other nodes.
+
+### Step 4: Verify time synchronization and DNS
+
+Verify that time synchronization and DNS configuration were not changed by the operating system upgrade.
+
+```bash
+date
+timedatectl
+cat /etc/resolv.conf
+```
+
+The time skew between nodes must be no more than 10 seconds. If the skew is larger than 10 seconds, synchronize time before restarting workloads on the node.
+
+### Step 5: Restart kubelet and verify node recovery
+
+Restart `kubelet` after the operating system upgrade is complete and the base node checks pass.
+
+```bash
+systemctl daemon-reload
+systemctl restart kubelet
+systemctl status kubelet
+```
+
+Wait for the node to return to the `Ready` state.
+
+```bash
+kubectl get node <node-name> --watch
+```
+
+When the node is healthy, resume scheduling.
+
+```bash
+kubectl uncordon <node-name>
+```
+
+You can also resume scheduling from the <Term name="productShort" /> console. For the console operation, see [Manage Nodes](./node-management.mdx).
+
+### Step 6: Validate workload recovery
+
+Verify the node status and workload placement after scheduling is resumed.
+
+```bash
+kubectl get nodes
+kubectl get pods -A -o wide | grep <node-name>
+```
+
+Then validate the business services that were affected by the node drain. Proceed to the next node only after the current node and related services are healthy.
+</Steps>
+
+## Known High-Risk Scenarios
+
+| Symptom | Possible Cause | How to Check | Recommended Action |
+| --- | --- | --- | --- |
+| `containerd` fails to start | The operating system upgrade overwrote the <Term name="productShort" /> runtime binary | Compare `containerd --version` with the pre-upgrade record | Stop the maintenance and contact technical support |
+| The node stays `NotReady` | `kubelet`, container runtime, CNI, DNS, or node network configuration changed | Check `systemctl status kubelet`, `systemctl status containerd`, and node events | Restore the changed configuration or contact technical support |
+| Cluster components report TLS errors | Node time drifted during or after the upgrade | Check `timedatectl` and compare `date` across nodes | Synchronize time before continuing |
+| DNS resolution fails | `/etc/resolv.conf` was overwritten | Check `cat /etc/resolv.conf` | Restore the approved DNS configuration |
+| `kubelet` fails with security policy errors | SELinux or AppArmor was re-enabled | Check `getenforce` or `systemctl status apparmor` | Disable the service according to node requirements |
+| Workloads cannot be scheduled after uncordon | The node is still unhealthy, tainted, or resource-constrained | Check `kubectl describe node <node-name>` | Resolve node conditions before continuing |
+
+## Operation Checklist
+
+Use this checklist during the maintenance window and keep the completed record after the upgrade.
+
+| Phase | Item | Owner | Status |
+| --- | --- | --- | --- |
+| Pre-upgrade | Confirm that the target operating system and kernel are in the support matrix | | |
+| Pre-upgrade | Confirm that the kernel is the official vendor kernel | | |
+| Pre-upgrade | Check and resolve conflicting packages | | |
+| Pre-upgrade | Record `containerd`, `runc`, `crictl`, and `kubelet` versions | | |
+| Pre-upgrade | Record DNS, time synchronization, `/etc/fstab`, and runtime configuration | | |
+| Pre-upgrade | Confirm that the cluster has enough capacity for drained workloads | | |
+| Pre-upgrade | Drain the target node and confirm workload impact | | |
+| Control plane only | Back up etcd data | | |
+| Control plane only | Confirm etcd health and quorum | | |
+| Upgrade | Run the operating system vendor's supported upgrade procedure | | |
+| Upgrade | Reboot the node if required by the vendor procedure | | |
+| Post-upgrade | Confirm operating system and kernel versions | | |
+| Post-upgrade | Confirm SELinux or AppArmor is disabled as required | | |
+| Post-upgrade | Confirm swap is disabled | | |
+| Post-upgrade | Confirm firewall services match the cluster network plan | | |
+| Post-upgrade | Confirm `/tmp` is not mounted with `noexec` | | |
+| Post-upgrade | Confirm `DefaultTasksMax` is `infinity` or a sufficiently large value | | |
+| Post-upgrade | Confirm runtime and node component versions were not overwritten | | |
+| Post-upgrade | Confirm `containerd` and `kubelet` are healthy | | |
+| Post-upgrade | Confirm time skew between nodes is no more than 10 seconds | | |
+| Post-upgrade | Confirm DNS configuration is correct | | |
+| Post-upgrade | Confirm the node is `Ready` | | |
+| Post-upgrade | Resume scheduling on the node | | |
+| Post-upgrade | Confirm workloads and business services are healthy | | |

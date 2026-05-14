@@ -1,0 +1,106 @@
+---
+weight: 20
+---
+
+# Configure BGP
+
+Kube-OVN can advertise Pod and Subnet routes to external networks using BGP. To use this feature, install `kube-ovn-speaker` on selected (or all) nodes and add the `ovn.kubernetes.io/bgp` annotation to Pods or Subnets that should be reachable from outside the cluster.
+
+`kube-ovn-speaker` uses [GoBGP](https://osrg.github.io/gobgp/) to publish routes and sets the next hop to itself.
+
+## Installing `kube-ovn-speaker`
+
+Nodes that run `kube-ovn-speaker` must carry return traffic. Label the nodes where you want to deploy the speaker:
+
+```bash
+kubectl label nodes speaker-node-1 ovn.kubernetes.io/bgp=true
+kubectl label nodes speaker-node-2 ovn.kubernetes.io/bgp=true
+```
+
+:::note
+When multiple `kube-ovn-speaker` instances are running, each publishes routes upstream. The upstream router must support multi-path ECMP.
+:::
+
+Download `speaker.yaml` from a tag or branch that matches your cluster's Kube-OVN version (align with your `kube-ovn` image tag), for example:
+
+```bash
+wget https://raw.githubusercontent.com/kubeovn/kube-ovn/release-1.15/yamls/speaker.yaml
+```
+
+Adjust the BGP arguments in the manifest as needed.
+
+If you have one upstream peer:
+
+```yaml
+- --neighbor-address=10.32.32.254
+- --neighbor-ipv6-address=2409:AB00:AB00:2000::AFB:8AFE
+- --neighbor-as=65030
+- --cluster-as=65000
+```
+
+If you have a pair of switches:
+
+```yaml
+- --neighbor-address=10.32.32.252,10.32.32.253
+- --neighbor-ipv6-address=2409:AB00:AB00:2000::AFB:8AFC,2409:AB00:AB00:2000::AFB:8AFD
+- --neighbor-as=65030
+- --cluster-as=65000
+```
+
+- `neighbor-address`: BGP peer address, usually the router gateway.
+- `neighbor-as`: Autonomous system number of the BGP peer.
+- `cluster-as`: Autonomous system number for the container network.
+
+Apply the manifest:
+
+```bash
+kubectl apply -f speaker.yaml
+```
+
+## Publishing Pod and Subnet routes
+
+For BGP export on a subnet, set `natOutgoing` to `false` on that Subnet so Pod IPs can be used directly on the underlay.
+
+Enable route advertisement with annotations:
+
+```bash
+kubectl annotate pod sample ovn.kubernetes.io/bgp=true
+kubectl annotate subnet ovn-default ovn.kubernetes.io/bgp=true
+```
+
+Remove the annotations to stop advertising:
+
+```bash
+kubectl annotate pod sample ovn.kubernetes.io/bgp-
+kubectl annotate subnet ovn-default ovn.kubernetes.io/bgp-
+```
+
+See [Announcement policies](#announcement-policies) for behavior when the annotation uses different values.
+
+## Announcement policies \{#announcement-policies}
+
+`kube-ovn-speaker` supports two policies:
+
+- **Cluster**: Pod IPs and Subnet CIDRs are announced from every speaker, even if no Pod with that IP runs on that node. External traffic may enter any node that hosts a speaker and then be forwarded inside the cluster. Extra hops are possible. This is the default for Pods and Subnets.
+- **Local**: Pod IPs are announced only from speakers on nodes that actually host those Pods (or Pods whose Subnet is marked for BGP). External traffic lands on the node where the workload runs, which shortens the path.
+
+:::note
+For the **Local** policy, you typically need `kube-ovn-speaker` on every node. If a Pod lands on a node without a speaker, its IP will not be advertised.
+:::
+
+Override the policy per Pod or Subnet with the `ovn.kubernetes.io/bgp` annotation:
+
+- `ovn.kubernetes.io/bgp=cluster`, or the default `ovn.kubernetes.io/bgp=yes`, selects the **Cluster** policy.
+- `ovn.kubernetes.io/bgp=local` selects the **Local** policy.
+
+## BGP advanced options
+
+`kube-ovn-speaker` supports additional flags for complex environments:
+
+- `auth-password`: Password for the BGP peer.
+- `holdtime`: BGP hold time; neighbors with no traffic after this interval are removed (default 90 seconds).
+- `graceful-restart`: Enable BGP Graceful Restart.
+- `graceful-restart-time`: Graceful Restart time (RFC 4724 section 3).
+- `graceful-restart-deferral-time`: Graceful Restart deferral time (RFC 4724 section 4.1).
+- `passivemode`: Speaker accepts connections only (passive mode).
+- `ebgp-multihop`: TTL for EBGP multi-hop peers (default 1).
