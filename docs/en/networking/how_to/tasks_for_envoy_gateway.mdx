@@ -1,0 +1,458 @@
+---
+weight: 11
+---
+
+# Tasks for Envoy Gateway
+
+## Overview
+
+Use these advanced Envoy Gateway tasks after completing the main configuration path: operator, gateway, route, and policy.
+
+When applying configuration changes in the Gateway API, there are three primary approaches available:
+
+1. **Modify standard Gateway API resources**: Directly edit `Gateway`, `HTTPRoute`, `TCPRoute`, `UDPRoute`, and other core resources.
+2. **Attach policies via PolicyAttachment**: Use `SecurityPolicy`, `ClientTrafficPolicy`, `BackendTrafficPolicy`, and other policy resources to extend
+   Gateway and Route behavior.
+3. **Configure global settings**: Modify the `EnvoyGatewayCtl` to change `envoy-gateway` instance behavior or other global settings that affect all gateways.
+
+Advanced tasks and special scenarios include cross-namespace routing,
+observability setup, deployment customization, and troubleshooting.
+
+## Prerequisites
+
+1. [Configure EnvoyGatewayCtl](/networking/operators/envoy_gateway_operator.mdx)
+2. [Configure Gateway](../functions/configure_gatewayapi_gateway.mdx#configure_gatewayapi_gateway)
+3. [Configure Route](../functions/configure_gatewayapi_route.mdx#configure_gatewayapi_route)
+4. [Configure GatewayAPI Policy](../functions/configure_gatewayapi_policy.mdx#configure_gatewayapi_policy)
+
+## Advanced Tasks
+
+### OpenTelemetry (OTel)
+
+Please follow instructions in [OpenTelemetry Integration](https://gateway.envoyproxy.io/docs/tasks/observability/gateway-observability/#enable-open-telemetry-sink-in-envoy-gateway), but use `EnvoyGatewayCtl` to modify the `envoy-gateway-config`.
+
+### How To Attach to Listener Created In Other Namespace \{#attach_to_gateway_create_on_other_ns}
+
+In the Gateway's listener configuration, you need to specify which namespaces are allowed to attach Routes to it.
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: example-gateway
+spec:
+  listeners:
+    - name: http-80
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: All # without limit
+    - name: http-81
+      protocol: HTTP
+      port: 81
+      allowedRoutes:
+        namespaces:
+          from: Same # only allow routes in the same namespace
+    - name: http-82
+      protocol: HTTP
+      port: 82
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels:
+              team: frontend # only allow routes in the namespace with label team=frontend
+```
+
+Please refer to [Cross-Namespace routing](https://gateway-api.sigs.k8s.io/guides/multiple-ns/) for more details.
+
+### How To Use a Certificate Created In Another Namespace \{#use_secret_create_on_other_ns}
+
+To use a certificate created in another namespace, create a `ReferenceGrant` in the namespace where the certificate is stored. Please follow instructions in [cross-namespace-certificate-references](https://gateway.envoyproxy.io/v1.5/tasks/security/secure-gateways/#cross-namespace-certificate-references) and [referencegrant](https://gateway-api.sigs.k8s.io/api-types/referencegrant/).
+:::note
+You cannot specify individual `secret` resources; you must allow the entire namespace
+:::
+
+### How To Use SSL Passthrough \{#ssl_passthrough}
+
+Please follow instructions in
+
+- [tls](https://gateway-api.sigs.k8s.io/guides/tls/)
+- [tls-passthrough](https://gateway.envoyproxy.io/docs/tasks/security/tls-passthrough/)
+
+### How To Change the Minimum TLS Version
+
+Please follow instructions in [customize-gateway-tls-parameters](https://gateway.envoyproxy.io/v1.5/tasks/security/secure-gateways/#customize-gateway-tls-parameters)
+
+```bash
+cat <<EOF | kubectl apply -f -
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: ClientTrafficPolicy
+metadata:
+  name: enforce-tls-13
+  namespace: default
+spec:
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: eg
+  tls:
+    minVersion: "1.3"
+EOF
+```
+
+The `.spec.tls` field in `ClientTrafficPolicy` is [clienttlssettings](https://gateway.envoyproxy.io/v1.5/api/extension_types/#clienttlssettings).
+If you need to customize cipher suites in addition to the minimum TLS version, refer to the same upstream task and API
+reference.
+
+### How To Specify NodePort When Using NodePort Service \{#specify_nodeport}
+
+When using a NodePort service, Kubernetes assigns a NodePort value to each service port. When accessing the service through a node IP, use the assigned
+NodePort instead of the service port.
+
+There are two approaches:
+
+Manually retrieve the NodePort assignment by following [get nodeport from svc port](../functions/configure_gatewayapi_gateway.mdx#get_nodeport_from_svc_port).
+
+Manually specify the NodePort in the `EnvoyProxy` configuration instead of letting Kubernetes automatically assign it.
+
+```yaml
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: demo
+spec:
+  ipFamily: DualStack
+  provider:
+    kubernetes:
+      envoyDeployment:
+        container:
+          imageRepository: registry.alauda.cn:60080/acp/envoyproxy/envoy
+      envoyService:
+        patch: # [!code callout]
+          type: StrategicMerge
+          value:
+            spec:
+              ports:
+                - nodeport: 31888
+                  port: 80
+        type: NodePort
+    type: Kubernetes
+```
+
+<Callouts>
+  1. Use patch field to patch the generated service resource to specify the
+  NodePort
+</Callouts>
+
+:::note
+NodePort can only be within a specific range, typically `30000-32767`. If you want the Gateway listener port and NodePort to be consistent, your listener port must also be within the NodePort range.
+:::
+
+### How To Specify a VIP When Using MetalLB \{#specify_vip_metallb}
+
+When using MetalLB as the LoadBalancer provider, you can specify a static VIP for the Gateway service through service annotations.
+
+```yaml
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: demo
+  namespace: demo
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyService:
+        type: LoadBalancer
+        annotations:                                      # [!code callout]
+          metallb.universe.tf/address-pool: production    # [!code callout]
+          metallb.universe.tf/loadBalancerIPs: VIP_IP   # [!code callout]
+```
+
+<Callouts>
+  1. Add MetalLB annotations in the `envoyService.annotations` field
+  2. Specify the address pool name to allocate IP from
+  3. Or specify a specific IP address (must be within the address pool range)
+</Callouts>
+
+**Available Annotations:**
+
+| Annotation | Description |
+| ---------- | ----------- |
+| `metallb.universe.tf/address-pool` | Select the address pool to allocate IP from |
+| `metallb.universe.tf/loadBalancerIPs` | Specify a specific IP address (supports multiple IPs, comma-separated) |
+
+:::note
+- The specified IP must be within a configured MetalLB address pool
+- Make sure MetalLB is properly installed and configured before specifying VIPs
+- For MetalLB configuration, see [Configure MetalLB](../functions/configure_metallb.mdx#configure_ip_pool)
+:::
+
+### How To Add Pod Annotations In Envoy Gateway \{#add_pod_annotation_in_envoy_gateway}
+
+Set `annotations` in `.spec.provider.kubernetes.envoyDeployment.patch.value.spec.template.metadata.annotations` of `EnvoyProxy`.
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: demo
+spec:
+  infrastructure:
+    parametersRef:
+      group: gateway.envoyproxy.io
+      kind: EnvoyProxy
+      name: demo
+  gatewayClassName: envoy-gateway-operator-cpaas-default
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: demo
+spec:
+  provider:
+    kubernetes:
+      envoyDeployment:
+        replicas: 1
+        patch:
+          type: StrategicMerge
+          value:
+            spec:
+              template:
+                metadata:
+                  annotations:
+                    your-annotation-key: 'your-annotation-value'
+        container:
+          imageRepository: registry.alauda.cn:60080/acp/envoyproxy/envoy
+    type: Kubernetes
+```
+
+### How To Set NodeSelector And Tolerations For `envoy-gateway-operator`
+
+Update the `Subscription` resource.
+
+```bash
+# example of nodeSelector and tolerations
+kubectl patch subscription envoy-gateway-operator  -n envoy-gateway-operator   --type='merge' -p '
+{
+  "spec": {
+    "config": {
+      "nodeSelector": {
+        "node-role.kubernetes.io/infra": ""
+      },
+      "tolerations": [
+        {
+          "effect": "NoSchedule",
+          "key": "node-role.kubernetes.io/infra",
+          "operator": "Equal",
+          "value": "reserved"
+        }
+      ]
+    }
+  }
+}'
+```
+
+### How To Set NodeSelector And Tolerations For `envoy-gateway`
+
+Update the `EnvoyGatewayCtl` resource.
+
+```bash
+# in default $NAME=cpaas-default and $NS=envoy-gateway-operator
+kubectl patch envoygatewayctl $NAME -n $NS --type='merge' -p '
+{
+  "spec": {
+    "deployment": {
+      "pod": {
+        "nodeSelector": {
+          "node-role.kubernetes.io/infra": ""
+        },
+        "tolerations": [
+          {
+            "effect": "NoSchedule",
+            "key": "node-role.kubernetes.io/infra",
+            "operator": "Equal",
+            "value": "reserved"
+          }
+        ]
+      }
+    }
+  }
+}'
+```
+
+### How To Set NodeSelector And Tolerations For `envoy-proxy`
+
+Update the `EnvoyProxy` resource.
+
+```bash
+kubectl patch envoyproxy $NAME -n $NS --type='merge' -p '
+{
+  "spec": {
+    "provider": {
+      "kubernetes": {
+        "envoyDeployment": {
+          "pod": {
+            "nodeSelector": {
+              "node-role.kubernetes.io/infra": ""
+            },
+            "tolerations": [
+              {
+                "effect": "NoSchedule",
+                "key": "node-role.kubernetes.io/infra",
+                "operator": "Equal",
+                "value": "reserved"
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}'
+```
+### How To Use `hostNetwork` In `envoy-proxy`
+
+Using `hostNetwork: true` allows the Envoy proxy pods to use the host network namespace directly. This can be useful for:
+- achieving better network performance
+- accessing the gateway through the node IP directly
+
+**Considerations:**
+- Pods using hostNetwork will bind directly to the host's network interfaces
+- Port conflicts may occur if multiple pods try to use the same port on the same node
+- Security isolation is reduced as pods share the host's network namespace
+- You should use `nodeSelector` or `affinity` rules to control pod placement and avoid port conflicts
+
+There are two approaches to configure `hostNetwork`, depending on whether you want to use privileged ports (< 1024) directly:
+
+#### Approach 1: Using Port Offset (Default, Recommended)
+
+This is the default and recommended approach. Envoy Gateway automatically adds an offset of 10000 to privileged ports to avoid requiring special permissions.
+
+**Pros:**
+- No special permissions or capabilities required
+- More secure because it runs as a non-root user without additional privileges
+- Simpler configuration
+- Works out of the box
+
+**Cons:**
+- Clients must use offset ports (10080, 10443)
+
+**Configuration:**
+
+```yaml
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: demo
+  namespace: demo
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyDeployment:
+        patch:
+          type: StrategicMerge
+          value:
+            spec:
+              template:
+                spec:
+                  hostNetwork: true                    # Enable host network mode
+                  dnsPolicy: ClusterFirstWithHostNet   # Required for proper DNS resolution
+        pod:
+          nodeSelector:                                # Recommended: control pod placement to avoid conflict
+            kubernetes.io/hostname: "demo"
+```
+
+**Access:**
+- Port 80 → Access via `http://<node-ip>:10080`
+- Port 443 → Access via `https://<node-ip>:10443`
+
+#### Approach 2: Using Privileged Ports Directly with useListenerPortAsContainerPort
+
+This approach allows Envoy to bind to privileged ports (< 1024) directly, such as port 80 and 443.
+
+**Pros:**
+- Can use standard ports (80 and 443) directly
+- Better compatibility with clients expecting standard ports
+
+**Cons:**
+- Requires NET_BIND_SERVICE capability
+- Slightly reduced security compared to port offset approach
+- More complex configuration
+
+**Configuration:**
+
+```yaml
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: demo
+  namespace: demo
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      useListenerPortAsContainerPort: true  # Disable port offset
+      envoyDeployment:
+        patch:
+          type: StrategicMerge
+          value:
+            spec:
+              template:
+                spec:
+                  hostNetwork: true
+                  dnsPolicy: ClusterFirstWithHostNet
+                  containers:
+                  - name: envoy
+                    command:
+                      - /usr/local/bin/envoy-with-cap  # use envoy with filecap
+                    securityContext:
+                      capabilities:
+                        add:
+                        - NET_BIND_SERVICE  # Required for binding to privileged ports
+        pod:
+          nodeSelector:                                # Recommended: control pod placement to avoid conflict
+            kubernetes.io/hostname: "demo"
+```
+
+**Access:**
+- Port 80 → Access via `http://<node-ip>:80`
+- Port 443 → Access via `https://<node-ip>:443`
+
+
+
+### How To Access a LoadBalancer VIP from Within the Cluster
+
+By default, Envoy Gateway creates LoadBalancer services with `externalTrafficPolicy: Local`. This policy preserves client source IP addresses but has an important limitation: requests from cluster nodes without Envoy Gateway pods will fail because traffic is not forwarded to other nodes.
+
+**Solution 1: Use Service ClusterIP (Recommended for in-cluster access)**
+
+For applications running inside the cluster, use the service ClusterIP instead of the LoadBalancer VIP. This avoids the routing limitation entirely.
+
+**Solution 2: Change to Cluster Traffic Policy**
+
+If you need to access the LoadBalancer VIP from any cluster node, change `externalTrafficPolicy` to `Cluster`:
+
+```bash
+kubectl patch envoyproxy $GATEWAY_NAME -n $GATEWAY_NS --type='json' -p='[
+  {"op": "replace", "path": "/spec/provider/kubernetes/envoyService/externalTrafficPolicy", "value": "Cluster"}
+]'
+```
+
+## Related Documentation
+
+- [Configure EnvoyGatewayCtl](/networking/operators/envoy_gateway_operator.mdx)
+- [Configure Gateway](../functions/configure_gatewayapi_gateway.mdx#configure_gatewayapi_gateway)
+- [Configure Route](../functions/configure_gatewayapi_route.mdx#configure_gatewayapi_route)
+- [Configure GatewayAPI Policy](../functions/configure_gatewayapi_policy.mdx#configure_gatewayapi_policy)
+
+## More Configuration
+
+Please refer to [EnvoyGateway Tasks](https://gateway.envoyproxy.io/v1.5/tasks)
