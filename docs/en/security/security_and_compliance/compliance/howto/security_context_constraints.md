@@ -33,7 +33,7 @@ Apply this guide when any of the following apply:
 Before you start, make sure all of the following are true:
 
 1. The Kubernetes cluster runs version **1.30 or later** (CEL admission is stable).
-2. Kyverno is already installed and running, at version **1.14 or later**, with the `MutatingPolicy`, `ValidatingPolicy`, and `GlobalContextEntry` CRDs available. You can verify with:
+2. Kyverno is already installed and running, at version **v4.3.1 or later**, with the `MutatingPolicy`, `ValidatingPolicy`, and `GlobalContextEntry` CRDs available. You can verify with:
 
    ```shell
    kubectl get crd validatingpolicies.policies.kyverno.io mutatingpolicies.policies.kyverno.io globalcontextentries.kyverno.io
