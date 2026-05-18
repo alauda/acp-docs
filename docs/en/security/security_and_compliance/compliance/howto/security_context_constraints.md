@@ -1934,7 +1934,7 @@ Always grant the least privilege required. A ServiceAccount bound to `privileged
 
 #### Step 2.2 — Bind an SCC to a ServiceAccount
 
-The most common case. Suppose you have an application running under `databases/postgres-sa` and the image runs as root (UID 0). You want this ServiceAccount to be allowed `anyuid`, while still keeping `restricted-v2` available for stricter workloads. In the default profile set in this guide, `anyuid` has higher `priority` than `restricted-v2`, so auto-pick prefers `anyuid` unless you adjust priorities or pin `alauda.io/required-scc`.
+The most common case. Suppose you have an application running under `databases/postgres-sa` and the image runs as root (UID 0). You want this ServiceAccount to be allowed `anyuid`, while still keeping `restricted-v2` available for stricter workloads. In this root-UID example, `restricted-v2` does not match (`runAsUser.uidRangeMin: 1`), so admission selects `anyuid`. More generally, when a Pod satisfies both profiles, the default profile set in this guide prefers `anyuid` first because `anyuid` has higher `priority` than `restricted-v2` unless you adjust priorities or pin `alauda.io/required-scc`.
 
 Save the following as `bind-postgres-sa.yaml`:
 
