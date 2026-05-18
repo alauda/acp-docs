@@ -118,13 +118,6 @@ spec:
                   type: integer
                   format: int32
                   minimum: 0
-                psaLevel:
-                  description: Target PSA level derived from this SCC.
-                  type: string
-                  enum:
-                    - restricted
-                    - baseline
-                    - privileged
                 requiredDropCapabilities:
                   description: Capabilities that must be dropped.
                   type: array
@@ -398,10 +391,6 @@ spec:
           type: string
           description: Secondary restrictive score
           jsonPath: .spec.restrictiveScore
-        - name: PSA
-          type: string
-          description: Target PSA level
-          jsonPath: .spec.psaLevel
         - name: ReadOnlyRootFS
           type: string
           description: Force read-only root filesystem
@@ -438,7 +427,6 @@ metadata:
 spec:
   priority: 0
   restrictiveScore: 100
-  psaLevel: restricted
   allowPrivilegedContainer: false
   allowPrivilegeEscalation: false
   allowHostNetwork: false
@@ -482,7 +470,6 @@ metadata:
 spec:
   priority: 0
   restrictiveScore: 100
-  psaLevel: restricted
   allowPrivilegedContainer: false
   allowPrivilegeEscalation: false
   allowHostNetwork: false
@@ -532,7 +519,6 @@ metadata:
 spec:
   priority: 0
   restrictiveScore: 98
-  psaLevel: restricted
   allowPrivilegedContainer: false
   allowPrivilegeEscalation: true
   allowHostNetwork: false
@@ -575,7 +561,6 @@ metadata:
 spec:
   priority: 0
   restrictiveScore: 95
-  psaLevel: restricted
   allowPrivilegedContainer: false
   allowPrivilegeEscalation: false
   allowHostNetwork: false
@@ -615,7 +600,6 @@ metadata:
 spec:
   priority: 0
   restrictiveScore: 92
-  psaLevel: restricted
   allowPrivilegedContainer: false
   allowPrivilegeEscalation: true
   allowHostNetwork: false
@@ -656,7 +640,6 @@ metadata:
 spec:
   priority: 0
   restrictiveScore: 70
-  psaLevel: privileged
   allowPrivilegedContainer: false
   allowPrivilegeEscalation: false
   allowHostNetwork: true
@@ -698,7 +681,6 @@ metadata:
 spec:
   priority: 0
   restrictiveScore: 68
-  psaLevel: privileged
   allowPrivilegedContainer: false
   allowPrivilegeEscalation: true
   allowHostNetwork: true
@@ -741,7 +723,6 @@ metadata:
 spec:
   priority: 10
   restrictiveScore: 60
-  psaLevel: baseline
   allowPrivilegedContainer: false
   allowPrivilegeEscalation: true
   allowHostNetwork: false
@@ -778,7 +759,6 @@ metadata:
 spec:
   priority: 0
   restrictiveScore: 58
-  psaLevel: privileged
   allowPrivilegedContainer: false
   allowPrivilegeEscalation: true
   allowHostNetwork: false
@@ -830,7 +810,6 @@ metadata:
 spec:
   priority: 0
   restrictiveScore: 55
-  psaLevel: privileged
   allowPrivilegedContainer: false
   allowPrivilegeEscalation: true
   allowHostNetwork: false
@@ -870,7 +849,6 @@ metadata:
 spec:
   priority: 0
   restrictiveScore: 50
-  psaLevel: privileged
   allowPrivilegedContainer: false
   allowPrivilegeEscalation: true
   allowHostNetwork: false
@@ -909,7 +887,6 @@ metadata:
 spec:
   priority: 0
   restrictiveScore: 40
-  psaLevel: privileged
   allowPrivilegedContainer: false
   allowPrivilegeEscalation: true
   allowHostNetwork: true
@@ -952,7 +929,6 @@ metadata:
 spec:
   priority: 0
   restrictiveScore: 0
-  psaLevel: privileged
   allowPrivilegedContainer: true
   allowPrivilegeEscalation: true
   allowHostNetwork: true
