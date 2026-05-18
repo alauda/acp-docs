@@ -962,7 +962,7 @@ kubectl apply -f scc-profiles.yaml
 kubectl get scc
 ```
 
-You should see all 13 profiles listed with their `Priority`, `Score`, and `PSA` columns populated.
+You should see all 13 profiles listed with their `Priority` and `Score` columns populated (along with other SCC columns such as `Priv`, `RunAsUser`, and `Volumes`).
 
 #### Step 1.3 — Install GlobalContextEntries, Kyverno reader RBAC, and admission policies
 
@@ -1912,7 +1912,7 @@ With the engine installed, no Pod is granted any SCC by default. Until you creat
 
 #### Step 2.1 — Choose the right SCC profile
 
-Match your workload's security needs against the table below. Pick the **most restrictive** profile that still allows your workload to run; the engine will preserve that choice when no `alauda.io/required-scc` annotation is present.
+Match your workload's security needs against the table below. By default, the engine ranks granted SCCs by `priority` first and `restrictiveScore` second. Pick the least-privilege profile set your workload needs, and use `alauda.io/required-scc` when you must force one specific profile.
 
 | Workload characteristics | Recommended SCC |
 |---|---|
@@ -1934,7 +1934,7 @@ Always grant the least privilege required. A ServiceAccount bound to `privileged
 
 #### Step 2.2 — Bind an SCC to a ServiceAccount
 
-The most common case. Suppose you have an application running under `databases/postgres-sa` and the image runs as root (UID 999). You want this ServiceAccount to be allowed `anyuid`, while still keeping `restricted-v2` available so that compliant Pods get the stricter profile automatically.
+The most common case. Suppose you have an application running under `databases/postgres-sa` and the image runs as root (UID 0). You want this ServiceAccount to be allowed `anyuid`, while still keeping `restricted-v2` available for stricter workloads. In the default profile set in this guide, `anyuid` has higher `priority` than `restricted-v2`, so auto-pick prefers `anyuid` unless you adjust priorities or pin `alauda.io/required-scc`.
 
 Save the following as `bind-postgres-sa.yaml`:
 
