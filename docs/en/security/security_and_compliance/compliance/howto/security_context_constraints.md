@@ -1841,7 +1841,7 @@ spec:
           }
 ```
 
-Both policies skip the following namespaces by default: any namespace whose name starts with `kube-`, plus `kyverno`, `cattle-system`, and `default`. Adjust the `skip-system-ns` expression in both policies if your platform uses different system namespaces.
+Both policies skip the following namespaces by default: namespaces starting with `kube-`, `cpaas-`, or `alauda-`, plus `kyverno`, `cattle-system`, `operators`, and `default`. Adjust the `skip-system-ns` expression in both policies if your platform uses different system namespaces.
 
 #### Step 1.4 — Roll out safely with Warn → Deny
 
@@ -1977,7 +1977,7 @@ kubectl apply -f bind-postgres-sa.yaml
 The `rbac.alauda.io/scc-use=true` label is optional. It does not affect SCC selection, but lets you list all SCC-related RBAC objects with `kubectl get clusterrole,rolebinding -l rbac.alauda.io/scc-use=true -A`.
 
 ::: note
-You can equally well use a `ClusterRoleBinding` if you want one binding to cover the ServiceAccount across all namespaces — but for a ServiceAccount, which is always namespaced, a namespaced `RoleBinding` is usually clearer.
+You can equally well use a `ClusterRoleBinding` to grant this namespaced ServiceAccount cluster-scoped `use` permission. A namespaced `RoleBinding` is usually clearer when you want the grant to apply only within one namespace.
 :::
 
 #### Step 2.3 — Bind an SCC to a User
