@@ -59,18 +59,69 @@ After completing the installation parameter configuration according to the page 
 
 [Parameter Description](#parameters) provides detailed descriptions of key parameters. Please read carefully and configure according to actual needs.
 
-### Verify Successful Installation
+### Monitor Installation Progress \{#monitor-progress}
 
-After the installation is complete, the platform access URL will be displayed on the page. Click the **Access** button to open the platform Web UI and verify whether the platform is accessible.
+After you confirm the parameters, the installer runs through several phases. A 3-node `global` cluster usually completes in 30–60 minutes; total time depends on node hardware, network throughput, and the number of plugins selected.
 
-Next, run the following commands on the installation node to verify the installation status:
+#### Phases You Will Observe
+
+| Phase | What is happening | First place to watch |
+|---|---|---|
+| Bootstrap | The installer container starts in the temporary `minialauda` KIND environment on the installation node and brings up the embedded registry. | Terminal output of `bash setup.sh` |
+| Control plane provisioning | The first control plane node is bootstrapped with kubeadm; etcd starts; additional control plane nodes join. | Installer Web UI; installer log |
+| Network and core add-ons | The CNI (Kube-OVN by default), CoreDNS, kube-proxy, and other in-cluster networking components come up. | Installer Web UI; `kubectl get pods -n kube-system` on the new cluster |
+| Core platform | The base operator deploys, `ClusterModule/global` is created, and the platform control plane comes up. | Installer Web UI; `kubectl get clustermodule global` |
+| Aligned plugins | AppReleases for the selected Aligned plugins reconcile. | `kubectl get apprelease -A` |
+| Completion | The installer posts the platform access URL and stops the bootstrap container after a short grace period. | Installer Web UI; `/var/cpaas/data/installer.log` |
+
+#### Signals During Installation
+
+If the Web UI appears stuck for more than a few minutes, check the backend signals instead — the Web UI polls a backend progress API and can lag, but the underlying state is always available from the installation node.
 
 ```shell
-# Check if there are any failed Charts
-kubectl get apprelease --all-namespaces
-# Check if there are any Pods not in Running or Completed status
+# Live installer log on the installation node
+tail -f /var/cpaas/data/installer.log
+
+# Use the installer kubeconfig until the global cluster takes over
+export KUBECONFIG=/var/cpaas/data/alauda.kubeconfig
+
+# Cluster API resources that drive the new global cluster
+kubectl get clusters.cluster.x-k8s.io -A
+kubectl get kubeadmcontrolplane -A
+kubectl get machines -A
+
+# Charts that the installer is reconciling
+kubectl get apprelease -A
+```
+
+The installer log records each phase transition and any retryable errors. Most transient errors retry automatically on a 10-second interval; persistent errors stay in the log and surface in the Web UI as a stalled phase.
+
+### Verify Successful Installation
+
+After the installation completes, the platform access URL is displayed in the Web UI. Click the **Access** button to open the platform and confirm that login succeeds.
+
+Next, run the following commands on a control plane node of the new `global` cluster to confirm the installed state:
+
+```shell
+# All nodes are Ready
+kubectl get nodes
+
+# ClusterModule/global reports the base module as healthy
+kubectl get clustermodule global -o jsonpath='{.status.phase}'
+
+# No AppRelease is in a failed state
+kubectl get apprelease -A
+
+# No Pod is stuck outside Running or Completed
 kubectl get pod --all-namespaces | awk '{if ($4 != "Running" && $4 != "Completed")print}' | awk -F'[/ ]+' '{if ($3 != $4)print}'
 ```
+
+The installation is healthy when:
+
+- All `global` cluster nodes are `Ready`.
+- `ClusterModule/global` reports a healthy phase.
+- Every AppRelease is in a non-failed state.
+- Critical Pods in `cpaas-system` are `Running` or `Completed`.
 
 ### Install Product Docs Plugin
 
@@ -197,6 +248,22 @@ The **Alauda Container Platform Product Docs** plugin provides access to product
     </td>
   </tr>
 </table>
+
+## Common Stalls and Where to Look \{#common-stalls}
+
+If the installer reports an error or appears to make no progress, start with the symptom in the table below. The signals listed are the first place to look; collect that output before opening a ticket so support can act on the same data.
+
+| Symptom | First place to look | What you are looking for |
+|---|---|---|
+| Web UI does not load | Terminal output of `setup.sh` and `nerdctl ps` on the installation node | The `minialauda-control-plane` container is Running and port `8080` is reachable from the browser. |
+| Installer log stops advancing | `tail -f /var/cpaas/data/installer.log` | The last log line tells you which phase the installer is in. The same phase repeating for more than a few minutes usually points to one of the rows below. |
+| Stuck on control plane provisioning | `kubectl get machines -A` and `kubectl describe` on a machine that is not `Ready` | `Bootstrap` and `Infrastructure` conditions on the machine; the node can usually be reached at the IP from `status.addresses`. |
+| Stuck on network and core add-ons | `kubectl -n kube-system get pods` on the new cluster | Kube-OVN, CoreDNS, and kube-proxy pods are `Running`. Image-pull failures usually point to a registry reachability problem. |
+| AppRelease shows `Failed` | `kubectl describe apprelease <name> -n <namespace>` | The `Status` conditions and recent `Events` describe the underlying chart error. |
+| Pod is `ImagePullBackOff` or `ErrImagePull` | `kubectl describe pod <pod>` | Confirm the platform image repository is reachable from the failing node. |
+| `ClusterModule/global` does not reach a healthy phase | `kubectl describe clustermodule global` | The `Status.conditions` describe which module is blocking the cluster from completing. |
+
+Issues that are not listed here usually point to environment-specific causes. Capture the installer log and the relevant `kubectl describe` output, then escalate.
 
 ## Installer Cleanup
 
