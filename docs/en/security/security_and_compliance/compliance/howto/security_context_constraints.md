@@ -4,7 +4,7 @@ weight: 2
 
 # Apply Security Context Constraints for Pod Security
 
-This guide shows you how to install a SecurityContextConstraints (SCC) engine on top of an existing Kyverno deployment, and how to bind SCC profiles to ServiceAccounts, Users, and Groups so that Pod security boundaries are enforced automatically at admission time.
+This guide is for platform administrators and security administrators. It shows you how to install a SecurityContextConstraints (SCC) engine on top of an existing Kyverno deployment, and how to bind SCC profiles to ServiceAccounts, Users, and Groups so that Pod security boundaries are enforced automatically at admission time.
 
 ## Introduction
 
@@ -19,12 +19,32 @@ Vanilla Kubernetes has no equivalent built-in. This guide installs a Kyverno-bas
 
 The result: application teams continue to write straightforward Pod manifests, the cluster automatically constrains them to a security profile their ServiceAccount is allowed to use, and migration from OpenShift requires no changes to the binding model.
 
+SCC authorization is a security-control change. Application teams should not be granted permission to create or modify SCC RBAC bindings directly, because doing so lets them bypass the cluster security boundary. Application teams should describe the workload requirement, such as `anyuid`, `hostNetwork`, or `hostPath`; platform or security administrators review the request and bind the least-privilege SCC to the appropriate subject.
+
+## Who does what
+
+Use the following table to decide which parts of this guide apply to you.
+
+| Role | What you do | What you should not do |
+|---|---|---|
+| Platform administrator or security administrator | Install the SCC engine, approve SCC requests, create SCC RBAC bindings, switch the validating policy from `Warn` to `Deny`, and audit exceptions. | Do not grant broad SCCs such as `privileged`, `hostaccess`, or `anyuid` without a workload-level reason and an owner. |
+| Application manager or application owner | Identify what the workload needs, such as root UID, host networking, host ports, host paths, user namespaces, or a fixed UID range. Provide the namespace, ServiceAccount, workload name, and reason to the platform or security administrator. Deploy the workload with the assigned ServiceAccount after approval. | Do not create SCC RBAC bindings or grant SCC permissions to your own ServiceAccount. Do not use `alauda.io/required-scc` unless the requested SCC has already been approved and bound. |
+
+If you are a platform or security administrator, follow Part 1 and Part 2. If you are an application manager, use Step 2.1 to prepare the SCC request, then use Step 2.5 and Step 2.6 only after the SCC has been approved and bound by an administrator. Do not apply the RBAC manifests in Step 2.2 through Step 2.4 yourself.
+
+The normal workflow is:
+
+1. The application manager identifies the workload requirement and target ServiceAccount.
+2. The platform or security administrator selects the least-privilege SCC and creates the RBAC binding.
+3. The application manager deploys the workload with the approved ServiceAccount, and adds `alauda.io/required-scc` only when the administrator asks for a specific SCC to be pinned.
+4. The administrator verifies authorization with `kubectl auth can-i`, and the workload owner verifies the admitted Pod has the expected `alauda.io/scc` annotation.
+
 ## Scenarios
 
 Apply this guide when any of the following apply:
 
 - You are migrating workloads from OpenShift and want to keep the existing `oc adm policy add-scc-to-*` binding model so that platform teams and audit tooling continue to work unchanged.
-- You already use Kyverno and need a self-service security boundary that does not require every Pod manifest to declare a full `securityContext`.
+- You already use Kyverno and need a centrally managed security boundary that does not require every Pod manifest to declare a full `securityContext`.
 - You operate a multi-tenant cluster and want different ServiceAccounts in different namespaces to receive different security ceilings — for example, an application SA limited to `restricted-v2`, a log-collector SA allowed `hostmount-anyuid`, and an ingress controller SA allowed `NET_BIND_SERVICE`.
 - You want one cluster-wide place to express and audit "who is allowed to run privileged Pods" without scattering exemptions across every namespace.
 
@@ -49,7 +69,7 @@ Before you start, make sure all of the following are true:
 5. You have reviewed the Pod Security Admission (PSA) `enforce` label on each namespace where you intend to allow non-`restricted` Pods. PSA runs **before** Kyverno; if a namespace is labelled `pod-security.kubernetes.io/enforce: restricted`, that namespace will reject any Pod that matches a permissive SCC such as `anyuid` or `hostnetwork-v2` before Kyverno is consulted. Adjust the namespace label to `baseline` or `privileged` where appropriate, or restrict the SCC profile set you offer in those namespaces.
 
 ::: tip
-The engine installation is one-time work and is normally performed by a platform administrator. Application teams typically only need Part 2 of this guide.
+The engine installation is one-time work and is normally performed by a platform administrator. Part 2 is also an administrator workflow: platform or security administrators bind SCC profiles after reviewing workload requirements. Application teams typically only provide those requirements and then use the assigned ServiceAccount.
 :::
 
 ## Steps
@@ -57,7 +77,7 @@ The engine installation is one-time work and is normally performed by a platform
 The work splits into two parts:
 
 - **Part 1** installs the SCC engine cluster-wide. Run it once per cluster.
-- **Part 2** binds SCC profiles to your ServiceAccounts, Users, and Groups, and pins specific workloads to specific SCCs when needed.
+- **Part 2** authorizes workloads by binding SCC profiles to ServiceAccounts, Users, and Groups, and pins specific workloads to specific SCCs when needed.
 
 ### Part 1: Install the SCC engine
 
@@ -1102,7 +1122,11 @@ roleRef:
   name: kyverno-scc-reader
 ```
 
-Save the following as `scc-auto-pick.yaml` and apply it. This is the `ValidatingPolicy` that rejects Pods which no granted SCC accepts.
+Save the following as `scc-auto-pick.yaml`. This is the `ValidatingPolicy` that rejects Pods which no granted SCC accepts.
+
+::: warning
+The example below is configured with `validationActions: [Deny]`. On an existing cluster, change it to `validationActions: [Warn]` before the first apply, then switch it back to `Deny` after you have reviewed warnings and created the required SCC bindings. See Step 1.4 for the rollout process.
+:::
 
 ```yaml
 apiVersion: policies.kyverno.io/v1alpha1
@@ -1849,14 +1873,14 @@ The validating policy is delivered with `failurePolicy: Fail` and `validationAct
 
 Use a three-stage rollout:
 
-1. **Warn**. Edit `scc-auto-pick.yaml` and change `validationActions` to:
+1. **Warn before the first apply**. Before applying `scc-auto-pick.yaml` on an existing cluster, change `validationActions` to:
 
    ```yaml
    validationActions:
      - Warn
    ```
 
-   Re-apply the file. The policy now attaches a warning to every admission response that would have been rejected, but admits the Pod. Watch the Kyverno admission controller logs to collect the affected workloads:
+   Apply the file. The policy now attaches a warning to every admission response that would have been rejected, but admits the Pod. Watch the Kyverno admission controller logs to collect the affected workloads:
 
    ```shell
    kubectl logs -n kyverno -l app.kubernetes.io/component=admission-controller \
@@ -1906,13 +1930,15 @@ kubectl get clusterrolebinding kyverno-scc-reader
 
 If `scc-fill-defaults` shows `READY=false`, the most common cause is missing read permission on `pods/ephemeralcontainers` — make sure Step 1.3's `kyverno-scc-reader` ClusterRole was applied in full.
 
-### Part 2: Apply SCCs to your workloads
+### Part 2: Authorize workloads to use SCCs
 
-With the engine installed, no Pod is granted any SCC by default. Until you create an RBAC binding for a ServiceAccount (or User, or Group), Pods running under that subject in non-system namespaces will be rejected with the message `Pod violates all SCCs assigned to its ServiceAccount`.
+With the engine installed, no Pod is granted any SCC by default. Until an administrator creates an RBAC binding for a ServiceAccount (or User, or Group), Pods running under that subject in non-system namespaces will be rejected with the message `Pod violates all SCCs assigned to its ServiceAccount`.
+
+Treat each SCC binding as a security authorization decision. Grant SCC binding privileges only to platform administrators or security administrators; ordinary application users and namespace owners should not be able to grant themselves higher Pod privileges.
 
 #### Step 2.1 — Choose the right SCC profile
 
-Match your workload's security needs against the table below. By default, the engine ranks granted SCCs by `priority` first and `restrictiveScore` second. Pick the least-privilege profile set your workload needs, and use `alauda.io/required-scc` when you must force one specific profile.
+Match the workload's security needs against the table below. By default, the engine ranks granted SCCs by `priority` first and `restrictiveScore` second. Pick the least-privilege profile set the workload needs, and use `alauda.io/required-scc` when you must force one specific profile.
 
 | Workload characteristics | Recommended SCC |
 |---|---|
@@ -1932,9 +1958,17 @@ Match your workload's security needs against the table below. By default, the en
 Always grant the least privilege required. A ServiceAccount bound to `privileged` can run any Pod, including those that escape the container boundary. Reserve `privileged` for infrastructure DaemonSets and avoid granting it to user workloads.
 :::
 
+When an application manager requests SCC access, include:
+
+- Namespace and ServiceAccount, for example `databases/postgres-sa`.
+- Workload name and controller type, for example `StatefulSet/postgres`.
+- The requested SCC or required capability, for example `anyuid` because the image runs as UID 0.
+- Why a stricter SCC such as `restricted-v2` is not sufficient.
+- Whether the workload must pin a specific SCC with `alauda.io/required-scc`.
+
 #### Step 2.2 — Bind an SCC to a ServiceAccount
 
-The most common case. Suppose you have an application running under `databases/postgres-sa` and the image runs as root (UID 0). You want this ServiceAccount to be allowed `anyuid`, while still keeping `restricted-v2` available for stricter workloads. In this root-UID example, `restricted-v2` does not match (`runAsUser.uidRangeMin: 1`), so admission selects `anyuid`. More generally, when a Pod satisfies both profiles, the default profile set in this guide prefers `anyuid` first because `anyuid` has higher `priority` than `restricted-v2` unless you adjust priorities or pin `alauda.io/required-scc`.
+The most common administrator action is to bind an SCC to a workload ServiceAccount. Suppose you have an application running under `databases/postgres-sa` and the image runs as root (UID 0). You want this ServiceAccount to be allowed `anyuid`, while still keeping `restricted-v2` available for stricter workloads. In this root-UID example, `restricted-v2` does not match (`runAsUser.uidRangeMin: 1`), so admission selects `anyuid`. More generally, when a Pod satisfies both profiles, the default profile set in this guide prefers `anyuid` first because `anyuid` has higher `priority` than `restricted-v2` unless you adjust priorities or pin `alauda.io/required-scc`.
 
 Save the following as `bind-postgres-sa.yaml`:
 
@@ -1982,7 +2016,7 @@ You can equally well use a `ClusterRoleBinding` to grant this namespaced Service
 
 #### Step 2.3 — Bind an SCC to a User
 
-When a human operator (authenticated as a Kubernetes `User`, for example via OIDC or certificate) needs to launch Pods directly — for example, an SRE running `kubectl debug` or `kubectl run` — you can grant the SCC to the User principal.
+When a trusted human operator (authenticated as a Kubernetes `User`, for example via OIDC or certificate) needs to launch Pods directly - for example, an SRE running `kubectl debug` or `kubectl run` - you can grant the SCC to the User principal.
 
 Save as `bind-user-sre.yaml`, replacing `[email protected]` with your User name:
 
@@ -2025,7 +2059,7 @@ When `[email protected]` runs `kubectl run` directly (not via a controller's Ser
 
 #### Step 2.4 — Bind an SCC to a Group
 
-Group bindings are useful for blanket policies, such as "every authenticated user can run `restricted-v2` Pods". Two synthesized groups are particularly relevant:
+Group bindings are useful for administrator-managed blanket policies, such as "every authenticated user can run `restricted-v2` Pods". Two synthesized groups are particularly relevant:
 
 - `system:authenticated` — every authenticated principal.
 - `system:serviceaccounts:<namespace>` — every ServiceAccount in a specific namespace.
@@ -2076,7 +2110,7 @@ subjects:
 
 #### Step 2.5 — Pin a specific SCC with `alauda.io/required-scc`
 
-By default the engine picks the most restrictive SCC a subject is allowed to use and which the Pod actually satisfies. If you have a workload that must always be admitted under one specific profile — for example, an audit-sensitive deployment that must use `restricted-v3` even though its ServiceAccount is also allowed `anyuid` — set the `alauda.io/required-scc` annotation on the Pod:
+By default the engine picks the most restrictive SCC a subject is allowed to use and which the Pod actually satisfies. If you have a workload that must always be admitted under one specific profile - for example, an audit-sensitive deployment that must use `restricted-v3` even though its ServiceAccount is also allowed `anyuid` - set the `alauda.io/required-scc` annotation on the Pod:
 
 ```yaml
 apiVersion: v1
@@ -2102,7 +2136,7 @@ spec:
           drop: ["ALL"]
 ```
 
-For this annotation to take effect, **both** of the following must hold:
+The `alauda.io/required-scc` annotation only selects from SCCs the subject is already authorized to use. It does not grant SCC access. For this annotation to take effect, **both** of the following must hold:
 
 - A SecurityContextConstraints named `restricted-v3` exists in the cluster.
 - `payments/payments-sa` is bound to `restricted-v3` through a ClusterRole or Role that grants `use` on that resource name.
@@ -2134,32 +2168,32 @@ spec:
 
 #### Step 2.6 — Verify the binding takes effect
 
-After applying any binding, run two checks:
+After applying any binding, run the following checks.
 
-1. **Authorization check** — confirm the subject can `use` the SCC:
+**Administrator verification** — confirm the subject can `use` the SCC:
 
-   ```shell
-   kubectl auth can-i use \
-     securitycontextconstraints.security.alauda.io/anyuid \
-     --as="system:serviceaccount:databases:postgres-sa" -n databases
-   ```
+```shell
+kubectl auth can-i use \
+  securitycontextconstraints.security.alauda.io/anyuid \
+  --as="system:serviceaccount:databases:postgres-sa" -n databases
+```
 
-   The expected output is `yes`. If you get `no`, recheck the `apiGroups`, `resources`, `resourceNames`, and `verbs` in your ClusterRole.
+The expected output is `yes`. If you get `no`, recheck the `apiGroups`, `resources`, `resourceNames`, and `verbs` in your ClusterRole.
 
-2. **Admission check** — create a sample Pod and inspect its annotations:
+**Application owner verification** — after the administrator confirms the binding, create or redeploy the workload with the approved ServiceAccount, then inspect the admitted Pod annotation. For a quick probe:
 
-   ```shell
-   kubectl -n databases run probe \
-     --image=registry.example.com/library/pause:3.10 \
-     --serviceaccount=postgres-sa \
-     --overrides='{"spec":{"securityContext":{"runAsUser":999}}}' \
-     --command -- /pause
+```shell
+kubectl -n databases run probe \
+  --image=registry.example.com/library/pause:3.10 \
+  --serviceaccount=postgres-sa \
+  --overrides='{"spec":{"securityContext":{"runAsUser":999}}}' \
+  --command -- /pause
 
-   kubectl -n databases get pod probe \
-     -o jsonpath='{.metadata.annotations.alauda\.io/scc}{"\n"}'
-   ```
+kubectl -n databases get pod probe \
+  -o jsonpath='{.metadata.annotations.alauda\.io/scc}{"\n"}'
+```
 
-   The output should be the name of the SCC the engine selected (in this example, `anyuid`).
+The output should be the name of the SCC the engine selected (in this example, `anyuid`). If the application owner cannot create probe Pods, the administrator can perform this check or inspect a Pod from the real workload.
 
 ::: note
 GlobalContextEntries refresh on a list/watch basis and propagate new bindings to the admission cache typically within seconds, sometimes up to a minute under heavy load. If a Pod is rejected immediately after you apply a new binding, wait a moment and retry before assuming the binding is wrong.
@@ -2179,6 +2213,8 @@ After completing Part 1 and at least one Part 2 binding, you should be able to v
 ## Troubleshooting
 
 Use this table to map symptoms to causes and resolution steps.
+
+For Pods created by controllers such as Deployments, StatefulSets, Jobs, and DaemonSets, the effective workload identity is normally the Pod's ServiceAccount. For Pods created directly by a trusted human operator, such as `kubectl run` or `kubectl debug`, User and Group SCC bindings can also match the admission request.
 
 | Symptom | Likely cause | What to check |
 |---|---|---|
@@ -2230,7 +2266,7 @@ The first candidate whose fields the Pod fully satisfies is the one chosen. The 
 
 ### Mapping from OpenShift commands
 
-If you are coming from OpenShift, the following `oc` commands translate to plain `kubectl apply` against the SCC engine:
+If you are coming from OpenShift, the following `oc` commands translate to plain `kubectl apply` against the SCC engine. These operations grant SCC `use` permission and should be performed only by administrators who are allowed to change the cluster's Pod security boundary.
 
 | OpenShift command | Equivalent on this engine |
 |---|---|
@@ -2241,6 +2277,6 @@ If you are coming from OpenShift, the following `oc` commands translate to plain
 
 ## Next Steps
 
-- Decide which SCC each existing namespace and ServiceAccount should be bound to, document the mapping, and apply the bindings through your GitOps workflow so that they are auditable and reproducible.
+- Decide which SCC each existing namespace and ServiceAccount should be bound to after reviewing workload requirements, document the mapping, and apply the bindings through your GitOps workflow so that they are auditable and reproducible.
 - Plan a periodic review of `PolicyException` resources — they are intended for short windows, not permanent exemptions.
 - If you operate at large scale, monitor the Kyverno admission controller's `kyverno_admission_review_duration_seconds` metric to detect changes in admission latency as the number of SCC profiles or RBAC bindings grows.
