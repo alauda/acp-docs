@@ -25,13 +25,31 @@ If the environment uses **global DR**, follow the [Global DR Procedure](#global-
 
 ## Standard Workflow
 
+A global cluster upgrade is staged across a timeline. Most of the work is completed **before** the maintenance window so the window itself stays short and predictable:
+
+| Phase | When | What happens | Cluster impact |
+| --- | --- | --- | --- |
+| 1. Sync artifacts | Any time before the window | `upgrade.sh --only-sync-image` uploads images and plugin artifacts to the registry; `violet` pushes Aligned and Agnostic plugins. | None — registry only, no downtime. |
+| 2. Preflight | 1–2 weeks before the window | `upgrade.sh --preflight` validates upgrade readiness. Resolve every blocking item before the window opens. | None — read-only validation. |
+| 3. Upgrade | During the maintenance window | `upgrade.sh --skip-sync-image` deploys or updates the cluster version operator (CVO); the upgrade is then requested and observed. | The cluster is upgraded. |
+
+Phase 1 and Phase 2 do not change cluster state — run them early so the maintenance window only contains Phase 3. A small or lab environment can instead run a single `bash upgrade.sh` that performs synchronization and CVO deployment together, but production windows usually keep them separate.
+
 <Steps>
 
-### Prepare upgrade artifacts
+### Sync upgrade artifacts \{#sync-upgrade-artifacts}
 
-Run `bash upgrade.sh` from the extracted core package directory.
+**When:** any time before the maintenance window. This step uploads artifacts to the registry and does not change cluster state.
 
-`upgrade.sh` prepares the resources required by the CVO-based workflow, including:
+From the extracted core package directory, run `upgrade.sh` in sync-only mode:
+
+```bash
+bash upgrade.sh --only-sync-image
+```
+
+`--only-sync-image` uploads images and plugin artifacts without deploying the cluster version operator. The CVO is deployed later, inside the maintenance window — see [Deploy the cluster version operator](#deploy-the-cluster-version-operator).
+
+`upgrade.sh` synchronizes the artifacts required by the CVO-based workflow, including:
 
 | Type             | Content                    | Purpose                                                                    |
 | ---------------- | -------------------------- | -------------------------------------------------------------------------- |
@@ -51,13 +69,15 @@ Run `bash upgrade.sh` from the extracted core package directory.
 violet push <path/to/aligned-cluster-plugin-package> \
   --target-catalog-source "platform" \
   --platform-address "https://<your-platform-domain>" \
-  --platform-token "<platform_token>"
+  --platform-username "<platform_user>" \
+  --platform-password "<platform_password>"
 
 # Push Aligned or Agnostic operators — to global, and to each workload cluster that runs the operator
 violet push <path/to/operator-package> \
   --target-catalog-source "platform" \
   --platform-address "https://<your-platform-domain>" \
-  --platform-token "<platform_token>" \
+  --platform-username "<platform_user>" \
+  --platform-password "<platform_password>" \
   --clusters "global,<workload-cluster-1>,<workload-cluster-2>"
 ```
 
@@ -73,34 +93,30 @@ Registry behavior depends on how the environment is configured:
 | External registry                             | Automatically set `SKIP_SYNC_IMAGE=true` and skip image synchronization.      |
 | Image upload required but credentials omitted | Read `username` and `password` from the `cpaas-system/registry-admin` Secret. |
 
-Common parameters:
+When the target registry is not the platform default, add registry parameters:
 
-| Parameter                   | Purpose                                       |
-| --------------------------- | --------------------------------------------- |
-| `--registry`                | Specify the target registry address.          |
-| `--username` / `--password` | Specify registry credentials.                 |
-| `--only-sync-image`         | Synchronize images and plugin artifacts only. |
-| `--skip-sync-image`         | Skip image and plugin synchronization.        |
-| `--skip-check-artifacts`    | Skip artifact validation.                     |
+| Parameter                   | Purpose                               |
+| --------------------------- | ------------------------------------- |
+| `--registry`                | Specify the target registry address.  |
+| `--username` / `--password` | Specify registry credentials.         |
 
-```bash
-bash upgrade.sh
-```
+To bypass artifact validation when it is known to be redundant, add `--skip-check-artifacts`.
 
 :::warning
-
-- Do not continue to the next step until image and plugin synchronization is complete.
-- Use `--only-sync-image` only when you want artifact synchronization without further preparation.
-- Use `--skip-sync-image` only when the required images and plugin artifacts have already been uploaded.
-  :::
+Do not open the maintenance window until image and plugin synchronization is complete.
+:::
 
 ### Run preflight checks
 
-Run preflight before requesting the upgrade:
+**When:** 1–2 weeks before the maintenance window, so there is time to resolve any blocking items before the window opens.
+
+Run `upgrade.sh` in preflight mode:
 
 ```bash
 bash upgrade.sh --preflight
 ```
+
+Preflight is read-only — it validates upgrade readiness and does not change cluster state.
 
 Preflight returns two parts:
 
@@ -125,6 +141,8 @@ The default check set includes:
 - `PlatformLicense`
 
 ### Handle preflight blocks when needed \{#handle-preflight-blocks-when-needed}
+
+**When:** before the maintenance window. Resolve every blocking item discovered by preflight so the window is not spent troubleshooting.
 
 If `ResourcePatchUpgradeable` fails with `reason=UnexemptResourcePatches`, inspect the blocking `ResourcePatch` and add the required exemption annotation:
 
@@ -158,9 +176,21 @@ data:
       - VersionUpgradePath
 ```
 
+### Deploy the cluster version operator \{#deploy-the-cluster-version-operator}
+
+**When:** at the start of the maintenance window.
+
+Run `upgrade.sh` in skip-sync mode. Synchronization is skipped because the artifacts were already uploaded in [Sync upgrade artifacts](#sync-upgrade-artifacts):
+
+```bash
+bash upgrade.sh --skip-sync-image
+```
+
+This deploys or updates the cluster version operator (CVO) and completes the remaining preparation. The CVO drives the Core and Aligned plugin upgrade once the upgrade is requested in the next step.
+
 ### Request the upgrade
 
-After the preparation phase completes, request the upgrade through one of the following entry points. The three entry points are equivalent; pick the one that fits your operating model.
+After the cluster version operator is deployed, request the upgrade through one of the following entry points. The three entry points are equivalent; pick the one that fits your operating model.
 
 <Tabs>
   <Tab label="Web Console">
@@ -329,11 +359,11 @@ If any such nodes exist, resolve them before continuing.
 4. Find **<Term name="product" /> etcd Synchronizer** and uninstall it.
 5. Wait for the uninstallation to complete before proceeding.
 
-### Prepare upgrade artifacts on both global clusters
+### Sync upgrade artifacts on both global clusters
 
-Complete **Prepare upgrade artifacts** in the standard workflow on **both** the standby global cluster and the primary global cluster.
+Complete **Sync upgrade artifacts** in the standard workflow on **both** the standby global cluster and the primary global cluster.
 
-Use the same preparation mode on both clusters.
+Use the same synchronization mode on both clusters.
 
 ### Upgrade the standby global cluster
 
@@ -349,19 +379,21 @@ spec:
     - https://<standby-cluster-vip>
 ```
 
-After preparation completes, run the remaining steps from the standard workflow on the **standby global cluster**:
+After synchronization completes, run the remaining steps from the standard workflow on the **standby global cluster**:
 
 1. **Run preflight checks**
-2. **Request the upgrade**
-3. **Observe execution** until the standby global cluster reaches the desired version
+2. **Deploy the cluster version operator**
+3. **Request the upgrade**
+4. **Observe execution** until the standby global cluster reaches the desired version
 
 ### Upgrade the primary global cluster
 
 After the standby global cluster has reached the desired version, run the remaining steps from the standard workflow on the **primary global cluster**:
 
 1. **Run preflight checks**
-2. **Request the upgrade**
-3. **Observe execution** until the primary global cluster reaches the desired version
+2. **Deploy the cluster version operator**
+3. **Request the upgrade**
+4. **Observe execution** until the primary global cluster reaches the desired version
 
 ### Reinstall the etcd synchronization plugin and verify sync status
 
