@@ -1,0 +1,275 @@
+---
+weight: 45
+title: Workload Rebalancing (Descheduler)
+---
+
+# Workload Rebalancing (Descheduler)
+
+Kubernetes scheduling is a point-in-time decision. When a Pod is created, the kube-scheduler selects the most appropriate node based on the cluster state at that moment. As the cluster changes, that original decision can become stale: nodes can become over- or under-utilized, taints or labels can change, affinity rules can be updated, failed nodes can recover, and new nodes can be added.
+
+The **Alauda Build of Descheduler** plugin helps rebalance your cluster by identifying running Pods that violate scheduling policy or are placed on less suitable nodes, evicting those Pods, and allowing the default scheduler to place the replacement Pods on more appropriate nodes.
+
+The descheduler does not schedule replacement Pods itself. It only calls the Kubernetes eviction API. The default scheduler reschedules Pods that are managed by controllers such as Deployments, ReplicaSets, StatefulSets, or Jobs.
+
+Typical scenarios for using the descheduler include:
+
+* Nodes are underutilized or overutilized.
+* Node labels, node taints, Pod affinity, or Pod anti-affinity requirements changed after Pods were scheduled.
+* Node failures moved Pods onto a smaller set of nodes, and recovered nodes should receive workload again.
+* New nodes were added and existing workloads should be redistributed.
+* Pods have restarted too many times or have been running for longer than the expected lifecycle.
+
+## Pod Eviction Rules and Eligibility
+
+To maintain cluster stability, the descheduler must be conservative about which Pods it evicts. Keep these protections in place unless you have verified that the workload will be recreated safely and that eviction is operationally acceptable.
+
+* **Protected Pods**:
+  * Pods in system or platform namespaces, such as `kube-system` and ACP platform namespaces. If you add namespace include or exclude rules, keep platform namespaces excluded.
+  * Critical Pods with `priorityClassName` set to `system-cluster-critical` or `system-node-critical`.
+  * Static Pods, mirrored Pods, or standalone Pods that are not managed by a controller, because these Pods will not be recreated automatically.
+  * Pods associated with DaemonSets.
+  * Pods with local storage, unless the policy explicitly disables the `PodsWithLocalStorage` protection.
+* **Pod Disruption Budgets (PDBs)**: The descheduler uses the eviction subresource. If evicting a Pod would violate its PDB, the Pod is not evicted.
+* **Eviction Order**: When multiple Pods are eligible, lower-priority Pods are selected before higher-priority Pods. For Pods with the same priority, BestEffort Pods are evicted before Burstable and Guaranteed Pods.
+* **Explicit Eviction Override**: A Pod annotated with `descheduler.alpha.kubernetes.io/evict` is eligible for eviction even when some internal descheduler checks would normally skip it. This annotation does not bypass PDB protection. Use it only when you know how the Pod will be recreated.
+* **Eviction Preference**: A Pod annotated with `descheduler.alpha.kubernetes.io/prefer-no-eviction` asks the descheduler to avoid evicting it. Whether this is advisory or mandatory depends on the `DefaultEvictor` `noEvictionPolicy` setting.
+
+## Understanding Descheduler Strategies
+
+The descheduler policy enables strategy plugins. Use the strategy that matches the operational goal; avoid enabling strategies that pull the cluster in opposite directions, such as spreading workloads with `LowNodeUtilization` and compacting workloads with `HighNodeUtilization` in the same policy profile.
+
+| Goal | Strategy | Description |
+| --- | --- | --- |
+| Remove duplicate replicas | `RemoveDuplicates` | Evicts duplicate Pods from the same workload when more than one replica is running on the same node. This helps redistribute Pods after node failures or uneven recovery. |
+| Spread from overloaded nodes | `LowNodeUtilization` | Finds underutilized nodes and evicts Pods from overutilized nodes so the scheduler can spread workloads more evenly. By default, utilization is calculated from Pod resource requests versus node allocatable resources, not from `kubectl top` actual usage. |
+| Compact workloads | `HighNodeUtilization` | Evicts Pods from underutilized nodes so replacement Pods can be scheduled onto fewer nodes. Use this only with a scheduler or autoscaler profile that prefers more allocated nodes, such as `MostAllocated`; otherwise Pods can be spread out again. |
+| Recycle old Pods | `PodLifeTime` | Evicts Pods older than a configured lifetime or matching configured lifecycle states. This is useful for VM-like long-running Pods or cleanup policies. |
+| Move repeatedly failing Pods | `RemovePodsHavingTooManyRestarts` | Evicts Pods whose containers have restarted more than the configured threshold. Init container restarts can be included. |
+| Enforce updated taints | `RemovePodsViolatingNodeTaints` | Evicts Pods that no longer tolerate `NoSchedule` taints on their current nodes. |
+| Enforce required node affinity | `RemovePodsViolatingNodeAffinity` | Evicts Pods whose current node no longer satisfies required node affinity, such as `requiredDuringSchedulingIgnoredDuringExecution`. |
+| Enforce inter-Pod anti-affinity | `RemovePodsViolatingInterPodAntiAffinity` | Evicts Pods that violate inter-Pod anti-affinity rules after the cluster state or workload definitions changed. |
+| Rebalance topology domains | `RemovePodsViolatingTopologySpreadConstraint` | Evicts Pods from larger topology domains when topology spread constraints are violated. By default, use hard constraints such as `DoNotSchedule`; include `ScheduleAnyway` only when you intentionally want soft topology constraints considered. |
+
+Common strategy groups:
+
+| Group | Use When | Strategies |
+| --- | --- | --- |
+| Affinity and taints | You changed taints, labels, node affinity, or inter-Pod anti-affinity and want running Pods to follow the new rules. | `RemovePodsViolatingNodeTaints`, `RemovePodsViolatingNodeAffinity`, `RemovePodsViolatingInterPodAntiAffinity` |
+| Topology and duplicates | You need similar Pods spread across nodes or topology domains. | `RemoveDuplicates`, `RemovePodsViolatingTopologySpreadConstraint` |
+| Lifecycle and utilization | You need to remove stale or unhealthy Pods and spread workloads away from overloaded nodes. | `RemovePodsHavingTooManyRestarts`, `PodLifeTime`, `LowNodeUtilization` |
+| Compact and scale | You want to pack workloads onto fewer nodes to help scale down unused capacity. | `HighNodeUtilization` |
+
+## Installing Descheduler in ACP
+
+The Alauda Build of Descheduler is packaged and managed as a **Cluster Plugin** in ACP.
+
+1. **Upload the Plugin Package**:
+   * Obtain the `Alauda Build of Descheduler` plugin package from the Alauda Customer Portal.
+   * Publish it to the platform using the `violet` tool. For detailed CLI instructions, refer to [CLI Tools](/ui/cli_tools/index.mdx).
+   * Navigate to **Administrator** > **Marketplace** > **Upload Packages** and verify the package is present under the **Cluster Plugin** tab.
+
+2. **Install the Plugin**:
+   * Navigate to **Administrator** > **Marketplace** > **Cluster Plugins**.
+   * Select the target cluster, find the **Alauda Build of Descheduler** plugin, and click **Install**.
+   * Adjust installation-time configuration options in the dynamic form if required, then confirm the installation.
+
+## Configuring Scheduling Policies
+
+After the plugin is installed, do not edit Helm values directly. The installed plugin renders Kubernetes resources, and the runtime descheduler policy is stored as YAML in the descheduler ConfigMap.
+
+### Runtime Mode
+
+* **CronJob (Recommended)**: The descheduler runs periodically as a Job. This mode avoids running a persistent agent when the cluster state is stable. Updated policy YAML is loaded by the next scheduled Job.
+* **Deployment**: The descheduler runs as a continuous Pod and reconciles the cluster at the interval configured during plugin installation. After updating the policy YAML, restart the descheduler Pod so the running process reloads the configuration.
+
+### Editing the Policy YAML
+
+Locate the descheduler policy ConfigMap:
+
+```bash
+kubectl get configmap -n kube-system -l app.kubernetes.io/name=descheduler
+```
+
+Back up the current policy before editing it:
+
+```bash
+kubectl get configmap -n kube-system <descheduler-configmap-name> -o yaml > descheduler-configmap.backup.yaml
+```
+
+Edit the ConfigMap returned by the previous command:
+
+```bash
+kubectl edit configmap -n kube-system <descheduler-configmap-name>
+```
+
+In `data.policy.yaml`, keep the existing policy and merge only the fields you need to change. Do not replace the whole policy with an example, because doing so can remove existing protections, enabled strategies, namespace filters, or eviction limits.
+
+### Example: Rebalancing Overutilized Nodes
+
+This example enables `LowNodeUtilization` and sets the same threshold pattern commonly used for spread-style descheduling: nodes below `20%` CPU, memory, and Pod capacity are underutilized; nodes above `50%` for any of those resources are overutilized.
+
+Relevant policy fragment:
+
+```yaml
+apiVersion: "descheduler/v1alpha2"
+kind: "DeschedulerPolicy"
+maxNoOfPodsToEvictTotal: 20
+profiles:
+  - name: default
+    pluginConfig:
+      - name: DefaultEvictor
+        args:
+          nodeFit: true
+      - name: LowNodeUtilization
+        args:
+          thresholds:
+            cpu: 20
+            memory: 20
+            pods: 20
+          targetThresholds:
+            cpu: 50
+            memory: 50
+            pods: 50
+          evictionLimits:
+            node: 5
+    plugins:
+      balance:
+        enabled:
+          - LowNodeUtilization
+```
+
+Notes:
+
+* `thresholds` and `targetThresholds` must define the same resource keys.
+* The valid percentage range is `0` to `100`.
+* `thresholds` must not be greater than `targetThresholds` for the same resource.
+* The strategy only runs when at least one underutilized node and one overutilized node exist.
+* By default, node utilization is calculated from Pod resource requests and node allocatable resources. If you need actual-usage-based descheduling, configure supported metrics providers and `metricsUtilization` in the policy.
+
+### Common Policy Customizations
+
+| Requirement | Policy Location | Notes |
+| --- | --- | --- |
+| Limit total disruption per run | Top-level `maxNoOfPodsToEvictTotal`, `maxNoOfPodsToEvictPerNode`, or `maxNoOfPodsToEvictPerNamespace` | Start with small limits and increase only after observing eviction behavior. |
+| Check whether replacement Pods can fit before eviction | `DefaultEvictor.args.nodeFit: true` | Prevents evicting Pods that cannot fit on another node according to current selectors, tolerations, affinity, resource requests, and schedulability. |
+| Exclude or include namespaces | Strategy `args.namespaces` or `LowNodeUtilization` / `HighNodeUtilization` `args.evictableNamespaces` | Use either `include` or `exclude`, not both. Keep ACP and Kubernetes system namespaces excluded. |
+| Restrict by Pod priority | `DefaultEvictor.args.priorityThreshold.name` or `DefaultEvictor.args.priorityThreshold.value` | Do not set both `name` and `value`. The priority class must already exist. |
+| Evict old Pods | `PodLifeTime.args.maxPodLifeTimeSeconds` | The value is expressed in seconds, for example `86400` for 24 hours. |
+| Evict Pods with too many restarts | `RemovePodsHavingTooManyRestarts.args.podRestartThreshold` | Use `includingInitContainers: true` if init container restarts should count. |
+| Consider soft topology spread constraints | `RemovePodsViolatingTopologySpreadConstraint.args.constraints` | Add `ScheduleAnyway` only when soft constraints should trigger evictions. |
+| Allow local-storage Pods to be evicted | `DefaultEvictor.args.podProtections.defaultDisabled` with `PodsWithLocalStorage` | This disables a default protection. Use only for workloads that can safely tolerate eviction. |
+| Protect PVC-backed Pods | `DefaultEvictor.args.podProtections.extraEnabled` with `PodsWithPVC` | This adds extra protection for Pods using PVCs. |
+
+### Example: Lifecycle and Health Cleanup
+
+This fragment evicts Pods older than 24 hours and Pods whose containers have restarted more than 100 times:
+
+```yaml
+profiles:
+  - name: default
+    pluginConfig:
+      - name: PodLifeTime
+        args:
+          maxPodLifeTimeSeconds: 86400
+      - name: RemovePodsHavingTooManyRestarts
+        args:
+          podRestartThreshold: 100
+          includingInitContainers: true
+    plugins:
+      deschedule:
+        enabled:
+          - PodLifeTime
+          - RemovePodsHavingTooManyRestarts
+```
+
+### Example: Affinity, Taints, and Topology Drift
+
+This fragment evicts Pods that no longer match updated node taints, required node affinity, inter-Pod anti-affinity, or hard topology spread constraints:
+
+```yaml
+profiles:
+  - name: default
+    pluginConfig:
+      - name: RemovePodsViolatingNodeTaints
+      - name: RemovePodsViolatingNodeAffinity
+        args:
+          nodeAffinityType:
+            - requiredDuringSchedulingIgnoredDuringExecution
+      - name: RemovePodsViolatingInterPodAntiAffinity
+      - name: RemovePodsViolatingTopologySpreadConstraint
+        args:
+          constraints:
+            - DoNotSchedule
+    plugins:
+      deschedule:
+        enabled:
+          - RemovePodsViolatingNodeTaints
+          - RemovePodsViolatingNodeAffinity
+          - RemovePodsViolatingInterPodAntiAffinity
+      balance:
+        enabled:
+          - RemovePodsViolatingTopologySpreadConstraint
+```
+
+## Verifying Installation and Evictions
+
+### 1. Check Plugin Installation Status
+
+Verify that the `ModuleInfo` has transitioned to the `Running` state:
+
+```bash
+kubectl get moduleinfo -l cpaas.io/module-name=descheduler
+```
+
+### 2. Verify the Policy ConfigMap
+
+Check that the policy YAML contains the expected strategies and protections:
+
+```bash
+kubectl get configmap -n kube-system <descheduler-configmap-name> -o yaml
+```
+
+### 3. View Descheduler Runs and Logs
+
+If running as a `CronJob`, list the completed or running Jobs:
+
+```bash
+kubectl get jobs -n kube-system -l app.kubernetes.io/name=descheduler
+```
+
+If running as a `Deployment`, confirm the running Pod and restart it after policy changes:
+
+```bash
+kubectl get pods -n kube-system -l app.kubernetes.io/name=descheduler
+kubectl rollout restart deployment -n kube-system -l app.kubernetes.io/name=descheduler
+```
+
+Retrieve descheduler logs to check node evaluation, skipped Pods, and eviction actions:
+
+```bash
+kubectl logs -n kube-system -l app.kubernetes.io/name=descheduler --tail=100
+```
+
+Example eviction log:
+
+```text
+I0601 15:30:15.123456       1 evictions.go:160] "Evicting pod" pod="default/my-app-67d7f8d68c-xxxxx" reason="RemoveDuplicates"
+```
+
+### 4. Check Pod Events
+
+When a Pod is evicted by the descheduler, inspect Pod events and the Pod description. The event reason can vary by strategy, so do not rely on a single `reason=Descheduled` filter.
+
+```bash
+kubectl get events -n <namespace> --field-selector involvedObject.kind=Pod --sort-by=.lastTimestamp
+kubectl describe pod -n <namespace> <pod-name>
+```
+
+## Operational Guidance
+
+* Start in a narrow scope: limit namespaces, set conservative eviction limits, and verify logs before broadening the policy.
+* Ensure workloads have controllers and sufficient replicas before enabling strategies that may evict many Pods.
+* Keep PDBs current for critical applications. The descheduler respects PDBs, but missing PDBs provide no disruption budget.
+* Use `HighNodeUtilization` only when the scheduler or autoscaler is configured to compact Pods. Otherwise, evicted Pods may be spread again.
+* Do not disable local-storage, DaemonSet, system-critical, or standalone-Pod protections unless the workload has an explicit, tested recovery path.
+* For actual-usage-based decisions, confirm that metrics providers are configured and that the selected strategy consumes those metrics; otherwise utilization strategies are based on requests.
