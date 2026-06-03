@@ -1,8 +1,12 @@
 ---
-weight: 40
+weight: 60
 ---
 
 # Global Cluster Disaster Recovery
+
+<Directive type="info" title="Disaster Recovery Path">
+This disaster recovery path applies to `global` clusters running on a **traditional operating system**. Disaster recovery for `global` clusters on Immutable Infrastructure is in development; see <ExternalSiteLink name="immutable-infra" href="/global/disaster_recovery.html" children="Global Cluster Disaster Recovery on Immutable Infrastructure" />.
+</Directive>
 
 ## Overview
 
@@ -132,32 +136,67 @@ Refer to the following documentation to complete installation:
 
 ### Step 3: Enable etcd Synchronization \{#etcd_sync}
 
-1. When applicable, configure the load balancer to forward port `2379` to control plane nodes of the corresponding cluster. ONLY TCP mode is supported; forwarding on L7 is not supported.
+1. Before installing the plugin, get the bearer token for accessing the active global cluster API server from the active global cluster. Copy the command output and use it when creating the `etcd-sync-active-cluster-token` Secret in the standby global cluster under the `cpaas-system` namespace. The Secret stores the token under the data key `token`.
+
+   ```bash
+   # Run this command on the active cluster.
+   kubectl -n cpaas-system get secret k8sadmin -o jsonpath='{.data.token}' | base64 -d
+   ```
+
+   Copy the output value, then run this command on the standby cluster:
+
+   ```bash
+   ACTIVE_CLUSTER_TOKEN='<paste-the-token-from-the-active-cluster>'
+   kubectl -n cpaas-system create secret generic etcd-sync-active-cluster-token \
+     --from-literal=token="${ACTIVE_CLUSTER_TOKEN}" \
+     --dry-run=client -o yaml | kubectl apply -f -
+   ```
+
+2. When applicable, configure the load balancer to forward port `2379` to control plane nodes of the corresponding cluster. ONLY TCP mode is supported; forwarding on L7 is not supported.
 
     :::info
     Port forwarding through a load balancer is not required.
     If direct access from the standby cluster to the active global cluster is available, specify the etcd addresses via **Active Global Cluster ETCD Endpoints**.
     :::
 
-2. Access the **standby global cluster** Web Console using its VIP, and switch to **Administrator** view;
-3. Navigate to **Marketplace > Cluster Plugins**, select the `global` cluster;
-4. Find **<Term name="product" /> etcd Synchronizer**, click **Install**, configure parameters:
+3. Access the **standby global cluster** Web Console using its VIP, and switch to **Administrator** view.
+4. Navigate to **Marketplace > Cluster Plugins**, select the `global` cluster.
+5. Find **<Term name="product" /> etcd Synchronizer**, click **Install**, and configure these parameters:
 
-   * When not forwarding port `2379` through load balancer, its required to configure **Active Global Cluster ETCD Endpoints** correctly;
-   * Use the default value of **Data Check Interval**;
-   * Leave **Print detail logs** switch disabled unless troubleshooting.
+   * Set **Active Global Cluster VIP** to the VIP of the active global cluster.
+   * When not forwarding port `2379` through the load balancer, configure **Active Global Cluster ETCD Endpoints** correctly.
+   * Set **Standby Cluster ETCD Endpoints** to the standby cluster etcd address. Use the default value unless the local etcd service is exposed through a different endpoint.
+   * Set **Active Global Cluster Token Secret** to `etcd-sync-active-cluster-token`.
+   * Use the default value of **Data Check Interval**.
+   * Leave **Print detail logs** disabled unless troubleshooting.
 
-Verify the sync Pod is running on the standby cluster:
+During installation, the system runs the `etcd-sync-bootstrap` Job before the `etcd-sync` Deployment starts. The plugin installation continues only after the Job prepares `remote-etcd-ca`, `remote-etcd-issuer`, and `remote-etcd-client`.
+
+Verify the bootstrap Job and runtime resources:
+
+```bash
+kubectl get job -n cpaas-system etcd-sync-bootstrap
+kubectl logs -n cpaas-system job/etcd-sync-bootstrap
+kubectl get secret -n cpaas-system remote-etcd-ca
+kubectl get issuer -n cpaas-system remote-etcd-issuer
+kubectl get certificate -n cpaas-system remote-etcd-client
+kubectl get secret -n cpaas-system remote-etcd-client
+```
+
+Verify the sync Pods are running on the standby cluster and identify the current leader:
 
 ```bash
 kubectl get po -n cpaas-system -l app=etcd-sync
-kubectl logs -n cpaas-system $(kubectl get po -n cpaas-system -l app=etcd-sync --no-headers | head -1) | grep -i "Start Sync update"
+kubectl get lease -n cpaas-system etcd-sync-mirror
+leader_pod=$(kubectl get lease -n cpaas-system etcd-sync-mirror -o jsonpath='{.spec.holderIdentity}')
+kubectl logs -n cpaas-system "$leader_pod" | grep -E "Acquired leader lease|Start Sync update"
 ```
 
-Once “Start Sync update” appears, recreate one of the pods to re-trigger sync of resources with ownerReference dependencies:
+If resources with `ownerReference` dependencies need to be resynchronized, recreate the current leader Pod after `Start Sync update` appears:
 
 ```bash
-kubectl delete po -n cpaas-system $(kubectl get po -n cpaas-system -l app=etcd-sync --no-headers | head -1)
+leader_pod=$(kubectl get lease -n cpaas-system etcd-sync-mirror -o jsonpath='{.spec.holderIdentity}')
+kubectl delete po -n cpaas-system "$leader_pod"
 ```
 
 Check sync status:
@@ -166,16 +205,16 @@ Check sync status:
 mirror_svc=$(kubectl get svc -n cpaas-system etcd-sync-monitor -o jsonpath='{.spec.clusterIP}')
 ipv6_regex="^[0-9a-fA-F:]+$"
 if [[ $mirror_svc =~ $ipv6_regex ]]; then
-  export mirror_new_svc="[$mirror_svc]"
+  mirror_host="[$mirror_svc]"
 else
-  export mirror_new_svc=$mirror_svc
+  mirror_host="$mirror_svc"
 fi
-curl $mirror_new_svc/check
+curl -g "http://${mirror_host}/check"
 ```
 
 **Output explanation:**
 
-* `LOCAL ETCD missed keys`: Keys exist in the Primary but are missing from the standby. Often caused by GC due to resource order during sync. Restart one etcd-sync Pod to fix;
+* `LOCAL ETCD missed keys`: Keys exist in the Primary but are missing from the standby. Often caused by GC due to resource order during sync. Restart the current etcd-sync leader Pod to fix;
 * `LOCAL ETCD surplus keys`: Extra keys exist only in the standby cluster. Confirm with ops team before deleting these keys from the standby.
 
 If the following components are installed, restart their services:
@@ -193,6 +232,10 @@ If the following components are installed, restart their services:
   ```
 
 ## Disaster Recovery Process
+
+<Directive type="danger" title="Verify primary/standby consistency before uninstalling the etcd synchronization plugin">
+This procedure uninstalls the etcd synchronization plugin. Before you uninstall it, confirm that the standby cluster data is consistent with the primary cluster. Uninstalling the plugin while the standby is missing data that the primary holds can cause owner references to resolve incorrectly, and workload-cluster node `Machine` objects — including immutable-OS clusters, where this destroys the backing virtual machine — may be deleted. If the consistency check reports missing or surplus keys, do not uninstall the plugin; resolve the inconsistency or contact technical support first.
+</Directive>
 
 1. Restart Elasticsearch on the standby cluster in case it is necessary:
 
@@ -215,7 +258,12 @@ If the following components are installed, restart their services:
     fi
     ```
 
-2. Verify data consistency in the standby cluster (same check as in [Step 3](#etcd_sync));
+2. Verify data consistency in the standby cluster (same check as in [Step 3](#etcd_sync)). If the check reports missing or surplus keys, the standby is not consistent with the primary: do not continue to the next step. Resolve the inconsistency or contact technical support first. On **both** clusters, also confirm that no `Machine` nodes are in a non-running state, and resolve any that are before continuing:
+
+    ```bash
+    kubectl get machines.platform.tkestack.io
+    ```
+
 3. Uninstall the etcd synchronization plugin;
 4. Remove port forwarding for `2379` from both VIPs;
 5. Switch the platform domain DNS to the standby VIP, which now becomes the Primary Cluster;
@@ -258,7 +306,14 @@ If the following components are installed, restart their services:
 Regularly check sync status on the standby cluster:
 
 ```bash
-curl $(kubectl get svc -n cpaas-system etcd-sync-monitor -o jsonpath='{.spec.clusterIP}')/check
+mirror_svc=$(kubectl get svc -n cpaas-system etcd-sync-monitor -o jsonpath='{.spec.clusterIP}')
+ipv6_regex="^[0-9a-fA-F:]+$"
+if [[ $mirror_svc =~ $ipv6_regex ]]; then
+  mirror_host="[$mirror_svc]"
+else
+  mirror_host="$mirror_svc"
+fi
+curl -g "http://${mirror_host}/check"
 ```
 
 If any keys are missing or surplus, follow the instructions in the output to resolve them.
