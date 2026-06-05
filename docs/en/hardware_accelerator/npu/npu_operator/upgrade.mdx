@@ -1,0 +1,228 @@
+---
+weight: 25
+---
+
+# Driver upgrade and self-healing
+
+Starting with v1.2.3 the NPU Operator manages the driver lifecycle on each NPU node end-to-end. This page covers the two state-driven flows it exposes:
+
+- __Driver upgrade__ — rolling out a new driver version cluster-wide.
+- __Chip self-healing__ — automatically recovering a node whose chip has wedged at runtime.
+
+Both flows go through the same node-reboot path. Ascend chips cannot tolerate `rmmod` of a running driver — attempting an in-place driver swap leaves the chip in an unrecoverable `dev_num=0` state. The operator therefore always loads new modules from a fresh boot rather than reloading them inside a running kernel.
+
+## Driver upgrade
+
+### What triggers an upgrade
+
+Editing `NPUClusterPolicy.spec.driver.version` (or letting an OLM bump change it) makes the operator re-resolve the driver image tag for every NPU node, notices each node is still on the old image, and starts a rolling upgrade.
+
+```bash
+kubectl edit npuclusterpolicy cluster
+# change spec.driver.version, e.g. 25.3.RC1 -> 25.5.0
+```
+
+Before doing this, confirm a driver image matching the new version exists in the cluster registry for every `(chip, kernel, OS)` combination present in the cluster. If a matching image is missing the operator will mark the node `upgrade-required` and the driver pod will go `ImagePullBackOff`.
+
+### Per-node upgrade phases
+
+The operator drives each node through a state machine and reports progress via the `npu.openfuyao.com/driver-upgrade-state` label on the node. The phases are:
+
+```
+upgrade-required
+  → cordon-required
+  → wait-for-jobs-required
+  → pod-deletion-required
+  → drain-required
+  → node-reboot-required        ← waits for approval if AutoUpgrade is off
+  → pod-restart-required
+  → validation-required
+  → uncordon-required
+  → upgrade-done
+```
+
+While a node carries any non-empty `driver-upgrade-state` label the Ascend Device Plugin marks every NPU on that node `Unhealthy`, so the scheduler stops placing new NPU workloads on it for the duration of the upgrade.
+
+### Auto vs. manual approval
+
+The behaviour at the `node-reboot-required` phase is controlled by `spec.driver.upgradePolicy.autoUpgrade`:
+
+| `autoUpgrade` | Behaviour at `node-reboot-required` |
+|---|---|
+| `false` (default) | The operator pauses the node. The rebooter pod emits a `RebootRequired` Event and waits for an administrator to annotate the node. |
+| `true` | The rebooter pod proceeds to reboot the node once a few safety gates (node uptime, cluster-wide reboot lock) are satisfied. |
+
+Other `upgradePolicy` fields shape the rollout:
+
+```yaml
+spec:
+  driver:
+    version: "25.3.RC1"
+    upgradePolicy:
+      autoUpgrade: true        # default false
+      maxParallelUpgrades: 1   # how many nodes the state machine drives in parallel
+      maxUnavailable: "25%"    # cap on simultaneously-unavailable NPU nodes
+      drainSpec:               # optional drain configuration
+        enable: true
+        force: true
+        deleteEmptyDir: false
+        timeoutSecond: 300
+      podDeletion:
+        force: true
+        timeoutSecond: 300
+      waitForCompletion:
+        podSelector: "kubernetes.io/category=npu-job"
+        timeoutSecond: 1200
+```
+
+`maxUnavailable` and `maxParallelUpgrades` together gate how many nodes leave the available pool at once; the rebooter additionally serializes the actual reboot step via a cluster-wide annotation so only one node reboots at a time even when several are in the unavailable region.
+
+### Manual upgrade walk-through
+
+With `autoUpgrade: false` (recommended for first-time rollouts and for VM environments where chip wedging is a real risk):
+
+1. Update the driver version:
+
+    ```bash
+    kubectl patch npuclusterpolicy cluster --type=merge \
+      -p '{"spec":{"driver":{"version":"25.3.RC1"}}}'
+    ```
+
+2. Watch the state machine drive each node up to the reboot gate:
+
+    ```bash
+    kubectl get nodes -L npu.openfuyao.com/driver-upgrade-state -w
+    ```
+
+    The state column will move through `upgrade-required` → `cordon-required` → … → `node-reboot-required` and then stop.
+
+3. Confirm the rebooter is waiting:
+
+    ```bash
+    kubectl get events -A --field-selector reason=RebootRequired --sort-by=.lastTimestamp | tail
+    kubectl get nodes -l npu.openfuyao.com/reboot-required=true
+    ```
+
+    Each pending node has a `RebootRequired` Event explaining how to approve the reboot.
+
+4. Approve the node when ready. The rebooter polls every 30 seconds, so it acts within a minute:
+
+    ```bash
+    kubectl annotate node ${nodeName} npu.openfuyao.com/approve-reboot=true
+    ```
+
+5. The node reboots. After it comes back up, the new driver pod loads the new modules from a fresh boot, the validator pod confirms readiness, and the state machine clears the label.
+
+6. Verify the driver pod is now running the new image and `npu-smi info` reports the new version on the host:
+
+    ```bash
+    kubectl get pod -n npu-operator -l app.kubernetes.io/name=ascend-driver \
+      -o jsonpath='{range .items[*]}{.spec.nodeName}{"\t"}{.spec.containers[0].image}{"\n"}{end}'
+
+    LD_LIBRARY_PATH=/var/lib/Ascend/driver/lib64/driver:/var/lib/Ascend/driver/lib64/common \
+      /var/lib/Ascend/driver/tools/npu-smi info | head -2
+    ```
+
+Once a node is upgraded, the device plugin clears the `Unhealthy` mark and the scheduler resumes placing workloads on it.
+
+### Inspecting the upgrade state
+
+| Resource | What to check |
+|---|---|
+| Node label `npu.openfuyao.com/driver-upgrade-state` | Current phase. Empty means the node is _not_ in an upgrade. |
+| Node label `npu.openfuyao.com/reboot-required` | `true` while the node is in `node-reboot-required` and waiting for approval (manual mode) or for the reboot to fire (auto mode). |
+| Node annotation `npu.openfuyao.com/approve-reboot` | Set to `true` by the administrator to authorize the reboot. |
+| Node annotation `npu.openfuyao.com/reboot-in-progress` | Cluster-wide lock; only one node at a time carries this. |
+| Pod `npu-driver-*` logs | The runtime-init.sh log; useful when a node gets stuck. |
+| Pod `npu-rebooter-*` logs | Records why the rebooter is or is not acting on a given node. |
+| Events with reason `RebootRequired` | Tells you which nodes need approval and the suggested `kubectl annotate` command. |
+
+## Chip self-healing
+
+Some Ascend deployment scenarios — most notably 910B in VM with PCI passthrough — can occasionally leave the chip in a state where the kernel modules are loaded but the driver itself reports `dev_num=0` and refuses DCMI calls. From userspace this looks like a "healthy" host (all `/dev/davinciN` exist, modules loaded) but every `npu-smi info` returns an error. The only recovery is a node reboot.
+
+v1.2.3 detects this case automatically:
+
+- The driver pod runs a __health-watch loop__ that probes each NPU with `npu-smi info` every 60 seconds.
+- After three consecutive failures (≈3 minutes), the loop declares a runtime wedge: it drops the driver-ready marker (so the validator pod and device plugin see `NotReady` immediately) and writes a `recovery` marker for the rebooter.
+- A rebooter pod observes the marker on its next 30-second poll cycle.
+
+### Auto vs. manual recovery
+
+The behaviour at this point is controlled by `spec.driver.recoveryPolicy.autoRecover` (independent of `autoUpgrade`):
+
+| `autoRecover` | Behaviour after wedge detection |
+|---|---|
+| `false` (default) | The rebooter emits a `RebootRequired` Event (with `reason=recovery`) and waits for an administrator to annotate the node. |
+| `true` | The rebooter reboots the node after the uptime guard and cluster-wide lock are satisfied. |
+
+When auto-recovery is on the chip self-heals without operator intervention — typically 3 minutes of detection plus a few minutes of reboot. When it is off, the same approve-reboot annotation used for upgrades authorizes the recovery reboot.
+
+A typical recovery configuration:
+
+```yaml
+spec:
+  driver:
+    recoveryPolicy:
+      autoRecover: true   # rebooter reboots automatically on detected wedge
+```
+
+### Manual recovery walk-through
+
+If `autoRecover: false` and the health-watch loop has detected a wedge:
+
+1. Find the affected nodes and read the marker reason:
+
+    ```bash
+    kubectl get nodes -l npu.openfuyao.com/reboot-required=true
+    kubectl get events -A --field-selector reason=RebootRequired --sort-by=.lastTimestamp | tail
+    ```
+
+    For self-healing, the Event message contains `reason=recovery`. (Driver upgrades use `reason=upgrade`.)
+
+2. Approve the reboot when convenient:
+
+    ```bash
+    kubectl annotate node ${nodeName} npu.openfuyao.com/approve-reboot=true
+    ```
+
+3. The rebooter reboots the node; on fresh boot the driver pod loads the modules cleanly and the validator pod re-confirms readiness.
+
+### False-positive suppression
+
+If the chip recovers on its own before the rebooter acts, the health-watch loop clears its own marker so the node is not rebooted unnecessarily.
+
+## Operator vs. RuntimeClass coexistence
+
+v1.2.3 ships CDI-based device injection but keeps the legacy `ascend` `RuntimeClass` resource for compatibility. Workloads that still set `runtimeClassName: ascend` continue to work. New workloads should drop `runtimeClassName` and rely on the resource request alone — CDI handles `/dev/davinciN` and the driver userspace libraries automatically.
+
+## Quick reference: NPUClusterPolicy fields
+
+```yaml
+apiVersion: openfuyao.com/v1
+kind: NPUClusterPolicy
+metadata:
+  name: cluster
+spec:
+  driver:
+    managed: true
+    version: "25.5.0"
+    upgradePolicy:
+      autoUpgrade: false        # opt-in to fully automatic rolling upgrades
+      maxParallelUpgrades: 1
+      maxUnavailable: "25%"
+      drainSpec:
+        enable: false
+        force: true
+        deleteEmptyDir: false
+        timeoutSecond: 300
+      podDeletion:
+        force: true
+        timeoutSecond: 300
+      waitForCompletion:
+        podSelector: ""
+        timeoutSecond: 0
+    recoveryPolicy:
+      autoRecover: false        # opt-in to automatic chip-wedge recovery
+  # ... other components (devicePlugin, ociRuntime, exporter, …)
+```
