@@ -13,41 +13,26 @@ weight: 20
 3. __Supported NPU hardware__. NPU worker nodes must carry one of:
     - `Ascend 910B`
     - `Ascend 310P`
-4. __Worker-node OS — kernel is what matters, not the distro.__ The NPU Operator does __not__ require a specific Linux distribution. Because the Huawei driver `.ko` binaries are compiled per kernel version, what matters is whether a matching driver image (keyed on `(chip, kernel, OS-stem)`) is available in your registry.
+4. __Worker-node OS — kernel is what matters, not the distro.__ The Huawei driver `.ko` binaries are compiled per kernel version. There is no distro lock-in: any arm64 Linux on containerd works, as long as a driver image matching your node's exact kernel exists at [`docker.io/alaudadockerhub/ascend-driver`](https://hub.docker.com/r/alaudadockerhub/ascend-driver) (or your private mirror).
 
-    - Today, two pre-compiled driver images are published on DockerHub at [`docker.io/alaudadockerhub/ascend-driver`](https://hub.docker.com/r/alaudadockerhub/ascend-driver) (see [Driver image](#driver-image) for the exact tag pattern):
-
-        | Chip | Kernel | OS stem (informational) |
-        |---|---|---|
-        | 910B | `6.6.0-145.0.4.135` | `oe2403sp3` |
-        | 910B | `5.10.0-182.0.0.95` | `oe2203sp3` |
-        | 310P | `6.6.0-145.0.4.135` | `oe2403sp3` |
-
-    - These two kernels happen to match the kernels shipped by __KubeOS 6.6__ and __openEuler 22.03 LTS SP3__, so those two distros work out of the box. **They are not the only supported distros.** Any arm64 Linux running containerd, with a kernel version we publish an image for (or one you build yourself), is supported.
-    - **New kernel versions can be built on demand.** The driver image is produced from the [npu-driver-installer](https://gitcode.com/openFuyao/npu-driver-installer) build pipeline; supplying a different `KERNEL_UNAME` produces a new tag (`ascend-driver:<HDK>-<chip>-<kernel>-<os-stem>`). Filing a kernel-build request with the maintainers, or running the pipeline yourself, both work. There is no per-distro lock-in.
-    - Worker nodes that do _not_ run NPU workloads can use any OS; the operator only configures nodes labelled by NFD as carrying an Ascend PCI device.
+    - **Check before installing**: run `uname -r` on each NPU node, then list DockerHub tags (see the snippet under [Step 1](#sync-driver-images)) and confirm a tag matches. New kernel images are added continuously — if yours isn't on DockerHub yet, file a build request with the maintainers or run the [npu-driver-installer](https://gitcode.com/openFuyao/npu-driver-installer) pipeline with your `KERNEL_UNAME`; the resulting tag goes to the same registry path with no operator code changes.
+    - **Validated combinations** (smoke-tested on real hardware in this release): KubeOS 6.6 / kernel `6.6.0-145.x` (310P + 910B), openEuler 22.03 LTS SP3 / kernel `5.10.0-182.x` (910B bare-metal). Other kernels are not blocked — they just haven't been smoke-tested.
+    - Worker nodes that do _not_ carry NPU cards can run any OS; the operator only touches nodes labelled by NFD as having an Ascend PCI device.
 5. __`Alauda Build of Node Feature Discovery` cluster plugin__ must be installed. The operator reads NPU presence and kernel/OS labels from NFD to decide which driver image to pull on each node.
 
 ### Driver image \{#driver-image}
 
-Unlike v1.1.x, v1.2.3 does __not__ download a `.run` package or run DKMS on the host. The driver, firmware, and runtime tooling are baked into a container image keyed on `(HDK, chip, kernel, OS-stem)`. The image must already exist in the cluster image registry before the driver DaemonSet starts.
+Unlike v1.1.x, v1.2.3 does __not__ download a `.run` package or run DKMS on the host. The driver, firmware, and runtime tooling are baked into a container image keyed on `(HDK, chip, kernel, OS-stem)`, and loaded into the host kernel directly from the running pod. The image must already exist in the cluster image registry before the driver DaemonSet starts.
 
-The image tag follows the pattern:
+Tag pattern:
 
 ```
-ascend-driver:<HDK>-<chip>-<kernel-stem>-<os-stem>
+ascend-driver:<HDK>-<chip>-<kernel>-<os-stem>
 ```
 
-For example: `ascend-driver:25.5.0-910b-6.6.0-145.0.4.135-oe2403sp3`.
+The OS stem is __informational only__ — it disambiguates near-identical kernels from different userspace builds. The operator resolves the exact tag at reconcile time from `spec.driver.version` plus the node's NFD labels; you do not write the full tag in the deployment form.
 
-The OS stem is __informational only__ — it identifies the userspace build environment so that two near-identical kernels from different distros can both be staged side-by-side. The operator resolves the exact tag at reconcile time from `spec.driver.version` plus the node's NFD labels; you do not have to write the full tag yourself.
-
-__Where the images come from__:
-
-- __Public source__: [`docker.io/alaudadockerhub/ascend-driver`](https://hub.docker.com/r/alaudadockerhub/ascend-driver). Pre-compiled images for the kernels listed in [Prerequisites #4](#prerequisites) are published there; the same path is used for any future kernel-build request.
-- __Air-gapped / restricted clusters__: pull from `docker.io/alaudadockerhub/ascend-driver` on a machine with internet access, then push the matching tag(s) into your cluster image registry. The detailed sync flow is __Step 1__ of the install procedure (see [Sync driver images and configure ImageWhitelist](#sync-driver-images)).
-
-__Need a kernel that's not on the list?__ Build from [npu-driver-installer](https://gitcode.com/openFuyao/npu-driver-installer) with the target `KERNEL_UNAME`, or file a build request. Either way, the resulting tag follows the same pattern above and drops into the same registry path; no operator code changes are required.
+Public images are published to [`docker.io/alaudadockerhub/ascend-driver`](https://hub.docker.com/r/alaudadockerhub/ascend-driver) and the tag list grows over time as new kernels are built. For air-gapped clusters, mirror the tag(s) matching your nodes' kernels into your private registry — see [Step 1](#sync-driver-images). If your kernel isn't on the list yet, run [npu-driver-installer](https://gitcode.com/openFuyao/npu-driver-installer) with your `KERNEL_UNAME` (or file a build request); the output drops into the same registry path with no operator code changes.
 
 ### MindIO SDK (optional)
 
@@ -55,80 +40,67 @@ If you plan to enable __MindIO TFT__ or __MindIO ACP__, separately stage the mat
 
 ## Procedure
 
-### Step 1: Sync driver images and configure ImageWhitelist \{#sync-driver-images}
+### Step 1: Sync driver images and configure ImageWhiteList \{#sync-driver-images}
 
 :::warning
-Do this __before__ installing the NPU Operator. The bundle's own images (operator / device-plugin / toolkit / MindCluster sub-components) are pulled and registered automatically by OperatorHub when you install the operator package — those don't need manual sync. The __driver image__ is different: it's pulled at runtime by the driver DaemonSet on each NPU node based on the node's kernel label, and lives at a separate `mlops/ascend-driver` path. If it isn't present in your cluster registry or the path isn't allowed by ImageWhitelist, the DaemonSet pods stay in `ImagePullBackOff` and the operator never reaches `Ready`.
+Do this __before__ installing the NPU Operator. The bundle's own images (operator / device-plugin / toolkit / MindCluster sub-components) are pulled and registered automatically by OperatorHub when you install the operator package — those don't need manual sync. The __driver image__ is different: it's pulled at runtime by the driver DaemonSet on each NPU node based on the node's kernel label, and lives at a separate `mlops/ascend-driver` path. If it isn't present in your cluster registry or the tag isn't listed in an `ImageWhiteList`, the DaemonSet pods stay in `ImagePullBackOff` and the operator never reaches `Ready`.
 :::
 
 #### 1.1 Pull driver images from DockerHub
 
-On a machine with internet access, list the tags you need from [`docker.io/alaudadockerhub/ascend-driver`](https://hub.docker.com/r/alaudadockerhub/ascend-driver) and pull each one. For a default v1.2.x install (`spec.driver.version: 25.5.0`) the minimum tags are:
-
-```bash
-# 910B + KubeOS 6.6:
-skopeo copy --all \
-  docker://docker.io/alaudadockerhub/ascend-driver:25.5.0-910b-6.6.0-145.0.4.135-oe2403sp3 \
-  docker://<your-cluster-registry>/mlops/ascend-driver:25.5.0-910b-6.6.0-145.0.4.135-oe2403sp3
-
-# 910B + openEuler 22.03 SP3 (bare-metal):
-skopeo copy --all \
-  docker://docker.io/alaudadockerhub/ascend-driver:25.5.0-910b-5.10.0-182.0.0.95-oe2203sp3 \
-  docker://<your-cluster-registry>/mlops/ascend-driver:25.5.0-910b-5.10.0-182.0.0.95-oe2203sp3
-
-# 310P + KubeOS 6.6:
-skopeo copy --all \
-  docker://docker.io/alaudadockerhub/ascend-driver:25.5.0-310p-6.6.0-145.0.4.135-oe2403sp3 \
-  docker://<your-cluster-registry>/mlops/ascend-driver:25.5.0-310p-6.6.0-145.0.4.135-oe2403sp3
-```
-
-Push __only the tags that match the kernels actually running on your NPU nodes__. If you have a kernel that is not pre-built, build it from [npu-driver-installer](https://gitcode.com/openFuyao/npu-driver-installer) and push it to the same `mlops/ascend-driver` path under your cluster registry. The operator resolves tags by node labels — extra images sitting in the registry don't hurt.
-
-The chart's `values.yaml` defaults to `mlops/ascend-driver` as the repository path; if your cluster registry uses a different namespace, override `spec.driver.image.repository` in the deployment form.
-
-:::tip
-DockerHub tag listing:
+First, list available tags and pick the ones matching your NPU nodes' `(chip, kernel)`:
 
 ```bash
 curl -s 'https://hub.docker.com/v2/repositories/alaudadockerhub/ascend-driver/tags/?page_size=100' \
   | jq -r '.results[].name'
 ```
-:::
 
-#### 1.2 Allow the driver image path in ImageWhitelist
+Then, on a machine with internet access, mirror each selected tag into your cluster registry (replace the placeholder tag):
 
-ACP gates which image registries / repositories pods are allowed to pull from. The bundle's own images get whitelisted automatically by OperatorHub when you install the operator package, but the runtime-pulled driver image isn't part of the bundle — its path has to be added manually.
+```bash
+TAG=25.5.0-<chip>-<kernel>-<os-stem>   # e.g. one of the tags from the listing above
 
-Create or patch an ImageWhitelist that allows the driver path:
-
-```yaml
-apiVersion: image-policy.acp.alauda.io/v1
-kind: ImageWhitelist
-metadata:
-  name: npu-operator-driver
-spec:
-  registries:
-  - registry: <your-cluster-registry>
-    repositories:
-    - mlops/ascend-driver
+skopeo copy --all \
+  docker://docker.io/alaudadockerhub/ascend-driver:$TAG \
+  docker://<your-cluster-registry>/mlops/ascend-driver:$TAG
 ```
 
-If you overrode `spec.driver.image.repository` to a different path in the operator deployment form, allow that path instead.
+Mirror __only the tags that match kernels actually running on your NPU nodes__. The operator resolves tags from node labels — extra images in the registry don't hurt, but you must have at least the matching ones. The chart defaults `spec.driver.image.repository` to `mlops/ascend-driver`; override it in the deployment form if your cluster registry uses a different namespace.
+
+#### 1.2 Allow the driver image in ImageWhiteList
+
+ACP gates which images pods are allowed to pull. The bundle's own images get whitelisted automatically by OperatorHub, but the runtime-pulled driver image isn't part of the bundle — every tag the driver DaemonSet may pull has to be listed explicitly in an `ImageWhiteList`.
+
+Create one (or extend the existing `ascend-driver` `ImageWhiteList` in `cpaas-system`):
+
+```yaml
+apiVersion: app.alauda.io/v1alpha1
+kind: ImageWhiteList
+metadata:
+  name: ascend-driver
+  namespace: cpaas-system
+spec:
+  repoList:
+  # one entry per tag you mirrored in step 1.1 — full image reference, not bare repo path
+  - <your-cluster-registry>/mlops/ascend-driver:25.5.0-910b-<kernel>-<os-stem>
+  - <your-cluster-registry>/mlops/ascend-driver:25.5.0-310p-<kernel>-<os-stem>
+```
+
+Add one `repoList` entry per `<chip, kernel>` tag you mirrored. Each entry is a __full image reference including the tag__ (the API does not accept bare repository paths). If you override `spec.driver.image.repository` later, list the new path instead.
 
 :::tip
-If your platform doesn't enforce ImageWhitelist (the policy is `Allow` by default), this sub-step is a no-op and you can skip it. The skip is safe — kubelet still has to authenticate to the registry, so the image pull itself is gated by registry credentials.
+If your platform doesn't enforce ImageWhiteList (`Allow` policy by default), this sub-step is a no-op — kubelet still authenticates to the registry, so credentials gate the actual pull.
 :::
 
 #### 1.3 Verify
 
-On each NPU node, the kubelet should be able to pull a driver image:
+On each NPU node, the kubelet should be able to pull a driver image (use the tag matching the node's kernel):
 
 ```bash
-# replace tag with one that matches the node's kernel
-crictl pull <your-cluster-registry>/mlops/ascend-driver:25.5.0-910b-6.6.0-145.0.4.135-oe2403sp3
+crictl pull <your-cluster-registry>/mlops/ascend-driver:$TAG
 ```
 
-If this command succeeds on the node, Step 1 is complete. If it fails with `ImagePullBackOff` later, revisit either the registry credentials or the ImageWhitelist.
+If this succeeds, Step 1 is complete. A later `ImagePullBackOff` on the driver DaemonSet usually means a missing tag in the registry, a registry credential issue, or a missing `repoList` entry in the `ImageWhiteList`.
 
 ### Step 2: Download packages
 
