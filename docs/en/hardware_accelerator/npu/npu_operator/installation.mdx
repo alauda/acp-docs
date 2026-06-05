@@ -6,70 +6,138 @@ weight: 20
 
 ## Prerequisites
 
-### Online Installation
+### Common requirements
 
-1. **ACP version: v4.0 or later**
-2. **Cluster administrator access to your ACP cluster**
-3. **Ensure that the bash tool exists in the NPU node. Otherwise, the driver and firmware installation script may fail to be parsed.**
-4. **Worker Node Operating System Requirements**
-    - Worker nodes (or node groups) running **NPU workloads** must use one of the following operating systems (Arm architecture):
-      - `openEuler 22.03 LTS`
-      - `Ubuntu 22.04`
+1. __ACP version__: v4.0 or later.
+2. __Cluster administrator access__ to the target ACP cluster.
+3. __Supported NPU hardware__. NPU worker nodes must carry one of:
+    - `Ascend 910B`
+    - `Ascend 310P`
+4. __`Alauda Build of Node Feature Discovery` cluster plugin__ must be installed. The operator reads NPU presence and kernel/OS labels from NFD to decide which driver image to pull on each node.
 
-    - Worker nodes running **CPU workloads only** can use any operating system, as the NPU operator performs no configuration on nodes without NPU workloads.
-5. **Supported NPU Hardware**
-    - Nodes must use supported NPUs:
-      - `Ascend 910B`
-      - `Ascend 310P`
+### MindIO SDK (optional)
 
-    - For detailed OS and hardware compatibility, see [MindCluster Documentation](https://www.hiascend.com/document/detail/zh/mindx-dl/600/clusterscheduling/clusterschedulingig/clusterschedulingig/dlug_installation_002.html)
-
-6. **The `Alauda Build of Node Feature Discovery` cluster plugin must be installed.**
-
-### Offline Installation
-
-1. **Offline installation requires all online installation prerequisites plus additional preparation steps.**
-
-2. **Prepare the driver and firmware package and the MindIO SDK package.**
-    Download the following packages (if you do not need to install MindIO, then you do not need to download the MindIO package):
-    - For the driver and firmware package, find the `config.json` file in the GitCode repository of the [npu-driver-installer](https://gitcode.com/openFuyao/npu-driver-installer/tree/1.1.1/downloader/NPU), and download the package based on the version you want to choose, the NPU model and OS architecture of the corresponding node through the corresponding link provided.
-    - For the MindIO SDK package, find the `config.json` file in the GitCode repository of the [npu-node-provision](https://gitcode.com/openFuyao/npu-node-provision/blob/1.1.1/downloader/software/7.2.RC1/config.json), and download the SDK package based on the NPU model and OS architecture of the corresponding node through the corresponding link provided.
-3. **Save the ZIP file of the driver and firmware package to the `/tmp/driver_pkg/` path of the node where the offline installation is to be performed.**
-4. **Save the ZIP file of the MindIO package to the `/opt/openFuyao/mindio/` path of the node where the offline installation is to be performed. (If you do not need to install MindIO, skip this step.)**
-5. **Check whether the target node contains the following tools.**
-    - For systems using Yum as the package manager, the following package needs to be installed: "jq wget unzip which net-tools pciutils gcc make kernel-devel-$(uname-r) kernel-headers-(uname-r) dkms".
-    - For systems using apt-get as the package manager, the following package needs to be installed: "jq wget unzip debianutils net-tools pciutils gcc make dkms linux-headers-$(uname -r)".
-    - For systems using DNF as the package manager, the following package needs to be installed: "jq wget unzip which net-tools pciutils gcc make kernel-devel-$(uname -r) kernel-headers-(uname-r) dkms".
+If you plan to enable __MindIO TFT__ or __MindIO ACP__, separately stage the matching MindIO SDK package on each NPU node under `/opt/openFuyao/mindio/`. Skip this step otherwise.
 
 ## Procedure
 
-### Downloading Cluster plugin
+### Step 1: Sync driver images and configure ImageWhiteList \{#sync-driver-images}
 
-:::info
-You can download the app named `Alauda Build of NPU Operator` and `Alauda Build of Node Feature Discovery` from the Marketplace on the Customer Portal website.
+:::warning
+Do this __before__ installing the NPU Operator. The driver image is pulled at runtime by the driver DaemonSet based on each node's kernel label, and lives at the `mlops/ascend-driver` path — not bundled with the operator. If the matching tag isn't in your cluster registry, or isn't listed in an `ImageWhiteList`, the DaemonSet stays in `ImagePullBackOff` and the operator never reaches `Ready`.
 :::
 
-Note: The Volcano cluster plugin can be left uninstalled for now.
+:::info
+__You do NOT need to edit `/etc/containerd/config.toml` manually__ to enable CDI. The operator ships an `ascend-runtime-containerd` DaemonSet that runs on every NPU node and idempotently flips `enable_cdi = true` and adds the default `cdi_spec_dirs` (`/var/run/cdi`, `/etc/cdi`) in containerd's config, then `SIGHUP`s containerd. This works on both containerd 1.7.x (where CDI is off by default) and 2.x (where it is on by default).
+:::
 
-### Uploading the Cluster plugin
+#### 1.1 Pull driver images from DockerHub
 
-The platform provides the **`violet`** command-line tool for uploading packages downloaded from the Custom Portal Marketplace.
+The driver image is __shipped independently__ on DockerHub at [`docker.io/alaudadockerhub/ascend-driver`](https://hub.docker.com/r/alaudadockerhub/ascend-driver) — not as part of the operator bundle — because the driver `.ko` binaries are kernel-specific and the kernel list grows over time. Each tag follows the pattern `<HDK>-<chip>-<kernel>-<os-stem>` (for example `25.5.0-910b-6.6.0-145.0.4.135-oe2403sp3`); pick the tag matching your nodes' `uname -r` and chip. __Built-on-demand: if your kernel isn't on the list, contact <Term name="company"/> Customer Support__ — a new tag for your kernel will be built and published to the same DockerHub repository, no operator code changes required.
+
+List available tags:
+
+```bash
+curl -s 'https://hub.docker.com/v2/repositories/alaudadockerhub/ascend-driver/tags/?page_size=100' \
+  | jq -r '.results[].name'
+```
+
+On a machine with internet access, mirror each selected tag into your cluster registry:
+
+```bash
+TAG=25.5.0-<chip>-<kernel>-<os-stem>
+
+skopeo copy --all \
+  docker://docker.io/alaudadockerhub/ascend-driver:$TAG \
+  docker://<your-cluster-registry>/mlops/ascend-driver:$TAG
+```
+
+The chart defaults `spec.driver.image.repository` to `mlops/ascend-driver`; override it in the deployment form if your registry uses a different namespace.
+
+#### 1.2 Allow the driver image in ImageWhiteList
+
+ACP gates which images pods are allowed to pull. Every driver-image tag the DaemonSet may pull must be listed explicitly in an `ImageWhiteList`.
+
+Create one (or extend the existing `ascend-driver` `ImageWhiteList` in `cpaas-system`):
+
+```yaml
+apiVersion: app.alauda.io/v1alpha1
+kind: ImageWhiteList
+metadata:
+  name: ascend-driver
+  namespace: cpaas-system
+spec:
+  repoList:
+  # one entry per tag you mirrored in step 1.1 — full image reference, not bare repo path
+  - <your-cluster-registry>/mlops/ascend-driver:25.5.0-910b-<kernel>-<os-stem>
+  - <your-cluster-registry>/mlops/ascend-driver:25.5.0-310p-<kernel>-<os-stem>
+```
+
+Add one `repoList` entry per `<chip, kernel>` tag you mirrored. Each entry is a __full image reference including the tag__ (the API does not accept bare repository paths). If you override `spec.driver.image.repository` later, list the new path instead.
+
+:::tip
+If your platform doesn't enforce ImageWhiteList (`Allow` policy by default), this sub-step is a no-op — kubelet still authenticates to the registry, so credentials gate the actual pull.
+:::
+
+#### 1.3 Verify
+
+On each NPU node, the kubelet should be able to pull a driver image (use the tag matching the node's kernel):
+
+```bash
+crictl pull <your-cluster-registry>/mlops/ascend-driver:$TAG
+```
+
+If this succeeds, Step 1 is complete. A later `ImagePullBackOff` on the driver DaemonSet usually means a missing tag in the registry, a registry credential issue, or a missing `repoList` entry in the `ImageWhiteList`.
+
+### Step 2: Download packages
+
+:::info
+From the Marketplace on the __<Term name="company"/> Customer Portal__ website, download:
+
+- The __Alauda Build of NPU Operator__ operator package (delivered as an OLM OperatorBundle).
+- The __Alauda Build of Node Feature Discovery__ cluster plugin package.
+- (Optional) The __Volcano__ cluster plugin package — only needed if you plan to enable the __ClusterD__ component during deployment.
+:::
+
+### Step 3: Upload packages
+
+The platform provides the `violet` command-line tool for uploading both operator packages and cluster plugin packages downloaded from the Customer Portal Marketplace.
 
 For details, see [Upload Packages](/extend/upload_package).
 
+### Step 4: Install the Node Feature Discovery cluster plugin
 
-### Installing Alauda Build of NPU Operator
+`Alauda Build of Node Feature Discovery` is a __cluster plugin__, not an operator. Install it first because the NPU Operator depends on its node labelling.
 
+1. Navigate to __Administrator__ > __Marketplace__ > __Cluster Plugins__.
+2. Switch to the target cluster.
+3. Locate __Alauda Build of Node Feature Discovery__ and click __Install__.
+
+:::tip
+The __Volcano__ cluster plugin can be left uninstalled for now. Install it from the same __Cluster Plugins__ page only if you later enable the __ClusterD__ component of the NPU Operator.
+:::
+
+### Step 5: Install the Alauda Build of NPU Operator
+
+`Alauda Build of NPU Operator` is delivered as an __operator__ (OLM bundle), so the install flow is the OperatorHub flow, not the Cluster Plugins flow.
 
 1. Apply the label `masterselector=dls-master-node` to all master nodes and the label `workerselector=dls-worker-node` to all worker nodes.
+
     ```bash
     kubectl label nodes {master-node-id} masterselector=dls-master-node
     kubectl label nodes {worker-node-id} workerselector=dls-worker-node
     ```
 
-2. Go to the `Administrator` -> `Marketplace` -> `Cluster Plugin` page, switch to the target cluster, and then deploy the `Alauda Build of NPU Operator` Cluster plugin.
+2. Navigate to __Administrator__ > __Marketplace__ > __OperatorHub__, switch to the target cluster, and locate the __Alauda Build of NPU Operator__ entry.
+
+3. If the status is _Absent_, confirm the operator package was uploaded with `violet` in the previous step.
+
+4. Click the operator to open its details page, then click __Install__.
+
+5. On the install page, choose the target namespace (the default is `npu-operator`; all pods managed by this operator will land here) and fill in the deployment form below. Click __Install__ to start; confirm in the dialog and wait for the subscription to reach _Succeeded_.
 
     Deployment form parameter description:
+
     :::warning
     If the components listed in the table below are already installed, be sure to disable the corresponding buttons during deployment.
     :::
@@ -78,171 +146,157 @@ For details, see [Upload Packages](/extend/upload_package).
     Ascend Operator, NodeD, ClusterD, Resilience Controller, MindIO TFT, and MindIO ACP are not deployed by default. Please deploy them only when there is a clear need for them.
     :::
 
+    :::note
+    All pods created by the operator (driver, device plugin, container-runtime CDI sidecar, NPU exporter, Ascend Operator, NodeD, ClusterD, Resilience Controller, MindIO TFT, MindIO ACP, NPU Feature Discovery, and the operator itself) are deployed into the same namespace as the operator pod (the default is `npu-operator`). Volcano-related components (vc-controller / vc-scheduler) are intentionally not exposed in this form — the platform's own Volcano cluster plugin should be installed separately when ClusterD is enabled.
+    :::
+
     | Component | Default | Description |
     |------------|---------|-------------|
-    | Driver | Enabled | Whether to install driver and firmware.|
-    | Version | 24.1.RC3 | Driver and firmware version. You must select the version number from the repository directory [npu-driver-installer](https://gitcode.com/openFuyao/npu-driver-installer/tree/1.1.1/downloader/NPU).|
+    | Driver | Enabled | Whether to install driver and firmware. |
+    | Driver Version | 25.5.0 | Driver and firmware HDK version. Pick a version that you have a matching pre-staged image for (see [Step 1](#sync-driver-images)). Currently supported: `25.5.0` (default), `25.3.RC1`. Hidden when __Driver__ is disabled. |
     | Ascend Device Plugin | Enabled | Whether to install Ascend Device Plugin. |
-    | Ascend Docker Runtime | Enabled | Whether to install Ascend Docker Runtime. |
-    | NPU exporter | Enabled | Whether to install NPU exporter. |
+    | Ascend Docker Runtime | Enabled | Whether to install the container-runtime CDI generator. In v1.2.3 this component runs `npu-container-toolkit generate-cdi --watch` as a sidecar that emits the CDI spec for the device plugin to reference — workloads no longer need `runtimeClassName: ascend`. |
+    | NPU Exporter | Enabled | Whether to install NPU Exporter. |
     | Ascend Operator | Disabled | Whether to install Ascend Operator. |
     | NodeD | Disabled | Whether to install NodeD. |
-    | ClusterD | Disabled | Whether to install ClusterD. Need to install the Volcano cluster plugin first. |
+    | ClusterD | Disabled | Whether to install ClusterD. Requires the Volcano cluster plugin to be installed first. |
     | Resilience Controller | Disabled | Whether to install Resilience Controller. |
     | MindIO TFT | Disabled | Whether to install MindIO TFT. |
     | MindIO ACP | Disabled | Whether to install MindIO ACP. |
 
-
 #### Verification
 
-1. First, you can see the status of "Installed" in the `Alauda Build of NPU Operator` Cluster plugin page.
-2. Wait for the npu-driver pod to become running. Offline installation takes about 10 minutes, while online installation is much faster.
-    ```bash
-    kubectl -n kube-system get pod -w | grep npu-driver
-    ```
-3. Reboot all the NPU nodes.
+1. On the __Administrator__ > __Marketplace__ > __OperatorHub__ details page of __Alauda Build of NPU Operator__, the subscription status should be _Succeeded_. The corresponding CSV (`npu-operator.v<version>`) appears under __Installed Operators__ in the target namespace.
 
-4. Run the following command on the npu node.
-    ```bash
-    npu-smi info
-    ```
-    Make sure the display is working correctly.
+2. Wait for the npu-driver pod to become running. First-time install takes a few minutes for the driver image to pull and the modules to be inserted into the host kernel.
 
-5. Run the following command on the master node.
+    ```bash
+    kubectl -n npu-operator get pod -w | grep npu-driver
+    ```
+
+    :::note
+    Replace `npu-operator` with the namespace you chose during installation if you installed the operator into a different namespace. All pods managed by the operator share this namespace.
+    :::
+
+3. Confirm the `NPUClusterPolicy` is reconciling cleanly:
+
     ```bash
     kubectl get npuclusterpolicy cluster
     ```
-    Make sure the status of the `npuclusterpolicy` is Ready.
 
-6. Check whether there are allocatable NPU resources on the NPU node in the control node of the business cluster. Run the following command:
+    The `STATUS` column should read `Ready`.
+
+4. Check that the NPU node is now reporting allocatable Ascend devices:
+
     ```bash
-    kubectl get node  ${nodeName} -o=jsonpath='{.status.allocatable}'
-    # Example, the output contains: "huawei.com/Ascend310P":"1" (the specific value depends on the number of NPU cards)
+    kubectl get node ${nodeName} -o jsonpath='{.status.allocatable}'
+    # Example output includes:
+    #   "huawei.com/Ascend910":"8"   (910B nodes; specific value depends on card count)
+    #   "huawei.com/Ascend310P":"1"  (310P nodes)
     ```
 
-7. Run validation workload.
-    Create spec file:
+5. (Optional) Run `npu-smi info` on the host. The operator does not symlink `npu-smi` into the host `PATH` (`/usr` is read-only on KubeOS), so call the binary directly with its libraries loaded:
+
     ```bash
-    key="huawei.com/Ascend310P" # For 310P
-    cat <<EOF > deploy-npu.yaml
-    apiVersion: apps/v1
-    kind: Deployment
+    LD_LIBRARY_PATH=/var/lib/Ascend/driver/lib64/driver:/var/lib/Ascend/driver/lib64/common \
+      /var/lib/Ascend/driver/tools/npu-smi info
+    ```
+
+    Each card should report `Health: OK` and a non-zero `Bus-Id`.
+
+6. Validate end-to-end with a sample NPU workload. v1.2.3 no longer requires `runtimeClassName: ascend` — the resource request alone triggers CDI device injection.
+
+    ```bash
+    cat <<EOF | kubectl apply -f -
+    apiVersion: v1
+    kind: Pod
     metadata:
-      name: ascend-pytorch
+      name: npu-smoke
     spec:
-      replicas: 1
-      selector:
-        matchLabels:
-          service.cpaas.io/name: deployment-ascend-pytorch
-      strategy:
-        rollingUpdate:
-          maxSurge: 1
-          maxUnavailable: 1
-        type: RollingUpdate
-      template:
-        metadata:
-          labels:
-            service.cpaas.io/name: deployment-ascend-pytorch
-        spec:
-          affinity: {}
-          containers:
-            - args:
-                - |
-                  sleep infinity
-              command:
-                - /bin/bash
-                - -c
-              image: ascendai/pytorch:ubuntu-python3.8-cann8.0.rc1.beta1-pytorch2.1.0
-              imagePullPolicy: Always
-              name: ascend-pytorch
-              resources:
-                limits:
-                  cpu: 500m
-                  $key: "1"
-                  memory: 2Gi
-                requests:
-                  cpu: 500m
-                  memory: 2Gi
-          runtimeClassName: ascend
+      restartPolicy: Never
+      containers:
+      - name: probe
+        image: ascendai/pytorch:ubuntu-python3.8-cann8.0.rc1.beta1-pytorch2.1.0
+        command: ["bash", "-c"]
+        args:
+          - |
+            ls /dev/davinci*
+            npu-smi info
+            sleep 3600
+        resources:
+          limits:
+            huawei.com/Ascend910: 1   # Change to huawei.com/Ascend310P on a 310P node
     EOF
-    ```
-    Apply spec:
 
-    ```bash
-    kubectl apply -f deploy-npu.yaml
+    kubectl logs npu-smoke
     ```
 
-    ```bash
-    kubectl exec -it  deploy/ascend-pytorch -- bash
-    ```
+    The pod should reach `Running`. `ls /dev/davinci*` should show `/dev/davinci_manager` plus one per-card device node (e.g. `/dev/davinci0`), and `npu-smi info` should print the card's status. Both confirm that CDI injected the device into the container.
 
-    Then run the following command in the container:
-    ```bash
-    npu-smi info
-    ```
-    Make sure the display is working correctly.
+### Step 6: Install Monitor
 
-### Installing Monitor
+If the NPU Exporter component was deployed when installing the Alauda Build of NPU Operator, the operator automatically deploys a `ServiceMonitor` named `npu-exporter-servicemonitor` in the operator namespace, wired up to the `npu-exporter` Service. No manual `ServiceMonitor` creation is required. You can verify it with:
 
-If the NPU exporter component was deployed when installing the Alauda Build of NPU Operator, perform the following steps to create a monitoring panel.
+```bash
+kubectl -n npu-operator get servicemonitor npu-exporter-servicemonitor
+```
 
-1. Execute commands on the **control node** of the cluster.
+To get a Grafana dashboard, import the JSON file by following [Import Dashboard](../../../observability/monitor/functions/manage_dashboard.html#import-dashboard).
 
-    ```bash
-    cat << EOF | kubectl apply -f -
-    apiVersion: monitoring.coreos.com/v1
-    kind: ServiceMonitor
-    metadata:
-      labels:
-        prometheus: kube-prometheus
-        serviceMonitorSelector: prometheus
-      name: npu-exporter-ai
-      namespace: monitoring
-    spec:
-      endpoints:
-      - interval: 10s
-        path: /metrics
-        port: http
-        targetPort: 8082
-      namespaceSelector:
-        matchNames:
-        - npu-exporter
-      selector:
-        matchLabels:
-          app: npu-exporter-svc
-    EOF
-    ```
-2. You can import a Grafana dashboard JSON file by following [Import Dashboard](../../../observability/monitor/functions/manage_dashboard.html#import-dashboard), which converts it into a monitoring dashboard for display.
-    The JSON file is available in [ascend-npu-dashboard](https://github.com/Cz200OK/ascend-npu-dashboard/blob/main/Dashboards/ascend-npu-exporter-Dashboard_20240301.json).
+The JSON file is available in [ascend-npu-dashboard](https://github.com/Cz200OK/ascend-npu-dashboard/blob/main/Dashboards/ascend-npu-exporter-Dashboard_20240301.json).
 
-    :::note
-    Tags in the Grafana dashboard JSON file cannot contain Chinese characters and need to be manually deleted.
-    For examples:
-    ```json
-    {
-      "tags": [
-        "ascend",
-        "昇腾"
-      ]
-    }
-    ```
+:::note
+Tags in the Grafana dashboard JSON file cannot contain non-ASCII characters and need to be edited out. For example:
 
-    After modification:
-    ```json
-    {
-      "tags": [
-        "ascend"
-      ]
-    }
-    ```
-    :::
+```json
+{
+  "tags": [
+    "ascend",
+    "昇腾"
+  ]
+}
+```
+
+After modification:
+
+```json
+{
+  "tags": [
+    "ascend"
+  ]
+}
+```
+:::
+
+## What's next
+
+- [Driver upgrade and self-healing](./upgrade.mdx) — how to roll the driver version forward and how the chip self-healing path works.
 
 ## FAQ
 
+### Where is `npu-smi` installed on the host? \{#where-is-npu-smi-installed-on-the-host}
+
+In v1.2.3 the driver pod stages the Huawei tools tree to `/var/lib/Ascend/driver/`, so the binary is at `/var/lib/Ascend/driver/tools/npu-smi`. No host `PATH` symlink is created (KubeOS keeps `/usr` read-only). Call it with the matching `LD_LIBRARY_PATH`:
+
+```bash
+LD_LIBRARY_PATH=/var/lib/Ascend/driver/lib64/driver:/var/lib/Ascend/driver/lib64/common \
+  /var/lib/Ascend/driver/tools/npu-smi info
+```
+
+If you prefer a `PATH`-resolvable command, write a small wrapper into a writable location (e.g. `/opt/bin/npu-smi`) that exports `LD_LIBRARY_PATH` and execs the real binary.
+
+### Do I still need `runtimeClassName: ascend` on workload pods?
+
+No. v1.2.3 uses CDI for device injection: requesting `huawei.com/Ascend910` (or `Ascend310P`) is enough. Existing manifests that still set `runtimeClassName: ascend` continue to work — the RuntimeClass is kept for backwards compatibility — but no new manifests need it.
+
 ### What should I pay attention to when uninstalling Alauda Build of NPU Operator?
 
-Even after Alauda Build of NPU Operator is uninstalled, the driver may still exist on the host machine.
-On the NPU node, execute the following command to uninstall the driver:
+Uninstalling the operator removes the driver DaemonSet, but the driver modules already loaded into the host kernel stay loaded — `rmmod` would risk leaving the chip in an unrecoverable state. To fully remove the driver from a host, reboot the node after the operator is uninstalled; the modules will not auto-reload because the DaemonSet is gone.
+
+Files staged to the host can be cleaned up manually if needed:
+
 ```bash
-/usr/local/Ascend/driver/script/uninstall.sh
+rm -rf /var/lib/Ascend /var/lib/ascend /home/bios/driver /etc/ascend_install.info /run/ascend
 ```
+
+Run these only after the operator and its driver pod have been removed, and after the node has been rebooted (or before, if you intend to reboot anyway).
