@@ -1,0 +1,518 @@
+---
+weight: 70
+i18n:
+  title:
+    en: "Migrating from the Legacy ACP Registry"
+---
+
+# Registry v2: Migrating from the Legacy ACP Registry
+
+Migration from the legacy ACP Registry is an ACP-specific topic. It is not part of the OpenShift Registry chapter structure, but it is required when an existing ACP environment moves image workloads from the legacy Registry to **Registry v2** in `image-registry-system`. Registry v2 means the Registry deployed and managed by `cluster-image-registry-operator`.
+
+The migration workflow is based on the validated ACP `ac` runbook. No dedicated Registry migration subcommand is required. Use the following `ac` commands:
+
+- `ac get images` to export the legacy image list.
+- `ac registry login` to write OCI registry credentials.
+- `ac image mirror` to copy image blobs when the source and target registries do not share storage.
+- `ac image info` to read target image digests and media types.
+- `ac create -f` to create `ImageStreamMapping` resources and backfill Registry v2 Image and ImageStream metadata.
+
+During migration, use a maintenance window when possible. At minimum, pause writes to the legacy Registry. Reads can remain available. If new images are pushed during migration, repeat image copy and metadata backfill before the final cutover.
+
+## Migration Scenarios
+
+| Scenario | Use when | Blob migration | Metadata migration |
+| --- | --- | --- | --- |
+| Storage reuse | The legacy Registry and Registry v2 run in the same ACP environment and business cluster, and Registry v2 reuses the legacy Registry storage. | Not required. Registry v2 reads existing blobs from the reused storage. | Required. Backfill `ImageStreamMapping` objects for each migrated tag. |
+| Cross-registry sync | The legacy Registry and Registry v2 use different storage, different clusters, or different ACP environments. | Required. Use `ac image mirror` to copy images from the legacy Registry to the target Registry. | Required after image copy. Backfill `ImageStreamMapping` objects for each migrated tag. |
+
+## Required Inputs
+
+Prepare the following inputs before running the migration:
+
+| Variable | Description | Example |
+| --- | --- | --- |
+| `MIGRATION_KUBECONFIG` | Optional kubeconfig used only for migration. | `/tmp/registry-migration/kubeconfig` |
+| `ACP_PLATFORM_URL` | ACP platform login URL. | `https://acp.example.com` |
+| `ACP_SESSION_NAME` | ACP login session name for migration. | `registry-migration` |
+| `ACP_USERNAME` | ACP account used for migration. | `admin` |
+| `ACP_PASSWORD` | ACP password. Store it only in a private environment file. | `******` |
+| `ACP_CLUSTER` | Business cluster selected after login. | `business-1` |
+| `ACP_IDP` | Optional identity provider name required by the login entry. | `ldap-test` |
+| `ACP_AUTH_TYPE` | Optional authentication type required by the login entry. | `ldap` |
+| `LEGACY_REGISTRY_URL` | Legacy Registry URL used by `ac get images --registry-url`. Include `http://` or `https://`. | `http://old-registry.example.com:5000` |
+| `LEGACY_REGISTRY_HOST` | Legacy Registry external host used by `ac image mirror`. Do not include a scheme. | `old-registry.example.com:5000` |
+| `TARGET_REGISTRY_HOST` | Registry v2 external host used by mirror, image inspect, metadata backfill, and verification. Do not include a scheme. | `image-registry.example.com` |
+| `IMAGE_LIST_FILE` | Image list to migrate. Each line is `namespace/name:tag`. | `/tmp/registry-migration/image-list.txt` |
+| `IMAGE_DIGEST_FILE` | Optional image and digest list. Each line is `namespace/name:tag sha256:...`. | `/tmp/registry-migration/image-digests.txt` |
+| `MAPPING_FILE` | Mirror mapping file. Each line is `source=target`. | `/tmp/registry-migration/mirror-map.txt` |
+| `METADATA_DIR` | Output directory for `ac image info`, `ImageStreamMapping`, and apply results. | `/tmp/registry-migration/metadata` |
+| `METADATA_PLAN` | Optional path for a small-batch metadata backfill script. | `/tmp/registry-migration/metadata-plan.sh` |
+| `REGISTRY_AUTH_DIR` | OCI registry auth directory. | `/tmp/registry-migration/registry-auth` |
+| `REGISTRY_AUTH_FILE` | OCI registry auth file written by `ac registry login --to`. | `/tmp/registry-migration/registry-auth/config.json` |
+
+Create a migration workspace:
+
+```bash
+export MIGRATION_DIR=/tmp/registry-migration
+mkdir -p "$MIGRATION_DIR"
+
+export MIGRATION_KUBECONFIG="$MIGRATION_DIR/kubeconfig"
+export IMAGE_LIST_FILE="$MIGRATION_DIR/image-list.txt"
+export IMAGE_DIGEST_FILE="$MIGRATION_DIR/image-digests.txt"
+export MAPPING_FILE="$MIGRATION_DIR/mirror-map.txt"
+export METADATA_DIR="$MIGRATION_DIR/metadata"
+export METADATA_PLAN="$MIGRATION_DIR/metadata-plan.sh"
+export REGISTRY_AUTH_DIR="$MIGRATION_DIR/registry-auth"
+export REGISTRY_AUTH_FILE="$REGISTRY_AUTH_DIR/config.json"
+
+mkdir -p "$REGISTRY_AUTH_DIR" "$METADATA_DIR"
+```
+
+If the legacy Registry uses HTTP, derive `LEGACY_REGISTRY_URL` from `LEGACY_REGISTRY_HOST`. If it uses HTTPS, set the full URL explicitly:
+
+```bash
+export LEGACY_REGISTRY_URL="${LEGACY_REGISTRY_URL:-http://$LEGACY_REGISTRY_HOST}"
+```
+
+`REGISTRY_AUTH_DIR` stores an OCI registry auth file. Setting this variable does not start a local container runtime.
+
+## Log In and Check Registry Mode
+
+Log in to ACP and create a migration-only kubeconfig:
+
+```bash
+ac login "$ACP_PLATFORM_URL" \
+  --name "$ACP_SESSION_NAME" \
+  --username "$ACP_USERNAME" \
+  --password "$ACP_PASSWORD" \
+  --auth-type "$ACP_AUTH_TYPE" \
+  --kubeconfig "$MIGRATION_KUBECONFIG"
+
+export KUBECONFIG="$MIGRATION_KUBECONFIG"
+ac config use-cluster "$ACP_CLUSTER"
+```
+
+If the cluster has both legacy and Registry v2 backends, `auto` mode can require an explicit selection. Start migration in legacy mode and confirm that the legacy Registry can be discovered:
+
+```bash
+ac config set-registry-mode legacy
+ac config get-registry-mode
+ac registry info
+ac registry info --internal
+```
+
+`ac registry info` shows the Registry discovered for the current mode. It might return an in-cluster Service such as `image-registry.cpaas-system`, which is not directly reachable from an administrator workstation. Use `LEGACY_REGISTRY_URL` for image discovery and use `LEGACY_REGISTRY_HOST` and `TARGET_REGISTRY_HOST` for image copy.
+
+## Prepare the Image List
+
+Export the legacy image list visible to the current ACP user:
+
+```bash
+ac config set-registry-mode legacy
+ac get images \
+  --registry-url "$LEGACY_REGISTRY_URL" \
+  > "$MIGRATION_DIR/legacy-images.txt"
+```
+
+Generate the image list and the optional digest list from the `ac get images` table output:
+
+```bash
+awk 'NR > 1 && NF >= 2 { print $1 ":" $2 }' \
+  "$MIGRATION_DIR/legacy-images.txt" \
+  | sort -u > "$IMAGE_LIST_FILE"
+
+awk 'NR > 1 && NF >= 4 && $4 != "unknown" { print $1 ":" $2 " " $4 }' \
+  "$MIGRATION_DIR/legacy-images.txt" \
+  | sort -u > "$IMAGE_DIGEST_FILE"
+```
+
+You can also write the list manually when only selected images should be migrated:
+
+```bash
+cat >> "$IMAGE_LIST_FILE" <<EOF
+your-namespace/your-image:your-tag
+EOF
+
+cat >> "$IMAGE_DIGEST_FILE" <<EOF
+your-namespace/your-image:your-tag sha256:<digest>
+EOF
+```
+
+Review the generated list before continuing:
+
+```bash
+sed -n '1,20p' "$IMAGE_LIST_FILE"
+sed -n '1,20p' "$IMAGE_DIGEST_FILE"
+wc -l "$IMAGE_LIST_FILE"
+```
+
+Remove temporary test images, retired namespaces, and incorrect tags from the list.
+
+## Write Registry Credentials
+
+Write credentials for the legacy and target registries. `ac image mirror` and `ac image info` read this file:
+
+```bash
+export DOCKER_CONFIG="$REGISTRY_AUTH_DIR"
+
+ac registry login \
+  --registry "$LEGACY_REGISTRY_HOST" \
+  --skip-check \
+  --to "$REGISTRY_AUTH_FILE"
+
+ac registry login \
+  --registry "$TARGET_REGISTRY_HOST" \
+  --skip-check \
+  --to "$REGISTRY_AUTH_FILE"
+```
+
+If either Registry uses HTTP, a self-signed certificate, or a test certificate, add `--insecure` to the login, mirror, inspect, and verification commands.
+
+If the source and target registries belong to different ACP environments, write both credentials into the same auth file with the corresponding kubeconfig:
+
+```bash
+KUBECONFIG="$SOURCE_KUBECONFIG" \
+  ac registry login --registry "$LEGACY_REGISTRY_HOST" --skip-check --to "$REGISTRY_AUTH_FILE"
+
+KUBECONFIG="$TARGET_KUBECONFIG" \
+  ac registry login --registry "$TARGET_REGISTRY_HOST" --skip-check --to "$REGISTRY_AUTH_FILE"
+```
+
+## Prepare Metadata Backfill
+
+Registry v2 needs Image API metadata in addition to image blobs. Use `ImageStreamMapping` to backfill `Image`, `ImageStream`, and tag metadata.
+
+Define the metadata backfill functions in the migration shell session:
+
+```bash
+write_imagestream_mapping() {
+  image="$1"
+  digest="${2:-}"
+  namespace="${image%%/*}"
+  rest="${image#*/}"
+  stream="${rest%%:*}"
+  tag="${rest##*:}"
+  target_ref="$TARGET_REGISTRY_HOST/$image"
+  repo_ref="$TARGET_REGISTRY_HOST/$namespace/$stream"
+  inspect_ref="$target_ref"
+  name_prefix="${namespace}-${stream}-${tag}"
+  info_file="$METADATA_DIR/${name_prefix}.info.txt"
+  mapping_file="$METADATA_DIR/${name_prefix}.mapping.yaml"
+  apply_output_file="$METADATA_DIR/${name_prefix}.apply.txt"
+  BACKFILL_LAST_ACTION=""
+
+  if [ -n "$digest" ]; then
+    inspect_ref="$repo_ref@$digest"
+  fi
+
+  ac image info "$inspect_ref" --insecure > "$info_file"
+
+  [ -n "$digest" ] || digest="$(awk '/^Digest:/ { sub(/^Digest:[[:space:]]*/, ""); print; exit }' "$info_file")"
+  media_type="$(awk '/^Media Type:/ { sub(/^Media Type:[[:space:]]*/, ""); print; exit }' "$info_file")"
+  [ -n "$media_type" ] || media_type="application/vnd.docker.distribution.manifest.v2+json"
+
+  if [ -z "$digest" ]; then
+    echo "failed to read digest from $target_ref" >&2
+    return 1
+  fi
+
+  current_line="$(
+    ac get imagestreamtags "$stream:$tag" -n "$namespace" 2>/dev/null \
+      | awk 'NR > 1 && $3 == "current" { print $4 " " $6; exit }'
+  )"
+  current_digest="${current_line%% *}"
+  current_reference="${current_line#* }"
+  expected_reference="$repo_ref@$digest"
+
+  if [ "$current_digest" = "$digest" ] && [ "$current_reference" = "$expected_reference" ]; then
+    BACKFILL_LAST_ACTION="skipped"
+    return 0
+  fi
+
+  cat > "$mapping_file" <<EOF
+apiVersion: image.alauda.io/v1
+kind: ImageStreamMapping
+metadata:
+  name: $stream
+  namespace: $namespace
+image:
+  metadata:
+    name: "$digest"
+  dockerImageReference: "$repo_ref@$digest"
+  dockerImageManifestMediaType: "$media_type"
+tag: "$tag"
+EOF
+
+  if ac create -f "$mapping_file" > "$apply_output_file" 2>&1; then
+    BACKFILL_LAST_ACTION="applied"
+    return 0
+  fi
+
+  BACKFILL_LAST_ACTION="failed"
+  echo "[metadata] failed $image; output=$apply_output_file" >&2
+  sed -n '1,20p' "$apply_output_file" >&2
+  return 1
+}
+
+backfill_metadata() {
+  total=0
+  success=0
+  applied=0
+  skipped=0
+  failed=0
+  progress_interval="${METADATA_PROGRESS_INTERVAL:-100}"
+  verbose="${METADATA_VERBOSE:-false}"
+
+  if [ -n "${IMAGE_DIGEST_FILE:-}" ] && [ -s "$IMAGE_DIGEST_FILE" ]; then
+    echo "[metadata] start backfill source=$IMAGE_DIGEST_FILE output_dir=$METADATA_DIR progress_interval=$progress_interval"
+    while read -r image digest; do
+      [ -n "$image" ] || continue
+      total=$((total + 1))
+      if write_imagestream_mapping "$image" "$digest"; then
+        success=$((success + 1))
+        [ "$BACKFILL_LAST_ACTION" = "applied" ] && applied=$((applied + 1))
+        [ "$BACKFILL_LAST_ACTION" = "skipped" ] && skipped=$((skipped + 1))
+      else
+        failed=$((failed + 1))
+      fi
+      if [ "$verbose" = "true" ]; then
+        echo "[metadata] [$total] $image action=${BACKFILL_LAST_ACTION:-unknown}"
+      elif [ "$progress_interval" -gt 0 ] && [ $((total % progress_interval)) -eq 0 ]; then
+        echo "[metadata] progress: total=$total success=$success applied=$applied skipped=$skipped failed=$failed"
+      fi
+    done < "$IMAGE_DIGEST_FILE"
+  elif [ -n "${IMAGE_LIST_FILE:-}" ] && [ -s "$IMAGE_LIST_FILE" ]; then
+    echo "[metadata] start backfill source=$IMAGE_LIST_FILE output_dir=$METADATA_DIR progress_interval=$progress_interval"
+    while read -r image; do
+      [ -n "$image" ] || continue
+      total=$((total + 1))
+      if write_imagestream_mapping "$image"; then
+        success=$((success + 1))
+        [ "$BACKFILL_LAST_ACTION" = "applied" ] && applied=$((applied + 1))
+        [ "$BACKFILL_LAST_ACTION" = "skipped" ] && skipped=$((skipped + 1))
+      else
+        failed=$((failed + 1))
+      fi
+      if [ "$verbose" = "true" ]; then
+        echo "[metadata] [$total] $image action=${BACKFILL_LAST_ACTION:-unknown}"
+      elif [ "$progress_interval" -gt 0 ] && [ $((total % progress_interval)) -eq 0 ]; then
+        echo "[metadata] progress: total=$total success=$success applied=$applied skipped=$skipped failed=$failed"
+      fi
+    done < "$IMAGE_LIST_FILE"
+  else
+    echo "[metadata] no image list found; check IMAGE_DIGEST_FILE or IMAGE_LIST_FILE" >&2
+    return 1
+  fi
+
+  echo "[metadata] summary: total=$total success=$success applied=$applied skipped=$skipped failed=$failed output_dir=$METADATA_DIR"
+  [ "$failed" -eq 0 ]
+}
+```
+
+Confirm that the function exists in the current shell:
+
+```bash
+type backfill_metadata
+```
+
+For large migrations, the function prints progress every 100 images by default. Adjust the interval if needed:
+
+```bash
+export METADATA_PROGRESS_INTERVAL=500
+```
+
+Set `METADATA_VERBOSE=true` only when troubleshooting a small set of images.
+
+## Scenario A: Reuse Legacy Storage
+
+Use this path when Registry v2 can already read the legacy Registry blobs from reused storage.
+
+Switch to modern mode and backfill metadata:
+
+```bash
+ac config set-registry-mode modern
+backfill_metadata
+```
+
+If `ac image info "$TARGET_REGISTRY_HOST/$image"` fails for migrated images, Registry v2 cannot read the reused storage. Fix the Registry v2 storage configuration first, or use the cross-registry sync path.
+
+## Scenario B: Copy Images Between Registries
+
+Use this path when the source and target registries do not share storage.
+
+Generate a mirror mapping file. This preserves namespace, repository, and tag names and only replaces the Registry host:
+
+```bash
+while read -r image; do
+  [ -n "$image" ] || continue
+  printf '%s/%s=%s/%s\n' \
+    "$LEGACY_REGISTRY_HOST" "$image" \
+    "$TARGET_REGISTRY_HOST" "$image"
+done < "$IMAGE_LIST_FILE" > "$MAPPING_FILE"
+
+sed -n '1,20p' "$MAPPING_FILE"
+wc -l "$MAPPING_FILE"
+```
+
+Run a dry run before copying:
+
+```bash
+MIRROR_DRY_RUN_LOG="$MIGRATION_DIR/mirror-dry-run.log"
+
+ac image mirror \
+  -f "$MAPPING_FILE" \
+  --dry-run \
+  --keep-manifest-list \
+  --insecure \
+  > "$MIRROR_DRY_RUN_LOG" 2>&1
+
+echo "mirror dry-run log: $MIRROR_DRY_RUN_LOG"
+sed -n '1,20p' "$MIRROR_DRY_RUN_LOG"
+wc -l "$MIRROR_DRY_RUN_LOG"
+```
+
+After reviewing the plan, copy the images:
+
+```bash
+MIRROR_COPY_LOG="$MIGRATION_DIR/mirror-copy.log"
+
+ac image mirror \
+  -f "$MAPPING_FILE" \
+  --continue-on-error \
+  --keep-manifest-list \
+  --max-per-registry 4 \
+  --insecure \
+  > "$MIRROR_COPY_LOG" 2>&1
+
+copied_count="$(grep -c '^Copied ' "$MIRROR_COPY_LOG" || true)"
+warning_count="$(grep -Eci 'error|failed|denied|unauthorized|forbidden' "$MIRROR_COPY_LOG" || true)"
+echo "mirror copy summary: copied=$copied_count warning_lines=$warning_count log=$MIRROR_COPY_LOG"
+
+if [ "$warning_count" -gt 0 ]; then
+  grep -Ein 'error|failed|denied|unauthorized|forbidden' "$MIRROR_COPY_LOG" | sed -n '1,20p'
+fi
+```
+
+If both registries use trusted HTTPS certificates, remove `--insecure`. Keep `--keep-manifest-list` during migration to preserve manifest lists and multi-architecture images.
+
+After the image copy finishes, switch to modern mode and backfill metadata:
+
+```bash
+ac config set-registry-mode modern
+backfill_metadata
+```
+
+## Rerun Safely
+
+Migration steps are designed to be rerunnable. Re-run `ac image mirror` and `backfill_metadata` after fixing failures, after a final write freeze, or before cutover.
+
+```bash
+MIRROR_COPY_LOG="$MIGRATION_DIR/mirror-rerun.log"
+
+ac image mirror \
+  -f "$MAPPING_FILE" \
+  --continue-on-error \
+  --keep-manifest-list \
+  --max-per-registry 4 \
+  --insecure \
+  > "$MIRROR_COPY_LOG" 2>&1
+
+copied_count="$(grep -c '^Copied ' "$MIRROR_COPY_LOG" || true)"
+warning_count="$(grep -Eci 'error|failed|denied|unauthorized|forbidden' "$MIRROR_COPY_LOG" || true)"
+echo "mirror rerun summary: copied=$copied_count warning_lines=$warning_count log=$MIRROR_COPY_LOG"
+
+if [ "$warning_count" -gt 0 ]; then
+  grep -Ein 'error|failed|denied|unauthorized|forbidden' "$MIRROR_COPY_LOG" | sed -n '1,20p'
+fi
+
+backfill_metadata
+```
+
+After a rerun, confirm that the same tag still points to the expected digest and target Registry reference.
+
+## Verify Migration
+
+Verify important business images and random samples. The following example selects the first image from the migration list:
+
+```bash
+VERIFY_IMAGE="$(awk 'NF > 0 { print $1; exit }' "$IMAGE_LIST_FILE")"
+test -n "$VERIFY_IMAGE"
+
+VERIFY_NAMESPACE="${VERIFY_IMAGE%%/*}"
+VERIFY_REST="${VERIFY_IMAGE#*/}"
+VERIFY_STREAM="${VERIFY_REST%%:*}"
+VERIFY_TAG="${VERIFY_REST##*:}"
+
+echo "verify image: $VERIFY_IMAGE"
+
+ac get imagestreamtags "$VERIFY_STREAM:$VERIFY_TAG" -n "$VERIFY_NAMESPACE"
+
+VERIFY_REF="$(
+  ac get imagestreamtags "$VERIFY_STREAM:$VERIFY_TAG" -n "$VERIFY_NAMESPACE" \
+    | awk 'NR > 1 && $3 == "current" { print $6; exit }'
+)"
+
+ac image info "$VERIFY_REF" --insecure
+
+VERIFY_DIGEST="${VERIFY_REF##*@}"
+VERIFY_IMAGE_NAME="$(printf '%s\n' "$VERIFY_DIGEST" | sed 's/:/-/g')"
+VERIFY_IMAGES_OUTPUT="$MIGRATION_DIR/verify-modern-images.txt"
+
+ac get images > "$VERIFY_IMAGES_OUTPUT"
+awk -v digest="$VERIFY_DIGEST" -v safe="$VERIFY_IMAGE_NAME" '
+  NR > 1 && ($1 == digest || $1 == safe || index($2, digest) > 0) { found = 1 }
+  END { exit found ? 0 : 1 }
+' "$VERIFY_IMAGES_OUTPUT"
+```
+
+Acceptance criteria:
+
+- Registry v2 can inspect or pull the current digest reference from `ImageStreamTag`.
+- `ImageStreamMapping` creation succeeded.
+- Reruns do not produce unexplained failures.
+- `ImageStreamTag` points to the expected digest and Registry v2 address.
+- `ac get images` in modern mode shows the migrated Image resources with OCP-style image semantics.
+- Sample images in critical business namespaces can be read.
+
+## Switch Registry Mode
+
+After verification, switch the current kubeconfig context to modern Registry mode:
+
+```bash
+ac config set-registry-mode modern
+ac config get-registry-mode
+```
+
+`ac config set-registry-mode` changes only the current context's cluster by default. Use `--all-clusters` only after every cluster in the ACP session has completed Registry migration.
+
+Run dry-run image management commands to confirm that the backend has switched to Registry v2:
+
+```bash
+ac get images
+ac delete images --repo "$VERIFY_IMAGE"
+ac adm prune images
+```
+
+`ac delete images` and `ac adm prune images` are dry-run by default. Add `--confirm` only after reviewing the output.
+
+## Roll Back
+
+If workloads cannot read business images after cutover, switch the affected context back to legacy mode:
+
+```bash
+ac config set-registry-mode legacy
+ac config get-registry-mode
+```
+
+Keep the following artifacts for troubleshooting and reruns:
+
+- Image lists.
+- Mirror mapping files.
+- `ac image mirror` output.
+- `ac image info` output.
+- Generated `ImageStreamMapping` YAML files.
+- `ac create -f` output.
+- Migration verification output.
+
+After the issue is fixed, continue from the image list. You do not need to rebuild the migration scope from the beginning.

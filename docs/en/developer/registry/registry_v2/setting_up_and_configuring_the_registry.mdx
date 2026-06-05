@@ -1,0 +1,183 @@
+---
+weight: 30
+i18n:
+  title:
+    en: "Setting Up and Configuring the Registry"
+---
+
+# Registry v2: Setting Up and Configuring the Registry
+
+Use this page to configure storage, Registry request behavior, ServiceAccount pull credentials, image limits, and scheduled cleanup for **Registry v2**.
+
+## Configure Development Storage
+
+Use `emptyDir` only when image data can be discarded:
+
+```yaml
+apiVersion: imageregistry.operator.alauda.io/v1
+kind: Config
+metadata:
+  name: cluster
+spec:
+  managementState: Managed
+  replicas: 1
+  storage:
+    emptyDir: {}
+  resources:
+    requests:
+      cpu: 500m
+      memory: 500Mi
+    limits:
+      cpu: 500m
+      memory: 500Mi
+```
+
+## Configure PVC Storage
+
+Use a persistent backend for production. For a pre-created PVC:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: image-registry
+  namespace: image-registry-system
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: <storage-class-name>
+---
+apiVersion: imageregistry.operator.alauda.io/v1
+kind: Config
+metadata:
+  name: cluster
+spec:
+  managementState: Managed
+  replicas: 1
+  storage:
+    managementState: Unmanaged
+    pvc:
+      claim: image-registry
+  resources:
+    requests:
+      cpu: 500m
+      memory: 500Mi
+    limits:
+      cpu: 500m
+      memory: 500Mi
+```
+
+## Configure S3-Compatible Storage Credentials
+
+Create the user-managed storage Secret before applying `Config/cluster`. The Operator merges this Secret into the Registry private configuration:
+
+```bash
+kubectl -n image-registry-system create secret generic image-registry-private-configuration-user \
+  --from-literal=REGISTRY_STORAGE_S3_ACCESSKEY=<access-key-id> \
+  --from-literal=REGISTRY_STORAGE_S3_SECRETKEY=<secret-access-key>
+```
+
+Then configure the S3 backend:
+
+```yaml
+apiVersion: imageregistry.operator.alauda.io/v1
+kind: Config
+metadata:
+  name: cluster
+spec:
+  managementState: Managed
+  replicas: 2
+  storage:
+    managementState: Unmanaged
+    s3:
+      bucket: <bucket-name>
+      region: <region>
+      regionEndpoint: https://<s3-endpoint>
+      trustedCA:
+        name: <trusted-ca-configmap>
+  disableRedirect: true
+```
+
+Use `disableRedirect: true` when clients cannot reach the object storage endpoint directly and all content must be served through the Registry.
+
+## Configure Managed ServiceAccount Pull Secrets
+
+The Operator includes a managed imagePullSecret controller. When `Config/cluster` is managed, the controller can create, inject, refresh, and remove ServiceAccount pull secrets for the internal Registry.
+
+Configure additional hosts or ignored namespaces:
+
+```yaml
+apiVersion: imageregistry.operator.alauda.io/v1
+kind: Config
+metadata:
+  name: cluster
+spec:
+  managementState: Managed
+  imagePullSecret:
+    managementState: Managed
+    additionalRegistryHosts:
+      - registry.example.com
+    ignoredNamespaces:
+      - kube-public
+    ignoreSystemNamespaces: true
+```
+
+## Configure Image Limits
+
+In Registry v2, image size and tag-count limits are represented with Kubernetes `LimitRange` and `ResourceQuota` objects. Do not use the legacy Registry gateway limit ConfigMap for Registry v2 deployments.
+
+Namespace-level quota:
+
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: image-registry-quota
+  namespace: team-a
+spec:
+  hard:
+    alauda.io/imagestreams: "20"
+    alauda.io/images: "200"
+    alauda.io/image-tags: "200"
+```
+
+Per-image and per-ImageStream limits:
+
+```yaml
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: image-registry-limits
+  namespace: team-a
+spec:
+  limits:
+    - type: alauda.io/Image
+      max:
+        storage: 1Gi
+    - type: alauda.io/ImageStream
+      max:
+        alauda.io/images: "100"
+        alauda.io/image-tags: "100"
+```
+
+Legacy `max_image_size` and `tag_count_limit` settings can be converted during migration. See [Migrating from the legacy ACP Registry](./migrating_from_legacy_registry.mdx).
+
+## Operate Storage
+
+For PVC-backed Registry storage:
+
+```bash
+kubectl -n image-registry-system get pvc
+kubectl -n image-registry-system describe pvc image-registry
+kubectl get pv
+```
+
+Common actions:
+
+- If a PVC is pending, check StorageClass, access mode, capacity, quotas, and events.
+- If a Registry Pod cannot mount storage, check PV binding, node attachment, and backend storage availability.
+- If image metadata exists but blob data is missing, verify whether the Registry used `emptyDir` or whether the storage backend was changed.
+- Do not delete PVCs, PVs, or object storage data until the data retention decision is confirmed.
