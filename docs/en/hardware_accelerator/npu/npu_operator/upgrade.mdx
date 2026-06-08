@@ -43,14 +43,37 @@ upgrade-required
 
 While a node carries any non-empty `driver-upgrade-state` label the Ascend Device Plugin marks every NPU on that node `Unhealthy`, so the scheduler stops placing new NPU workloads on it for the duration of the upgrade.
 
+### Protecting critical inference workloads with PodDisruptionBudget
+
+NPU workload pods are removed from each node via the policy/v1 Eviction subresource, which honours any `PodDisruptionBudget` selecting the pod. Production-critical inference services should declare a PDB so the upgrade respects their availability SLOs:
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: vllm-inference
+  namespace: serving
+spec:
+  minAvailable: 2          # or maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: vllm-inference
+```
+
+While the PDB would be breached the API server returns `429 Too Many Requests` and the state machine leaves the pod in place — it retries on each reconcile (~30 s), eventually either the PDB allows the eviction (a replacement replica became `Ready` elsewhere) or `podDeletion.timeoutSecond` (default 300 s) fires and the upgrade proceeds anyway. Without a PDB the eviction succeeds immediately and the pod is killed.
+
+Workload owners who explicitly want to bypass PDBs (for example because a stuck PDB shouldn't block a security upgrade) can set `spec.driver.upgradePolicy.podDeletion.force=true` on the operator CR. This falls back to a hard `Delete` with grace=0.
+
 ### Auto vs. manual approval
 
-The behaviour at the `node-reboot-required` phase is controlled by `spec.driver.upgradePolicy.autoUpgrade`:
+The `spec.driver.upgradePolicy.autoUpgrade` flag controls only what happens at the `node-reboot-required` phase. Eviction behaviour, PDB handling, and every other phase are identical under both modes:
 
 | `autoUpgrade` | Behaviour at `node-reboot-required` |
 |---|---|
-| `false` (default) | The operator pauses the node. The rebooter pod emits a `RebootRequired` Event and waits for an administrator to annotate the node. |
-| `true` | The rebooter pod proceeds to reboot the node once a few safety gates (node uptime, cluster-wide reboot lock) are satisfied. |
+| `true`            | The rebooter reboots the node once the uptime and cluster-wide reboot-lock safety gates are satisfied. |
+| `false` (default) | The rebooter emits a `RebootRequired` Event and waits for the administrator to annotate the node `npu.openfuyao.com/approve-reboot=true`. |
+
+The driver pod itself is always deleted at `pod-deletion-required` regardless of `autoUpgrade` — it does not request `huawei.com/Ascend910`, and the new image must be rolled in to stage the new module tree before the reboot.
 
 Other `upgradePolicy` fields shape the rollout:
 
@@ -94,7 +117,7 @@ With `autoUpgrade: false` (recommended for first-time rollouts and for VM enviro
     kubectl get nodes -L npu.openfuyao.com/driver-upgrade-state -w
     ```
 
-    The state column will move through `upgrade-required` → `cordon-required` → … → `node-reboot-required` and then stop.
+    The state column will move through `upgrade-required` → `cordon-required` → … → `node-reboot-required` and then stop. If an NPU workload's PDB blocks eviction the state machine will hold at `pod-deletion-required` while it retries; consult the operator log (`kubectl logs -n npu-operator -l app.kubernetes.io/name=npu-operator | grep evict`) to see which pod or PDB is blocking.
 
 3. Confirm the rebooter is waiting:
 
