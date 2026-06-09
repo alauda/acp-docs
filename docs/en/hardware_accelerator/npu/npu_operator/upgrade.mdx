@@ -17,9 +17,13 @@ Both flows go through the same node-reboot path. Ascend chips cannot tolerate `r
 __Stop all NPU workloads before starting a driver upgrade.__ The upgrade reboots every NPU node in sequence and is __not__ designed to be transparent to running training jobs or inference services. Scale every NPU-requesting Deployment / StatefulSet / training job to zero, drain in-flight requests, and persist any model checkpoints __before__ patching `spec.driver.version`. Restore the workloads after the rollout reports `upgrade-done` on every node.
 :::
 
-### Pre-upgrade checklist
+The upgrade walks through four ordered steps: prepare the cluster, trigger the version bump, watch the rollout, and recover if anything blocks. Read top-down and do not start triggering until Step 1 is done — that is the single most common cause of a stuck rollout.
 
-Run through this short list before triggering an upgrade. A miss here is the single most common cause of a stuck rollout:
+### Step 1: Prepare before triggering {#step-1-prepare-before-triggering}
+
+Two things must be in place before you touch `spec.driver.version`. Both are __mandatory__; skipping either is how upgrades get stuck.
+
+#### 1.1 Pre-upgrade checklist
 
 1. **New driver image present in the cluster registry for every NPU node profile.** Reuse the `skopeo copy` step from [Step 1.1 of installation](./installation.mdx#sync-driver-images) for each `(chip, kernel, OS)` combination:
 
@@ -41,15 +45,43 @@ Run through this short list before triggering an upgrade. A miss here is the sin
     # add each new tag under spec.repoList
     ```
 
-3. **All NPU workloads stopped or quiesced.** See the [warning](#driver-upgrade) at the top of this section. Scale every NPU-requesting Deployment / StatefulSet / training job to zero before triggering the upgrade. For services that genuinely cannot be stopped during the rollout, a [`PodDisruptionBudget`](#protecting-workloads-during-upgrade) lets the eviction respect their availability SLO — but stopping the workloads is still the safer default.
+3. **Decide on the rollout cadence.** Default is one node at a time with PDB serialization. For larger fleets, raise `maxUnavailable` or `maxParallelUpgrades` only after you have confirmed your workloads can tolerate concurrent reboots.
 
-4. **Decide on the rollout cadence.** Default is one node at a time with PDB serialization. For larger fleets, raise `maxUnavailable` or `maxParallelUpgrades` only after you have confirmed your workloads can tolerate concurrent reboots.
+4. **(Manual mode only) Decide approval style.** Either approve each node when its `node-reboot-required` phase arrives, or [pre-approve every node up front](#pre-approve-workflow-batch-approval-before-patching). Pre-approval is the right pattern for routine version bumps where the admin has already accepted the rollout; per-node approval is the right pattern for first-time rollouts on a new driver tag.
 
-5. **(Manual mode only)** Decide whether you want to approve each node when its `node-reboot-required` phase arrives, or [pre-approve every node up front](#pre-approve-workflow-batch-approval-before-patching). Pre-approval is the right pattern for routine version bumps where the admin has already accepted the rollout; per-node approval is the right pattern for first-time rollouts on a new driver tag.
+#### 1.2 Stop or protect NPU workloads {#protecting-workloads-during-upgrade}
 
-### What triggers an upgrade
+The upgrade evicts every NPU-requesting pod from each node before rebooting it. To avoid losing in-flight work, do __one__ of the following before continuing to Step 2:
 
-Once the checklist above is satisfied, edit the `NPUOperatorCtl` instance — the one you created at the end of [Step 5.3 of installation](./installation.mdx#53-create-the-npuoperatorctl-instance). Bumping its `spec.driver.version` (via either the platform UI or YAML) makes the operator re-resolve the driver image tag for every NPU node, notices each node is still on the old image, and starts a rolling upgrade.
+__Option A — Stop everything (recommended).__ Scale every NPU-requesting workload to zero, then restore after the rollout finishes:
+
+```bash
+# Examples — scale every NPU-using workload to zero
+kubectl scale -n serving inferenceservice/my-model --replicas=0
+kubectl scale -n training statefulset/llama-trainer --replicas=0
+# … restore after upgrade-done on every node.
+```
+
+__Option B — Declare a `PodDisruptionBudget`__ for services you cannot stop. The operator's policy/v1 eviction respects every selecting PDB:
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: vllm-inference
+  namespace: serving
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: vllm-inference
+```
+
+While the PDB would be breached the API server returns `429`, the state machine leaves the pod in place and retries on each reconcile (~30 s). If the PDB never relents, `podDeletion.timeoutSecond` (default 300 s) fires and the upgrade proceeds anyway. To bypass PDBs for a particular rollout, set `spec.driver.upgradePolicy.podDeletion.force=true` — this falls back to a hard `Delete` with grace=0.
+
+### Step 2: Trigger the upgrade {#step-2-trigger-the-upgrade}
+
+Once Step 1 is done, edit the `NPUOperatorCtl` instance — the one you created at the end of [Step 5.3 of installation](./installation.mdx#53-create-the-npuoperatorctl-instance). Bumping its `spec.driver.version` makes the operator re-resolve the driver image tag for every NPU node, notice each node is still on the old image, and start a rolling upgrade.
 
 __Via the platform UI__ (recommended):
 
@@ -66,7 +98,9 @@ kubectl -n npu-operator patch npuoperatorctl npuoperatorctl-sample --type=merge 
 
 (Replace `npu-operator` with your install namespace and `npuoperatorctl-sample` with your instance name if either differs.)
 
-### Per-node upgrade phases
+### Step 3: Watch the rollout {#step-3-watch-the-rollout}
+
+#### 3.1 Per-node phases {#per-node-upgrade-phases}
 
 The operator drives each node through a state machine and reports progress via the `npu.openfuyao.com/driver-upgrade-state` label on the node. The phases are:
 
@@ -85,35 +119,7 @@ upgrade-required
 
 While a node carries any non-empty `driver-upgrade-state` label the Ascend Device Plugin marks every NPU on that node `Unhealthy`, so the scheduler stops placing new NPU workloads on it for the duration of the upgrade.
 
-### Protecting workloads during upgrade
-
-The recommended pattern is to stop every NPU workload before patching `spec.driver.version` (see the [warning](#driver-upgrade) at the top of this section):
-
-```bash
-# Examples — scale every NPU-using workload to zero
-kubectl scale -n serving inferenceservice/my-model --replicas=0
-kubectl scale -n training statefulset/llama-trainer --replicas=0
-# … restore after upgrade-done on every node.
-```
-
-For services that cannot be stopped during the rollout, declare a `PodDisruptionBudget` so the operator's policy/v1 eviction respects their availability SLO:
-
-```yaml
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: vllm-inference
-  namespace: serving
-spec:
-  minAvailable: 1
-  selector:
-    matchLabels:
-      app: vllm-inference
-```
-
-While the PDB would be breached the API server returns `429`, the state machine leaves the pod in place, and retries on each reconcile (~30 s). If the PDB never relents, `podDeletion.timeoutSecond` (default 300 s) fires and the upgrade proceeds anyway. To bypass PDBs for a particular rollout, set `spec.driver.upgradePolicy.podDeletion.force=true` — this falls back to a hard `Delete` with grace=0.
-
-### Auto vs. manual approval
+#### 3.2 Approval modes and other upgradePolicy fields {#auto-vs-manual-approval}
 
 The `spec.driver.upgradePolicy.autoUpgrade` flag controls only what happens at the `node-reboot-required` phase. Eviction behaviour, PDB handling, and every other phase are identical under both modes:
 
@@ -149,18 +155,11 @@ spec:
 
 `MaxUnavailable` and `MaxParallelUpgrades` together gate how many nodes leave the available pool at once; the rebooter additionally serializes the actual reboot step via a cluster-wide annotation so only one node reboots at a time even when several are in the unavailable region.
 
-### Manual upgrade walk-through
+#### 3.3 Manual approval walk-through {#manual-upgrade-walk-through}
 
 With `autoUpgrade: false` (recommended for first-time rollouts and for VM environments where chip wedging is a real risk):
 
-1. Update the driver version on the `NPUOperatorCtl` instance (via the UI or `kubectl`):
-
-    ```bash
-    kubectl -n npu-operator patch npuoperatorctl npuoperatorctl-sample --type=merge \
-      -p '{"spec":{"driver":{"version":"25.3.RC1"}}}'
-    ```
-
-2. Watch the state machine drive each node up to the reboot gate:
+1. After Step 2 you have already patched the version. Now watch the state machine drive each node up to the reboot gate:
 
     ```bash
     kubectl get nodes -L npu.openfuyao.com/driver-upgrade-state -w
@@ -168,7 +167,7 @@ With `autoUpgrade: false` (recommended for first-time rollouts and for VM enviro
 
     The state column will move through `upgrade-required` → `cordon-required` → … → `node-reboot-required` and then stop. If an NPU workload's PDB blocks eviction the state machine will hold at `pod-deletion-required` while it retries; consult the operator log (`kubectl logs -n npu-operator -l app.kubernetes.io/name=npu-operator | grep evict`) to see which pod or PDB is blocking.
 
-3. Confirm the rebooter is waiting:
+2. Confirm the rebooter is waiting:
 
     ```bash
     kubectl get events -A --field-selector reason=RebootRequired --sort-by=.lastTimestamp | tail
@@ -177,15 +176,15 @@ With `autoUpgrade: false` (recommended for first-time rollouts and for VM enviro
 
     Each pending node has a `RebootRequired` Event explaining how to approve the reboot.
 
-4. Approve the node when ready. The rebooter polls every 30 seconds, so it acts within a minute:
+3. Approve the node when ready. The rebooter polls every 30 seconds, so it acts within a minute:
 
     ```bash
     kubectl annotate node ${nodeName} npu.openfuyao.com/approve-reboot=true
     ```
 
-5. The node reboots. After it comes back up, the new driver pod loads the new modules from a fresh boot, the validator pod confirms readiness, and the state machine clears the label.
+4. The node reboots. After it comes back up, the new driver pod loads the new modules from a fresh boot, the validator pod confirms readiness, and the state machine clears the label.
 
-6. Verify the driver pod is now running the new image and `npu-smi info` reports the new version on the host:
+5. Verify the driver pod is now running the new image and `npu-smi info` reports the new version on the host:
 
     ```bash
     kubectl get pod -n npu-operator -l app.kubernetes.io/name=ascend-driver \
@@ -197,9 +196,9 @@ With `autoUpgrade: false` (recommended for first-time rollouts and for VM enviro
 
 Once a node is upgraded, the device plugin clears the `Unhealthy` mark and the scheduler resumes placing workloads on it.
 
-### Pre-approve workflow (batch approval before patching) {#pre-approve-workflow-batch-approval-before-patching}
+#### 3.4 Pre-approve workflow (batch approval) {#pre-approve-workflow-batch-approval-before-patching}
 
-For routine version bumps where the admin has already decided to roll the cluster, annotating every NPU node up front lets the rebooter act on each one without waiting for further attention:
+For routine version bumps where the admin has already decided to roll the cluster, annotate every NPU node up front __before__ Step 2's patch — the rebooter then acts on each one without waiting for further attention. The pre-approve step replaces Step 2 in this case:
 
 ```bash
 # 1. Pre-approve every NPU node
@@ -226,7 +225,81 @@ kubectl annotate node ${nodeName} npu.openfuyao.com/approve-reboot=true --overwr
 In practice this is only a concern on hardware profiles where chip-wedge during the install/upgrade window is common (910B in VM with PCI passthrough). On bare-metal clusters one pre-approval per node is usually enough.
 :::
 
-### Aborting an in-flight upgrade
+### Step 4: If something goes wrong {#step-4-if-something-goes-wrong}
+
+#### 4.1 Inspecting the upgrade state {#inspecting-the-upgrade-state}
+
+| Resource | What to check |
+|---|---|
+| Node label `npu.openfuyao.com/driver-upgrade-state` | Current phase. Empty means the node is _not_ in an upgrade. |
+| Node label `npu.openfuyao.com/reboot-required` | `true` while the node is in `node-reboot-required` and waiting for approval (manual mode) or for the reboot to fire (auto mode). |
+| Node annotation `npu.openfuyao.com/approve-reboot` | Set to `true` by the administrator to authorize the reboot. |
+| Node annotation `npu.openfuyao.com/reboot-in-progress` | Cluster-wide lock; only one node at a time carries this. |
+| Pod `npu-driver-*` logs | The runtime-init.sh log; useful when a node gets stuck. |
+| Pod `npu-rebooter-*` logs | Records why the rebooter is or is not acting on a given node. |
+| Events with reason `RebootRequired` | Tells you which nodes need approval and the suggested `kubectl annotate` command. |
+
+#### 4.2 Common issues {#troubleshooting}
+
+__State machine paused at `pod-deletion-required`__
+
+The most common cause is an NPU workload pod still bound to the cordoned node. The operator log spells out which pod:
+
+```bash
+kubectl logs -n npu-operator -l app.kubernetes.io/name=npu-operator --tail=200 \
+  | grep -E "evict|PDB"
+```
+
+Two sub-cases:
+
+- __A `PodDisruptionBudget` is blocking the eviction (HTTP 429).__ This is by design; let the budget recover by scaling up a replacement Deployment replica on another node, or temporarily increase `maxUnavailable` on the PDB.
+- __A `Pending` pod is wedged on the cordoned node because `spec.nodeName` was set before the cordon.__ The Deployment controller keeps recreating it, but the scheduler now skips the cordoned node, so the replacement lands elsewhere or stays `Pending` cluster-wide. Wait for the state machine's `podDeletion.timeoutSecond` (default 300 s) to fire, or scale the troublesome Deployment to `replicas=0` and back up.
+
+__State machine paused at `node-reboot-required`, `reboot-required=true`, no progress__
+
+Confirm the rebooter is actually running and has uptime above its `REBOOT_MIN_UPTIME` (default 600 s):
+
+```bash
+kubectl logs -n npu-operator -l app.kubernetes.io/component=npu-rebooter \
+  --tail=50 --prefix
+```
+
+If you see `uptime=<x>s < MIN_UPTIME=600s — deferring reboot until node settles`, the rebooter is correctly waiting on the safety gate — sit tight.
+
+If the rebooter rebooted the node but the state machine did not advance, the BootID stash may be out of sync with reality (the rebooter's post-reboot cleanup ran before the state machine re-read `status.nodeInfo.bootID`). Force a re-evaluation by clearing the stash:
+
+```bash
+kubectl annotate node ${nodeName} npu.openfuyao.com/pre-reboot-bootid-
+```
+
+The next reconcile re-stashes the current BootID and proceeds when the next reboot fires. If you do not expect any further reboot to happen, manually clean up the node per [Aborting an in-flight upgrade](#aborting-an-in-flight-upgrade).
+
+__Driver pod stuck in `CrashLoopBackOff` after a reboot__
+
+Read the pod log: `kubectl logs -n npu-operator npu-driver-<id>`. Common signatures:
+
+- __`==[6/8] insmod 41 compiled .ko ==` followed by `39 ascend modules loaded after 19 round(s)` and `failed to load: npu_peermem.ko`__ — benign on hosts without InfiniBand, see the [insmod stage 6](#per-node-upgrade-phases) discussion in the upgrade phases section.
+- __Stage 7 stuck at `waiting up to 120s for a /dev/davinci[0-9]* node`__ — kernel modules loaded but the chip did not present a userspace device node. On 910B with VM PCI passthrough this typically means the chip is in a wedged state from a previous rmmod cycle that only a **cold host reboot** clears (not a guest reboot). On bare-metal, check `dmesg | grep -iE 'ascend|davinci'` for firmware-level errors.
+- __`stage 5 fallback: chip wedge / persistent FP mismatch — wrote /var/lib/ascend/.reboot-required`__ — this is a normal step in an upgrade. The rebooter promotes the marker to `reboot-required=true` and waits for approval (manual mode) or the safety gates (auto mode). Not stuck.
+
+__Device plugin reporting `NPU=0` despite driver pod ready__
+
+The driver tier may have finished but the device plugin has the chips marked `Unhealthy` because it received a transient fault event. Inspect:
+
+```bash
+kubectl logs -n npu-operator -l name=ascend-device-plugin-ds --tail=30 \
+  | grep -iE "DevFaultInfo|hex code|ListAndWatch resp"
+```
+
+If the chip is genuinely operational the fault clears within a couple of minutes — wait. If it does not clear, restart the device-plugin pod to force re-evaluation:
+
+```bash
+kubectl delete pod -n npu-operator -l name=ascend-device-plugin-ds
+```
+
+If `NPU=0` persists across a device-plugin restart, the chip itself is wedged — recover the host per the stage 7 row above.
+
+#### 4.3 Aborting an in-flight upgrade {#aborting-an-in-flight-upgrade}
 
 Reverting an upgrade safely depends on how far the state machine has progressed on each node:
 
@@ -250,78 +323,6 @@ kubectl annotate node ${nodeName} \
   npu.openfuyao.com/reboot-in-progress-
 kubectl uncordon ${nodeName}
 ```
-
-### Inspecting the upgrade state
-
-| Resource | What to check |
-|---|---|
-| Node label `npu.openfuyao.com/driver-upgrade-state` | Current phase. Empty means the node is _not_ in an upgrade. |
-| Node label `npu.openfuyao.com/reboot-required` | `true` while the node is in `node-reboot-required` and waiting for approval (manual mode) or for the reboot to fire (auto mode). |
-| Node annotation `npu.openfuyao.com/approve-reboot` | Set to `true` by the administrator to authorize the reboot. |
-| Node annotation `npu.openfuyao.com/reboot-in-progress` | Cluster-wide lock; only one node at a time carries this. |
-| Pod `npu-driver-*` logs | The runtime-init.sh log; useful when a node gets stuck. |
-| Pod `npu-rebooter-*` logs | Records why the rebooter is or is not acting on a given node. |
-| Events with reason `RebootRequired` | Tells you which nodes need approval and the suggested `kubectl annotate` command. |
-
-### Troubleshooting
-
-#### State machine paused at `pod-deletion-required`
-
-The most common cause is an NPU workload pod still bound to the cordoned node. The operator log spells out which pod:
-
-```bash
-kubectl logs -n npu-operator -l app.kubernetes.io/name=npu-operator --tail=200 \
-  | grep -E "evict|PDB"
-```
-
-Two sub-cases:
-
-- __A `PodDisruptionBudget` is blocking the eviction (HTTP 429).__ This is by design; let the budget recover by scaling up a replacement Deployment replica on another node, or temporarily increase `maxUnavailable` on the PDB.
-- __A `Pending` pod is wedged on the cordoned node because `spec.nodeName` was set before the cordon.__ The Deployment controller keeps recreating it, but the scheduler now skips the cordoned node, so the replacement lands elsewhere or stays `Pending` cluster-wide. Wait for the state machine's `podDeletion.timeoutSecond` (default 300 s) to fire, or scale the troublesome Deployment to `replicas=0` and back up.
-
-#### State machine paused at `node-reboot-required`, `reboot-required=true`, no progress
-
-Confirm the rebooter is actually running and has uptime above its `REBOOT_MIN_UPTIME` (default 600 s):
-
-```bash
-kubectl logs -n npu-operator -l app.kubernetes.io/component=npu-rebooter \
-  --tail=50 --prefix
-```
-
-If you see `uptime=<x>s < MIN_UPTIME=600s — deferring reboot until node settles`, the rebooter is correctly waiting on the safety gate — sit tight.
-
-If the rebooter rebooted the node but the state machine did not advance, the BootID stash may be out of sync with reality (the rebooter's post-reboot cleanup ran before the state machine re-read `status.nodeInfo.bootID`). Force a re-evaluation by clearing the stash:
-
-```bash
-kubectl annotate node ${nodeName} npu.openfuyao.com/pre-reboot-bootid-
-```
-
-The next reconcile re-stashes the current BootID and proceeds when the next reboot fires. If you do not expect any further reboot to happen, manually clean up the node per [Aborting an in-flight upgrade](#aborting-an-in-flight-upgrade).
-
-#### Driver pod stuck in `CrashLoopBackOff` after a reboot
-
-Read the pod log: `kubectl logs -n npu-operator npu-driver-<id>`. Common signatures:
-
-- __`==[6/8] insmod 41 compiled .ko ==` followed by `39 ascend modules loaded after 19 round(s)` and `failed to load: npu_peermem.ko`__ — benign on hosts without InfiniBand, see the [insmod stage 6](#per-node-upgrade-phases) discussion in the upgrade phases section.
-- __Stage 7 stuck at `waiting up to 120s for a /dev/davinci[0-9]* node`__ — kernel modules loaded but the chip did not present a userspace device node. On 910B with VM PCI passthrough this typically means the chip is in a wedged state from a previous rmmod cycle that only a **cold host reboot** clears (not a guest reboot). On bare-metal, check `dmesg | grep -iE 'ascend|davinci'` for firmware-level errors.
-- __`stage 5 fallback: chip wedge / persistent FP mismatch — wrote /var/lib/ascend/.reboot-required`__ — this is a normal step in an upgrade. The rebooter promotes the marker to `reboot-required=true` and waits for approval (manual mode) or the safety gates (auto mode). Not stuck.
-
-#### Device plugin reporting `NPU=0` despite driver pod ready
-
-The driver tier may have finished but the device plugin has the chips marked `Unhealthy` because it received a transient fault event. Inspect:
-
-```bash
-kubectl logs -n npu-operator -l name=ascend-device-plugin-ds --tail=30 \
-  | grep -iE "DevFaultInfo|hex code|ListAndWatch resp"
-```
-
-If the chip is genuinely operational the fault clears within a couple of minutes — wait. If it does not clear, restart the device-plugin pod to force re-evaluation:
-
-```bash
-kubectl delete pod -n npu-operator -l name=ascend-device-plugin-ds
-```
-
-If `NPU=0` persists across a device-plugin restart, the chip itself is wedged — recover the host per the stage 7 row above.
 
 ## Chip self-healing
 
