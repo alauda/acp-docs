@@ -17,9 +17,39 @@ Both flows go through the same node-reboot path. Ascend chips cannot tolerate `r
 __Stop all NPU workloads before starting a driver upgrade.__ The upgrade reboots every NPU node in sequence and is __not__ designed to be transparent to running training jobs or inference services. Scale every NPU-requesting Deployment / StatefulSet / training job to zero, drain in-flight requests, and persist any model checkpoints __before__ patching `spec.driver.version`. Restore the workloads after the rollout reports `upgrade-done` on every node.
 :::
 
+### Pre-upgrade checklist
+
+Run through this short list before triggering an upgrade. A miss here is the single most common cause of a stuck rollout:
+
+1. **New driver image present in the cluster registry for every NPU node profile.** Reuse the `skopeo copy` step from [Step 1.1 of installation](./installation.mdx#sync-driver-images) for each `(chip, kernel, OS)` combination:
+
+    ```bash
+    # On a machine with internet access:
+    for COMBO in 910b-6.6.0-145.0.4.135-oe2403sp3 310p-6.6.0-145.0.4.135-oe2403sp3; do
+      skopeo copy --all \
+        docker://docker.io/alaudadockerhub/ascend-driver:${NEW_VERSION}-$COMBO \
+        docker://<your-cluster-registry>/mlops/ascend-driver:${NEW_VERSION}-$COMBO
+    done
+    ```
+
+    If no tag in the source DockerHub repo matches your node's kernel, contact <Term name="company"/> Customer Support — see the [installation note on missing tags](./installation.mdx#11-pull-driver-images-from-dockerhub).
+
+2. **`ImageWhiteList` updated** to include the new tag(s):
+
+    ```bash
+    kubectl edit imagewhitelist ascend-driver -n cpaas-system
+    # add each new tag under spec.repoList
+    ```
+
+3. **All NPU workloads stopped or quiesced.** See the [warning](#driver-upgrade) at the top of this section. Scale every NPU-requesting Deployment / StatefulSet / training job to zero before triggering the upgrade. For services that genuinely cannot be stopped during the rollout, a [`PodDisruptionBudget`](#protecting-workloads-during-upgrade) lets the eviction respect their availability SLO — but stopping the workloads is still the safer default.
+
+4. **Decide on the rollout cadence.** Default is one node at a time with PDB serialization. For larger fleets, raise `maxUnavailable` or `maxParallelUpgrades` only after you have confirmed your workloads can tolerate concurrent reboots.
+
+5. **(Manual mode only)** Decide whether you want to approve each node when its `node-reboot-required` phase arrives, or [pre-approve every node up front](#pre-approve-workflow-batch-approval-before-patching). Pre-approval is the right pattern for routine version bumps where the admin has already accepted the rollout; per-node approval is the right pattern for first-time rollouts on a new driver tag.
+
 ### What triggers an upgrade
 
-The user-facing CR for the operator is `NPUOperatorCtl` — the instance you created at the end of [Step 5.3 of installation](./installation.mdx#53-create-the-npuoperatorctl-instance). Editing its `spec.driver.version` (via either the platform UI or YAML) makes the operator re-resolve the driver image tag for every NPU node, notices each node is still on the old image, and starts a rolling upgrade.
+Once the checklist above is satisfied, edit the `NPUOperatorCtl` instance — the one you created at the end of [Step 5.3 of installation](./installation.mdx#53-create-the-npuoperatorctl-instance). Bumping its `spec.driver.version` (via either the platform UI or YAML) makes the operator re-resolve the driver image tag for every NPU node, notices each node is still on the old image, and starts a rolling upgrade.
 
 __Via the platform UI__ (recommended):
 
@@ -35,36 +65,6 @@ kubectl -n npu-operator patch npuoperatorctl npuoperatorctl-sample --type=merge 
 ```
 
 (Replace `npu-operator` with your install namespace and `npuoperatorctl-sample` with your instance name if either differs.)
-
-Before doing this, confirm a driver image matching the new version exists in the cluster registry for every `(chip, kernel, OS)` combination present in the cluster. If a matching image is missing the operator will mark the node `upgrade-required` and the driver pod will go `ImagePullBackOff`.
-
-### Pre-upgrade checklist
-
-Run through this short list before patching `spec.driver.version`. A miss here is the single most common cause of a stuck rollout:
-
-1. **New driver image present in the cluster registry for every NPU node profile.** Reuse the `skopeo copy` step from [Step 1.1 of installation](./installation.mdx#sync-driver-images) for each `(chip, kernel, OS)` combination:
-
-    ```bash
-    # On a machine with internet access:
-    for COMBO in 910b-6.6.0-145.0.4.135-oe2403sp3 310p-6.6.0-145.0.4.135-oe2403sp3; do
-      skopeo copy --all \
-        docker://docker.io/alaudadockerhub/ascend-driver:${NEW_VERSION}-$COMBO \
-        docker://<your-cluster-registry>/mlops/ascend-driver:${NEW_VERSION}-$COMBO
-    done
-    ```
-
-2. **`ImageWhiteList` updated** to include the new tag(s):
-
-    ```bash
-    kubectl edit imagewhitelist ascend-driver -n cpaas-system
-    # add each new tag under spec.repoList
-    ```
-
-3. **All NPU workloads stopped or quiesced.** See the [warning](#driver-upgrade) at the top of this section. Scale every NPU-requesting Deployment / StatefulSet / training job to zero before patching `spec.driver.version`. For services that genuinely cannot be stopped during the rollout, a [`PodDisruptionBudget`](#protecting-workloads-during-upgrade) lets the eviction respect their availability SLO — but stopping the workloads is still the safer default.
-
-4. **Decide on the rollout cadence.** Default is one node at a time with PDB serialization. For larger fleets, raise `maxUnavailable` or `maxParallelUpgrades` only after you have confirmed your workloads can tolerate concurrent reboots.
-
-5. **(Manual mode only)** Decide whether you want to approve each node when its `node-reboot-required` phase arrives, or [pre-approve every node up front](#pre-approve-workflow-batch-approval-before-patching). Pre-approval is the right pattern for routine version bumps where the admin has already accepted the rollout; per-node approval is the right pattern for first-time rollouts on a new driver tag.
 
 ### Per-node upgrade phases
 
