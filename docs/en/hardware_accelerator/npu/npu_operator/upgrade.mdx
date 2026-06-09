@@ -45,39 +45,15 @@ Two things must be in place before you touch `spec.driver.version`. Both are __m
     # add each new tag under spec.repoList
     ```
 
-3. **Decide on the rollout cadence.** Default is one node at a time with PDB serialization. For larger fleets, raise `maxUnavailable` or `maxParallelUpgrades` only after you have confirmed your workloads can tolerate concurrent reboots.
+#### 1.2 Stop NPU workloads {#stop-npu-workloads}
 
-4. **(Manual mode only) Decide approval style.** Either approve each node when its `node-reboot-required` phase arrives, or [pre-approve every node up front](#pre-approve-workflow-batch-approval-before-patching). Pre-approval is the right pattern for routine version bumps where the admin has already accepted the rollout; per-node approval is the right pattern for first-time rollouts on a new driver tag.
-
-#### 1.2 Stop or protect NPU workloads {#protecting-workloads-during-upgrade}
-
-The upgrade evicts every NPU-requesting pod from each node before rebooting it. To avoid losing in-flight work, do __one__ of the following before continuing to Step 2:
-
-__Option A — Stop everything (recommended).__ Scale every NPU-requesting workload to zero, then restore after the rollout finishes:
+Scale every NPU-requesting Deployment / StatefulSet / training job to zero before continuing. Restore them after the rollout reports `upgrade-done` on every node.
 
 ```bash
 # Examples — scale every NPU-using workload to zero
 kubectl scale -n serving inferenceservice/my-model --replicas=0
 kubectl scale -n training statefulset/llama-trainer --replicas=0
-# … restore after upgrade-done on every node.
 ```
-
-__Option B — Declare a `PodDisruptionBudget`__ for services you cannot stop. The operator's policy/v1 eviction respects every selecting PDB:
-
-```yaml
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: vllm-inference
-  namespace: serving
-spec:
-  minAvailable: 1
-  selector:
-    matchLabels:
-      app: vllm-inference
-```
-
-While the PDB would be breached the API server returns `429`, the state machine leaves the pod in place and retries on each reconcile (~30 s). If the PDB never relents, `podDeletion.timeoutSecond` (default 300 s) fires and the upgrade proceeds anyway. To bypass PDBs for a particular rollout, set `spec.driver.upgradePolicy.podDeletion.force=true` — this falls back to a hard `Delete` with grace=0.
 
 ### Step 2: Trigger the upgrade {#step-2-trigger-the-upgrade}
 
@@ -119,45 +95,26 @@ upgrade-required
 
 While a node carries any non-empty `driver-upgrade-state` label the Ascend Device Plugin marks every NPU on that node `Unhealthy`, so the scheduler stops placing new NPU workloads on it for the duration of the upgrade.
 
-#### 3.2 Approval modes and other upgradePolicy fields {#auto-vs-manual-approval}
+#### 3.2 Approval modes {#auto-vs-manual-approval}
 
-The `spec.driver.upgradePolicy.autoUpgrade` flag controls only what happens at the `node-reboot-required` phase. Eviction behaviour, PDB handling, and every other phase are identical under both modes:
+The `spec.driver.upgradePolicy.autoUpgrade` flag controls only what happens at the `node-reboot-required` phase. Every other phase is identical under both modes:
 
 | `autoUpgrade` | Behaviour at `node-reboot-required` |
 |---|---|
 | `true`            | The rebooter reboots the node once the uptime and cluster-wide reboot-lock safety gates are satisfied. |
 | `false` (default) | The rebooter emits a `RebootRequired` Event and waits for the administrator to annotate the node `npu.openfuyao.com/approve-reboot=true`. |
 
-The driver pod itself is always deleted at `pod-deletion-required` regardless of `autoUpgrade` — it does not request `huawei.com/Ascend910`, and the new image must be rolled in to stage the new module tree before the reboot.
-
-Other `upgradePolicy` fields shape the rollout:
-
 ```yaml
 spec:
   driver:
-    version: "25.3.RC1"
+    version: "25.5.0"
     upgradePolicy:
-      autoUpgrade: true        # default false
-      maxParallelUpgrades: 1   # how many nodes the state machine drives in parallel
-      maxUnavailable: "25%"    # cap on simultaneously-unavailable NPU nodes
-      drainSpec:               # optional drain configuration
-        enable: true
-        force: true
-        deleteEmptyDir: false
-        timeoutSecond: 300
-      podDeletion:
-        force: true
-        timeoutSecond: 300
-      waitForCompletion:
-        podSelector: "kubernetes.io/category=npu-job"
-        timeoutSecond: 1200
+      autoUpgrade: false       # set true for fully automatic rolling upgrades
 ```
-
-`MaxUnavailable` and `MaxParallelUpgrades` together gate how many nodes leave the available pool at once; the rebooter additionally serializes the actual reboot step via a cluster-wide annotation so only one node reboots at a time even when several are in the unavailable region.
 
 #### 3.3 Manual approval walk-through {#manual-upgrade-walk-through}
 
-With `autoUpgrade: false` (recommended for first-time rollouts and for VM environments where chip wedging is a real risk):
+With `autoUpgrade: false` (recommended for first-time rollouts and for VM environments where chip wedging is a real risk), approve each node when it reaches `node-reboot-required`. For routine version bumps where you have already decided to roll the whole cluster, see [3.4 Pre-approve workflow](#pre-approve-workflow-batch-approval-before-patching) to approve every node up front instead.
 
 1. After Step 2 you have already patched the version. Now watch the state machine drive each node up to the reboot gate:
 
@@ -165,7 +122,7 @@ With `autoUpgrade: false` (recommended for first-time rollouts and for VM enviro
     kubectl get nodes -L npu.openfuyao.com/driver-upgrade-state -w
     ```
 
-    The state column will move through `upgrade-required` → `cordon-required` → … → `node-reboot-required` and then stop. If an NPU workload's PDB blocks eviction the state machine will hold at `pod-deletion-required` while it retries; consult the operator log (`kubectl logs -n npu-operator -l app.kubernetes.io/name=npu-operator | grep evict`) to see which pod or PDB is blocking.
+    The state column will move through `upgrade-required` → `cordon-required` → … → `node-reboot-required` and then stop.
 
 2. Confirm the rebooter is waiting:
 
@@ -243,17 +200,12 @@ In practice this is only a concern on hardware profiles where chip-wedge during 
 
 __State machine paused at `pod-deletion-required`__
 
-The most common cause is an NPU workload pod still bound to the cordoned node. The operator log spells out which pod:
+An NPU workload pod is still on the cordoned node — Step 1.2 was probably skipped or missed a workload. Identify the offending pod from the operator log and scale its owner to zero:
 
 ```bash
 kubectl logs -n npu-operator -l app.kubernetes.io/name=npu-operator --tail=200 \
-  | grep -E "evict|PDB"
+  | grep evict
 ```
-
-Two sub-cases:
-
-- __A `PodDisruptionBudget` is blocking the eviction (HTTP 429).__ This is by design; let the budget recover by scaling up a replacement Deployment replica on another node, or temporarily increase `maxUnavailable` on the PDB.
-- __A `Pending` pod is wedged on the cordoned node because `spec.nodeName` was set before the cordon.__ The Deployment controller keeps recreating it, but the scheduler now skips the cordoned node, so the replacement lands elsewhere or stays `Pending` cluster-wide. Wait for the state machine's `podDeletion.timeoutSecond` (default 300 s) to fire, or scale the troublesome Deployment to `replicas=0` and back up.
 
 __State machine paused at `node-reboot-required`, `reboot-required=true`, no progress__
 
@@ -397,19 +349,6 @@ spec:
     version: "25.5.0"
     upgradePolicy:
       autoUpgrade: false        # opt-in to fully automatic rolling upgrades
-      maxParallelUpgrades: 1
-      maxUnavailable: "25%"
-      drainSpec:
-        enable: false
-        force: true
-        deleteEmptyDir: false
-        timeoutSecond: 300
-      podDeletion:
-        force: true
-        timeoutSecond: 300
-      waitForCompletion:
-        podSelector: ""
-        timeoutSecond: 0
     recoveryPolicy:
       autoRecover: false        # opt-in to automatic chip-wedge recovery
   # ... other components (devicePlugin, ociRuntime, exporter, …)
