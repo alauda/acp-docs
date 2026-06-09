@@ -46,7 +46,7 @@ Run through this short list before patching `spec.driver.version`. A miss here i
     # add each new tag under spec.repoList
     ```
 
-3. **Critical inference workloads carry a `PodDisruptionBudget`.** Without one the state machine evicts pods immediately at the `pod-deletion-required` phase. See [Protecting critical inference workloads](#protecting-critical-inference-workloads-with-poddisruptionbudget) below.
+3. **Critical inference workloads carry a `PodDisruptionBudget` — or you have manually quiesced them first.** The state machine evicts NPU workload pods via the policy/v1 Eviction subresource at the `pod-deletion-required` phase. Without a PDB the eviction kills the pod immediately. KServe `RawDeployment`, Knative Service, and vLLM-style Prefill/Decode (PD) Deployments **do not create PDBs by default** — if your inference stack uses any of these, either add PDBs before the upgrade or [quiesce the workloads manually](#quiescing-workloads-without-a-pdb) before patching `spec.driver.version`.
 
 4. **Decide on the rollout cadence.** Default is one node at a time with PDB serialization. For larger fleets, raise `maxUnavailable` or `maxParallelUpgrades` only after you have confirmed your workloads can tolerate concurrent reboots.
 
@@ -91,6 +91,76 @@ spec:
 While the PDB would be breached the API server returns `429 Too Many Requests` and the state machine leaves the pod in place — it retries on each reconcile (~30 s), eventually either the PDB allows the eviction (a replacement replica became `Ready` elsewhere) or `podDeletion.timeoutSecond` (default 300 s) fires and the upgrade proceeds anyway. Without a PDB the eviction succeeds immediately and the pod is killed.
 
 Workload owners who explicitly want to bypass PDBs (for example because a stuck PDB shouldn't block a security upgrade) can set `spec.driver.upgradePolicy.podDeletion.force=true` on the operator CR. This falls back to a hard `Delete` with grace=0.
+
+#### Quiescing workloads without a PDB
+
+If your inference workloads do not declare a PodDisruptionBudget, the operator has no way to know which pods are critical and will evict them at the first cordoned node. Inference frameworks commonly used on NPU clusters that **do not** ship a PDB by default include:
+
+- __KServe `InferenceService` (RawDeployment mode)__ — replicas are managed directly by a Deployment, no PDB.
+- __Knative Service__ (the alternative KServe mode) — same gap.
+- __InferNex / vLLM Prefill–Decode (PD) split deployments__ — `prefill` and `decode` run as separate Deployments and must stay paired (HCCL / gRPC link breaks if one side is evicted alone). A naive per-Deployment PDB does not capture the P–D coupling and is not sufficient.
+
+For each, choose one of the patterns below before patching `spec.driver.version`:
+
+__Option A — Add a PDB__ (preferred, requires application owner cooperation):
+
+```yaml
+# Per-Deployment, when the service tolerates rolling restarts
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: my-kserve-predictor
+  namespace: serving
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      serving.kserve.io/inferenceservice: my-model
+
+---
+# For PD-disaggregated services: select BOTH sides together so the PDB
+# blocks any eviction that would leave a Prefill orphaned from its Decode
+# (or vice versa). This treats the P-D pair as a single availability unit.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: my-pd-service
+  namespace: infernex-2
+spec:
+  minAvailable: 100%   # nothing in the P-D bundle may go down during the upgrade
+  selector:
+    matchExpressions:
+      - key: app.kubernetes.io/instance
+        operator: In
+        values: [my-pd-service]   # matches both prefill-* and decode-* pods
+```
+
+__Option B — Scale to zero before the upgrade, restore after__ (when adding a PDB is not feasible in the window):
+
+```bash
+# KServe RawDeployment / Knative
+kubectl scale -n serving inferenceservice/my-model --replicas=0
+
+# vLLM-PD or generic Deployment
+kubectl scale -n infernex-2 deploy/my-pd-prefill   --replicas=0
+kubectl scale -n infernex-2 deploy/my-pd-decode    --replicas=0
+kubectl scale -n infernex-2 deploy/my-pd-router    --replicas=0
+
+# Patch the driver version, wait for upgrade-done on every node, then restore:
+kubectl scale -n serving inferenceservice/my-model --replicas=2
+# (restore each PD component to its previous replica count)
+```
+
+__Option C — Migrate replicas off the to-be-cordoned node ahead of time__ (multi-node clusters with spare NPU capacity):
+
+```bash
+# Add a temporary node affinity / taint to force pods off the target node
+kubectl cordon ${nodeName}                     # prevents new scheduling
+kubectl drain ${nodeName} --pod-selector='app=my-model' --ignore-daemonsets --delete-emptydir-data
+# Then patch spec.driver.version and let the state machine take it from here.
+```
+
+In all three options, the responsibility for not breaking service moves from the operator to the workload owner. The state machine still uses the Eviction API as before; PDB / manual quiescing simply makes sure the eviction does not break anything critical.
 
 ### Auto vs. manual approval
 
