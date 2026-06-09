@@ -233,61 +233,6 @@ The __Volcano__ cluster plugin can be left uninstalled for now. Install it from 
 
     The pod should reach `Running`. `ls /dev/davinci*` should show `/dev/davinci_manager` plus one per-card device node (e.g. `/dev/davinci0`), and `npu-smi info` should print the card's status. Both confirm that CDI injected the device into the container.
 
-### Manual HCCN IP configuration for multi-node workloads {#manual-hccn-ip-configuration-for-multi-node-workloads}
-
-:::warning
-__Required only for multi-node distributed workloads.__ Single-node training, single-node inference, and pod-to-pod TCP communication work out of the box and do not need this step. Skip the rest of this section if you only run single-node workloads.
-:::
-
-Cross-node HCCL collective operations (allreduce / allgather / …) used by multi-rank PyTorch or MindSpore training, or by Prefill–Decode disaggregated inference where the P and D pods land on different nodes, do **not** flow over the K8s pod network. They route directly over each NPU's on-die 100 GbE RoCE NIC, which therefore needs an IP address.
-
-Standard Atlas 800 / 900 training servers are pre-configured at the factory. If you are using NPU PCI passthrough into VMs, repurposed hardware, or any other non-standard deployment, the operator does not configure these IPs for you in v1.2.3 — you have to do it once after the driver is installed.
-
-#### Configure HCCN IPs
-
-Pick a routable `/24` subnet for NPU RoCE traffic that does not overlap with any host network or pod network. Assign a distinct IP to every NPU in the cluster, then on each NPU node:
-
-```bash
-# Example: subnet 192.168.200.0/24; allocate one IP per NPU.
-# Adjust the offset (e.g. (node_index * 8) + chip_id) to fit your fleet.
-HCCN=/var/lib/Ascend/driver/tools/hccn_tool
-export LD_LIBRARY_PATH=/var/lib/Ascend/driver/lib64/driver:/var/lib/Ascend/driver/lib64/common
-
-NODE_BASE=10   # change per node so each NPU gets a unique address
-for i in 0 1 2 3 4 5 6 7; do
-  $HCCN -i $i -ip -s address 192.168.200.$((NODE_BASE + i)) netmask 255.255.255.0
-done
-
-# Verify the assignment
-for i in 0 1 2 3 4 5 6 7; do $HCCN -i $i -ip -g; done
-```
-
-`hccn_tool` writes the address to the chip's network firmware. The link state should report `UP`.
-
-#### Verify cross-node reachability
-
-From any NPU node, ping a remote NPU's HCCN address:
-
-```bash
-$HCCN -i 0 -ping -g address 192.168.200.<remote-npu-ip> pkt 64
-```
-
-A successful run prints `recv seq=N,time=…` lines with `0.00% packet loss` and confirms the RoCE plane is up. Repeat the check for at least one chip per node to validate every cross-node path.
-
-#### Persist across reboots
-
-The IPs set by `hccn_tool -ip -s` live in volatile firmware registers and clear on host reboot. To survive a reboot, persist them via `/etc/hccn.conf` and the Huawei `setup_hccn_ip.sh` boot script shipped with the Atlas toolkit:
-
-```bash
-# /etc/hccn.conf — one block per chip
-address_0=192.168.200.10
-netmask_0=255.255.255.0
-gateway_0=192.168.200.1
-...
-```
-
-Refer to the Atlas server administrator guide for the canonical `hccn.conf` schema and the matching systemd unit (`hccn.service`). On KubeOS the file lives on the writable partition under `/etc/` and survives upgrades of the operator image.
-
 ### Step 6: Install Monitor
 
 If the NPU Exporter component was deployed when installing the Alauda Build of NPU Operator, the operator automatically deploys a `ServiceMonitor` named `npu-exporter-servicemonitor` in the operator namespace, wired up to the `npu-exporter` Service. No manual `ServiceMonitor` creation is required. You can verify it with (replace `npu-operator` with the namespace you chose during installation):
