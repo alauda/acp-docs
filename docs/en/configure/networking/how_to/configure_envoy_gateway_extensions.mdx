@@ -1,0 +1,365 @@
+---
+title: Configure Envoy Gateway Extensions
+weight: 13
+---
+
+# Configure Envoy Gateway Extensions
+
+## Overview
+
+Envoy Gateway supports traffic extension through `EnvoyExtensionPolicy`. You can attach an extension policy to a
+`Gateway` or `HTTPRoute` to run custom logic in the Envoy data plane without changing application code.
+
+This document describes three extension mechanisms:
+
+| Extension mechanism | Typical use case | Configuration resource |
+| ------------------- | ---------------- | ---------------------- |
+| LuaFilter | Lightweight request or response processing, such as adding headers or simple routing logic | `EnvoyExtensionPolicy.spec.lua` |
+| Wasm | Portable extension logic compiled as a WebAssembly module | `EnvoyExtensionPolicy.spec.wasm` |
+| Dynamic Module | Native Envoy extension loaded from a shared object file, such as a WAF module | `EnvoyProxy.spec.dynamicModules` and `EnvoyExtensionPolicy.spec.dynamicModule` |
+
+## Prerequisites
+
+Before configuring extensions, make sure that you have completed the following tasks:
+
+1. Install or upgrade Envoy Gateway to a version that supports the required extension fields. Dynamic Module examples in
+   this document require Envoy Gateway 1.8 or later.
+2. [Configure EnvoyGatewayCtl](../../../networking/operators/envoy_gateway_operator.mdx)
+3. [Configure Gateway](../functions/configure_gatewayapi_gateway.mdx#configure_gatewayapi_gateway)
+4. [Configure Route](../functions/configure_gatewayapi_route.mdx#configure_gatewayapi_route)
+5. Prepare a backend Service and an `HTTPRoute` that forwards traffic to that Service.
+
+The examples in this document use the following resource names. Replace them with the names in your environment.
+
+| Resource | Example value |
+| -------- | ------------- |
+| Namespace | `gateway-demo` |
+| Gateway | `example-gateway` |
+| Gateway listener | `http` |
+| HTTPRoute | `example-route` |
+| Hostname | `www.example.com` |
+
+:::note
+The extension artifact must be reachable by the Envoy data plane. For Wasm modules, use an HTTP or OCI source that the
+Envoy pods can access. For Dynamic Modules, make sure the shared object file is mounted into the Envoy container before
+Envoy starts.
+:::
+
+## Configure a LuaFilter Extension
+
+Use LuaFilter for lightweight request or response handling. The following example attaches a Lua script to
+`example-route` and adds the `x-gwext-lua: enabled` response header.
+
+```yaml
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyExtensionPolicy
+metadata:
+  name: lua-header-policy
+  namespace: gateway-demo
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: example-route
+  lua:
+    - type: Inline
+      inline: |
+        function envoy_on_response(response_handle)
+          response_handle:headers():add("x-gwext-lua", "enabled")
+        end
+```
+
+Apply the policy:
+
+```bash
+kubectl apply -f lua-header-policy.yaml
+```
+
+Verify that the route returns the response header:
+
+```bash
+curl -i -H "Host: www.example.com" http://<GATEWAY_ADDRESS>/<PATH>
+```
+
+Expected response header:
+
+```text
+x-gwext-lua: enabled
+```
+
+For more Lua configuration options, see the upstream
+[Envoy Gateway Lua task](https://gateway.envoyproxy.io/latest/tasks/extensibility/lua/).
+
+## Configure a Wasm Extension
+
+Use Wasm when extension logic is packaged as a WebAssembly module. The following example loads the sample Wasm module
+used by the upstream Envoy Gateway Wasm task from an HTTP endpoint and attaches it to `example-route`.
+
+```yaml
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyExtensionPolicy
+metadata:
+  name: wasm-header-policy
+  namespace: gateway-demo
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: example-route
+  wasm:
+    - name: wasm-filter
+      rootID: my_root_id
+      code:
+        type: HTTP
+        http:
+          url: https://raw.githubusercontent.com/envoyproxy/examples/main/wasm-cc/lib/envoy_filter_http_wasm_example.wasm
+          sha256: 79c9f85128bb0177b6511afa85d587224efded376ac0ef76df56595f1e6315c0
+```
+
+Apply the policy:
+
+```bash
+kubectl apply -f wasm-header-policy.yaml
+```
+
+Verify that the Wasm filter runs. The test module used in this example adds the `x-wasm-custom: FOO` response header:
+
+```bash
+curl -i -H "Host: www.example.com" http://<GATEWAY_ADDRESS>/<PATH>
+```
+
+Expected response header:
+
+```text
+x-wasm-custom: FOO
+```
+
+The Wasm module URL in this example comes from the upstream Envoy Gateway Wasm task. To build and use your own Wasm
+filter, follow the upstream task and replace `url` and `sha256` with your own artifact details.
+
+For more Wasm configuration options, see the upstream
+[Envoy Gateway Wasm task](https://gateway.envoyproxy.io/latest/tasks/extensibility/wasm/).
+
+## Configure a Dynamic Module WAF Extension
+
+Use Dynamic Module when you need to load a native Envoy extension from a shared object file. This example uses the
+Composer Dynamic Module with Coraza WAF rules. The WAF filter blocks suspicious requests, such as SQL injection payloads.
+
+Dynamic Module configuration has two parts:
+
+1. Configure `EnvoyProxy.spec.dynamicModules` to allow Envoy to load the module.
+2. Configure `EnvoyExtensionPolicy.spec.dynamicModule` to attach the module as an HTTP filter.
+
+### Prepare a Helper Image
+
+The Composer module is provided as `libcomposer.so`. Prepare a helper image that contains the file and can run a shell
+command in an init container.
+
+Kubernetes 1.35 or later supports mounting an OCI image or artifact directly as an `image` volume. If all clusters that
+run this configuration use Kubernetes 1.35 or later, you can mount the Composer artifact as an `image` volume instead of
+copying the file in an init container.
+
+This example uses an init container and a shared `emptyDir` volume for compatibility with older Kubernetes versions.
+With this approach, the init container copies `libcomposer.so` from the helper image into the shared volume, and the
+Envoy container loads the module from the same volume.
+
+The following Dockerfile copies `libcomposer.so` from the Composer image into a normal Alpine-based image:
+
+```dockerfile
+ARG ALPINE_IMAGE=alpine:3.20
+
+FROM ghcr.io/tetratelabs/built-on-envoy/composer:0.6.0-dev AS composer
+
+FROM ${ALPINE_IMAGE}
+COPY --from=composer /libcomposer.so /opt/envoy-dynamic-modules/libcomposer.so
+RUN chmod 755 /opt/envoy-dynamic-modules/libcomposer.so
+```
+
+Build and push the helper image to a registry that the cluster can access:
+
+```bash
+docker build -t <REGISTRY>/envoy-gateway-composer-provider:0.6.0-dev-alpine -f Dockerfile .
+docker push <REGISTRY>/envoy-gateway-composer-provider:0.6.0-dev-alpine
+```
+
+### Configure EnvoyProxy
+
+Create or update the `EnvoyProxy` used by your `Gateway`. The following configuration uses an init container to copy
+`libcomposer.so` into a shared `emptyDir` volume. The Envoy container mounts the same volume and loads the module from
+`/etc/envoy/dynamic-modules/libcomposer.so`.
+
+```yaml
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: example-proxy
+  namespace: gateway-demo
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyDeployment:
+        initContainers:
+          - name: provide-dynamic-module
+            image: <REGISTRY>/envoy-gateway-composer-provider:0.6.0-dev-alpine
+            imagePullPolicy: IfNotPresent
+            command:
+              - sh
+              - -ec
+              - |
+                cp /opt/envoy-dynamic-modules/libcomposer.so /etc/envoy/dynamic-modules/libcomposer.so
+                chmod 755 /etc/envoy/dynamic-modules/libcomposer.so
+            volumeMounts:
+              - name: dynamic-modules
+                mountPath: /etc/envoy/dynamic-modules
+        pod:
+          volumes:
+            - name: dynamic-modules
+              emptyDir: {}
+        container:
+          env:
+            - name: GODEBUG
+              value: "cgocheck=0"
+          volumeMounts:
+            - name: dynamic-modules
+              mountPath: /etc/envoy/dynamic-modules
+              readOnly: true
+  dynamicModules:
+    - name: composer
+      source:
+        type: Local
+        local:
+          path: /etc/envoy/dynamic-modules/libcomposer.so
+      doNotClose: true
+      loadGlobally: false
+```
+
+Apply the `EnvoyProxy`:
+
+```bash
+kubectl apply -f example-proxy.yaml
+```
+
+Make sure the `Gateway` references this `EnvoyProxy`:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: example-gateway
+  namespace: gateway-demo
+spec:
+  gatewayClassName: <GATEWAY_CLASS_NAME>
+  infrastructure:
+    parametersRef:
+      group: gateway.envoyproxy.io
+      kind: EnvoyProxy
+      name: example-proxy
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+```
+
+### Attach the Coraza WAF Filter
+
+Create an `EnvoyExtensionPolicy` that attaches the Composer module to the Gateway and enables the Coraza WAF rules:
+
+```yaml
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyExtensionPolicy
+metadata:
+  name: coraza-waf-policy
+  namespace: gateway-demo
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: example-gateway
+  dynamicModule:
+    - name: composer
+      filterName: coraza-waf
+      config:
+        directives:
+          - Include @coraza.conf
+          - SecRuleEngine On
+          - SecResponseBodyAccess Off
+          - Include @crs-setup.conf
+          - Include @owasp_crs/*.conf
+```
+
+Apply the policy:
+
+```bash
+kubectl apply -f coraza-waf-policy.yaml
+```
+
+Verify a normal request:
+
+```bash
+curl -i -H "Host: www.example.com" http://<GATEWAY_ADDRESS>/<PATH>
+```
+
+Expected status:
+
+```text
+HTTP/1.1 200 OK
+```
+
+Verify that the WAF blocks a SQL injection style request:
+
+```bash
+curl -i -H "Host: www.example.com" "http://<GATEWAY_ADDRESS>/<PATH>?id=1'+OR+'1'%3D'1"
+```
+
+Expected status:
+
+```text
+HTTP/1.1 403 Forbidden
+```
+
+For more Dynamic Module configuration options, see the upstream
+[Envoy Gateway Dynamic Modules task](https://gateway.envoyproxy.io/latest/tasks/extensibility/dynamic-modules/).
+
+## Check Extension Status
+
+After applying an extension policy, check whether the policy is accepted:
+
+```bash
+kubectl get envoyextensionpolicy -n gateway-demo
+kubectl describe envoyextensionpolicy <POLICY_NAME> -n gateway-demo
+```
+
+If the policy is not accepted, check the Envoy Gateway controller logs and the generated Envoy pods:
+
+```bash
+kubectl logs -n envoy-gateway-system deploy/envoy-gateway
+kubectl get pods -n gateway-demo
+kubectl describe pod <ENVOY_POD_NAME> -n gateway-demo
+```
+
+For Dynamic Modules, also verify the following items:
+
+| Item | Expected result |
+| ---- | --------------- |
+| Helper image | The image can be pulled by the cluster |
+| Init container | The init container completes successfully |
+| Module path | `/etc/envoy/dynamic-modules/libcomposer.so` exists in the Envoy container |
+| `EnvoyProxy.spec.dynamicModules[].name` | Matches `EnvoyExtensionPolicy.spec.dynamicModule[].name` |
+
+## Cleanup
+
+Delete the extension policies when they are no longer needed:
+
+```bash
+kubectl delete envoyextensionpolicy lua-header-policy -n gateway-demo
+kubectl delete envoyextensionpolicy wasm-header-policy -n gateway-demo
+kubectl delete envoyextensionpolicy coraza-waf-policy -n gateway-demo
+```
+
+If you created a dedicated `EnvoyProxy` for Dynamic Module testing, delete it after removing or updating the Gateway
+that references it:
+
+```bash
+kubectl delete envoyproxy example-proxy -n gateway-demo
+```
