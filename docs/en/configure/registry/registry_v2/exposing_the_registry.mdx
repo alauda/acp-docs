@@ -35,40 +35,72 @@ kubectl get configs.imageregistry.operator.alauda.io cluster -o yaml
 kubectl -n image-registry-system get ingress default-route
 ```
 
+Get the generated host:
+
+```bash
+REGISTRY_HOST="$(
+  kubectl -n image-registry-system get ingress default-route \
+    -o jsonpath='{.spec.rules[0].host}'
+)"
+
+echo "$REGISTRY_HOST"
+```
+
 Expected results:
 
 - `Config/cluster.spec.defaultRoute` is `true`.
 - The `default-route` Ingress exists in `image-registry-system`.
+- `REGISTRY_HOST` contains the hostname assigned to the default route.
+
+If the Ingress certificate is signed by a private CA, add the CA certificate to the trust store of the external client and the OCI client before logging in. Verify the TLS chain from the external client:
+
+```bash
+openssl s_client \
+  -connect "$REGISTRY_HOST:443" \
+  -servername "$REGISTRY_HOST" \
+  -verify_return_error </dev/null
+```
+
+Write credentials for the generated host:
+
+```bash
+ac registry login \
+  --registry "$REGISTRY_HOST"
+```
 
 ## Expose a Custom Secure Registry Host
 
 Create or provide a TLS Secret in `image-registry-system`, then configure `Config.spec.routes[]`.
 
-Create a file named `registry-custom-route.yaml`:
-
-```yaml
-apiVersion: imageregistry.operator.alauda.io/v1
-kind: Config
-metadata:
-  name: cluster
-spec:
-  managementState: Managed
-  defaultRoute: false
-  routes:
-    - name: public-registry
-      hostname: registry.example.com
-      secretName: registry-tls
-```
-
 The TLS Secret must exist in `image-registry-system` when `secretName` is set.
 
 The generated Ingress uses the registry service as the backend and sets the backend protocol to HTTPS.
 
-Apply the configuration:
+Patch `Config/cluster` with the custom route. Use a merge patch so other `Config/cluster.spec` fields, such as storage and pull-secret settings, are not removed. The `routes` array in this patch replaces the current routes array, so include every custom route that must remain configured:
 
 ```bash
-kubectl apply -f registry-custom-route.yaml
+kubectl patch configs.imageregistry.operator.alauda.io cluster \
+  --type=merge \
+  -p '{
+    "spec": {
+      "managementState": "Managed",
+      "defaultRoute": false,
+      "routes": [
+        {
+          "name": "public-registry",
+          "hostname": "registry.example.com",
+          "secretName": "registry-tls"
+        }
+      ]
+    }
+  }'
 ```
+
+| Value | Description |
+| --- | --- |
+| `public-registry` | Route name. The Operator uses it as the generated Ingress name. |
+| `registry.example.com` | Registry hostname reachable by external clients. The DNS record must resolve to the Ingress controller. |
+| `registry-tls` | TLS Secret in `image-registry-system`. The certificate Subject Alternative Name must match the Registry hostname. |
 
 Verify the configuration and generated Ingress:
 
@@ -83,6 +115,18 @@ Expected results:
 - `Config/cluster.spec.routes[]` contains `public-registry`.
 - The `public-registry` Ingress uses `registry.example.com`.
 - The Ingress references the `registry-tls` Secret.
+
+Verify TLS trust and login:
+
+```bash
+openssl s_client \
+  -connect registry.example.com:443 \
+  -servername registry.example.com \
+  -verify_return_error </dev/null
+
+ac registry login \
+  --registry registry.example.com
+```
 
 ## Configure Client Trust
 
@@ -129,5 +173,5 @@ nerdctl pull registry.example.com/team-a/my-app:external-test
 | Ingress is missing | `Config.spec.defaultRoute`, `Config.spec.routes[]`, and Operator logs. |
 | Ingress has no address | Ingress controller status, ALB project label, and Ingress events. |
 | TLS handshake fails | TLS Secret, client trust store, certificate SANs, and private CA configuration. |
-| Login fails | ACP credentials, namespace RoleBinding, OIDC runtime discovery, and Registry logs. |
+| Login fails | <Term name="productShort" /> credentials, namespace RoleBinding, OIDC runtime discovery, and Registry logs. |
 | Push or pull fails after login | Image namespace permissions, repository path, storage backend, and Registry readiness. |
