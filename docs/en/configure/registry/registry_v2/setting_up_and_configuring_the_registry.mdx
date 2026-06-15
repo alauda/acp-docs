@@ -1,0 +1,360 @@
+---
+weight: 30
+i18n:
+  title:
+    en: "Setting Up and Configuring the Registry"
+---
+
+# Registry v2: Setting Up and Configuring the Registry
+
+Use this page to configure storage, registry request behavior, service account pull credentials, image limits, and scheduled image cleanup for **Registry v2**.
+
+## Prerequisites
+
+- Registry v2 is installed, and `Config/cluster` exists.
+- You have permission to update `configs.imageregistry.operator.alauda.io`, `imagepruners.imageregistry.operator.alauda.io`, `LimitRange`, `ResourceQuota`, and related Kubernetes resources.
+- For persistent storage, prepare the storage backend and required credentials before configuring `Config/cluster`.
+
+## Configure Development Storage
+
+`emptyDir` stores image data on ephemeral Pod storage. Use it only for development or test environments where all pushed image data can be discarded when the Registry Pod is recreated. Do not use `emptyDir` for production or for any environment that must retain images.
+
+Patch `Config/cluster`. The `null` fields remove mutually exclusive storage backends from the current configuration:
+
+```bash
+kubectl patch configs.imageregistry.operator.alauda.io cluster \
+  --type=merge \
+  -p '{
+    "spec": {
+      "managementState": "Managed",
+      "replicas": 1,
+      "storage": {
+        "emptyDir": {},
+        "pvc": null,
+        "s3": null
+      },
+      "resources": {
+        "requests": {
+          "cpu": "500m",
+          "memory": "500Mi"
+        },
+        "limits": {
+          "cpu": "500m",
+          "memory": "500Mi"
+        }
+      }
+    }
+  }'
+```
+
+Verify the configuration and rollout:
+
+```bash
+kubectl get configs.imageregistry.operator.alauda.io cluster -o yaml
+kubectl -n image-registry-system rollout status deployment/image-registry --timeout=300s
+```
+
+Expected results:
+
+- `Config/cluster` reports `Available=True`, `Progressing=False`, and `Degraded=False`.
+- The `image-registry` Deployment rolls out successfully.
+
+## Configure PVC Storage
+
+Use a persistent backend for production. Create a file named `image-registry-pvc.yaml`:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: image-registry
+  namespace: image-registry-system
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: <storage-class-name>
+```
+
+| Placeholder | Description |
+| --- | --- |
+| `<storage-class-name>` | StorageClass that provisions the Registry PVC. Run `kubectl get storageclass` to list available values. For multi-replica Registry deployments, choose storage that supports the required access mode. |
+
+Apply the PVC:
+
+```bash
+kubectl apply -f image-registry-pvc.yaml
+```
+
+Patch `Config/cluster` to use the PVC. Use a merge patch so that other `Config/cluster.spec` fields, such as routes or pull-secret settings, are not removed. The `null` fields remove mutually exclusive storage backends from the current configuration:
+
+```bash
+kubectl patch configs.imageregistry.operator.alauda.io cluster \
+  --type=merge \
+  -p '{
+    "spec": {
+      "managementState": "Managed",
+      "replicas": 1,
+      "storage": {
+        "managementState": "Unmanaged",
+        "emptyDir": null,
+        "pvc": {
+          "claim": "image-registry"
+        },
+        "s3": null
+      },
+      "resources": {
+        "requests": {
+          "cpu": "500m",
+          "memory": "500Mi"
+        },
+        "limits": {
+          "cpu": "500m",
+          "memory": "500Mi"
+        }
+      }
+    }
+  }'
+```
+
+Verify the PVC, configuration, and rollout:
+
+```bash
+kubectl -n image-registry-system get pvc image-registry
+kubectl get configs.imageregistry.operator.alauda.io cluster -o yaml
+kubectl -n image-registry-system rollout status deployment/image-registry --timeout=300s
+```
+
+Expected results:
+
+- The `image-registry` PVC is `Bound`.
+- `Config/cluster` reports `Available=True`, `Progressing=False`, and `Degraded=False`.
+- The `image-registry` Deployment rolls out successfully.
+
+## Configure S3-Compatible Storage Credentials
+
+Create the user-managed storage Secret before configuring `Config/cluster`. The Operator merges this Secret into the Registry private configuration:
+
+```bash
+kubectl -n image-registry-system create secret generic image-registry-private-configuration-user \
+  --from-literal=REGISTRY_STORAGE_S3_ACCESSKEY=<access-key-id> \
+  --from-literal=REGISTRY_STORAGE_S3_SECRETKEY=<secret-access-key>
+```
+
+| Placeholder | Description |
+| --- | --- |
+| `<access-key-id>` | Access key ID for the S3-compatible storage account. Obtain it from the storage administrator. |
+| `<secret-access-key>` | Secret access key for the S3-compatible storage account. Store it only in the Kubernetes Secret. |
+
+Use `disableRedirect: true` when clients cannot reach the object storage endpoint directly and all content must be served through the Registry.
+
+Patch `Config/cluster`. The `null` fields remove mutually exclusive storage backends from the current configuration:
+
+```bash
+kubectl patch configs.imageregistry.operator.alauda.io cluster \
+  --type=merge \
+  -p '{
+    "spec": {
+      "managementState": "Managed",
+      "replicas": 2,
+      "storage": {
+        "managementState": "Unmanaged",
+        "emptyDir": null,
+        "pvc": null,
+        "s3": {
+          "bucket": "<bucket-name>",
+          "region": "<region>",
+          "regionEndpoint": "https://<s3-endpoint>",
+          "trustedCA": {
+            "name": "<trusted-ca-configmap>"
+          }
+        }
+      },
+      "disableRedirect": true
+    }
+  }'
+```
+
+| Placeholder | Description |
+| --- | --- |
+| `<bucket-name>` | Existing object storage bucket or bucket-equivalent container used for Registry blobs. |
+| `<region>` | Region value required by the storage backend. Use the provider value, or the value required by the S3-compatible service. |
+| `<s3-endpoint>` | S3-compatible endpoint reachable from the Registry Pod, without the bucket name. |
+| `<trusted-ca-configmap>` | ConfigMap in `image-registry-system` that contains the CA certificate for the object storage endpoint. Omit `trustedCA` when the endpoint uses a public CA trusted by the Registry Pod. |
+
+Verify the configuration and rollout:
+
+```bash
+kubectl get configs.imageregistry.operator.alauda.io cluster -o yaml
+kubectl -n image-registry-system rollout status deployment/image-registry --timeout=300s
+kubectl -n image-registry-system logs deployment/image-registry -c registry --tail=80
+```
+
+Expected results:
+
+- `Config/cluster` reports `Available=True`, `Progressing=False`, and `Degraded=False`.
+- The Registry logs do not show storage authentication, bucket, endpoint, or certificate errors.
+
+## Configure Managed Service Account Pull Secrets
+
+The Operator includes a managed imagePullSecret controller. When `Config/cluster` is managed, the controller can create, inject, refresh, and remove service account pull secrets for the internal registry.
+
+Patch `Config/cluster` with additional hosts or ignored namespaces. The array fields in this patch replace the current arrays, so include every host and namespace that must remain configured:
+
+```bash
+kubectl patch configs.imageregistry.operator.alauda.io cluster \
+  --type=merge \
+  -p '{
+    "spec": {
+      "managementState": "Managed",
+      "imagePullSecret": {
+        "managementState": "Managed",
+        "additionalRegistryHosts": [
+          "registry.example.com"
+        ],
+        "ignoredNamespaces": [
+          "kube-public"
+        ],
+        "ignoreSystemNamespaces": true
+      }
+    }
+  }'
+```
+
+Verify the configuration:
+
+```bash
+kubectl get configs.imageregistry.operator.alauda.io cluster -o yaml
+```
+
+Expected result:
+
+- `Config/cluster.spec.imagePullSecret` contains the configured management state, additional hosts, and ignored namespace settings.
+
+## Configure Image Limits
+
+In Registry v2, image size and tag-count limits are represented with Kubernetes `LimitRange` and `ResourceQuota` objects. Do not use the legacy Registry gateway limit ConfigMap for Registry v2 deployments.
+
+Create a file named `team-a-image-quota.yaml` for namespace-level quota:
+
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: image-registry-quota
+  namespace: team-a
+spec:
+  hard:
+    alauda.io/imagestreams: "20"
+    alauda.io/images: "200"
+    alauda.io/image-tags: "200"
+```
+
+Apply the quota:
+
+```bash
+kubectl apply -f team-a-image-quota.yaml
+```
+
+Create a file named `team-a-image-limits.yaml` for per-image and per-ImageStream limits:
+
+```yaml
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: image-registry-limits
+  namespace: team-a
+spec:
+  limits:
+    - type: alauda.io/Image
+      max:
+        storage: 1Gi
+    - type: alauda.io/ImageStream
+      max:
+        alauda.io/images: "100"
+        alauda.io/image-tags: "100"
+```
+
+Apply the limits:
+
+```bash
+kubectl apply -f team-a-image-limits.yaml
+```
+
+Verify the quota and limits:
+
+```bash
+kubectl -n team-a get resourcequota image-registry-quota -o yaml
+kubectl -n team-a get limitrange image-registry-limits -o yaml
+```
+
+Expected results:
+
+- The `ResourceQuota` contains the configured Image API limits.
+- The `LimitRange` contains the configured `alauda.io/Image` and `alauda.io/ImageStream` limits.
+
+## Configure Scheduled Image Pruning \{#configure-scheduled-image-pruning}
+
+Create or update the singleton `ImagePruner/cluster` to configure scheduled image pruning. Confirm the retention policy before enabling the schedule because pruning removes unused image metadata.
+
+Create a file named `image-pruner.yaml`:
+
+```yaml
+apiVersion: imageregistry.operator.alauda.io/v1
+kind: ImagePruner
+metadata:
+  name: cluster
+spec:
+  schedule: "0 0 * * *"
+  suspend: false
+  keepTagRevisions: 3
+  keepYoungerThanDuration: 60m
+  resources:
+    requests:
+      cpu: 500m
+      memory: 500Mi
+    limits:
+      cpu: 500m
+      memory: 500Mi
+```
+
+Apply the configuration:
+
+```bash
+kubectl apply -f image-pruner.yaml
+```
+
+Verify the pruner resource and rendered CronJob:
+
+```bash
+kubectl get imagepruners.imageregistry.operator.alauda.io cluster -o yaml
+kubectl -n image-registry-system get cronjob image-pruner
+```
+
+Expected results:
+
+- `ImagePruner/cluster` contains the configured schedule and retention policy.
+- The Operator renders the `image-pruner` CronJob in `image-registry-system`.
+
+Pruning removes unused image metadata. Run registry garbage collection separately when blob storage reclamation is required.
+
+For manual pruning and registry garbage collection commands, see [Managing access and cleanup](./managing_access_and_cleanup.mdx).
+
+## Operate Storage
+
+For PVC-backed Registry storage:
+
+```bash
+kubectl -n image-registry-system get pvc
+kubectl -n image-registry-system describe pvc image-registry
+kubectl get pv
+```
+
+Common actions:
+
+- If a PVC is pending, check StorageClass, access mode, capacity, quotas, and events.
+- If a Registry Pod cannot mount storage, check PV binding, node attachment, and backend storage availability.
+- If image metadata exists but blob data is missing, verify whether the Registry used `emptyDir` or whether the storage backend was changed.
+- Do not delete PVCs, PVs, or object storage data until the data retention decision is confirmed.

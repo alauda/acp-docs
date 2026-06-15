@@ -1,0 +1,218 @@
+---
+weight: 60
+i18n:
+  title:
+    en: "Managing Access and Cleanup"
+---
+
+# Registry v2: Managing Access and Cleanup
+
+Use this page for administrator and namespace administrator tasks, including namespace image access, usage reporting, image pruning, registry garbage collection, and image signature verification.
+
+## Task Index
+
+| Task | Use when |
+| --- | --- |
+| [Grant namespace permissions](#grant-namespace-permissions) | A user or service account needs pull, push, delete, or prune access in an image namespace. |
+| [View usage](#view-usage) | An administrator needs image or ImageStream usage information. |
+| [Verify image signatures](#verify-image-signatures) | An administrator needs to check or save trusted image signature conditions. |
+| [Prune images](#prune-images) | An administrator needs to remove unused image metadata after reviewing a dry run. |
+| [Run registry garbage collection](#run-registry-garbage-collection) | An administrator needs to reclaim unreferenced blobs from Registry storage after metadata cleanup. |
+
+## Prerequisites
+
+- Registry v2 is installed and available.
+- You have `kubectl` and `ac` access to the target cluster.
+- You have permission to create RoleBindings in the image namespace.
+- You have administrator permissions for usage reporting, image pruning, registry garbage collection, and signature verification.
+
+## Grant Namespace Permissions \{#grant-namespace-permissions}
+
+Grant pull permission to a user:
+
+```bash
+kubectl create rolebinding image-puller-user \
+  --clusterrole=system:image-puller \
+  --user=<username> \
+  -n <image-namespace>
+```
+
+Grant push permission to a user:
+
+```bash
+kubectl create rolebinding image-pusher-user \
+  --clusterrole=system:image-pusher \
+  --user=<username> \
+  -n <image-namespace>
+```
+
+Grant pull permission to a service account in another namespace:
+
+```bash
+kubectl create rolebinding image-puller-sa \
+  --clusterrole=system:image-puller \
+  --serviceaccount=<workload-namespace>:<serviceaccount-name> \
+  -n <image-namespace>
+```
+
+| Placeholder | Description |
+| --- | --- |
+| `<username>` | <Term name="productShort" /> or Kubernetes username that needs access to images in the target namespace. |
+| `<image-namespace>` | Namespace that owns the image repository, for example `team-a`. |
+| `<workload-namespace>` | Namespace where the workload service account runs. |
+| `<serviceaccount-name>` | ServiceAccount name used by the workload that pulls the image. |
+
+Verify the RoleBinding and effective access:
+
+```bash
+kubectl -n <image-namespace> get rolebinding
+
+kubectl auth can-i get imagestreams/layers.image.alauda.io \
+  -n <image-namespace> \
+  --as=system:serviceaccount:<workload-namespace>:<serviceaccount-name>
+```
+
+Expected results:
+
+- The RoleBinding exists in the image namespace.
+- The `kubectl auth can-i` command returns `yes` for the service account that should pull images.
+
+Registry v2 uses ImageStream layer authorization:
+
+| Operation | Typical role | Image API permission |
+| --- | --- | --- |
+| Pull | `system:image-puller` | `image.alauda.io` `imagestreams/layers` `get` |
+| Push | `system:image-pusher` | `image.alauda.io` `imagestreams/layers` `update` |
+| Delete | `system:image-deleter` | Image API delete permissions for the target image metadata |
+| Prune | `system:image-pruner` | Image API prune and layer inspection permissions |
+
+## View Usage \{#view-usage}
+
+Show storage and usage statistics for Images:
+
+```bash
+ac adm top images
+```
+
+Show storage and usage statistics for ImageStreams:
+
+```bash
+ac adm top imagestreams
+```
+
+Expected result:
+
+- The command prints usage rows for Image or ImageStream resources visible to the current administrator.
+
+## Verify Image Signatures \{#verify-image-signatures}
+
+Verify the image signature identity recorded on an Image object:
+
+```bash
+ac adm verify-image-signature sha256:<digest> \
+  --expected-identity=registry.example.com/team-a/demo:latest
+```
+
+| Placeholder | Description |
+| --- | --- |
+| `sha256:<digest>` | Digest of the Image object to verify. Use `ac get images` or `ac get imagestreamtags <name>:<tag> -n <namespace> -o wide` to find the digest. |
+| `registry.example.com/team-a/demo:latest` | Expected signed image identity. Use the image reference required by your signing policy. |
+
+Save trusted conditions back to the Image object:
+
+```bash
+ac adm verify-image-signature sha256:<digest> \
+  --expected-identity=registry.example.com/team-a/demo:latest \
+  --save
+```
+
+Verify the saved condition:
+
+```bash
+ac get images.image.alauda.io sha256:<digest> -o yaml
+```
+
+Expected result:
+
+- The Image object contains the trusted signature condition saved by the verification command.
+
+Saving trust conditions changes Image API metadata. To roll back a saved condition, edit the Image object and remove the saved condition, or restore the Image object from a known-good backup.
+
+## Prune Images \{#prune-images}
+
+Confirmed pruning can permanently remove unused image metadata. If you also run registry garbage collection, unreferenced blobs can be permanently reclaimed from storage. Run these commands during a maintenance window, keep required backups, and review dry-run output before adding `--confirm`.
+
+Preview image pruning:
+
+```bash
+ac adm prune images
+```
+
+Expected result:
+
+- The dry run lists prune candidates and does not delete image metadata.
+
+Run pruning after reviewing the dry-run output:
+
+```bash
+ac adm prune images \
+  --keep-tag-revisions=5 \
+  --keep-younger-than=72h \
+  --confirm
+```
+
+Verify pruning:
+
+```bash
+ac adm prune images \
+  --keep-tag-revisions=5 \
+  --keep-younger-than=72h
+```
+
+Expected result:
+
+- A follow-up dry run no longer lists the metadata that was pruned by the confirmed command.
+
+Exclude repositories with an allow-list pattern by using `--whitelist`:
+
+```bash
+ac adm prune images \
+  --whitelist='^cpaas-system/.*' \
+  --confirm
+```
+
+For scheduled pruning, see [Setting up and configuring the registry](./setting_up_and_configuring_the_registry.mdx#configure-scheduled-image-pruning).
+
+Confirmed pruning is not automatically reversible. Restore pruned metadata from backup, recreate metadata from a trusted image source, or re-import the image when recovery is required.
+
+## Run Registry Garbage Collection \{#run-registry-garbage-collection}
+
+Registry garbage collection reclaims unreferenced blobs from Registry storage. Blob reclamation is not reversible from the Registry after it is confirmed.
+
+Run registry garbage collection after metadata cleanup:
+
+```bash
+ac adm registry gc
+ac adm registry gc --confirm
+```
+
+Expected results:
+
+- Without `--confirm`, the command previews garbage-collection candidates.
+- With `--confirm`, the command removes eligible unreferenced blobs from storage.
+
+You can also trigger registry garbage collection as part of pruning:
+
+```bash
+ac adm prune images --confirm --prune-registry
+```
+
+Both `ac adm prune images` and `ac adm registry gc` are dry-run by default. Review the preview before adding `--confirm`.
+
+After confirmed garbage collection, verify critical images by pulling or inspecting them:
+
+```bash
+ac image info registry.example.com/team-a/demo:latest
+```
+
+If a required blob was reclaimed, restore it from backend storage backup or copy the image again from a trusted source.
