@@ -1,0 +1,244 @@
+---
+weight: 74
+---
+
+# Configure Multus multi-NIC networking
+
+This topic describes how to attach ACP distributed storage (Ceph) to dedicated container networks using Multus, so that the Ceph **public** and **cluster** traffic can be separated onto different network interfaces (NICs).
+
+## Overview
+
+By default, an ACP Ceph storage cluster uses the host network (`provider: host`). When you create a storage cluster from the web console, you can also choose **Container Network**, which places Ceph traffic on a single container network (a single `NetworkAttachmentDefinition` assigned to the `rook-ceph` namespace). See [Create a Standard Storage Service](../installation/create_service_stand.mdx) for the basic single-network option.
+
+Multus multi-NIC networking extends the container-network model so that you can map the two Ceph network roles onto **separate** networks:
+
+- **public network** — client traffic between Ceph clients (CSI, applications) and the cluster.
+- **cluster network** — internal traffic between OSDs, such as replication and recovery.
+
+Separating these roles onto different NICs improves isolation and can prevent heavy replication/recovery traffic from competing with client I/O.
+
+### Two management surfaces \{#two-management-surfaces}
+
+ACP provides a legacy and a new web console, which manage Ceph storage through **different** resources. Configure the network on the resource that manages your cluster:
+
+| Web console | Managing resource | Where to set the network |
+| :--- | :--- | :--- |
+| New web console | `StorageCluster` (managed by the storage operator) | `StorageCluster.spec.ceph.network` — the operator maps it to the underlying `CephCluster.spec.network` |
+| Legacy web console | `CephCluster` (Rook, managed directly) | `CephCluster.spec.network` |
+
+To determine which resource manages a given cluster, check whether a `StorageCluster` exists:
+
+```bash
+kubectl get storagecluster -A
+```
+
+- If a `StorageCluster` exists for your cluster, it is managed by the new console — configure the network on the **StorageCluster** (the operator reverts manual edits to the underlying `CephCluster`).
+- If no `StorageCluster` exists, the cluster is managed directly as a **CephCluster** by the legacy console — configure the network on the `CephCluster`.
+
+Both resources expose the same network fields (`provider`, `selectors`, `addressRanges`). The sections below give the manifest for each surface.
+
+The network role to network mapping is declared with `selectors`:
+
+| Selector key | Ceph role | Backing network |
+| :--- | :--- | :--- |
+| `public` | Ceph public network | A `NetworkAttachmentDefinition` (NAD) referenced as `<namespace>/<nad-name>` |
+| `cluster` | Ceph cluster (replication) network | A `NetworkAttachmentDefinition` (NAD) referenced as `<namespace>/<nad-name>` |
+
+You can specify only `public`, or both `public` and `cluster`. At least one selector is required when `provider` is `multus`.
+
+## Limitations and prerequisites
+
+Before you configure Multus multi-NIC networking, note the following restrictions:
+
+- **Creation-time only**
+  - Multus multi-NIC networking must be configured **when the storage cluster is created**. Changing the network provider on a running cluster is **not supported**: Ceph must fail over all monitors to apply a new network model, and the API rejects switching directly from one non-empty provider to another (the provider must first be reverted to an empty value). Treat the network model as a fixed property of the cluster.
+
+- **Multus CNI plugin installed**
+  - The cluster must use Kube-OVN as its network plugin, and the Multus CNI plugin must be installed. This is a one-time, cluster-wide setup. To install it, navigate to **Administrator** > **Marketplace** > **Cluster Plugins**, search for `multus`, and install **Alauda Container Platform Networking for Multus**. For details, see [Configuring Kube-OVN Network to Support Pod Multi-Network Interfaces](/networking/how_to/kube_ovn/multiple_networks.mdx).
+
+- **Single IP family**
+  - A Multus network must use a single IP family. IPv4 and IPv6 are both supported, but dual-stack (IPv4 and IPv6 together) is not supported with Multus. To use IPv6, set `ipFamily: IPv6` in the network block.
+  - This differs from the basic **Container Network** option in [Create a Standard Storage Service](../installation/create_service_stand.mdx), which does not support IPv6. That restriction applies only to that single-network form option; the Multus multi-NIC procedure described here does support IPv6.
+
+:::warning
+When Ceph uses a Multus network, only clients that are attached to the same Multus network can reach the storage; reachability is bound to the underlay network and its routing. A restart or failure of the Ceph CSI Pod may also cause a temporary service interruption. Plan the network roles, NADs, and operational ownership before deployment.
+:::
+
+## Configure multi-NIC networking at cluster creation
+
+The multi-NIC settings cannot be expressed in the wizard's form fields, but the **Create Cluster** wizard provides a **YAML mode**. The recommended flow is to complete the wizard as usual so it auto-populates the manifest, then switch to YAML mode, edit only the network section, and submit from YAML mode. This avoids hand-writing the full manifest.
+
+The manifest shown in YAML mode depends on your console (see [Two management surfaces](#two-management-surfaces)): the new console shows a `StorageCluster`, the legacy console shows a `CephCluster`. Edit the network block at the path that matches.
+
+<Steps>
+
+### Create the Multus networks
+
+To put storage traffic on dedicated physical NICs at near-host speed, use a **Kube-OVN Underlay** network rather than an overlay one. Underlay bridges a dedicated physical NIC directly to the storage network, with no encapsulation overhead.
+
+Underlay requires the physical network to be prepared first: each storage node needs a dedicated NIC (not carrying other traffic such as SSH), and the upstream switch port/VLAN and gateway must be configured. Then create a **bridge network** (`ProviderNetwork`) and a **VLAN** (`Vlan`) that the storage subnet will attach to. For the physical prerequisites and how to create the bridge network and VLAN, see [Preparing the Kube-OVN Underlay Physical Network](/networking/how_to/kube_ovn/kubeovn_underlay_py.mdx) and [Configure Subnet](/networking/functions/configure_subnet.mdx#kube_ovn_underlay_network).
+
+For each Ceph network role you want to isolate, create a `NetworkAttachmentDefinition` in the `rook-ceph` namespace and a backing underlay subnet. The following creates the **public** network; repeat with different names and a different CIDR/VLAN for the **cluster** network if you also want to separate replication traffic.
+
+Create the `NetworkAttachmentDefinition`. The `provider` field must use the `<name>.<namespace>.ovn` format:
+
+```yaml
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: ceph-public-net
+  namespace: rook-ceph
+spec:
+  config: |-
+    {
+      "cniVersion": "0.3.0",
+      "type": "kube-ovn",
+      "server_socket": "/run/openvswitch/kube-ovn-daemon.sock",
+      "provider": "ceph-public-net.rook-ceph.ovn"
+    }
+```
+
+Create the underlay Kube-OVN subnet that provides addresses for that network. Set `vlan` to the `Vlan` you prepared, use a `cidrBlock`/`gateway` that match the physical network, and make `provider` match the one in the `NetworkAttachmentDefinition`:
+
+```yaml
+apiVersion: kubeovn.io/v1
+kind: Subnet
+metadata:
+  name: ceph-public-net
+spec:
+  protocol: IPv4
+  cidrBlock: 192.168.10.0/24
+  gateway: 192.168.10.1
+  vlan: ceph-public-vlan
+  provider: ceph-public-net.rook-ceph.ovn
+```
+
+Apply both resources, then confirm the `NetworkAttachmentDefinition` exists:
+
+```bash
+kubectl get net-attach-def -n rook-ceph
+```
+
+The `selectors` you set in a later step reference these NADs in `<namespace>/<name>` form, for example `rook-ceph/ceph-public-net`.
+
+### Open the Create Cluster wizard
+
+Start creating a distributed storage cluster as described in [Create a Standard Storage Service](../installation/create_service_stand.mdx). On the **Create Cluster** step, configure device classes, storage devices, and component placement as usual so the wizard fills in the rest of the manifest.
+
+### Switch to YAML mode
+
+Toggle the wizard from form mode to **YAML** mode. The manifest is already populated from your selections.
+
+### Edit the network section
+
+Add or replace the network block in the manifest. Set `provider: multus` and the `selectors` that map the Ceph public/cluster roles to your NADs.
+
+- **New web console** — the manifest is a `StorageCluster`; edit `spec.ceph.network`:
+
+  ```yaml
+  spec:
+    ceph:
+      network:
+        provider: multus
+        selectors:
+          public: rook-ceph/ceph-public-net
+          cluster: rook-ceph/ceph-cluster-net
+  ```
+
+- **Legacy web console** — the manifest is a `CephCluster`; edit `spec.network` (same fields, without the `spec.ceph` wrapper):
+
+  ```yaml
+  spec:
+    network:
+      provider: multus
+      selectors:
+        public: rook-ceph/ceph-public-net
+        cluster: rook-ceph/ceph-cluster-net
+  ```
+
+If you only need to move client traffic onto a dedicated network, keep just the `public` selector and omit `cluster`.
+
+To pin CIDR ranges (when Rook's auto-detection is unreliable), add an `addressRanges` block at the same level as `selectors`:
+
+```yaml
+addressRanges:
+  public:
+    - 192.168.10.0/24
+  cluster:
+    - 192.168.20.0/24
+```
+
+### Submit from YAML mode
+
+Submit the wizard while still in YAML mode (click **Create Cluster**). Do not switch back to form mode before submitting, as it may not preserve the network fields.
+
+:::warning
+On the new console, configure the network here in the `StorageCluster`, not by editing the `CephCluster` afterwards. When a cluster is managed by a `StorageCluster`, `spec.network` is a managed field and manual edits to the `CephCluster` are reverted by the operator.
+:::
+
+</Steps>
+
+## Verification
+
+After the storage cluster is created, verify the network configuration from both the ACP and Ceph sides.
+
+### (New console) Check the StorageCluster network settings
+
+If your cluster is managed by a `StorageCluster`, confirm the desired configuration:
+
+```bash
+kubectl get storagecluster ceph-storage -n rook-ceph -o yaml
+```
+
+The output should contain the expected provider and selectors:
+
+```yaml
+spec:
+  ceph:
+    network:
+      provider: multus
+      selectors:
+        public: rook-ceph/ceph-public-net
+        cluster: rook-ceph/ceph-cluster-net
+```
+
+### Check the effective CephCluster network settings
+
+This check applies to both consoles, because the `CephCluster` is the resource Rook acts on:
+
+```bash
+kubectl get cephcluster ceph-cluster -n rook-ceph -o jsonpath='{.spec.network}' | jq
+```
+
+The `provider` and `selectors` should match what you configured. On the new console, they should also match the managing `StorageCluster`.
+
+### Check that Ceph Pods are attached to the networks
+
+Confirm that the Ceph daemon Pods (for example, MON and OSD) carry the Multus network attachment annotation and report the expected interfaces:
+
+```bash
+kubectl get pod -n rook-ceph -l app=rook-ceph-osd \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.annotations.k8s\.v1\.cni\.cncf\.io/networks}{"\n"}{end}'
+```
+
+Each OSD Pod should reference the public (and, if configured, cluster) network.
+
+### Check workload mounts
+
+Create or restart a test workload that mounts a CephFS PVC and an RBD PVC, then verify:
+
+- the Pod starts successfully
+- the filesystem can be read and written
+- no mount-related errors appear in CSI or workload logs
+
+## Troubleshooting suggestions
+
+If the storage cluster fails to become healthy after enabling Multus, check the following items first:
+
+1. **NAD does not exist** — the `NetworkAttachmentDefinition` referenced by a selector is missing from the `rook-ceph` namespace, or the `<namespace>/<nad-name>` reference is misspelled.
+2. **Missing selector** — `provider: multus` is set but no `public` or `cluster` selector is defined. At least one selector is required.
+3. **CIDR detection failures** — Rook cannot auto-detect the network range. Specify `addressRanges` explicitly.
+4. **IP exhaustion** — the IPAM pool backing the NAD (for example, the configured CIDR or address range) has no free addresses for new Ceph Pods.
+5. **Client reachability** — a client is not attached to, or cannot route to, the underlay network. With Multus networking, the storage endpoints live on the underlay network, so clients must be on that network or have routes to it.
+
+If the cluster cannot be recovered, recreate it with a corrected network configuration. Because the network model cannot be switched on a running cluster, network mistakes are resolved by recreating the storage cluster rather than by patching it in place.
