@@ -7,6 +7,10 @@ sourceSHA: 00aae36df1b13f6ea25df3e8f77cbbe339bc28a55c915bb2a31eb0d1c9b9591b
 
 Data disks can be used to meet the data persistence requirements of the business.
 
+> In the **new console**, data disks are managed from **Virtualization > Virtual Disks** (the **Virtual Disk** tab); a virtual machine's disks also appear on its **detail page**. The procedures below describe the classic console; each operation also has an equivalent API call shown under **Using the API**.
+
+A data disk is backed by a CDI `DataVolume` (which provisions a PVC of the same name). The operations below map to: create a `DataVolume`, hot-plug it to a virtual machine (`addvolume`), expand its PVC, detach it (`removevolume`), and delete the `DataVolume`.
+
 ## Creating a Virtual Disk
 
 Create a **data disk** for the virtual machine. Only **one** virtual disk can be added at a time; if multiple disks are needed, please repeat this operation.
@@ -32,6 +36,35 @@ Create a **data disk** for the virtual machine. Only **one** virtual disk can be
 
 5. Click on **Create**.
 
+### Using the API
+
+Create a blank data disk as a `DataVolume`:
+
+```yaml
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: datadisk-1
+  namespace: demo
+spec:
+  source:
+    blank: {}
+  storage:
+    resources:
+      requests:
+        storage: 10Gi
+    storageClassName: rbd-1
+    volumeMode: Block
+    accessModes:
+      - ReadWriteMany
+```
+
+```bash
+kubectl apply -f datadisk.yaml
+# wait for the DataVolume to reach Succeeded and its PVC to be Bound
+kubectl get datavolume datadisk-1 -n demo -w
+```
+
 ## Mounting a Virtual Disk
 
 Mount the **data disk** to a virtual machine, attaching the already created virtual disk to the target virtual machine.
@@ -47,6 +80,16 @@ Mount the **data disk** to a virtual machine, attaching the already created virt
 3. Click ⋮ > **Mount** next to the virtual disk to be mounted.
 
 4. Select the target virtual machine and click **Mount**.
+
+### Using the API
+
+Hot-plug the disk into a running virtual machine. With `virtctl`, use `--persist` so the disk is added to the virtual machine spec and survives a restart:
+
+```bash
+virtctl addvolume vm web-01 --volume-name=datadisk-1 --persist -n demo
+```
+
+This issues the `addvolume` subresource request (`AddVolumeOptions`). The disk then appears in `VirtualMachineInstance.status.volumeStatus` and progresses from `AttachedToNode` to `Ready`. Without `--persist`, the hot-plug applies to the running instance only and does not survive a restart.
 
 ## Expanding a Virtual Disk
 
@@ -64,6 +107,17 @@ Expand the **system disk** and **data disk** already mounted to the virtual mach
 
 5. Enter the new capacity and click **Expand**.
 
+### Using the API
+
+Patch the PVC's requested size (the StorageClass must allow volume expansion):
+
+```bash
+kubectl patch pvc datadisk-1 -n demo --type merge \
+  -p '{"spec":{"resources":{"requests":{"storage":"20Gi"}}}}'
+```
+
+`status.capacity.storage` grows to the new size; CSI drivers such as Ceph RBD expand online (no restart needed).
+
 ## Unmounting a Virtual Disk
 
 Unmount the **data disk** from the virtual machine; only virtual machines in the **stopped** state can unmount disks.
@@ -75,6 +129,16 @@ Unmount the **data disk** from the virtual machine; only virtual machines in the
 2. In the left navigation bar, click on **Virtualization** > **Virtual Disk**.
 
 3. Click ⋮ > **Unmount** next to the virtual disk to be unmounted and confirm.
+
+### Using the API
+
+Detach the hot-plugged disk:
+
+```bash
+virtctl removevolume vm web-01 --volume-name=datadisk-1 -n demo
+```
+
+This issues the `removevolume` subresource and the disk is detached (the entry leaves `VirtualMachineInstance.status.volumeStatus`). The KubeVirt API supports detaching from a **running** virtual machine, but make sure the disk is no longer in use inside the guest (unmounted at the OS level) before removing it, to avoid data loss.
 
 ## Deleting a Virtual Disk
 
@@ -89,3 +153,11 @@ Deletion is only supported when the virtual disk is in an unmounted state.
 2. In the left navigation bar, click on **Virtualization** > **Virtual Disk**.
 
 3. Click ⋮ > **Delete** next to the virtual disk to be deleted and confirm.
+
+### Using the API
+
+```bash
+kubectl delete datavolume datadisk-1 -n demo
+```
+
+The backing PVC is owned by the `DataVolume` and is garbage-collected with it. If CDI already garbage-collected the `DataVolume`, delete the PVC directly (`kubectl delete pvc datadisk-1 -n demo`).
