@@ -1,0 +1,98 @@
+---
+weight: 25
+---
+
+# Cloning a Virtual Machine
+
+Cloning creates a full copy of an existing virtual machine — including its specification, disks, and network configuration — as a new virtual machine in the **same namespace**. ACP implements this with the KubeVirt `VirtualMachineClone` (`clone.kubevirt.io/v1beta1`) resource, which performs the copy asynchronously through an internal snapshot → restore.
+
+This is different from cloning a **bootable volume** (a PVC or snapshot data source): a VM clone reproduces the whole machine, whereas a bootable-volume clone only duplicates a disk image.
+
+## Notes
+
+- **Same namespace only.** `VirtualMachineClone.spec.target` has no namespace field, so the new virtual machine is always created in the source's namespace. To copy a virtual machine to another namespace, export and re-import it instead.
+- **The new virtual machine appears asynchronously.** Submitting the clone returns immediately; the target is created as the snapshot → restore completes (`status.phase` progresses to `Succeeded`).
+- **Cloning a stopped virtual machine is the most reliable**, because the disk state is quiescent.
+- **MAC addresses are reset by default** so the clone does not conflict with the source on the network.
+- **Kube-OVN networks**: the clone always filters out the source `ovn.kubernetes.io/*` pod annotations so the new virtual machine requests a fresh IP instead of inheriting (and conflicting with) the source IP.
+- **Permission**: cloning requires the `create` verb on `virtualmachineclones`.
+
+## Clone a virtual machine
+
+<Tabs>
+<Tab label="Web Console">
+
+1. In the left navigation bar, click **Virtualization** > **Virtual Machines**.
+
+2. Start the clone from either entry point:
+
+   - On the virtual machine's **detail** page, click **Actions** > **Clone**; or
+   - In the virtual machine **row** of the list, click the ⋮ icon and select **Clone**.
+
+3. In the **Clone Virtual Machine** dialog, configure the copy:
+
+   | Parameter | Description |
+   | :-- | :-- |
+   | **Name** | Name of the new virtual machine. Prefilled with `<source-name>-clone`; must be unique in the namespace. |
+   | **Reset MAC Address** | Enabled by default. The cloned network interfaces get newly generated MAC addresses to avoid conflicts with the source. Disable only if you intend to keep the source MAC addresses (not recommended on shared networks). |
+   | **Label / Annotation Filters** (optional) | Restrict which labels and annotations are copied to the new virtual machine. Leave empty to copy all. |
+
+4. Click **Clone**. A "clone started" message appears and the dialog closes.
+
+5. Return to the **Virtual Machines** list and wait for the new virtual machine to appear and reach the **Stopped** or **Running** state.
+
+</Tab>
+<Tab label="API / CLI">
+
+Create a `VirtualMachineClone` object in the source namespace. The example below clones `web-01` to `web-01-clone`, resets MAC addresses (`newMacAddresses: {}`), and strips Kube-OVN annotations from the pod template so the clone gets a fresh IP:
+
+```yaml
+apiVersion: clone.kubevirt.io/v1beta1
+kind: VirtualMachineClone
+metadata:
+  name: web-01-clone
+  namespace: demo
+spec:
+  source:
+    apiGroup: kubevirt.io
+    kind: VirtualMachine
+    name: web-01
+  target:
+    apiGroup: kubevirt.io
+    kind: VirtualMachine
+    name: web-01-clone
+  # Empty object = clear and regenerate all interface MAC addresses (default behavior).
+  newMacAddresses: {}
+  # Kube-OVN: drop the source IP annotations so the clone requests a new address.
+  template:
+    annotationFilters:
+      - "!ovn.kubernetes.io/*"
+```
+
+Apply it and watch the clone progress to `Succeeded`:
+
+```bash
+kubectl apply -f vmclone.yaml
+kubectl get virtualmachineclone web-01-clone -n demo \
+  -o jsonpath='{.status.phase}{"\n"}'
+```
+
+When `status.phase` is `Succeeded`, the new virtual machine `web-01-clone` exists in the `demo` namespace. `status.restoreName` and `status.snapshotName` reference the intermediate restore and snapshot objects created during the operation.
+
+To copy only a subset of metadata, set the top-level `labelFilters` / `annotationFilters` (they filter the **virtual machine** object's own labels/annotations; `template.*` filters the **pod template** metadata):
+
+```yaml
+spec:
+  labelFilters:
+    - "*"
+    - "!some/transient-label"
+  annotationFilters:
+    - "*"
+```
+
+</Tab>
+</Tabs>
+
+## Related operations
+
+After the clone reaches **Running**, manage it like any other virtual machine — see [Managing Virtual Machines](./virtual_management.mdx). Because MAC addresses (and, on Kube-OVN, the IP) are regenerated, verify the new virtual machine's network configuration if your guest pins addresses internally.
