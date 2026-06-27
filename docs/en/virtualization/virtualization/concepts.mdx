@@ -1,0 +1,93 @@
+---
+weight: 12
+---
+
+# Concepts and Glossary
+
+This page is for administrators who are fluent in Kubernetes but new to virtualization. The rest of the manual assumes the terms below; each is defined once here, with the closest Kubernetes analogy, so the how-to pages stay short.
+
+## How it fits together
+
+Virtualization on this platform is KubeVirt and CDI, deployed and reconciled by one operator:
+
+- **HyperConverged (HCO)** — the `HyperConverged` custom resource is the single source of truth. The operator installs and continuously reconciles KubeVirt and CDI from it, so cluster-wide settings (for example live-migration limits) are set on `HyperConverged`, **not** directly on the `KubeVirt` resource. Analogy: a top-level operator CR, like an `Installation`/`Subscription` that owns everything below it.
+- **KubeVirt** — runs the virtual machines. Its controllers are **virt-controller** (cluster-level, schedules VMs), **virt-handler** (a DaemonSet, one per node, like the kubelet for VMs), and **virt-launcher** (one pod per running VM that wraps the QEMU process).
+- **CDI (Containerized Data Importer)** — imports and clones disk images into PVCs. It is the engine behind bootable volumes and VM disks.
+
+A running virtual machine is therefore an ordinary **Pod** (the virt-launcher pod) on an ordinary node, holding an ordinary **PVC** for its disk and getting an ordinary **Pod IP** — which is why your existing Kubernetes tooling (RBAC, NetworkPolicy, scheduling, monitoring) still applies.
+
+## Compute objects
+
+| Term | What it is | Kubernetes analogy |
+| :-- | :-- | :-- |
+| **VirtualMachine** (`kubevirt.io/v1`) | The desired-state definition of a VM (CPU, memory, disks, network, whether it should be running). | A `Deployment` — the spec you create and edit. |
+| **VirtualMachineInstance (VMI)** | The *running* instance produced when a `VirtualMachine` is started. Lifecycle subresources (console, VNC, pause, migrate) act on the VMI. | A `Pod` — created from the spec, exists only while running. |
+| **virt-launcher pod** | The pod that wraps one running VM's QEMU process. | The Pod that actually executes the workload. |
+| **`spec.running`** | Boolean power switch on the `VirtualMachine` (`true` starts it, `false` stops it). This platform uses this field. | `replicas: 1` vs `0`. |
+| **`spec.runStrategy`** | The upstream alternative to `spec.running` (`Always` / `RerunOnFailure` / `Manual` / `Halted`) for finer restart behavior. | A restart policy. |
+| **instancetype** | A reusable, cluster-wide CPU/memory profile a VM can reference instead of inline resources. | A sizing preset / `LimitRange`-like template. |
+| **preference** | A reusable profile of OS-specific device/firmware defaults (bus types, clock, features). | A device/firmware "profile" applied to the VM. |
+| **QEMU guest agent** | An agent installed *inside* the guest OS. Enables IP reporting, graceful shutdown, and filesystem freeze for application-consistent snapshots. Without it, the platform cannot see the guest IP and online snapshots are only crash-consistent. | A sidecar/agent inside the workload that reports health and responds to signals. See [Installing Guest Tools](./virtual_machine/how_to/guest_tools.mdx). |
+| **vTPM** | A virtual TPM 2.0 device (`spec.template.spec.domain.devices.tpm`). Required by Windows 11 and BitLocker. | A virtual security device attached to the VM. |
+
+## Images and disks
+
+A VM boots from a **disk** that is cloned from a reusable **image**. The chain is:
+
+```
+remote image (HTTP / registry / S3)  ──CDI import──▶  PVC (a DataVolume)  ──published as──▶  DataSource (a "bootable volume")  ──cloned at VM create──▶  the VM's boot disk
+```
+
+| Term | What it is | Kubernetes analogy |
+| :-- | :-- | :-- |
+| **qcow2 / raw** | Disk-image file formats. `qcow2` is sparse/copy-on-write; `raw` is a flat image. This is the *content* you import, not a container image. | A disk image artifact, like an OS cloud image. |
+| **containerDisk** | A VM disk packaged *inside* a container image and pulled like one. Note: a normal application container image is **not** a containerDisk and will not boot. | An OCI image whose payload is a bootable disk. |
+| **CDI / DataVolume** | A `DataVolume` (`cdi.kubevirt.io/v1beta1`) declares "import this image into a PVC"; CDI does the import and creates the backing PVC. | A PVC plus an init job that populates it. |
+| **DataSource / bootable volume** | A `DataSource` (`cdi.kubevirt.io/v1beta1`) points at a golden-image PVC. In the new console it is shown as a **Bootable Volume**; creating a VM clones it into the VM's boot disk. | A read-only "golden" PVC used as a template. See [Bootable Volumes](./virtual_machine/bootable_volume.mdx). |
+| **volumeMode: Block vs Filesystem** | How the PVC is presented. **Block** performs closer to bare metal and is preferred for VM disks; Filesystem also works. | The PVC `volumeMode` you already know. |
+| **StorageProfile / cloneStrategy** | A CDI-published object per StorageClass describing supported access/volume modes and how clones are made (`csi-clone`, `snapshot`, or host-assisted `copy`). | Capabilities metadata for a StorageClass. See [Managing Virtual Disks](./storage/functions/virtual_disk.mdx). |
+
+A fresh cluster has **no** bootable volumes until an administrator imports one (or publishes golden images into `kube-public`). Start at [Bootable Volumes](./virtual_machine/bootable_volume.mdx).
+
+## Networking
+
+By default a VM runs in a virt-launcher **Pod** and uses that Pod's network — so it gets a Pod IP and is subject to the same CNI and `NetworkPolicy` as any Pod. The create form's **Network Mode** maps to a KubeVirt binding:
+
+| UI label | YAML binding | Behavior |
+| :-- | :-- | :-- |
+| **Bridged** | `bridge: {}` | The VM takes over the Pod's network interface and **uses the Pod IP directly**. Required for some protocols; not compatible with live migration. |
+| **NAT** | `masquerade: {}` | The VM gets a private internal IP and is NAT'd out through the Pod IP. The default; live-migration friendly. |
+
+> "**Container group**" in the UI means the Kubernetes **Pod** that backs the VM.
+
+For a routable IP on the physical network (instead of a Pod IP), use a Kube-OVN **Underlay** subnet or an auxiliary NIC. Secondary NICs attach via a `NetworkAttachmentDefinition` (Multus).
+
+## Migration and availability
+
+| Term | What it is | Kubernetes analogy |
+| :-- | :-- | :-- |
+| **Live / hot migration** | Moving a *running* VM to another node with no downtime, by copying its memory. **Pre-copy** copies memory iteratively while the VM runs; **post-copy** finishes copying after the VM is already on the target. | Rescheduling a Pod without restarting the process — which Pods cannot normally do. See [Hot Migration](./virtual_machine/how_to/vm_precopy.mdx). |
+| **VirtualMachineInstanceMigration** | The request object that triggers one live migration; deleting it cancels an in-progress migration. | A one-shot Job that moves the VMI. |
+| **MigrationPolicy** | Cluster-scoped overrides (per namespace/VM) for migration tuning. Cluster defaults live on `HyperConverged.spec.liveMigrationConfig`. | A policy CR selected by labels. |
+| **evictionStrategy** | What happens on node drain: `LiveMigrate`, `LiveMigrateIfPossible`, or `None`. A non-migratable VM (RWO storage or device passthrough) with `LiveMigrate` **blocks the drain** — and therefore cluster upgrades. | A `PodDisruptionBudget`-like constraint, but it migrates instead of just blocking. See [High Availability](./virtual_machine/how_to/vm_availability.mdx). |
+| **Live migration requires shared storage** | A VM can only live-migrate when all its disk PVCs use **ReadWriteMany (RWX)** access mode (for example CephRBD in Block mode). | RWX vs RWO PVCs — the same concept. |
+| **Storage migration** | Moving a running VM's disks between StorageClasses online. | Re-homing a PVC to a different StorageClass without downtime. |
+
+## Backup and recovery
+
+| Term | What it is | Kubernetes analogy |
+| :-- | :-- | :-- |
+| **VirtualMachineSnapshot / VirtualMachineRestore** | Point-in-time snapshot of a VM's disks (and config) and its restore object. Backed by CSI `VolumeSnapshot`. | A `VolumeSnapshot`, scoped to the whole VM. |
+| **crash-consistent vs application-consistent** | Without the guest agent a snapshot is *crash-consistent* (like pulling the power). With the guest agent the filesystem is quiesced first, giving an *application-consistent* snapshot. | The fsfreeze distinction familiar from storage backups. |
+
+## Where to start
+
+A first-time path through the manual:
+
+1. [Install](./installation.mdx) — enable virtualization and deploy the HCO operator.
+2. [Bootable Volumes](./virtual_machine/bootable_volume.mdx) — import a usable OS image (a fresh cluster has none).
+3. [Creating Virtual Machines](./virtual_machine/functions/create_virtual_machine.mdx) — create your first VM from that image.
+4. [Serial Console](./virtual_machine/functions/console_access.mdx) — log in (cloud images have no default password; use the SSH key or password you set at create time).
+5. [Managing Virtual Disks](./storage/functions/virtual_disk.mdx) — attach a data disk.
+
+The [overview](./overview/intro.mdx) also has a "Console feature → API object" mapping table, and every how-to page carries a copy-pasteable **Using the API** block.
