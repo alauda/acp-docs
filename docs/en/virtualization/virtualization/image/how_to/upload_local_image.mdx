@@ -1,0 +1,338 @@
+---
+weight: 10
+---
+
+# Uploading a Local Image and Creating a Virtual Machine
+
+Use this procedure when you already have a virtual machine disk image **on your local
+machine** (for example a `qcow2`, `raw`, or `img` file downloaded from an OS vendor) and want
+to run a virtual machine from it, rather than importing the image from a remote HTTP, registry,
+or S3 source.
+
+On Alauda Container Platform this is a **command-line workflow** built on the KubeVirt
+`virtctl` client and the CDI upload proxy — the web console does not yet offer a local-upload
+source. The uploaded image is stored as a `DataSource` (a **bootable volume**) that virtual
+machines can boot from and that can be reused by many virtual machines.
+
+> **Tip**: If instead you want to **install** an operating system from an ISO, see
+> [Creating Linux Images Based on ISO](./vm_iso_linux.mdx) and
+> [Creating Windows Images Based on ISO](./vm_iso_windows.mdx).
+
+## Prerequisites
+
+- The `virtctl` command-line client is installed and matches the cluster's KubeVirt version.
+  `virtctl` is the standard KubeVirt CLI; download the binary that matches your cluster from the
+  KubeVirt releases and place it on your `PATH`.
+- The `kubectl` command-line tool is installed and configured to access the cluster.
+- A local disk image in `qcow2`, `raw`, or `img` format. To speed up the upload, compress the
+  image first with `virt-sparsify`, `xz`, or `gzip`.
+- A `StorageClass` that supports the `ReadWriteOnce` (RWO) access mode.
+- The `cdi-uploadproxy` Service (in the `kubevirt` namespace) is reachable from where you run
+  `virtctl` — see Step 1.
+
+## Procedure
+
+<Steps>
+
+### Expose the CDI upload proxy outside the cluster
+
+`virtctl image-upload` streams the image to the `cdi-uploadproxy` Service, which is an internal
+`ClusterIP` Service in the `kubevirt` namespace. You must make it reachable from where you run
+`virtctl`.
+
+> **Note**: On OpenShift, CDI automatically discovers an OpenShift `Route` to `cdi-uploadproxy`
+> and fills in the upload URL for you. Alauda Container Platform runs on upstream Kubernetes,
+> which has no `Route` resource, so you expose the Service yourself (this step) and set the
+> upload URL explicitly (Step 2).
+
+<Tabs>
+
+<Tab label="Gateway API (recommended)">
+
+The Gateway API (backed by Envoy Gateway) is the recommended way to expose a Service on Alauda
+Container Platform. Use a **TLS passthrough** listener so that `virtctl` negotiates TLS directly
+with `cdi-uploadproxy` (which serves its own certificate).
+
+1. Save the following to `cdi-uploadproxy-gateway.yaml`. Co-locating the `Gateway` and
+   `TLSRoute` in the `kubevirt` namespace (the same namespace as the Service) avoids the need
+   for a `ReferenceGrant`. Replace the host name with one that resolves to the Gateway's
+   external address.
+
+   ```yaml
+   apiVersion: gateway.networking.k8s.io/v1
+   kind: Gateway
+   metadata:
+     name: cdi-uploadproxy-gw
+     namespace: kubevirt
+   spec:
+     gatewayClassName: envoy-gateway-operator-cpaas-default # use your cluster's GatewayClass
+     listeners:
+       - name: tls
+         protocol: TLS
+         port: 8443
+         hostname: cdi-uploadproxy.example.com
+         tls:
+           mode: Passthrough
+         allowedRoutes:
+           kinds:
+             - kind: TLSRoute
+           namespaces:
+             from: Same
+   ---
+   apiVersion: gateway.networking.k8s.io/v1alpha2
+   kind: TLSRoute
+   metadata:
+     name: cdi-uploadproxy-route
+     namespace: kubevirt
+   spec:
+     parentRefs:
+       - name: cdi-uploadproxy-gw
+     hostnames:
+       - cdi-uploadproxy.example.com
+     rules:
+       - backendRefs:
+           - name: cdi-uploadproxy
+             port: 443
+   ```
+
+   ```bash
+   kubectl apply -f cdi-uploadproxy-gateway.yaml
+   ```
+
+2. Confirm the route resolves and the Gateway has an address.
+
+   ```bash
+   kubectl get tlsroute cdi-uploadproxy-route -n kubevirt -o yaml   # Accepted=True, ResolvedRefs=True
+   kubectl get gateway  cdi-uploadproxy-gw   -n kubevirt            # PROGRAMMED=True, ADDRESS populated
+   ```
+
+   > **Note**: The Gateway needs an external address. If the cluster has **MetalLB** configured
+   > with an `IPAddressPool`, the Gateway's `LoadBalancer` Service receives an IP automatically.
+   > Without MetalLB the `LoadBalancer` Service stays pending (Gateway `PROGRAMMED=False`,
+   > `AddressNotAssigned`); configure the Gateway's Envoy Service as `NodePort` (via an
+   > `EnvoyProxy` resource referenced by the Gateway) and reach it at `https://<node-ip>:<nodePort>`.
+
+3. Verify that the proxy answers through the Gateway (the certificate is self-signed, so use
+   `-k`):
+
+   ```bash
+   curl -k https://cdi-uploadproxy.example.com:8443/healthz
+   # -> OK
+   ```
+
+</Tab>
+
+<Tab label="Ingress (ingress-nginx)">
+
+If the cluster uses `ingress-nginx-controller`, expose the proxy with an SSL-passthrough
+`Ingress` so TLS terminates at `cdi-uploadproxy`:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cdi-uploadproxy
+  namespace: kubevirt
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-passthrough: "true"
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: cdi-uploadproxy.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cdi-uploadproxy
+                port:
+                  number: 443
+```
+
+> **Note**: The legacy ALB ingress (`cpaas.io/alb2`) is deprecated; use `ingress-nginx-controller`
+> or, where available, the Gateway API.
+
+</Tab>
+
+<Tab label="LoadBalancer Service">
+
+When **MetalLB** (or another load-balancer provider) is available, expose the proxy directly:
+
+```bash
+kubectl expose service cdi-uploadproxy -n kubevirt \
+  --name=cdi-uploadproxy-lb --type=LoadBalancer --port=443 --target-port=8443
+kubectl get service cdi-uploadproxy-lb -n kubevirt   # wait for EXTERNAL-IP
+```
+
+Reach the proxy at `https://<external-ip>:443`. Without a configured `IPAddressPool` the
+external IP stays `<pending>`.
+
+</Tab>
+
+<Tab label="NodePort Service">
+
+A `NodePort` Service always works, regardless of the cluster's ingress setup:
+
+```bash
+kubectl expose service cdi-uploadproxy -n kubevirt \
+  --name=cdi-uploadproxy-np --type=NodePort --port=443 --target-port=8443
+kubectl get service cdi-uploadproxy-np -n kubevirt   # note the 443:<nodePort> mapping
+```
+
+Reach the proxy at `https://<node-ip>:<nodePort>`.
+
+</Tab>
+
+</Tabs>
+
+### Point `virtctl` at the upload proxy URL
+
+`virtctl image-upload` needs to know the external URL from Step 1. Choose one of the following.
+
+**Configure it once (persistent).** Set `CDIConfig.spec.uploadProxyURLOverride` so that every
+`virtctl image-upload` discovers the URL automatically. Because the CDI configuration is managed
+by the HyperConverged (HCO) operator — which reconciles direct edits away and does not expose
+this field — set it through HCO's jsonpatch annotation:
+
+```bash
+kubectl annotate hyperconverged kubevirt-hyperconverged -n kubevirt \
+  'containerizeddataimporter.kubevirt.io/jsonpatch=[{"op":"add","path":"/spec/config/uploadProxyURLOverride","value":"https://cdi-uploadproxy.example.com:8443"}]' \
+  --overwrite
+
+# Verify it propagated to the calculated URL that virtctl reads:
+kubectl get cdiconfig config -o jsonpath='{.status.uploadProxyURL}{"\n"}'
+```
+
+> **Warning**: HCO documents jsonpatch annotations as an advanced, **unsupported** mechanism —
+> an incorrect patch can destabilize the virtualization stack. Use it deliberately, and remove
+> the annotation
+> (`kubectl annotate hyperconverged kubevirt-hyperconverged -n kubevirt containerizeddataimporter.kubevirt.io/jsonpatch-`)
+> to revert.
+
+**Or pass it per command.** Skip the cluster configuration and give the URL on each upload with
+`--uploadproxy-url` (shown in Step 3).
+
+### Upload the local image
+
+Run `virtctl image-upload`. The `--datasource` flag also creates a `DataSource` that points at
+the uploaded volume, making it selectable as a bootable volume:
+
+```bash
+virtctl image-upload dv uploaded-image \
+  --datasource \
+  --size=30Gi \
+  --storage-class=rbd-1 \
+  --image-path=./my-image.qcow2 \
+  --namespace=my-namespace
+# add --uploadproxy-url=https://cdi-uploadproxy.example.com:8443 --insecure
+# if you did NOT set uploadProxyURLOverride in Step 2.
+```
+
+Notes:
+
+- `--size` must be **larger than the image's virtual disk size** (not the file size). For
+  example, if your image has a 24 GiB virtual disk, request at least a 30 GiB volume. CDI
+  rejects a volume smaller than the uncompressed disk.
+- Use `--no-create` (and omit `--size`) to upload into a `DataVolume` that already exists.
+- `--insecure` skips verification of the proxy's self-signed certificate.
+
+Wait for the upload and import to finish:
+
+```bash
+kubectl get dv uploaded-image -n my-namespace -w
+# PHASE: UploadReady -> ... -> Succeeded
+
+kubectl get datasource uploaded-image -n my-namespace
+# the DataSource becomes Ready
+```
+
+> **Note**: A `DataSource` created by `virtctl --datasource` does not carry the
+> `virtualization.cpaas.io/*` labels that the web console's **Bootable Volumes** picker requires.
+> The image is fully usable through the API (by `sourceRef`, as in the next step); to also
+> surface it in the console picker, add the label contract described in
+> [Bootable Volumes](../../virtual_machine/bootable_volume.mdx).
+
+### Create a virtual machine from the uploaded image
+
+Reference the `DataSource` from a `dataVolumeTemplates` entry via `sourceRef`. KubeVirt clones
+the uploaded volume into a fresh disk for the new virtual machine:
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: example-vm
+  namespace: my-namespace
+spec:
+  runStrategy: RerunOnFailure
+  dataVolumeTemplates:
+    - metadata:
+        name: example-vm-rootdisk
+      spec:
+        sourceRef:
+          kind: DataSource
+          name: uploaded-image
+          namespace: my-namespace
+        storage:
+          resources:
+            requests:
+              storage: 30Gi
+          storageClassName: rbd-1
+  template:
+    metadata:
+      labels:
+        kubevirt.io/vm: example-vm
+    spec:
+      domain:
+        cpu:
+          cores: 1
+        resources:
+          requests:
+            memory: 2Gi
+        devices:
+          disks:
+            - name: rootdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              masquerade: {}
+      networks:
+        - name: default
+          pod: {}
+      volumes:
+        - name: rootdisk
+          dataVolume:
+            name: example-vm-rootdisk
+```
+
+```bash
+kubectl apply -f example-vm.yaml
+kubectl get vm example-vm -n my-namespace          # STATUS: Running
+kubectl get vmi example-vm -n my-namespace         # PHASE: Running, with an IP
+```
+
+Confirm the operating system boots by opening the serial console; a login prompt indicates a
+successful boot:
+
+```bash
+virtctl console example-vm -n my-namespace
+# example-vm login:
+```
+
+> **Tip**: To create the virtual machine from the web console instead, the uploaded image appears
+> as a bootable volume once it carries the required labels — see
+> [Creating Virtual Machines](../../virtual_machine/functions/create_virtual_machine.mdx) and
+> [Bootable Volumes](../../virtual_machine/bootable_volume.mdx).
+
+</Steps>
+
+## Creating a Windows virtual machine
+
+For Windows, upload the image to a volume and then clone it when you create the virtual machine,
+applying an `autounattend.xml` answer file during first boot. The upload step is identical to
+the procedure above (use a `qcow2`/`raw`/`img` Windows disk image); for the ISO-based install
+flow and the VirtIO driver requirements, see
+[Creating Windows Images Based on ISO](./vm_iso_windows.mdx).
