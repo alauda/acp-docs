@@ -1,0 +1,327 @@
+---
+weight: 55
+---
+
+# Migrate the Volume Snapshot Component from the Legacy Plugin
+
+In ACP 4.4, new clusters no longer need to install the **<Term
+name="product" /> Snapshot Management** cluster plugin separately. If an
+existing workload cluster already installed the legacy plugin, use this runbook
+to migrate the cluster to the ACP 4.4 snapshot component without deleting
+existing snapshot resources.
+
+## Scope
+
+This procedure applies only when all of the following are true:
+
+- The workload cluster uses the legacy **<Term name="product" /> Snapshot
+  Management** cluster plugin.
+- You are moving the workload cluster to ACP 4.4 or later.
+- You want ACP to manage the cluster-level snapshot component after the legacy
+  plugin is removed.
+
+Do not use this procedure for clusters where another platform or an
+administrator-managed component still provides the Snapshot Controller. Only one
+Snapshot Controller should manage a cluster.
+
+## Impact
+
+There is a short expected gap between uninstalling the legacy plugin and the new
+snapshot component becoming ready. During this gap, the cluster has no running
+Snapshot Controller. New snapshot create or delete requests can remain pending
+until the new component is ready.
+
+Existing `VolumeSnapshot`, `VolumeSnapshotContent`, `VolumeSnapshotClass`,
+`VolumeGroupSnapshot`, `VolumeGroupSnapshotContent`, and
+`VolumeGroupSnapshotClass` resources are retained.
+
+:::warning
+Do not delete snapshot CRDs during this migration. Deleting snapshot CRDs can
+delete all cluster-wide snapshot objects and cause data loss.
+:::
+
+:::warning
+Do not use cleanup actions that delete snapshot CRDs or snapshot custom
+resources.
+:::
+
+## Prerequisites
+
+- You have administrator access to the global cluster and the target workload
+  cluster.
+- The target workload cluster is on ACP 4.4 or later, or is being upgraded to
+  ACP 4.4.
+- The ACP Storage component is installed in the target workload cluster.
+- The `jq` command-line tool is available on the workstation where you run the
+  `kubectl patch` commands.
+- You have a maintenance window for snapshot operations.
+
+## Procedure
+
+<Steps>
+
+### Record current snapshot resources
+
+Run these commands in the target workload cluster before making changes:
+
+```bash
+kubectl get crd | grep -E 'snapshot.storage.k8s.io|groupsnapshot.storage.k8s.io'
+kubectl get volumesnapshots.snapshot.storage.k8s.io -A --ignore-not-found
+kubectl get volumesnapshotcontents.snapshot.storage.k8s.io --ignore-not-found
+kubectl get volumesnapshotclasses.snapshot.storage.k8s.io --ignore-not-found
+kubectl get volumegroupsnapshots.groupsnapshot.storage.k8s.io -A --ignore-not-found
+kubectl get volumegroupsnapshotcontents.groupsnapshot.storage.k8s.io --ignore-not-found
+kubectl get volumegroupsnapshotclasses.groupsnapshot.storage.k8s.io --ignore-not-found
+```
+
+Keep the output for post-migration comparison.
+
+### Confirm the legacy plugin is installed
+
+Run this command in the global cluster. Replace `<workload-cluster-name>` with
+the target workload cluster name:
+
+```bash
+kubectl get moduleinfo \
+  -l cpaas.io/module-name=snapshot,cpaas.io/cluster-name=<workload-cluster-name>
+```
+
+The legacy Snapshot Management plugin is installed when this command returns a
+resource.
+
+### Uninstall the legacy plugin
+
+Uninstall the legacy plugin from the global cluster. You can use the web console
+or YAML.
+
+To use the web console:
+
+1. Go to **Administrator** > **Marketplace** > **Cluster Plugins**.
+2. Select the target workload cluster.
+3. Find **<Term name="product" /> Snapshot Management**.
+4. Uninstall the plugin.
+
+To use YAML, delete the plugin installation resource from the global cluster:
+
+```bash
+kubectl delete moduleinfo \
+  -l cpaas.io/module-name=snapshot,cpaas.io/cluster-name=<workload-cluster-name>
+```
+
+The uninstall removes the legacy Snapshot Controller workload, but it must not
+delete snapshot CRDs or existing snapshot resources.
+
+### Verify the legacy controller is gone
+
+Run this command in the target workload cluster:
+
+```bash
+kubectl get deployment -A | grep -E 'snapshot-controller|snapshot' || true
+```
+
+Continue only when there is no legacy Snapshot Controller deployment.
+
+If another Snapshot Controller is still running, stop here. Enabling ACP to take
+over snapshot management while another controller is active can create two
+Snapshot Controllers in the same cluster.
+
+### Enable ACP snapshot management
+
+Run this command in the target workload cluster:
+
+```bash
+kubectl patch storagefoundation default --type=json -p "$(
+  kubectl get storagefoundation default -o json | jq -c '
+    (.spec.operators // []) as $operators |
+    (
+      if any($operators[]?; .name == "snapshot") then
+        $operators | map(
+          if .name == "snapshot" then
+            .enabled = true | .upgradePolicy.mode = "Automatic"
+          else
+            .
+          end
+        )
+      else
+        $operators + [{
+          "name": "snapshot",
+          "enabled": true,
+          "upgradePolicy": {"mode": "Automatic"}
+        }]
+      end
+    ) as $updated |
+    [{
+      "op": (if .spec.operators == null then "add" else "replace" end),
+      "path": "/spec/operators",
+      "value": $updated
+    }]
+  '
+)"
+```
+
+This patch adds or updates the `snapshot` entry and preserves all existing
+entries. Use this setting only after the legacy controller has been removed.
+
+### Wait for the snapshot component to become ready
+
+Run this command in the target workload cluster:
+
+```bash
+kubectl get storagefoundation default \
+  -o jsonpath='{range .status.operators[?(@.name=="snapshot")]}phase={.phase}{"\n"}{range .conditions[*]}{.type}={.status} reason={.reason} message={.message}{"\n"}{end}{end}'
+```
+
+The migration succeeds when the `snapshot` entry reports `phase=Ready`.
+
+### Verify snapshot CRDs are present
+
+Run this command in the target workload cluster:
+
+```bash
+for crd in \
+  volumesnapshots.snapshot.storage.k8s.io \
+  volumesnapshotcontents.snapshot.storage.k8s.io \
+  volumesnapshotclasses.snapshot.storage.k8s.io \
+  volumegroupsnapshots.groupsnapshot.storage.k8s.io \
+  volumegroupsnapshotcontents.groupsnapshot.storage.k8s.io \
+  volumegroupsnapshotclasses.groupsnapshot.storage.k8s.io; do
+  kubectl get crd "$crd"
+done
+```
+
+All six CRDs should exist after the snapshot component is ready.
+
+### Verify existing snapshot resources are retained
+
+Compare the following output with the output recorded before the migration:
+
+```bash
+kubectl get volumesnapshots.snapshot.storage.k8s.io -A --ignore-not-found
+kubectl get volumesnapshotcontents.snapshot.storage.k8s.io --ignore-not-found
+kubectl get volumesnapshotclasses.snapshot.storage.k8s.io --ignore-not-found
+kubectl get volumegroupsnapshots.groupsnapshot.storage.k8s.io -A --ignore-not-found
+kubectl get volumegroupsnapshotcontents.groupsnapshot.storage.k8s.io --ignore-not-found
+kubectl get volumegroupsnapshotclasses.groupsnapshot.storage.k8s.io --ignore-not-found
+```
+
+Existing snapshot resources should still be present.
+
+</Steps>
+
+## Rollback
+
+If the snapshot component does not become `Ready`, inspect the snapshot status:
+
+```bash
+kubectl get storagefoundation default \
+  -o jsonpath='{range .status.operators[?(@.name=="snapshot")]}phase={.phase}{"\n"}{range .conditions[*]}{.type}={.status} reason={.reason} message={.message}{"\n"}{end}{end}'
+```
+
+If you need to stop ACP snapshot management while keeping snapshot CRDs and
+snapshot resources, set the `snapshot` entry to `enabled: false`:
+
+```bash
+kubectl patch storagefoundation default --type=json -p "$(
+  kubectl get storagefoundation default -o json | jq -c '
+    (.spec.operators // []) as $operators |
+    (
+      if any($operators[]?; .name == "snapshot") then
+        $operators | map(
+          if .name == "snapshot" then
+            .enabled = false | .upgradePolicy.mode = "Automatic"
+          else
+            .
+          end
+        )
+      else
+        $operators + [{
+          "name": "snapshot",
+          "enabled": false,
+          "upgradePolicy": {"mode": "Automatic"}
+        }]
+      end
+    ) as $updated |
+    [{
+      "op": (if .spec.operators == null then "add" else "replace" end),
+      "path": "/spec/operators",
+      "value": $updated
+    }]
+  '
+)"
+```
+
+To restore the legacy plugin, install **<Term name="product" /> Snapshot
+Management** again from **Administrator** > **Marketplace** > **Cluster
+Plugins** in the global cluster. Do this only if ACP snapshot management has
+been disabled and its controller is no longer running.
+
+## Troubleshooting
+
+### Snapshot status reports `Skipped`
+
+`Skipped` means the cluster already has one or more snapshot CRDs and ACP did
+not automatically take over snapshot management. During migration from the
+legacy plugin, this is expected until you explicitly enable ACP snapshot
+management:
+
+```yaml
+name: snapshot
+enabled: true
+```
+
+### Snapshot operations remain pending
+
+Check whether a Snapshot Controller is running:
+
+```bash
+kubectl get deployment -A | grep -E 'snapshot-controller|snapshot'
+```
+
+If no controller is running and the snapshot status reports `Skipped`, confirm
+that the legacy plugin has been uninstalled, then enable ACP snapshot
+management.
+
+### Snapshot management was enabled while another controller is still running
+
+This can create two Snapshot Controllers in the same cluster. Disable ACP
+snapshot management first:
+
+```bash
+kubectl patch storagefoundation default --type=json -p "$(
+  kubectl get storagefoundation default -o json | jq -c '
+    (.spec.operators // []) as $operators |
+    (
+      if any($operators[]?; .name == "snapshot") then
+        $operators | map(
+          if .name == "snapshot" then
+            .enabled = false | .upgradePolicy.mode = "Automatic"
+          else
+            .
+          end
+        )
+      else
+        $operators + [{
+          "name": "snapshot",
+          "enabled": false,
+          "upgradePolicy": {"mode": "Automatic"}
+        }]
+      end
+    ) as $updated |
+    [{
+      "op": (if .spec.operators == null then "add" else "replace" end),
+      "path": "/spec/operators",
+      "value": $updated
+    }]
+  '
+)"
+```
+
+After the ACP snapshot component is removed, decide which component should
+provide the cluster-level snapshot capability. Only one Snapshot Controller
+should remain.
+
+## Related Documentation
+
+- [Deploy Volume Snapshot Component](../functions/snapshot_con.mdx)
+- [Using Volume Snapshots](../functions/using_volume_snapshot.mdx)
+- [Cluster Plugin](../../../extend/cluster_plugin.mdx)

@@ -1,0 +1,71 @@
+---
+weight: 30
+---
+
+# Release Notes
+
+## v1.2.4
+
+Based on the openFuyao [npu-operator 1.2.0](https://gitcode.com/openFuyao/npu-operator/tree/1.2.0) community release. v1.2.4 is the first release built for the __Alauda OS__ immutable operating system and reworks how the driver is delivered, how devices reach workloads, and how the operator manages the driver lifecycle.
+
+### Breaking changes
+
+- __Delivery model changed from cluster plugin to operator.__ Earlier versions of __Alauda Build of NPU Operator__ shipped as a cluster plugin, installed from __Marketplace__ > __Cluster Plugins__. Starting with v1.2.4 the project is packaged as an OLM operator bundle and installed from __Marketplace__ > __OperatorHub__.
+
+    :::warning
+    In-place upgrade from v1.1.3 (or any earlier cluster-plugin release) is __not__ supported. To move to v1.2.4, uninstall the old cluster plugin first and then install the new operator from scratch:
+
+    1. Uninstall the existing __Alauda Build of NPU Operator__ cluster plugin from __Marketplace__ > __Cluster Plugins__.
+    2. If the driver is no longer needed on the host, run on each NPU node:
+        ```bash
+        /usr/local/Ascend/driver/script/uninstall.sh
+        ```
+    3. Install v1.2.4 from __Marketplace__ > __OperatorHub__ following the [Installation](./installation.mdx) page.
+    :::
+
+- __Driver is now delivered as a container image, not a `.run` package.__ By default the driver, firmware, and runtime tooling ship in `mlops/ascend-driver:<HDK>-<chip>-<kernel>-<os-stem>` and are loaded into the host kernel from the running pod. The legacy DKMS / kernel-headers / `make` host prerequisites listed in v1.1.x are no longer needed (and no longer used even if present). For air-gapped clusters, the matching driver image must be pre-staged to the cluster registry before installation — see [Step 1: Sync driver images](./installation.mdx#sync-driver-images). Clusters whose nodes already carry a host-installed `.run` driver can opt out by setting `spec.driver.enabled=false` (see _New features_ below).
+
+- __OS support model changed: kernel-keyed, not distro-keyed.__ v1.2.4 does __not__ restrict to specific distros. Any arm64 Linux running containerd is supported, as long as a driver image matching the node's kernel exists at [`docker.io/alaudadockerhub/ascend-driver`](https://hub.docker.com/r/alaudadockerhub/ascend-driver) — the driver image is shipped independently from the operator bundle and is built on demand. If your kernel isn't on the tag list yet, contact <Term name="company"/> Customer Support to have a new tag built and published. Smoke-tested in this release: 310P + 910B on Alauda OS 6.6, 910B on openEuler 22.03 LTS SP3 bare-metal. The v1.1.x DKMS host-side flow is gone — the container-image model replaces it.
+
+- __Workloads no longer need `runtimeClassName: ascend`.__ Device injection in v1.2.4 is driven by the Container Device Interface (CDI). Requesting `huawei.com/Ascend910` (or `Ascend310P`) is enough — containerd binds `/dev/davinciN` and the driver userspace libraries into the container automatically. Existing pods that still set `runtimeClassName: ascend` continue to work; the legacy RuntimeClass is retained for backwards compatibility.
+
+### New features
+
+- __Alauda OS / immutable-OS support.__ NPU nodes running Alauda OS are now fully supported. The operator stages the driver tree under `/var/lib/Ascend` / `/var/lib/ascend` / `/home/bios/driver` (all on writable partitions on Alauda OS), inserts kernel modules directly from the driver pod, and never writes to `/usr` or relies on a package manager.
+
+- __Pre-installed-driver passthrough (`spec.driver.enabled=false`).__ Clusters whose NPU hosts already carry a Huawei `.run` driver — typically bare-metal sites running an independent driver lifecycle — can now opt the operator out of driver management entirely. With __Driver__ disabled at install time (or set to `false` on the `NPUOperatorCtl` later), the operator skips the driver image sync ([installation Step 1](./installation.mdx#sync-driver-images)), does not deploy the driver / rebooter DaemonSets, and points CDI / device-plugin / runtime at the host's existing driver tree at `/var/lib/Ascend/driver` or `/usr/local/Ascend/driver` (auto-detected by the toolkit). Driver upgrades and chip-recovery reboots are then the host operator's responsibility.
+
+- __Driver upgrade lifecycle.__ Editing `NPUOperatorCtl.spec.driver.version` now triggers a per-node rolling upgrade. The operator walks each node through `upgrade-required → cordon-required → wait-for-jobs-required → pod-deletion-required → drain-required → node-reboot-required → pod-restart-required → validation-required → uncordon-required → upgrade-done`, with the rollout pace gated by:
+
+    - `spec.driver.upgradePolicy.autoUpgrade` — `true` for fully automatic rolling upgrades, `false` (default) to wait for a per-node `npu.openfuyao.com/approve-reboot=true` annotation before each reboot.
+    - `spec.driver.upgradePolicy.maxParallelUpgrades` and `maxUnavailable` — concurrency caps.
+    - `spec.driver.upgradePolicy.drainSpec`, `podDeletion`, `waitForCompletion` — drain and eviction policy fields, modelled on the upstream `k8s-operator-libs` schema.
+
+    The node reboot is always required because `rmmod` of a running Ascend driver leaves the chip in an unrecoverable state. The new __rebooter__ component performs the reboot using `sysrq b` (panic-reboot) to avoid VFIO/AER deadlocks on PCI-passthrough VMs. See [Driver upgrade and self-healing](./upgrade.mdx) for the full walk-through.
+
+- __Chip self-healing.__ A `health-watch` loop inside the driver pod runs `npu-smi info` every 60 seconds. After three consecutive failures (≈3 minutes) the loop detects a runtime chip-wedge condition, drops the driver-ready marker (causing the device plugin to report the chip as `Unhealthy`), and writes a recovery marker for the rebooter. With `spec.driver.recoveryPolicy.autoRecover: true` the rebooter automatically reboots the node to recover the chip; with `false` (default) it waits for the same approve-reboot annotation used for upgrades.
+
+- __CDI device injection.__ Replaces the v1.1.x `ascend-docker-hook` mechanism. The `Ascend Docker Runtime` form toggle now provisions `npu-container-toolkit generate-cdi --watch` as a sidecar that emits the CDI spec at `/var/run/cdi/ascend.com-npu.yaml`. The CDI kind is `huawei.com/ascend`; the pod annotation key the device plugin attaches is `cdi.k8s.io/ascend-device-plugin`.
+
+- __Validator DaemonSet.__ A new `npu-validator` DaemonSet runs alongside the driver. The upgrade state machine waits for both the driver pod and the validator pod to report `PodReady` before transitioning past `validation-required`, so a driver pod that self-reports ready but whose ready file isn't actually visible to other host consumers no longer fools the upgrade.
+
+- __Device-plugin drain-aware.__ The MindCluster device plugin now watches for the `npu.openfuyao.com/driver-upgrade-state` and `reboot-required` node labels, and reports every NPU on the node as `Unhealthy` while either is set. The scheduler therefore stops placing new NPU workloads on a node about to be torn down.
+
+- __Per-node `npu-smi` access on the host.__ The driver pod stages `npu-smi` to `/var/lib/Ascend/driver/tools/npu-smi`. The operator does not add it to the host `PATH` (Alauda OS keeps `/usr` read-only); call it with the matching `LD_LIBRARY_PATH` or wrap it in a script under `/opt/bin/`. See the [Installation FAQ](./installation.mdx#where-is-npu-smi-installed-on-the-host).
+
+- __MindCluster / Ascend component stack upgraded to v7.3.0.__ Picks up the v7.3.0 train of `ascend-docker-runtime`, `ascend-operator`, `ascend-k8sdeviceplugin`, `noded`, `vc-controller-manager`, `vc-scheduler`, `clusterd`, and `npu-exporter`. The driver and firmware default HDK version is bumped to `25.5.0`. `25.3.RC1` is shipped as a co-supported alternative.
+
+### Bug fixes
+
+- Fixed `npu-exporter` `ServiceMonitor` not taking effect: it was created in the wrong namespace and missed Prometheus selector labels, so the platform's Prometheus never scraped the exporter. The operator now ships a `ServiceMonitor` in its own namespace with the correct `prometheus: kube-prometheus` label and `honorLabels: true`. No manual `ServiceMonitor` creation is required.
+
+- Fixed the operator never advancing the upgrade state machine past `validation-required` when only the driver-pod readinessProbe was used as the signal: a separate validator pod now confirms the driver-ready marker is visible to other host consumers.
+
+- Fixed `runtime-init.sh` fast-skipping in a half-installed state on nodes whose chip had wedged while the driver pod was running: the fast-skip predicate now includes a chip-health probe (`davinci_dev_num > 0` via PCI sysfs) so a wedged-but-loaded chip falls through to the recovery path.
+
+- (Community) Fixed installation / detection logic on nodes that do not carry NPU cards.
+- (Community) Fixed environment-variable indicators not being deduplicated.
+
+## v1.1.3
+
+Based on the openFuyao [npu-operator 1.1.1](https://gitcode.com/openFuyao/npu-operator/tree/1.1.1) community release. Backed by the MindCluster / Ascend v7.2.RC1 component stack and delivered as a cluster plugin.

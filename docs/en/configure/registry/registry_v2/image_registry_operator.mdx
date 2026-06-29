@@ -1,0 +1,225 @@
+---
+weight: 20
+i18n:
+  title:
+    en: "Image Registry Operator"
+---
+
+# Registry v2: Image Registry Operator
+
+The Image Registry Operator installs and manages the cluster-wide Registry v2 instance. It reconciles registry runtime resources from `Config/cluster` and scheduled pruning resources from `ImagePruner/cluster`.
+
+## Main Components
+
+| Component | Purpose |
+| --- | --- |
+| `cluster-image-registry-operator` Deployment | Reconciles the singleton Registry from `Config/cluster` and `ImagePruner/cluster`. |
+| `image-registry` Deployment | Serves OCI push and pull traffic, authentication, authorization, storage access, health checks, and metrics. |
+| `image-api-server` Deployment | Serves the <Term name="productShort" /> Image API through Kubernetes API aggregation. |
+| `APIService/v1.image.alauda.io` | Registers `image.alauda.io/v1` with the Kubernetes API server. |
+| `node-ca` DaemonSet | Distributes Registry CA trust and Registry service host mappings to nodes. |
+| `image-pruner` CronJob | Runs scheduled prune and garbage-collection workflows. |
+| Managed imagePullSecret controller | Creates, injects, refreshes, and removes service account pull secrets for the internal registry. |
+
+## Install the Operator
+
+Install the Image Registry Operator from the <Term name="productShort" /> web console when the Operator package is available in OperatorHub. Use the YAML path only for controlled automation, recovery, or support-guided installation when the web console is not available.
+
+Do not use the legacy Registry Cluster Plugin to install Registry v2. The legacy Registry Cluster Plugin remains available only for legacy Registry deployments.
+
+### Install from OperatorHub
+
+1. Log in to <Term name="productShort" /> and navigate to the **Administrator** page.
+2. In the left navigation bar, click **Marketplace** > **OperatorHub**.
+3. Search for **Image Registry Operator** or `cluster-image-registry-operator`.
+4. Click **Install**.
+5. On the installation page, use the following settings unless your release guidance states otherwise:
+
+| Parameter | Recommended value |
+| --- | --- |
+| Channel | `stable` |
+| Installation Mode | `Cluster` |
+| Namespace | `image-registry-system` |
+| Upgrade Strategy | `Manual` |
+
+6. Click **Install**.
+7. If an approval prompt appears, review and approve the generated install plan.
+8. Wait until the Operator status is **Installed**.
+
+Verify the installation:
+
+```bash
+kubectl -n image-registry-system get subscription,csv,installplan
+kubectl -n image-registry-system get deployment cluster-image-registry-operator
+```
+
+Expected results:
+
+- The installed CSV is `Succeeded`.
+- The `cluster-image-registry-operator` Deployment is available.
+
+### Install by Using YAML
+
+Create the installation namespace if it does not exist:
+
+```bash
+kubectl get namespace image-registry-system >/dev/null 2>&1 || \
+  kubectl create namespace image-registry-system
+
+kubectl label namespace image-registry-system \
+  cpaas.io/project=cpaas-system \
+  pod-security.kubernetes.io/audit=privileged \
+  pod-security.kubernetes.io/enforce=privileged \
+  pod-security.kubernetes.io/warn=privileged \
+  --overwrite
+```
+
+Create a file named `image-registry-operator-subscription.yaml`:
+
+```yaml
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  annotations:
+    cpaas.io/target-namespaces: ""
+  name: cluster-image-registry-operator
+  namespace: image-registry-system
+spec:
+  channel: stable
+  installPlanApproval: Manual
+  name: cluster-image-registry-operator
+  source: platform
+  sourceNamespace: cpaas-system
+```
+
+Apply the `Subscription`:
+
+```bash
+kubectl apply -f image-registry-operator-subscription.yaml
+```
+
+Approve the generated `InstallPlan`:
+
+```bash
+kubectl -n image-registry-system get installplan
+
+kubectl -n image-registry-system patch installplan <installplan-name> \
+  --type=merge \
+  -p '{"spec":{"approved":true}}'
+```
+
+Wait for the Operator:
+
+```bash
+kubectl -n image-registry-system wait \
+  --for=condition=Available \
+  deployment/cluster-image-registry-operator \
+  --timeout=300s
+```
+
+## Change the Registry Management State
+
+Enable the Registry by setting `Config/cluster.spec.managementState` to `Managed`:
+
+```bash
+kubectl patch configs.imageregistry.operator.alauda.io cluster \
+  --type=merge \
+  -p '{"spec":{"managementState":"Managed"}}'
+```
+
+Verify that the Registry data plane is available:
+
+```bash
+kubectl -n image-registry-system rollout status deployment/image-registry --timeout=300s
+kubectl -n image-registry-system rollout status deployment/image-api-server --timeout=300s
+kubectl get configs.imageregistry.operator.alauda.io cluster -o yaml
+```
+
+Expected result:
+
+- `Config/cluster` reports `Available=True`, `Progressing=False`, and `Degraded=False`.
+
+Setting the management state to `Removed` stops Registry v2 runtime components. Push and pull traffic, the Image API server, and scheduled pruning are unavailable while the Registry is removed. Use this state only during a maintenance window or for support-guided recovery.
+
+Before switching to `Removed`, back up required image data and inspect the storage management mode:
+
+```bash
+kubectl get configs.imageregistry.operator.alauda.io cluster \
+  -o jsonpath='{.spec.storage.managementState}{"\n"}'
+```
+
+Only assume image data is retained when `spec.storage.managementState` is `Unmanaged`, or when the storage administrator has confirmed that the backend storage reclaim policy preserves the data after the Registry instance is removed.
+
+To stop the Registry, set the management state to `Removed`:
+
+```bash
+kubectl patch configs.imageregistry.operator.alauda.io cluster \
+  --type=merge \
+  -p '{"spec":{"managementState":"Removed"}}'
+```
+
+Verify that the data-plane deployments are removed:
+
+```bash
+kubectl -n image-registry-system get deployment image-registry image-api-server --ignore-not-found
+```
+
+Expected result:
+
+- The `image-registry` and `image-api-server` Deployments are not present while the Registry is removed.
+
+## Image Pruner Reconciliation
+
+The Operator reconciles the singleton `ImagePruner/cluster` into an `image-pruner` CronJob in `image-registry-system`. Configure the retention policy in the `ImagePruner` resource. See [Setting up and configuring the registry](./setting_up_and_configuring_the_registry.mdx#configure-scheduled-image-pruning).
+
+The CronJob uses the Registry v2 internal service URL by default.
+
+## Check Operator and Registry Status
+
+```bash
+kubectl -n image-registry-system get subscription,csv,installplan
+kubectl -n image-registry-system get deploy cluster-image-registry-operator image-registry image-api-server
+kubectl -n image-registry-system get daemonset node-ca
+kubectl -n image-registry-system get cronjob image-pruner
+kubectl get apiservice v1.image.alauda.io
+kubectl get configs.imageregistry.operator.alauda.io cluster -o yaml
+kubectl get imagepruners.imageregistry.operator.alauda.io cluster -o yaml
+```
+
+Expected results:
+
+- The Operator CSV is `Succeeded`.
+- `cluster-image-registry-operator`, `image-registry`, and `image-api-server` are available.
+- `node-ca` is ready on target nodes.
+- `APIService/v1.image.alauda.io` is `Available=True`.
+- `Config/cluster` reports `Available=True`, `Progressing=False`, and `Degraded=False`.
+
+## Check Registry Logs and Metrics Access
+
+Check Registry Pods:
+
+```bash
+kubectl -n image-registry-system get pods -l app.kubernetes.io/name=image-registry
+```
+
+View Registry logs:
+
+```bash
+kubectl -n image-registry-system logs deployment/image-registry -c registry
+```
+
+Check metrics access from a monitoring service account:
+
+```bash
+kubectl auth can-i get pods -n image-registry-system \
+  --as=system:serviceaccount:cpaas-system:prometheus-sa
+```
+
+## Common Operator Issues
+
+| Symptom | Check |
+| --- | --- |
+| CSV is not `Succeeded` | `Subscription`, `InstallPlan`, CSV events, and the `cpaas-system` catalog source. |
+| `Config/cluster` is `Degraded=True` | `Config.status.conditions`, Operator logs, Registry Pod events, storage, TLS Secret, and RBAC. |
+| Registry Pod is pending | PVC binding, node resources, node selectors, taints, tolerations, and topology constraints. |
+| `node-ca` is not ready | DaemonSet scheduling, Pod logs, node trust configuration, and host mapping updates. |

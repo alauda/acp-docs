@@ -1,0 +1,185 @@
+---
+weight: 15
+---
+
+# Bootable Volumes
+
+A **bootable volume** is a ready-to-use boot image that virtual machines can be created from. Each bootable volume is a KubeVirt `DataSource` (`cdi.kubevirt.io/v1beta1`) backed by a PVC that CDI populates from an import or clone source. Bootable volumes are aggregated across namespaces — including the shared `kube-public` namespace where platform "golden images" live — so they can be reused by many virtual machines.
+
+When you create a virtual machine and choose **Provision Method** > **Image Instance**, the picker lists the bootable volumes you can boot from.
+
+## Notes
+
+- A bootable volume becomes selectable for virtual-machine creation only when its `DataSource` carries the `virtualization.cpaas.io/*` label contract (operating system, architecture, capacity, storage class, volume mode, access mode). A data source without these labels still appears in the management list but is **not** offered in the **Image Instance** picker.
+- The volume's **Status** is `Importing` while CDI populates the backing PVC and `Ready` once it can be used.
+- Local **Upload** as a source is not yet supported; use HTTP/HTTPS, Registry, Clone PVC, or Clone snapshot.
+
+## View bootable volumes
+
+In the left navigation bar, click **Virtualization** > **Bootable Volumes**. The list aggregates data sources across namespaces (default **All Namespaces**, including `kube-public`). The new console shows a small resource-type abbreviation badge (for `DataSource`) before each name in the list.
+
+| Column | Description |
+| :-- | :-- |
+| **Name** / **Namespace** | The data source identity. |
+| **Operating System** / **Architecture** | Read from the `virtualization.cpaas.io/image-os-*` labels. |
+| **Description** | Optional free-text description. |
+| **Status** | `Ready` or `Importing` (a failed import shows `Failed`). |
+| **Capacity (Gi)** | Size of the backing volume. |
+| **Created At** | Creation time. |
+
+The API equivalent lists the data sources directly:
+
+```bash
+kubectl get datasource -A
+```
+
+## Add a bootable volume
+
+A bootable volume supports four source types:
+
+| Source type | What it does | DataVolume source |
+| :-- | :-- | :-- |
+| **HTTP/HTTPS** (default) | Import a qcow2/raw image from an HTTP(S) URL | `http` |
+| **Registry** | Pull a container disk from a container registry | `registry` |
+| **Clone PVC** | Duplicate an existing PVC | `pvc` |
+| **Clone snapshot** | Restore from a VolumeSnapshot | `snapshot` |
+
+> **Note**: Create bootable volumes in your **own project namespace**. The shared `kube-public` namespace holds platform **golden images** published by a cluster administrator — ordinary project users can **consume** (clone and boot from) `kube-public` images out of the box, but creating or modifying objects in `kube-public` requires elevated platform permissions.
+
+<Tabs>
+<Tab label="Web Console">
+
+1. In the left navigation bar, click **Virtualization** > **Bootable Volumes**.
+
+2. Click **Add Bootable Volume** (use **More create options** to switch between the form and YAML).
+
+3. In the **Basic Information** area, set the project/namespace, name, and an optional description.
+
+4. In the **Operating System** area, select the **Operating System** and **Architecture** (x86_64 or ARM64). These populate the label contract used by the virtual-machine image picker.
+
+5. In the **Source** area, select one of the four **Source Type** cards and fill in its fields (for example, **Image URL** for HTTP/HTTPS).
+
+6. In the **Storage** area, set the **Capacity (Gi)**, **Storage Class**, **Volume Mode** (Filesystem or Block), and **Access Mode** (ReadWriteOnce or ReadWriteMany).
+
+7. Click **Add Bootable Volume** and wait for the **Status** to change from **Importing** to **Ready**.
+
+</Tab>
+<Tab label="API / CLI">
+
+Adding a bootable volume creates two objects: a `DataVolume` (CDI imports the image into a PVC) and a `DataSource` that points at it and carries the label contract. The example imports an image over HTTP:
+
+```yaml
+# 1) DataVolume — CDI imports the image into a PVC of the same name.
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: ubuntu-2204
+  namespace: demo
+spec:
+  source:
+    http:
+      url: https://images.example.com/ubuntu-22.04.qcow2
+      # secretRef: my-pull-secret   # for an authenticated source
+  storage:
+    resources:
+      requests:
+        storage: 20Gi
+    storageClassName: sc-topolvm
+    volumeMode: Filesystem
+    accessModes:
+      - ReadWriteOnce
+---
+# 2) DataSource — makes the PVC selectable as a bootable volume.
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataSource
+metadata:
+  name: ubuntu-2204
+  namespace: demo
+  labels:
+    virtualization.cpaas.io/image-os-type: ubuntu
+    virtualization.cpaas.io/image-os-arch: amd64
+    virtualization.cpaas.io/size: 20Gi
+    virtualization.cpaas.io/storage-class: sc-topolvm
+    virtualization.cpaas.io/volume-mode: Filesystem
+    virtualization.cpaas.io/access-mode: ReadWriteOnce
+    virtualization.cpaas.io/source-origin: url   # url | registry | pvc | snapshot
+spec:
+  source:
+    pvc:
+      name: ubuntu-2204
+      namespace: demo
+```
+
+For the other source types, replace `spec.source` on the `DataVolume`:
+
+```yaml
+# Registry
+source:
+  registry:
+    url: docker://registry.example.com/library/fedora:40
+# Clone an existing PVC
+source:
+  pvc:
+    name: source-pvc
+    namespace: demo
+# Restore from a VolumeSnapshot
+source:
+  snapshot:
+    name: source-snapshot
+    namespace: demo
+```
+
+Apply and watch the import:
+
+```bash
+kubectl apply -f bootable-volume.yaml
+kubectl get datavolume ubuntu-2204 -n demo -w
+```
+
+</Tab>
+</Tabs>
+
+## Create a virtual machine from a bootable volume
+
+In the bootable volume's ⋮ menu, select **Create Virtual Machine**. The virtual machine defaults to the bootable volume's namespace (a same-namespace clone). You can also start from **Virtualization** > **Virtual Machines** > **Create Virtual Machine** and choose **Provision Method** > **Image Instance**.
+
+Under the hood, the virtual machine references the data source in a `dataVolumeTemplates` entry — CDI clones the bootable volume into the new virtual machine's root disk:
+
+```yaml
+spec:
+  dataVolumeTemplates:
+    - metadata:
+        name: web-01-rootfs
+      spec:
+        sourceRef:
+          kind: DataSource
+          name: ubuntu-2204
+          # The bootable volume's namespace. Use kube-public to boot from an
+          # administrator-published golden image.
+          namespace: demo
+        storage:
+          resources:
+            requests:
+              storage: 20Gi
+          storageClassName: sc-topolvm
+          volumeMode: Filesystem
+          accessModes:
+            - ReadWriteOnce
+```
+
+The clone source namespace is restricted to the current/target namespace and `kube-public`. Cloning from another non-public namespace may require additional CDI clone permissions.
+
+## Update or delete a bootable volume
+
+Use the ⋮ menu on the **Bootable Volumes** list to update the description or delete the volume. Deleting a bootable volume removes its `DataSource` and the managed `DataVolume`. The backing PVC is owned by the `DataVolume` (via `ownerReferences`), so it is garbage-collected automatically when the `DataVolume` is deleted — do not delete the PVC while the `DataVolume` still exists, or CDI will re-provision it. The `DataSource`, `DataVolume`, and PVC share the same name:
+
+```bash
+kubectl delete datasource ubuntu-2204 -n demo
+kubectl delete datavolume ubuntu-2204 -n demo
+```
+
+If CDI already garbage-collected the `DataVolume` after a successful import, `kubectl delete datavolume` returns `NotFound` and the PVC is left without an owner — delete it directly in that case:
+
+```bash
+kubectl delete pvc ubuntu-2204 -n demo
+```

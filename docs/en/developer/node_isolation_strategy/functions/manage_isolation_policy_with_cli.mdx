@@ -1,0 +1,412 @@
+---
+weight: 20
+---
+
+# Manage Node Isolation Policies with the CLI
+
+Node isolation policies provide project-level node isolation. Platform administrators can bind one or more projects to selected cluster nodes and choose whether those nodes are exclusive to the bound projects or shared with other projects.
+
+In versions where the web console no longer provides **Administrator** > **Security Settings** > **Node Isolation Policies**, you can continue to manage node isolation policies with `ac` or `kubectl`.
+
+## How Node Isolation Policies Work
+
+A node isolation policy is stored as a Kubernetes custom resource named `NodeGroup`.
+
+| Item | Value |
+| --- | --- |
+| API group | `security.alauda.io` |
+| API version | `v1beta1` |
+| Kind | `NodeGroup` |
+| Resource | `nodegroups.security.alauda.io` |
+| Scope | Cluster |
+
+The key fields are:
+
+| Field | Description |
+| --- | --- |
+| `metadata.name` | Policy name. It must start and end with a lowercase letter or number, can contain lowercase letters, numbers, and `-`, and can be up to 63 characters long. |
+| `metadata.annotations["alauda.io/display-name"]` | Optional display name. |
+| `spec.shareMode` | Node sharing mode. Valid values are `Exclusive` and `Share`. |
+| `spec.projects[].name` | Names of the projects that use the policy. |
+| `spec.nodes[].name` | Names of the nodes assigned to the policy. |
+| `status.phase` | Policy reconciliation status, for example `Active`. |
+
+The sharing modes are:
+
+- `Exclusive`: Only projects bound to the policy can schedule new Pods on the policy nodes. Other projects cannot schedule new Pods on those nodes.
+- `Share`: Projects bound to the policy are constrained to the policy nodes, but other projects can still use those nodes.
+
+After a policy is created or updated, the platform labels related `Node` and `Namespace` resources, labels `ProjectQuota` objects when they exist, and injects scheduling constraints when Pods are created or updated. Common labels and taints include:
+
+| Type | Name | Description |
+| --- | --- | --- |
+| Label | `acp.cpaas.io/node-group-name` | Node isolation policy name. |
+| Label | `acp.cpaas.io/node-group-share-mode` | Node isolation mode, usually `Exclusive` or `Share`. |
+| Taint | `nodeGroup=<policy-name>:NoSchedule` | Added to policy nodes in `Exclusive` mode to block Pods that do not tolerate the taint. |
+
+## Before You Begin
+
+Before you run the commands in this guide, confirm the following:
+
+- The `ac` CLI is installed. If you use `kubectl`, prepare a kubeconfig for the target cluster first.
+- Your account can manage `nodegroups.security.alauda.io`.
+- You know the target workload cluster name, for example `business-1`.
+- You know the project names and node names to bind.
+- You have evaluated the impact on existing workloads.
+
+Important limits:
+
+- `NodeGroup` is a cluster-scoped resource. Do not specify `-n` when managing `NodeGroup` resources.
+- In one workload cluster, each project can belong to only one node isolation policy.
+- In one workload cluster, each node can belong to only one node isolation policy.
+- Creating a policy does not move existing Pods. Existing Pods that do not match the policy are constrained only after they are recreated.
+- In `Exclusive` mode, existing Pods on the policy nodes are not evicted automatically. Migrate them manually if required.
+- The web console creation page filters out control plane nodes and disables projects and nodes that are already used by another policy. When you use the CLI, check conflicts yourself before creating or updating a policy.
+
+## Authenticate to ACP
+
+Use `ac` to manage node isolation policies. The `ac` CLI manages ACP multi-cluster sessions and can switch to the target workload cluster.
+
+```bash
+ac login <acp-url> --name <session-name>
+ac config get-clusters
+ac config use-cluster <cluster-name>
+ac config current-context
+```
+
+Example:
+
+```bash
+ac login https://acp.example.com --name prod
+ac config use-cluster business-1
+ac config current-context
+```
+
+Confirm that the `NodeGroup` CRD exists:
+
+```bash
+ac api-resources --api-group=security.alauda.io
+ac get crd nodegroups.security.alauda.io
+```
+
+If you prefer `kubectl`, export kubeconfig from `ac` and then select the target context. Use the value from the `NAME` column in `kubectl config get-contexts` as `<target-context>`.
+
+```bash
+ac config view --raw > kubeconfig
+export KUBECONFIG=./kubeconfig
+kubectl config get-contexts
+kubectl config use-context <target-context>
+kubectl get nodegroups.security.alauda.io
+```
+
+The following examples use `ac`. If your `kubectl` context is configured correctly, you can replace `ac` with `kubectl`.
+
+## View Node Isolation Policies
+
+View all node isolation policies in the current cluster:
+
+```bash
+ac get nodegroups.security.alauda.io
+```
+
+View the policy list with selected fields:
+
+```bash
+ac get nodegroups.security.alauda.io \
+  -o 'custom-columns=NAME:.metadata.name,MODE:.spec.shareMode,PROJECTS:.spec.projects[*].name,NODES:.spec.nodes[*].name,PHASE:.status.phase'
+```
+
+View details for one policy:
+
+```bash
+ac get nodegroups.security.alauda.io <policy-name> -o yaml
+ac describe nodegroups.security.alauda.io <policy-name>
+```
+
+Check whether the policy is reconciled:
+
+```bash
+ac get nodegroups.security.alauda.io <policy-name> \
+  -o jsonpath='{.status.phase}{"\n"}'
+```
+
+When `status.phase` is `Active`, the controller has reconciled the policy.
+
+## Check Available Projects and Nodes
+
+Before you create or update a policy, check whether the projects and nodes are already used by another policy.
+
+If `ProjectQuota` objects exist in the environment, view their node isolation labels:
+
+```bash
+ac get projectquotas.auth.alauda.io \
+  -L acp.cpaas.io/node-group-name,acp.cpaas.io/node-group-share-mode
+```
+
+View `ProjectQuota` objects that are not bound to a policy:
+
+```bash
+ac get projectquotas.auth.alauda.io \
+  --selector='!acp.cpaas.io/node-group-name'
+```
+
+View nodes and their node isolation labels:
+
+```bash
+ac get nodes \
+  -L acp.cpaas.io/node-group-name,acp.cpaas.io/node-group-share-mode
+```
+
+View compute nodes that are not bound to a policy:
+
+```bash
+ac get nodes \
+  --selector='!node-role.kubernetes.io/master,!node-role.kubernetes.io/control-plane,!acp.cpaas.io/node-group-name'
+```
+
+## Create a Node Isolation Policy
+
+Create `nodegroup-pro.yaml`:
+
+```yaml
+apiVersion: security.alauda.io/v1beta1
+kind: NodeGroup
+metadata:
+  name: pro-nodegroup
+  annotations:
+    alauda.io/display-name: "pro nodes"
+spec:
+  shareMode: Exclusive
+  projects:
+    - name: pro
+  nodes:
+    - name: node-1
+    - name: node-2
+```
+
+Set `spec.shareMode` to `Exclusive` when the bound projects must have exclusive access to the nodes. Set it to `Share` when the bound projects must run on the selected nodes but other projects can still use those nodes.
+
+Apply the policy:
+
+```bash
+ac apply -f nodegroup-pro.yaml
+```
+
+Confirm the policy status:
+
+```bash
+ac get nodegroups.security.alauda.io pro-nodegroup
+ac get nodegroups.security.alauda.io pro-nodegroup -o yaml
+```
+
+Confirm that the nodes are labeled:
+
+```bash
+ac get nodes \
+  --selector='acp.cpaas.io/node-group-name=pro-nodegroup' \
+  -L acp.cpaas.io/node-group-name,acp.cpaas.io/node-group-share-mode
+```
+
+For `Exclusive` policies, confirm that a policy node has the `nodeGroup` taint:
+
+```bash
+ac describe node node-1
+```
+
+In the output, check that `Taints` contains:
+
+```text
+nodeGroup=pro-nodegroup:NoSchedule
+```
+
+Shared nodes usually do not keep a `nodeGroup=<policy-name>:NoSchedule` taint.
+
+## Update a Node Isolation Policy
+
+Before you update a policy, check its current configuration:
+
+```bash
+ac get nodegroups.security.alauda.io <policy-name> -o yaml
+```
+
+### Update Display Name
+
+```bash
+ac annotate nodegroups.security.alauda.io <policy-name> \
+  alauda.io/display-name="<display-name>" \
+  --overwrite
+```
+
+### Change Share Mode
+
+Switch the policy to shared mode:
+
+```bash
+ac patch nodegroups.security.alauda.io <policy-name> \
+  --type=merge \
+  -p '{"spec":{"shareMode":"Share"}}'
+```
+
+Switch the policy to exclusive mode:
+
+```bash
+ac patch nodegroups.security.alauda.io <policy-name> \
+  --type=merge \
+  -p '{"spec":{"shareMode":"Exclusive"}}'
+```
+
+After the policy switches to `Exclusive`, the controller adds `nodeGroup=<policy-name>:NoSchedule` to the policy nodes. Existing Pods are not evicted by this taint, but new Pods are constrained.
+
+### Replace Bound Projects
+
+The following command replaces the entire project list with `pro` and `dev`:
+
+```bash
+ac patch nodegroups.security.alauda.io <policy-name> \
+  --type=merge \
+  -p '{"spec":{"projects":[{"name":"pro"},{"name":"dev"}]}}'
+```
+
+### Replace Bound Nodes
+
+The following command replaces the entire node list with `node-1` and `node-2`:
+
+```bash
+ac patch nodegroups.security.alauda.io <policy-name> \
+  --type=merge \
+  -p '{"spec":{"nodes":[{"name":"node-1"},{"name":"node-2"}]}}'
+```
+
+> Important:
+>
+> `spec.projects` and `spec.nodes` are arrays. A merge patch replaces the entire array. Include the complete final list in the patch to avoid removing projects or nodes unintentionally.
+
+## Delete a Node Isolation Policy
+
+After you delete a policy, the bound projects are no longer restricted to the policy nodes, and the nodes are no longer reserved for the policy.
+
+```bash
+ac delete nodegroups.security.alauda.io <policy-name>
+```
+
+Confirm that the policy is deleted:
+
+```bash
+ac get nodegroups.security.alauda.io
+```
+
+Confirm that related labels are cleaned up:
+
+```bash
+ac get nodes \
+  --selector='acp.cpaas.io/node-group-name=<policy-name>'
+
+ac get projectquotas.auth.alauda.io \
+  --selector='acp.cpaas.io/node-group-name=<policy-name>'
+
+ac get namespaces \
+  --selector='acp.cpaas.io/node-group-name=<policy-name>'
+```
+
+If the policy stays in deletion for a long time, do not remove its finalizer directly. Check the node isolation controller and webhook first.
+
+## Verify Scheduling Behavior
+
+After you create or update a policy, verify that it is effective.
+
+### Verify Labels
+
+View policy nodes:
+
+```bash
+ac get nodes \
+  --selector='acp.cpaas.io/node-group-name=<policy-name>' \
+  -L acp.cpaas.io/node-group-name,acp.cpaas.io/node-group-share-mode
+```
+
+View policy project quotas, if `ProjectQuota` objects exist in the environment:
+
+```bash
+ac get projectquotas.auth.alauda.io \
+  --selector='acp.cpaas.io/node-group-name=<policy-name>' \
+  -L acp.cpaas.io/node-group-name,acp.cpaas.io/node-group-share-mode
+```
+
+View namespaces that belong to the policy projects:
+
+```bash
+ac get namespaces \
+  --selector='acp.cpaas.io/node-group-name=<policy-name>' \
+  -L acp.cpaas.io/node-group-name,acp.cpaas.io/node-group-share-mode
+```
+
+### Verify New Pod Scheduling
+
+Create a test Pod in a namespace that belongs to a bound project:
+
+```bash
+ac -n <namespace> run nodegroup-check \
+  --image=busybox:1.36 \
+  --restart=Never \
+  --command -- sleep 3600
+```
+
+View the node where the Pod is scheduled:
+
+```bash
+ac -n <namespace> get pod nodegroup-check -o wide
+```
+
+View the injected node selector and toleration:
+
+```bash
+ac -n <namespace> get pod nodegroup-check -o yaml
+```
+
+In the output, check for the following fields:
+
+```yaml
+spec:
+  nodeSelector:
+    acp.cpaas.io/node-group-name: <policy-name>
+  tolerations:
+    - key: nodeGroup
+      operator: Equal
+      value: <policy-name>
+      effect: NoSchedule
+```
+
+Delete the test Pod after verification:
+
+```bash
+ac -n <namespace> delete pod nodegroup-check
+```
+
+> Note:
+>
+> Existing Pods go through the scheduling flow again only after they are recreated.
+
+## Troubleshooting
+
+| Issue | Possible cause | Action |
+| --- | --- | --- |
+| `nodegroups.security.alauda.io` does not exist | The target cluster does not have the node isolation components installed or enabled. | Confirm that you selected the correct cluster, then check the node isolation feature switch and related components. |
+| Create or update is rejected | The project or node already belongs to another policy, or your account does not have permission. | Check the `acp.cpaas.io/node-group-name` labels and confirm your permissions. |
+| The policy does not become `Active` | The controller has not finished reconciliation, or a referenced project or node does not exist. | Check the project and node names, then check the node isolation controller logs. |
+| New Pods are not scheduled to policy nodes | The namespace is not labeled, the Pod was not recreated, or the webhook did not inject scheduling constraints. | Check the Namespace labels, delete and recreate the Pod, and check the webhook and controller. |
+| Existing Pods from other projects remain on exclusive nodes | This is expected. `NoSchedule` does not evict existing Pods. | Manually recreate, evict, or adjust the related workloads if migration is required. |
+| Node labels do not change after you update the node list | The controller is still syncing or the policy is unhealthy. | Wait briefly and query again. If labels still do not update, check controller logs and `NodeGroup` events. |
+
+## Recommended Operation Flow
+
+For production operations, use the following flow:
+
+1. Confirm the target workload cluster context.
+2. Query the existing `NodeGroup` list.
+3. Check whether the projects and nodes are already bound to another policy.
+4. Write and save the `NodeGroup` YAML.
+5. Create or update the policy with `ac apply -f`.
+6. Wait until `status.phase` is `Active`.
+7. Check the `Node`, `Namespace`, and `ProjectQuota` labels when the related resources exist.
+8. Create a new test Pod in a test namespace to verify scheduling.
+9. Recreate business workloads or migrate existing Pods only after verification.
