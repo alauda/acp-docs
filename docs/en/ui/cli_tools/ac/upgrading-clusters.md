@@ -226,6 +226,8 @@ Interpret the states as follows:
 
 If no preflight data is available yet, treat it as "no result yet", not as "all checks passed".
 
+If `AdminAckRequired` is `Failed`, an administrator acknowledgement gate applies to the current upgrade target. Review the gate, complete the required manual checks, write the acknowledgement, and then run `ac adm upgrade status --cluster=<cluster>` again to confirm that the check passes.
+
 ### Upgrade Stages
 
 After the upgrade enters execution, the status output shows stage and operation progress.
@@ -271,6 +273,29 @@ When `ac adm upgrade` shows a desired target but the upgrade is not moving:
 1. Run `ac adm upgrade status`.
 2. Check whether any preflight item is in `Retry` or `Failed`.
 3. Review whether upgrade stages have started.
+
+When `ac adm upgrade status --cluster=<cluster>` shows `AdminAckRequired` in `Failed` state:
+
+1. Inspect the release-provided gates from the global cluster:
+
+   ```bash
+   kubectl -n cpaas-system get configmap admin-gates -o yaml
+   ```
+
+2. For ACP 4.4 upgrades to Kubernetes 1.35, complete the [ACP 4.4 Kubernetes 1.35 node readiness checks](/upgrade/pre-upgrade.mdx#kubernetes-135-node-readiness) on every production node in the target cluster.
+
+3. Write the acknowledgement to the global-side `admin-acks` ConfigMap:
+
+   ```bash
+   kubectl -n cpaas-system patch configmap admin-acks --type merge \
+     -p '{"data":{"ack-4.4-kubernetes-1.35-kernel-update":"true"}}'
+   ```
+
+4. Confirm that the preflight check passes:
+
+   ```bash
+   ac adm upgrade status --cluster=<cluster>
+   ```
 
 When the upgrade is already in progress:
 
