@@ -45,147 +45,41 @@ machines can boot from and that can be reused by many virtual machines.
 > which has no `Route` resource, so you expose the Service yourself (this step) and set the
 > upload URL explicitly (Step 2).
 
-<Tabs>
+Use **TLS passthrough** so that `virtctl` negotiates TLS directly with `cdi-uploadproxy` (the
+proxy serves a self-signed certificate, so clients pass `--insecure`). For every method below the
+backend is the `cdi-uploadproxy` Service on port `443` in the `kubevirt` namespace; note the
+resulting external URL for Step 2.
 
-<Tab label="Gateway API (recommended)">
+- **Gateway API (Envoy Gateway) — recommended.** Add a `TLS` listener in `Passthrough` mode to a
+  `Gateway`, then create a `TLSRoute` whose backend is the `cdi-uploadproxy` Service on port
+  `443`. The Gateway's external address — a `LoadBalancer` IP or a `NodePort`, set by the
+  gateway's Service Type — becomes the upload URL. See
+  [Configure GatewayAPI Gateway](/networking/functions/configure_gatewayapi_gateway.mdx) and
+  [Configure GatewayAPI Route](/networking/functions/configure_gatewayapi_route.mdx) for the full
+  procedure, and [Envoy Gateway Operator](/networking/operators/envoy_gateway_operator.mdx) to
+  install the controller.
+- **Ingress (ingress-nginx).** Expose `cdi-uploadproxy` with an SSL-passthrough `Ingress`. See
+  [Configure Ingresses](/networking/functions/configure_ingress.mdx) and
+  [Ingress Nginx Operator](/networking/operators/ingress_nginx_operator.mdx). The legacy ALB
+  ingress (`cpaas.io/alb2`) is deprecated.
+- **LoadBalancer or NodePort Service.** Without an ingress controller, expose the Service
+  directly — a `LoadBalancer` where MetalLB is configured, or a `NodePort`, which always works:
 
-The Gateway API (backed by Envoy Gateway) is the recommended way to expose a Service on Alauda
-Container Platform. Use a **TLS passthrough** listener so that `virtctl` negotiates TLS directly
-with `cdi-uploadproxy` (which serves its own certificate).
+  ```bash
+  kubectl expose service cdi-uploadproxy -n kubevirt \
+    --name=cdi-uploadproxy-np --type=NodePort --port=443 --target-port=8443
+  kubectl get service cdi-uploadproxy-np -n kubevirt   # note the 443:<nodePort> mapping
+  ```
 
-1. Save the following to `cdi-uploadproxy-gateway.yaml`. Co-locating the `Gateway` and
-   `TLSRoute` in the `kubevirt` namespace (the same namespace as the Service) avoids the need
-   for a `ReferenceGrant`. Replace the host name with one that resolves to the Gateway's
-   external address.
+  Reach the proxy at `https://<node-ip>:<nodePort>`.
 
-   ```yaml
-   apiVersion: gateway.networking.k8s.io/v1
-   kind: Gateway
-   metadata:
-     name: cdi-uploadproxy-gw
-     namespace: kubevirt
-   spec:
-     gatewayClassName: envoy-gateway-operator-cpaas-default # use your cluster's GatewayClass
-     listeners:
-       - name: tls
-         protocol: TLS
-         port: 8443
-         hostname: cdi-uploadproxy.example.com
-         tls:
-           mode: Passthrough
-         allowedRoutes:
-           kinds:
-             - kind: TLSRoute
-           namespaces:
-             from: Same
-   ---
-   apiVersion: gateway.networking.k8s.io/v1alpha2
-   kind: TLSRoute
-   metadata:
-     name: cdi-uploadproxy-route
-     namespace: kubevirt
-   spec:
-     parentRefs:
-       - name: cdi-uploadproxy-gw
-     hostnames:
-       - cdi-uploadproxy.example.com
-     rules:
-       - backendRefs:
-           - name: cdi-uploadproxy
-             port: 443
-   ```
-
-   ```bash
-   kubectl apply -f cdi-uploadproxy-gateway.yaml
-   ```
-
-2. Confirm the route resolves and the Gateway has an address.
-
-   ```bash
-   kubectl get tlsroute cdi-uploadproxy-route -n kubevirt -o yaml   # Accepted=True, ResolvedRefs=True
-   kubectl get gateway  cdi-uploadproxy-gw   -n kubevirt            # PROGRAMMED=True, ADDRESS populated
-   ```
-
-   > **Note**: The Gateway needs an external address. If the cluster has **MetalLB** configured
-   > with an `IPAddressPool`, the Gateway's `LoadBalancer` Service receives an IP automatically.
-   > Without MetalLB the `LoadBalancer` Service stays pending (Gateway `PROGRAMMED=False`,
-   > `AddressNotAssigned`); configure the Gateway's Envoy Service as `NodePort` (via an
-   > `EnvoyProxy` resource referenced by the Gateway) and reach it at `https://<node-ip>:<nodePort>`.
-
-3. Verify that the proxy answers through the Gateway (the certificate is self-signed, so use
-   `-k`):
-
-   ```bash
-   curl -k https://cdi-uploadproxy.example.com:8443/healthz
-   # -> OK
-   ```
-
-</Tab>
-
-<Tab label="Ingress (ingress-nginx)">
-
-If the cluster uses `ingress-nginx-controller`, expose the proxy with an SSL-passthrough
-`Ingress` so TLS terminates at `cdi-uploadproxy`:
-
-```yaml
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: cdi-uploadproxy
-  namespace: kubevirt
-  annotations:
-    nginx.ingress.kubernetes.io/ssl-passthrough: "true"
-    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
-spec:
-  ingressClassName: nginx
-  rules:
-    - host: cdi-uploadproxy.example.com
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: cdi-uploadproxy
-                port:
-                  number: 443
-```
-
-> **Note**: The legacy ALB ingress (`cpaas.io/alb2`) is deprecated; use `ingress-nginx-controller`
-> or, where available, the Gateway API.
-
-</Tab>
-
-<Tab label="LoadBalancer Service">
-
-When **MetalLB** (or another load-balancer provider) is available, expose the proxy directly:
+After exposing the Service, verify it answers through the new endpoint (the certificate is
+self-signed, so use `-k`):
 
 ```bash
-kubectl expose service cdi-uploadproxy -n kubevirt \
-  --name=cdi-uploadproxy-lb --type=LoadBalancer --port=443 --target-port=8443
-kubectl get service cdi-uploadproxy-lb -n kubevirt   # wait for EXTERNAL-IP
+curl -k https://<upload-proxy-host>/healthz
+# -> OK
 ```
-
-Reach the proxy at `https://<external-ip>:443`. Without a configured `IPAddressPool` the
-external IP stays `<pending>`.
-
-</Tab>
-
-<Tab label="NodePort Service">
-
-A `NodePort` Service always works, regardless of the cluster's ingress setup:
-
-```bash
-kubectl expose service cdi-uploadproxy -n kubevirt \
-  --name=cdi-uploadproxy-np --type=NodePort --port=443 --target-port=8443
-kubectl get service cdi-uploadproxy-np -n kubevirt   # note the 443:<nodePort> mapping
-```
-
-Reach the proxy at `https://<node-ip>:<nodePort>`.
-
-</Tab>
-
-</Tabs>
 
 ### Point `virtctl` at the upload proxy URL
 
