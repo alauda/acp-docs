@@ -29,7 +29,7 @@ A global cluster upgrade is staged across a timeline. Most of the work is comple
 
 | Phase | When | What happens | Cluster impact |
 | --- | --- | --- | --- |
-| 1. Sync artifacts | Any time before the window | `upgrade.sh --only-sync-image` uploads images and plugin artifacts to the registry; `violet` pushes Aligned and Agnostic plugins. | None — registry only, no downtime. |
+| 1. Sync artifacts | Any time before the window | `upgrade.sh --only-sync-image` uploads images and plugin artifacts to the registry; `violet` pushes Aligned and Agnostic plugins. | None — images and catalog entries are published, but no running plugin is changed; no downtime. |
 | 2. Preflight | 1–2 weeks before the window | `upgrade.sh --preflight` validates upgrade readiness. Resolve every blocking item before the window opens. | None — read-only validation. |
 | 3. Upgrade | During the maintenance window | `upgrade.sh --skip-sync-image` deploys or updates the cluster version operator (CVO); the upgrade is then requested and observed. | The cluster is upgraded. |
 
@@ -157,6 +157,23 @@ kubectl annotate resourcepatches <rp-name> \
   config.cpaas.io/exempt-for-ver=4.3.0 \
   --overwrite
 ```
+
+### Resolve other common preflight blocks \{#resolve-other-preflight-blocks}
+
+The default check set validates several more conditions. List every check that is not `Passed`, then resolve each with the table below:
+
+```bash
+kubectl -n cpaas-system get cvsh global \
+  -o jsonpath='{range .status.preflight.checks[*]}{.name}{"\t"}{.state}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
+```
+
+| Check | What it validates | How to resolve |
+| --- | --- | --- |
+| `KubernetesVersionSupported` | The cluster's Kubernetes version is within the target release's supported range. | If it is below the supported range, upgrade the cluster's Kubernetes into that range first — see [Kubernetes Support Matrix](/overview/kubernetes-support-matrix.html). |
+| `VersionUpgradePath` | The current version can reach the requested target through a supported upgrade path. | Confirm the current version is a supported source for the target release; upgrade to an intermediate supported version first if it is not. |
+| `ClusterRunning` | The cluster is healthy and reconciled. | Check the cluster with `kubectl get clusterview global` and resolve any unhealthy node or component before retrying. |
+| `DockerRuntimeUnsupported` | No node still uses the unsupported Docker runtime. | Migrate the affected nodes to `containerd` before upgrading. |
+| `ClusterModuleStable`, `ModuleInfoStable` | Installed Core and Aligned modules are stable (`Running`), not mid-deploy or mid-upgrade. | See [Verify Module Stability Before You Upgrade](./pre-upgrade.mdx#module-stability-self-check). |
 
 ### Handle administrator acknowledgement gates \{#handle-administrator-acknowledgement-gates}
 
@@ -333,6 +350,20 @@ kubectl -n cpaas-system get cvsh global \
 kubectl -n cpaas-system get cvsh global \
   -o jsonpath='{range .status.history[*]}{.version}{"\t"}{.state}{"\t"}{.startedTime}{"\t"}{.completionTime}{"\n"}{end}'
 ```
+
+The commands above track the cluster-level (Core and Aligned) upgrade. To observe an individual plugin or operator module — for example while upgrading an Agnostic plugin — read its `ModuleInfo` instead:
+
+```bash
+# Current version, target, next available version, and phase per installed module on this cluster
+kubectl get moduleinfo -l cpaas.io/cluster-name=global \
+  -o custom-columns='MODULE:.metadata.labels.cpaas\.io/module-name,CURRENT:.status.version,TARGET:.spec.version,NEW:.status.availableVersions[0].version,PHASE:.status.phase'
+
+# Conditions and any block reasons for one module
+kubectl get moduleinfo <name> \
+  -o jsonpath='{range .status.conditions[*]}{.type}{"\t"}{.status}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
+```
+
+A module has reached its target when `status.phase` is `Running` and `status.version` equals the target version.
 
 ### Upgrade Agnostic plugins from Marketplace \{#upgrade-agnostic-from-marketplace}
 
