@@ -22,8 +22,8 @@ After installation, an EtcdBackupConfiguration resource is automatically created
 ## How it works
 
 - etcd backup is provided by **<Term name="product" /> Cluster Enhancer**.
-- Supports both local storage and S3-compatible object storage. Local backups are written to a directory on each control plane node — `/cpaas/backup` by default. Plan this directory on a dedicated disk with room to grow; keeping backups on the root filesystem can cause disk pressure as they accumulate. Configuring S3 storage creates an additional copy in the S3 bucket; local backups continue to be generated.
-- For clusters running on Immutable OS, S3 storage is **required** (local storage is not supported)
+- Supports both local storage and S3-compatible object storage. Local backups are written to a directory on each control plane node — `/var/cpaas/backup` by default. Plan this directory with enough capacity for your etcd data size and retention period. Configuring S3 storage creates an additional copy in the S3 bucket; local backups continue to be generated.
+- For Immutable OS clusters, local backup uses `/var/cpaas/backup` by default. S3 storage remains supported through `remoteStorage.s3`.
 
 ## Configuration Reference
 
@@ -34,15 +34,13 @@ You can configure the `EtcdBackupConfiguration` resource to customize backup sch
 - **`schedule`**: Defines the backup frequency using standard cron syntax.
   - Example: `0 0 * * *` (Run backup daily at midnight).
 - **`localStorage`**: Configures local backup storage.
-  - **`path`**: The directory on each control plane node where backups are stored. Default is `/cpaas/backup`. Set this to a directory backed by a dedicated, expandable disk; see the storage note below.
+  - **`path`**: The directory on each control plane node where backups are stored. Default is `/var/cpaas/backup`. Set this to a directory with enough capacity for the etcd data size and the configured retention period; see the storage note below.
   - **`ttl`**: The retention period for backup files in seconds. Backups older than this duration will be automatically deleted.
     - Example: `7776000` (approximately 90 days).
 - **`paused`**: Set to `true` to temporarily suspend automatic backups without deleting the configuration.
 
 :::warning
-Plan dedicated storage for local backups before enabling etcd backup. Local backups accumulate on the control plane nodes and are kept until their `ttl` expires, so the directory must sit on a disk that is sized for your retention policy and can be expanded later — not on the root filesystem, where growing backups can cause disk pressure and node instability.
-
-The default path `/cpaas/backup` is only suitable when `/cpaas` is mounted on a separate, adequately sized disk on every control plane node. Where `/cpaas` is part of the root filesystem, set `path` to a directory backed by a dedicated disk that you have provisioned, or mount `/cpaas` on a dedicated disk before using the default.
+Plan storage capacity for local backups before enabling etcd backup. Local backups accumulate on the control plane nodes and are kept until their `ttl` expires, so `/var/cpaas/backup` must have enough free space for the expected backup size and retention period.
 :::
 
 Example configuration:
@@ -56,7 +54,7 @@ spec:
   schedule: "0 0 * * *"       # Run daily at 00:00
   paused: false               # Enable backups
   localStorage:
-    path: /mnt/etcd-backup    # A directory on a dedicated, mounted backup disk
+    path: /var/cpaas/backup   # Local backup directory on each control plane node
     ttl: "7776000"            # Retain for 90 days
   # ... other fields
 ```
@@ -139,6 +137,18 @@ curl $platform_url/kubernetes/$cluster_name/apis/enhancement.cluster.alauda.io/v
 
 After the backup completes, verify that backup files exist in your S3 bucket.
 
+For restore preparation, use the `fileName` shown in the backup record and the configured `remoteStorage.s3.dir` value to download the tar archive from S3:
+
+```bash
+aws --endpoint-url <s3-endpoint> s3 cp \
+  s3://<bucket>/<dir>/<backup-file-name> \
+  /tmp/snapshot-etcd.tar
+
+mkdir -p /tmp/etcd-restore
+tar -xf /tmp/snapshot-etcd.tar -C /tmp/etcd-restore
+find /tmp/etcd-restore -name 'snapshot-etcd-*.db' -type f
+```
+
 ## etcd Restore
 
 > **Warning:**
@@ -153,6 +163,8 @@ After the backup completes, verify that backup files exist in your S3 bucket.
 - An etcd backup snapshot is available.
 - The cluster is malfunctioning due to the failure of etcd nodes (e.g., more than half of the control plane nodes are down).
 - This recovery procedure is specifically designed for a **3-node control plane** cluster. If your cluster has 5 or more control plane nodes, contact technical support for assistance.
+- On Immutable OS, confirm that `/var/lib/etcd`, `/etc/kubernetes/manifests/etcd.yaml`, and `/etc/kubernetes/pki/etcd/` exist on each control plane node before starting restore.
+- On Immutable OS, `etcdctl` might not be available in the host `PATH`. Locate it under `/var/lib/containerd`, or use a container image that includes a compatible `etcdctl` binary.
 
 ### Step 1: Backup Original Data and Modify etcd Configuration
 
@@ -165,8 +177,14 @@ mkdir -p /root/backup_$(date +%Y%m%d%H)/old-etcd/
 # Stop kubelet
 systemctl stop kubelet
 
-# Backup etcdctl binary
-cp $(find /var/lib/containerd/ -name etcdctl | tail -1) /root/etcdctl
+# Prepare etcdctl binary
+ETCDCTL_PATH="$(find /var/lib/containerd/ -name etcdctl -type f | tail -1)"
+if [ -z "$ETCDCTL_PATH" ]; then
+  echo "etcdctl was not found under /var/lib/containerd. Use a container image that includes a compatible etcdctl binary."
+  exit 1
+fi
+cp "$ETCDCTL_PATH" /root/etcdctl
+chmod +x /root/etcdctl
 
 # Remove etcd containers
 crictl ps -a | grep etcd | awk '{print $1}' | xargs -r crictl rm -f
@@ -185,7 +203,27 @@ sed -i '/initial-cluster=/a\    - --initial-cluster-state=existing' /etc/kuberne
 
 ### Step 2: Copy Backup Snapshot
 
-Copy the latest etcd backup snapshot to the `/tmp` directory on the **first control plane node** and name it `snapshot.db`.
+Copy the selected etcd backup snapshot to the `/tmp` directory on the **first control plane node** and name it `snapshot.db`.
+
+If the backup tar archive is available locally, extract it from `/var/cpaas/backup`:
+
+```bash
+mkdir -p /tmp/etcd-restore
+tar -xf "$(ls -1t /var/cpaas/backup/snapshot-etcd-*.tar | head -1)" -C /tmp/etcd-restore
+cp "$(find /tmp/etcd-restore -name 'snapshot-etcd-*.db' -type f | head -1)" /tmp/snapshot.db
+```
+
+If the backup tar archive is stored in S3, download it first, and then extract the snapshot file:
+
+```bash
+aws --endpoint-url <s3-endpoint> s3 cp \
+  s3://<bucket>/<dir>/<backup-file-name> \
+  /tmp/snapshot-etcd.tar
+
+mkdir -p /tmp/etcd-restore
+tar -xf /tmp/snapshot-etcd.tar -C /tmp/etcd-restore
+cp "$(find /tmp/etcd-restore -name 'snapshot-etcd-*.db' -type f | head -1)" /tmp/snapshot.db
+```
 
 ### Step 3: Restore etcd
 
