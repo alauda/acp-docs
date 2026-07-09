@@ -6,13 +6,22 @@ weight: 20
 
 ## 1. Overview
 
-This document explains the core concepts of custom roles and how to configure a RoleTemplate.
+This document explains the core concepts of custom roles and how to configure a RoleTemplate. There are two main ways to build a working custom role — pick either and follow it end to end:
+
+- **FunctionResource method** (5.1): select permissions from the product's built-in permission catalog. Simplest option, no RBAC authoring required.
+- **ClusterRole aggregation method** (5.2): author your own native `ClusterRole` and pull it into a RoleTemplate via label matching. More setup, but works independently of what any product module has migrated, and is the platform's long-term direction.
+
+`customRules` (5.3) is a third, lower-level option for one-off native RBAC rules.
+
+**Not sure which to pick?** Start with **Method A (5.1)** — it's the simplest and covers almost every need. Choose **Method B (5.2)** only when you specifically need a role built from your own `ClusterRole`, or one that must span multiple clusters.
+
+Once a RoleTemplate exists, grant it to users via UserBinding — see [Manage Roles](./manage_role_howto.mdx) for the console steps.
 
 ## 2. Core Concepts
 
 - **RoleTemplate**: Custom role template. It defines role semantics and permission sets, and is converted by the controller into ClusterRoles.
 - **FunctionResource**: An abstraction of K8s resources used by product features; referenced by `functionResourceRef` in RoleTemplate.
-- **ClusterRole**: RBAC rule set; can be aggregated into system roles via labels.
+- **ClusterRole**: RBAC rule set. A hand-written ClusterRole can be aggregated into a RoleTemplate (or into a built-in system role) via labels.
 - **UserBinding**: Binding between users and roles/scopes; the controller generates RoleBinding/ClusterRoleBinding based on UserBinding for final authorization.
 
 :::note
@@ -22,19 +31,62 @@ This document explains the core concepts of custom roles and how to configure a 
 
 ## 3. Technical Changes
 
+:::note
+You don't need this section to create a custom role — skip to section 5 (Configuration) for the steps. It's background: it explains why certain aggregation labels can silently grant no permissions, so you know which pattern to avoid.
+:::
+
 Starting from ACP v4.3, feature permissions are gradually migrated from FunctionResource to native K8s ClusterRole management. RoleTemplate module permissions will be aggregated into system roles via ClusterRole labels. FunctionResource-based management will be retired in v4.5.
 
-## 4. Supported Configuration Methods
+:::caution
+This migration is still in progress. Alongside the built-in system RoleTemplates (`cluster-admin-system`, `namespace-admin-system`, `namespace-developer-system`, `platform-admin-system`, `platform-auditor-system`, `project-admin-system`) you'll also see matching `legacy-*` RoleTemplates (`legacy-cluster-admin-system`, `legacy-namespace-admin-system`, ...). These `legacy-*` templates are a deliberate compatibility bridge, not leftover cruft: they keep the original FunctionResource-based configuration unchanged while generating the labeled ClusterRoles that the aggregation mechanism (`aggregationRules`) depends on. In other words, today's built-in aggregation roles work *because* their `legacy-*` counterparts still exist and feed them — the underlying permission source is still FunctionResource. `legacy-*` RoleTemplates are expected to be removed in v4.5 once FunctionResource permissions have been fully sunk/migrated into product-owned ClusterRoles. Most product modules (ACP, DevOps, ASM, Platform, Middleware, ...) haven't completed that migration yet, so they haven't published aggregation-ready ClusterRoles of their own.
 
-- **FunctionResource method**: Select permissions by product modules and control verbs at fine granularity.
-- **ClusterRole aggregation method (aggregationRules)**: Centralized aggregation via ClusterRole labels; recommended for v4.2+.
-- **customRules**: Configure permissions using native K8s RBAC syntax; same rule format as ClusterRole `rules`.
+**Practical impact for custom roles**: if you try to build a custom role by referencing a system/product label that no module has published yet (e.g. `rbac.cpaas.io/aggregate-to-namespace-auditor: "true"`), the RoleTemplate applies successfully but silently grants **no permissions** — there is no error to warn you. This does *not* mean the aggregation method is unusable for custom roles: 5.2 shows a pattern (your own ClusterRole + your own label) that works today regardless of migration progress. Always verify with 5.5 either way.
+:::
+
+:::note
+- `legacy-*` RoleTemplates are intentionally hidden from the role list in the console — if you don't see them there, that's by design, not a sign they're missing.
+- RoleTemplates carry a `rbac.cpaas.io/version` label. `v2` is the current, aggregation-aware model; `v1` is the legacy model, where `aggregationRules` is ignored and ClusterRoles use the old naming. **The controller automatically rewrites any custom RoleTemplate that doesn't explicitly declare `v2` into `v1` and freezes it** — so a role you thought used `aggregationRules` silently grants nothing, and later `spec` edits stop taking effect. Always set `rbac.cpaas.io/version: "v2"` and `auth.cpaas.io/roletemplate.frozen: "false"` yourself (see the required-labels caution in section 5).
+- In multi-cluster deployments, a business cluster only receives newly-generated aggregation ClusterRoles once its `auth-controller2` is on a version at or above the global cluster's. If a permission configured on global doesn't show up in a business cluster, check that cluster's `auth-controller2` version first.
+- The system labels in 5.4 (`aggregate-to-platform-admin`, `aggregate-to-namespace-developer`, ...) are fixed targets for ACP's *built-in* roles. They are what each plugin/module is expected to eventually publish ClusterRoles against, following the naming convention `cpaas:{module-name}:{scope}:{permission-level}` with at least a `view` and an `admin` level. Most modules haven't done this yet, which is why the label lookup in 5.5 comes back empty for them today — and why they're the wrong labels to reach for when building an independent custom role (see 5.2).
+:::
+
+## 4. Choosing a Method
+
+All three methods produce a working RoleTemplate; they differ in what you author and what they can express.
+
+| | Method A: FunctionResource (5.1) | Method B: ClusterRole aggregation (5.2) | Method C: customRules (5.3) |
+| --- | --- | --- | --- |
+| Best for | Reusing permissions a product already exposes | An independent role built from your own ClusterRole, especially across clusters | A quick one-off native RBAC rule |
+| You author | Nothing — pick from the catalog | A ClusterRole plus its aggregation labels | Inline RBAC rules |
+| Multi-cluster | Handled by the platform | Add `sync.scope: "platform"` to your ClusterRole | Handled by the platform |
+| Cross-scope rules | Yes | Yes — one ClusterRole per scope | No — base ClusterRole only |
+
+If you're unsure, use Method A.
 
 ## 5. Configuration
 
-### 5.1 RoleTemplate YAML
+:::caution
+**Every custom RoleTemplate needs these four labels.** The examples below all carry them, and three are **not optional**: if you leave them out, the controller silently rewrites your RoleTemplate into the legacy (`v1`, frozen) model, which **ignores `aggregationRules` completely and stops regenerating its ClusterRoles when you later edit `spec`**. Copy all four into every custom RoleTemplate you create:
 
-#### FunctionResource method (supported until v4.5)
+- `auth.cpaas.io/roletemplate.level` — where the role is granted: `platform` / `cluster` / `project` / `namespace`.
+- `auth.cpaas.io/roletemplate.official: "false"` — marks this as a user-defined role. **Never set it to `"true"`** on a custom role; that makes the controller treat it as a built-in system role and rewrite its naming and labels.
+- `rbac.cpaas.io/version: "v2"` — opt into the current conversion logic. Omitting it defaults the role to `v1`, where `aggregationRules` does nothing.
+- `auth.cpaas.io/roletemplate.frozen: "false"` — keep the role editable. Omitting it lets the controller freeze the role, after which edits to `spec` no longer update the generated ClusterRoles.
+:::
+
+### 5.1 Method A: FunctionResource
+
+Use this when the permissions you need are already exposed as FunctionResources — this is true for almost all current product modules.
+
+**Step 1 — find the FunctionResources you need**
+
+```bash
+kubectl get functionresource -o custom-columns='NAME:.metadata.name,MODULE:.metadata.labels.auth\.cpaas\.io/functionresource\.module,DISPLAY:.metadata.annotations.cpaas\.io/functionresource\.function\.display-name'
+```
+
+`metadata.name` is what you'll put in `functionResourceRef`; the display-name annotation tells you which UI feature it maps to.
+
+**Step 2 — write the RoleTemplate**
 
 ```yaml
 apiVersion: auth.alauda.io/v1beta1
@@ -46,13 +98,16 @@ metadata:
     cpaas.io/description: FunctionResource example
   labels:
     auth.cpaas.io/roletemplate.level: namespace
+    auth.cpaas.io/roletemplate.official: "false"
+    rbac.cpaas.io/version: "v2"
+    auth.cpaas.io/roletemplate.frozen: "false"
 spec:
   rules:
     - functionResourceRef: acp-app
       verbs: [get, list, watch]
 ```
 
-FunctionResource example:
+FunctionResource example (for reference — you select existing ones, you don't normally write these yourself):
 
 ```yaml
 apiVersion: auth.alauda.io/v1beta1
@@ -75,37 +130,25 @@ spec:
       bindNamespacePart: common
 ```
 
-#### ClusterRole aggregation method (v4.2+)
+**Step 3 — apply and verify** with 5.5.
 
-```yaml
-apiVersion: auth.alauda.io/v1beta1
-kind: RoleTemplate
-metadata:
-  name: demo-aggrole
-  annotations:
-    cpaas.io/display-name: Example Aggregation Role
-    cpaas.io/description: ClusterRole aggregation example
-  labels:
-    auth.cpaas.io/roletemplate.level: namespace
-spec:
-  aggregationRules:
-    - clusterRoleSelectors:
-        - matchLabels:
-            rbac.cpaas.io/aggregate-to-namespace-developer: "true"
-            rbac.cpaas.io/aggregate-to-scope-business-ns: "true"
-      scope: business-ns
-  rules: []
-```
+:::note
+`acp-namespace-resource-manage` is **not allowed** in custom roles.
+:::
 
-ClusterRole with aggregation labels:
+### 5.2 Method B: ClusterRole aggregation (independent custom role)
+
+Unlike the FunctionResource method, `aggregationRules` doesn't define permissions by itself — it only pulls `rules` in from existing ClusterRoles that carry matching labels. To build a genuinely independent custom role this way, you provide both halves yourself: the ClusterRole with real rules, and the label that connects it to your RoleTemplate.
+
+**Step 1 — write a native ClusterRole with the real permissions**, and label it with your own aggregation label plus a scope label. Don't reuse the system labels listed in 5.4 (`aggregate-to-namespace-developer`, etc.) unless you deliberately want to grant these permissions to everyone who already holds that built-in role — for an independent role, invent your own label name.
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: cpaas:demo:business-ns:view
+  name: cpaas:demo-auditor:business-ns:view
   labels:
-    rbac.cpaas.io/aggregate-to-namespace-developer: "true"
+    rbac.cpaas.io/aggregate-to-demo-auditor: "true"
     rbac.cpaas.io/aggregate-to-scope-business-ns: "true"
 rules:
   - apiGroups: ["apps"]
@@ -113,7 +156,51 @@ rules:
     verbs: ["get", "list", "watch"]
 ```
 
-#### customRules method
+**Step 2 — if this role needs to work in business clusters too**, and the ClusterRole above was only created in the global cluster, add `rbac.cpaas.io/sync.scope: "platform"` so the platform replicates it to every cluster. Without this label the ClusterRole only exists wherever you created it, and the RoleTemplate below will resolve to empty permissions on any cluster that doesn't have it.
+
+```yaml
+  labels:
+    rbac.cpaas.io/aggregate-to-demo-auditor: "true"
+    rbac.cpaas.io/aggregate-to-scope-business-ns: "true"
+    rbac.cpaas.io/sync.scope: "platform"
+```
+
+**Step 3 — create the RoleTemplate**, referencing the same labels via `aggregationRules`:
+
+```yaml
+apiVersion: auth.alauda.io/v1beta1
+kind: RoleTemplate
+metadata:
+  name: demo-auditor
+  annotations:
+    cpaas.io/display-name: Example Aggregation Role
+    cpaas.io/description: ClusterRole aggregation example
+  labels:
+    auth.cpaas.io/roletemplate.level: namespace
+    auth.cpaas.io/roletemplate.official: "false"
+    rbac.cpaas.io/version: "v2"
+    auth.cpaas.io/roletemplate.frozen: "false"
+spec:
+  aggregationRules:
+    - clusterRoleSelectors:
+        - matchLabels:
+            rbac.cpaas.io/aggregate-to-demo-auditor: "true"
+            rbac.cpaas.io/aggregate-to-scope-business-ns: "true"
+      scope: business-ns
+  rules: []
+```
+
+To cover more than one scope (e.g. also `cluster` or `system-ns`), add one ClusterRole per scope with the matching scope label, and one more entry under `aggregationRules` per scope — see 6.2 for a worked multi-scope example.
+
+**Step 4 — apply and verify** with 5.5. An empty result means either the labels on the ClusterRole and in `clusterRoleSelectors` don't actually match, or the ClusterRole hasn't synced to the cluster you're checking (step 2).
+
+:::caution
+Don't build a custom role by guessing at a label you hope some product module has already published (e.g. `rbac.cpaas.io/aggregate-to-namespace-auditor`) — see the caution in section 3. Most modules haven't migrated yet, so that label resolves to nothing and the RoleTemplate silently grants no permissions. The pattern above — your own ClusterRole, your own label — works regardless of migration progress.
+:::
+
+### 5.3 Method C: customRules
+
+For a one-off native RBAC rule that doesn't warrant a separate ClusterRole object, inline it directly in the RoleTemplate:
 
 ```yaml
 apiVersion: auth.alauda.io/v1beta1
@@ -125,6 +212,9 @@ metadata:
     cpaas.io/description: customRules example
   labels:
     auth.cpaas.io/roletemplate.level: namespace
+    auth.cpaas.io/roletemplate.official: "false"
+    rbac.cpaas.io/version: "v2"
+    auth.cpaas.io/roletemplate.frozen: "false"
 spec:
   customRules:
     - apiGroups: [""]
@@ -132,12 +222,21 @@ spec:
       verbs: ["get", "list", "watch"]
 ```
 
+:::note
+`customRules` are written only into the role's base ClusterRole — they can't be targeted at a specific scope like `cluster` or `system-ns` (there is no `scope` field on `customRules`). If you need cross-scope rules, use Method A or Method B.
+:::
+
+### 5.4 Field Reference
+
 RoleTemplate field reference (with ranges):
 
 | Field | Description | Values/Range |
 | --- | --- | --- |
 | `metadata.name` | Role name | Custom string |
 | `metadata.labels.auth.cpaas.io/roletemplate.level` | Role level | `platform / cluster / project / namespace` |
+| `metadata.labels.auth.cpaas.io/roletemplate.official` | Marks a user-defined role; required on custom roles | `"false"` (never `"true"` on a custom role) |
+| `metadata.labels.rbac.cpaas.io/version` | Conversion model; required on custom roles | `"v2"` (current) / `"v1"` (legacy, ignores `aggregationRules`) |
+| `metadata.labels.auth.cpaas.io/roletemplate.frozen` | Keeps the role editable; required on custom roles | `"false"` |
 | `metadata.annotations.cpaas.io/(display-name/description)` | Display name and description | Custom string |
 | `spec.rules[].functionResourceRef` | FunctionResource reference | See index (FunctionResource `metadata.name`) |
 | `spec.rules[].verbs` | Verbs | `get / list / watch / create / update / patch / delete / deletecollection` |
@@ -152,10 +251,13 @@ RoleTemplate field reference (with ranges):
 | `spec.customRules[].nonResourceURLs` | Non-resource URLs | Optional (typically for ClusterRole) |
 
 :::note
-`spec.rules` and `spec.aggregationRules` are mutually exclusive.
+- Use either direct rules (`spec.rules` / `spec.customRules`) or `spec.aggregationRules` for a given scope, not both — where they overlap on the same generated ClusterRole, the aggregation rule wins and the direct rules are dropped.
+- `auth.cpaas.io/roletemplate.level` (where the role is *granted* — `platform` / `cluster` / `project` / `namespace`) and `spec.aggregationRules[].scope` (which generated ClusterRole each aggregated rule lands in) are different things. The controller enforces one constraint between them: **`platform`- and `cluster`-level roles may only use `scope: cluster`**; `project`- and `namespace`-level roles may use any of the five scopes (including `cluster`). Breaking this rule puts the RoleTemplate into a `Failed` state.
 :::
 
 **System labels for matchLabels**
+
+These are the fixed aggregation targets for ACP's *built-in* system roles. Use them only when you deliberately want to add permissions to one of these existing roles for everyone who already holds it. For an independent custom role, define your own label instead (5.2) — any `rbac.cpaas.io/aggregate-to-<name>` string works; it doesn't need to appear in this list.
 
 System role aggregation labels:
 - `rbac.cpaas.io/aggregate-to-platform-admin: "true"`
@@ -166,16 +268,15 @@ System role aggregation labels:
 - `rbac.cpaas.io/aggregate-to-namespace-developer: "true"`
 - `rbac.cpaas.io/aggregate-to-basic-user: "true"`
 
-Scope aggregation labels:
+Scope aggregation labels (shared vocabulary — safe to reuse regardless of whether the role is built-in or custom, since they only describe *where* a rule applies, not *which* role it belongs to):
 - `rbac.cpaas.io/aggregate-to-scope-cluster: "true"`
 - `rbac.cpaas.io/aggregate-to-scope-project-ns: "true"`
 - `rbac.cpaas.io/aggregate-to-scope-business-ns: "true"`
 - `rbac.cpaas.io/aggregate-to-scope-system-ns: "true"`
 - `rbac.cpaas.io/aggregate-to-scope-kube-public: "true"`
 
-:::note
-Custom labels are also supported for aggregation.
-:::
+Multi-cluster distribution label (5.2 step 2):
+- `rbac.cpaas.io/sync.scope: "platform"` — replicates a ClusterRole created in the global cluster to all clusters. Put it on a ClusterRole you create by hand (as in 5.2); it has no effect on a RoleTemplate or on the ClusterRoles a RoleTemplate generates — those are distributed by their own mechanism.
 
 FunctionResource field reference:
 
@@ -190,30 +291,46 @@ FunctionResource field reference:
 | `spec.rules[].bindCluster` | Cluster scope (`global / unlimit / business`) |
 | `spec.rules[].bindNamespacePart` | Namespace part (`common / system / kube-public / project_ns / cluster / ""`) |
 
-:::note
-`acp-namespace-resource-manage` is **not allowed** in custom roles.
-:::
+### 5.5 Verify a configuration actually takes effect
 
-### 5.2 Get ClusterRoles generated from a RoleTemplate
+#### Get ClusterRoles generated from a RoleTemplate
 
-Query ClusterRoles generated by a RoleTemplate using labels:
+Query ClusterRoles generated by a RoleTemplate using labels. Every ClusterRole a RoleTemplate generates carries `auth.cpaas.io/roletemplate=<name>`; custom (v2) roles additionally carry `auth.cpaas.io/role.relative=<name>`:
 
 ```bash
-kubectl get clusterrole -l auth.cpaas.io/role.relative=<roletemplate-name>
+kubectl get clusterrole -l auth.cpaas.io/roletemplate=<roletemplate-name>
 ```
+
+If this returns nothing, or the returned ClusterRoles have empty `rules`, the RoleTemplate isn't granting what you expect. Common causes, in rough order of frequency:
+
+- The RoleTemplate is missing `rbac.cpaas.io/version: "v2"`, or was auto-frozen — see the required-labels caution in section 5. This is the most frequent reason `aggregationRules` appears to do nothing.
+- A `functionResourceRef` name is misspelled — the controller skips unknown references silently and produces an empty ClusterRole with no error.
+- Your `aggregationRules` labels don't match any ClusterRole, or the source ClusterRole hasn't synced to this cluster.
+
+#### Check whether an aggregation label is usable before writing `aggregationRules`
+
+Before referencing an `rbac.cpaas.io/aggregate-to-*` label in `clusterRoleSelectors`, confirm it actually resolves to a ClusterRole:
+
+```bash
+kubectl get clusterrole -l rbac.cpaas.io/aggregate-to-<your-label>=true \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.labels.auth\.cpaas\.io/roletemplate}{"\n"}{end}'
+```
+
+- No output → no ClusterRole carries this label. If you're using your own custom label (5.2), double-check the label was actually applied to your ClusterRole and that it synced to this cluster. If you're using a system label (5.4) hoping a product module published it, it likely hasn't — see 3.
+- Output shows a `legacy-*` value for `auth.cpaas.io/roletemplate` → this ClusterRole comes from the FunctionResource-based compatibility bridge described in 3, not from a module that has actually migrated. The permissions still originate from FunctionResource, and this bridge is expected to disappear in v4.5.
 
 ## 6. Copy & Trim (Examples)
 
-For custom roles, it is recommended to copy a built-in system template and trim it to avoid missing module permissions.
+Two worked examples: trimming a built-in template (Method A, 6.1), and building a multi-scope role from your own ClusterRoles (Method B, 6.2). For a FunctionResource role, copying a built-in system template and trimming it is the quickest way to avoid missing module permissions.
 
-### 6.1 Trim a system RoleTemplate YAML
+### 6.1 Trim a system RoleTemplate YAML (Method A)
 
 Steps:
 - Keep the required FunctionResources.
 - Reduce verbs to read-only (get/list/watch).
 - Remove unused modules.
 
-Role example: developer auditor without secret permissions  
+Role example: developer auditor without secret permissions
 
 :::note
 - In custom roles, do not configure Namespace Resource Management (FunctionResource: `acp-namespace-resource-manage`).
@@ -232,6 +349,9 @@ Example YAML:
       cpaas.io/display-name: Developer Copy
     labels:
       auth.cpaas.io/roletemplate.level: namespace
+      auth.cpaas.io/roletemplate.official: "false"
+      rbac.cpaas.io/version: "v2"
+      auth.cpaas.io/roletemplate.frozen: "false"
     name: namespace-developer-system-copy
   spec:
     rules:
@@ -282,33 +402,73 @@ Example YAML:
           - watch
   ```
 
-### 6.2 Trim namespace-developer-system into an auditor role
+### 6.2 Build a multi-scope auditor role (Method B)
 
-Approach:
-- Keep the scope structure (cluster / project-ns / business-ns / system-ns / kube-public).
-- Replace aggregation labels with auditor labels (requires labeled ClusterRoles).
+This is the aggregation-method equivalent of 6.1: a namespace-level read-only role that spans both the business and project namespaces, built from your own ClusterRoles and your own label — following the pattern from 5.2.
 
-Example (excerpt):
+**ClusterRoles** — one per scope you want to cover, all sharing the same custom label, each with its own scope label:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cpaas:demo-auditor:business-ns:view
+  labels:
+    rbac.cpaas.io/aggregate-to-demo-auditor: "true"
+    rbac.cpaas.io/aggregate-to-scope-business-ns: "true"
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["configmaps", "services"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cpaas:demo-auditor:project-ns:view
+  labels:
+    rbac.cpaas.io/aggregate-to-demo-auditor: "true"
+    rbac.cpaas.io/aggregate-to-scope-project-ns: "true"
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps", "services"]
+    verbs: ["get", "list", "watch"]
+```
+
+**RoleTemplate** — one `aggregationRules` entry per scope, reusing the same custom label:
 
 ```yaml
 apiVersion: auth.alauda.io/v1beta1
 kind: RoleTemplate
 metadata:
-  name: namespace-auditor
+  name: demo-namespace-auditor
   annotations:
-    cpaas.io/display-name: Namespace Auditor
-    cpaas.io/description: Read-only audit
+    cpaas.io/display-name: Custom Namespace Auditor
+    cpaas.io/description: Read-only audit across business and project namespaces
   labels:
     auth.cpaas.io/roletemplate.level: namespace
+    auth.cpaas.io/roletemplate.official: "false"
+    rbac.cpaas.io/version: "v2"
+    auth.cpaas.io/roletemplate.frozen: "false"
 spec:
   aggregationRules:
     - clusterRoleSelectors:
         - matchLabels:
-            rbac.cpaas.io/aggregate-to-namespace-auditor: "true"
+            rbac.cpaas.io/aggregate-to-demo-auditor: "true"
             rbac.cpaas.io/aggregate-to-scope-business-ns: "true"
       scope: business-ns
+    - clusterRoleSelectors:
+        - matchLabels:
+            rbac.cpaas.io/aggregate-to-demo-auditor: "true"
+            rbac.cpaas.io/aggregate-to-scope-project-ns: "true"
+      scope: project-ns
   rules: []
 ```
-:::note
-`aggregate-to-namespace-auditor` must match labels on existing ClusterRoles. If not, create a read-only ClusterRole and add the label first.
+
+Add `system-ns` the same way if you need it, and remember `rbac.cpaas.io/sync.scope: "platform"` on each ClusterRole (5.2 step 2) if it's only created in the global cluster but the role must work in business clusters too.
+
+:::caution
+It's tempting to skip the ClusterRoles above and just point `aggregationRules` at a ready-made platform label like `rbac.cpaas.io/aggregate-to-namespace-auditor`. Don't — that's a *system* label (5.4), and no product module has published a read-only ClusterRole under it yet, so the role would silently grant nothing (verify with 5.5). Supplying your own ClusterRoles and your own label, as above, is what makes this work today.
 :::
