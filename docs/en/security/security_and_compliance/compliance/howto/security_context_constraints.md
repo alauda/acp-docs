@@ -2424,7 +2424,20 @@ kubectl auth can-i use \
 
 The expected outputs are `yes` for `payment-agent-privileged` and `no` for `default`. The dedicated ServiceAccount also inherits `restricted-v2` from the namespace group binding.
 
-### Step 5 - Transfer enforcement from PSA to Kyverno SCC
+### Step 5 - Prevent other workloads from reusing the ServiceAccount
+
+This procedure grants `privileged` to a ServiceAccount, not to a Pod or controller name. Kubernetes RBAC does not provide field-level authorization for `spec.serviceAccountName`. A user who can create arbitrary Pods, Deployments, StatefulSets, DaemonSets, Jobs, or CronJobs in `payments` may otherwise reference `payment-agent-privileged` from another workload and receive the same SCC access.
+
+Before continuing, enforce at least one of these controls:
+
+- Allow only a dedicated GitOps or deployment identity to create or update workloads that reference `payment-agent-privileged`, and prevent ordinary namespace users from modifying those workloads.
+- Add an admission guard that rejects references to `payment-agent-privileged` unless the request is authorized. Apply the guard to direct Pods and every Pod-template controller enabled in the namespace.
+
+Do not rely only on a workload label or annotation to authorize use of the dedicated ServiceAccount; users who can create workloads can normally copy those values. If neither deployment ownership nor admission-time ServiceAccount usage can be restricted, this pattern provides a ServiceAccount-level exception only and must not be represented as a single-Pod exception.
+
+Do not continue to the PSA transition until one of these controls is enforced.
+
+### Step 6 - Transfer enforcement from PSA to Kyverno SCC
 
 Remove only the PSA restricted enforcement labels. Keep restricted audit and warning labels so the API server continues to report workloads that would violate the restricted standard.
 
@@ -2453,7 +2466,7 @@ kubectl label namespace payments \
 
 Here `enforce=privileged` means PSA does not impose additional restrictions. It does not grant privileged access to Pods; the Kyverno SCC bindings remain the enforcing authorization boundary.
 
-### Step 6 - Pin the approved SCC in the workload
+### Step 7 - Pin the approved SCC in the workload
 
 Put `alauda.io/required-scc` in the Pod template metadata and use the dedicated ServiceAccount. Do not put the annotation only on the Deployment metadata because controller metadata is not copied automatically to its Pods.
 
@@ -2490,7 +2503,7 @@ spec:
 
 The annotation does not grant SCC permission. If the SCC is missing or the ServiceAccount does not have `use` permission, the validating policy rejects the Pod.
 
-### Step 7 - Verify that the exception is isolated
+### Step 8 - Verify that the exception is isolated
 
 Run admission probes as the real application deployment identity, not as `cluster-admin`. SCC selection takes the request User and Groups into account for directly created Pods, so an administrator with separate broad SCC grants can produce a different result from the workload identity used in production.
 
@@ -2553,18 +2566,6 @@ EOF
 ```
 
 When submitted by the normal application deployment identity, the request must be rejected with a message stating that the required SCC is not bound to ServiceAccount `default`. If this Pod is admitted, stop and inspect broad SCC RoleBindings, ClusterRoleBindings, and User or Group grants before allowing production workloads.
-
-### Protect the dedicated ServiceAccount from reuse
-
-The SCC binding limits the permission to one ServiceAccount, but Kubernetes RBAC does not provide field-level authorization for `spec.serviceAccountName`. A user who can create arbitrary Pods, Deployments, StatefulSets, DaemonSets, Jobs, or CronJobs in `payments` may be able to reference `payment-agent-privileged` from another workload.
-
-Use at least one of these controls:
-
-- Allow only a dedicated GitOps or deployment identity to create or update the exceptional workload, and prevent ordinary namespace users from modifying it.
-- Add a Kyverno admission guard that rejects references to `payment-agent-privileged` unless the request comes from an approved deployment identity. Apply the guard to direct Pods and every Pod-template controller enabled in the namespace.
-- Use a separate, tightly controlled namespace when neither deployment ownership nor admission-time ServiceAccount usage can be restricted.
-
-Do not rely only on a workload label or annotation to authorize use of the dedicated ServiceAccount; users who can create workloads can normally copy those values.
 
 ### Roll back the exception
 
