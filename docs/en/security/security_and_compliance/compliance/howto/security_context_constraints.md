@@ -1133,6 +1133,8 @@ apiVersion: policies.kyverno.io/v1alpha1
 kind: ValidatingPolicy
 metadata:
   name: scc-auto-pick
+  labels:
+    reports.kyverno.io/disabled: "true"
   annotations:
     policies.kyverno.io/title: SCC Auto-Pick (CEL, CRD + RBAC)
     pod-policies.kyverno.io/autogen-controllers: "none"
@@ -1428,6 +1430,8 @@ apiVersion: policies.kyverno.io/v1alpha1
 kind: MutatingPolicy
 metadata:
   name: scc-fill-defaults
+  labels:
+    reports.kyverno.io/disabled: "true"
   annotations:
     policies.kyverno.io/title: SCC default value filler (CRD + RBAC, explicit-wins)
     pod-policies.kyverno.io/autogen-controllers: "none"
@@ -1864,6 +1868,8 @@ spec:
             }
           }
 ```
+
+Keep `reports.kyverno.io/disabled: "true"` on both policies. SCC selection depends on the admission request User, Groups, and ServiceAccount, while a background report scan does not have the equivalent request identity. The mutating policy also fills defaults only during admission. Excluding these admission-only policies from background reporting avoids misleading PolicyReports and unnecessary recompilation for every existing Pod.
 
 Both policies skip the following namespaces by default: namespaces starting with `kube-`, `cpaas-`, or `alauda-`, plus `kyverno`, `cattle-system`, `operators`, and `default`. Adjust the `skip-system-ns` expression in both policies if your platform uses different system namespaces.
 
