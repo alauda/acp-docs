@@ -120,13 +120,15 @@ ACP evaluates group membership for each user as `(<Group Attr>=<User Attr value>
 
 ## Choose a Tested Mapping
 
-These mappings are starting points for the listed layouts. Add exclusions for disabled, service, or system accounts only when required by the customer's directory policy and after the broad Filter returns the correct population.
+These mappings are validated starting points for the listed layouts. The Active Directory Filter excludes computer objects and disabled accounts. Change that Filter only when the customer's directory policy requires a different population, and repeat the external count, ACP synchronization, and login checks after the change.
 
 | Directory layout | User Filter | User Name Attr | Login Field | Group Attr | User Attr | Group Name Attr |
 | --- | --- | --- | --- | --- | --- | --- |
 | OpenLDAP `groupOfNames` | `(&(objectClass=inetOrgPerson)(uid=*))` | `uid` | `uid` | `member` | `DN` | `cn` |
 | OpenLDAP `posixGroup` | `(&(objectClass=inetOrgPerson)(uid=*))` | `uid` | `uid` | `memberUid` | `uid` | `cn` |
-| Active Directory | `(&(objectClass=user)(!(objectClass=computer))(sAMAccountName=*))` | `sAMAccountName` | `sAMAccountName` | `member` | `DN` | `cn` |
+| Active Directory | `(&(objectClass=user)(!(objectClass=computer))(sAMAccountName=*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))` | `sAMAccountName` | `sAMAccountName` | `member` | `DN` | `cn` |
+
+When Active Directory group synchronization uses **Group Attr** `member` and **User Attr** `DN`, use `(&(objectClass=group)(member=*))` as the Group Filter. ACP validates `member` against sampled group entries during creation. A broader `(objectClass=group)` Filter can sample empty groups that do not return a `member` attribute and reject an otherwise valid mapping.
 
 ## Add LDAP \{#addldap}
 
@@ -191,7 +193,15 @@ Deleting the Connector without cleanup retains users and groups from that source
 
 The following v2 `Connector` templates use `bindPW` only as an initial-creation input. Submit them through the ACP console YAML tab. ACP moves the submitted password to a managed Secret, and stored YAML later contains a managed `clientSecretRef` instead of `bindPW`. Do not use `kubectl apply` with an inline `bindPW`: the Kubernetes last-applied annotation can retain the submitted password in the Connector metadata. Replace every example value before use.
 
-### OpenLDAP Template
+### Strict-Verification OpenLDAP Template
+
+:::warning Certificate verification limitation on port 636
+
+In the ACP environment validated for this guide (`auth-controller2` v4.3.6), a Connector whose `host` ends in `:636` is stored with `insecureSkipVerify: true`, even when the submitted value is `false` and `rootCAData` contains the correct CA. Standard-port LDAPS traffic is encrypted, but ACP does not verify the LDAP server certificate.
+
+The template below is for a directory that exposes LDAPS on a non-636 port. This configuration was validated with `insecureSkipVerify: false` and `rootCAData` on a non-636 port. If certificate verification is required, coordinate the port with the directory and network administrators, then complete Connector creation, synchronization, and a real login before rollout.
+
+:::
 
 ```yaml
 apiVersion: dex.coreos.com/v1
@@ -206,7 +216,7 @@ metadata:
     cpaas.io/idp.version: v2
 spec:
   config:
-    host: ldap.example.com:636
+    host: "<LDAPS_HOST>:<NON_636_LDAPS_PORT>"
     bindDN: cn=reader,dc=example,dc=com
     bindPW: <BIND_PASSWORD>
     insecureNoSSL: false
@@ -252,13 +262,13 @@ spec:
     usernamePrompt: AD username
     userSearch:
       baseDN: OU=Employees,DC=example,DC=com
-      filter: "(&(objectClass=user)(!(objectClass=computer))(sAMAccountName=*))"
+      filter: "(&(objectClass=user)(!(objectClass=computer))(sAMAccountName=*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
       idAttr: sAMAccountName
       nameAttr: sAMAccountName
       username: sAMAccountName
     groupSearch:
       baseDN: OU=Groups,DC=example,DC=com
-      filter: "(objectClass=group)"
+      filter: "(&(objectClass=group)(member=*))"
       groupAttr: member
       userAttr: DN
       nameAttr: cn
@@ -269,11 +279,12 @@ Choose the transport flags as a set:
 | Transport | Typical port | `insecureNoSSL` | `startTLS` | Certificate verification |
 | --- | --- | --- | --- | --- |
 | Plain LDAP | 389 | `true` | `false` | Not applicable; use only on a trusted network when policy permits |
-| LDAPS | 636 | `false` | `false` | Keep `insecureSkipVerify: false` and provide the trusted CA through `rootCAData` |
+| LDAPS on the standard port | 636 | `false` | `false` | The validated ACP implementation stores `insecureSkipVerify: true`; traffic is encrypted, but the LDAP server certificate is not verified |
+| LDAPS with strict certificate verification | A configured non-636 LDAPS port | `false` | `false` | Keep `insecureSkipVerify: false` and provide the trusted CA through `rootCAData`; this was validated on a non-636 port |
 
-The Active Directory template above uses the plain LDAP transport that was validated with ACP. Plain LDAP does not protect the bind password on the network. Use it only when the customer's network and security policy permit it. When TLS is required, obtain the directory CA certificate and complete an ACP LDAPS creation, synchronization, and login test before rollout.
+The Active Directory template above uses the plain LDAP transport that was validated with ACP. Plain LDAP does not protect the bind password on the network. Use it only when the customer's network and security policy permit it. When TLS is required, first determine whether the policy also requires certificate verification: standard-port 636 provides encryption without server certificate verification in the validated implementation, while strict verification requires a non-636 LDAPS port and `rootCAData`. Complete an ACP LDAPS creation, synchronization, and login test before rollout.
 
-For LDAPS, encode the PEM CA certificate without line breaks and use the output as `rootCAData`:
+For strict certificate verification on a non-636 LDAPS port, encode the PEM CA certificate without line breaks and use the output as `rootCAData`:
 
 ```bash
 openssl base64 -A -in ldap-ca.pem
@@ -297,6 +308,7 @@ The example rule is suitable only for observing an acceptance-test run. Replace 
 | --- | --- | --- | --- |
 | ACP cannot create the Connector because it cannot connect. | Connector creation | Cluster DNS, routing, firewall, port, TLS mode, or certificate trust is incorrect. | From a host or Pod with ACP-equivalent reachability, run the external TCP or TLS checks below, then inspect `auth-controller2` logs. |
 | Bind succeeds but Base DN or Filter validation fails. | Connector creation and search validation | The Base DN does not exist for the bind account, the Filter is invalid, or the Filter returns no usable entries. | Run an external base-scope query for the Base DN, then run the exact subtree Filter and inspect `auth-controller2` logs. |
+| ACP rejects Active Directory **Group Attr** `member` and also suggests `member`. | Connector creation and group attribute validation | The Group Filter sampled empty groups that did not return a `member` attribute. | Use `(&(objectClass=group)(member=*))`, confirm that the external query returns the intended groups, and retry creation. |
 | Sync reports success but returns fewer users than expected. | Manual or scheduled synchronization | The Filter excludes users, users are outside the Base DN, or required **User Name Attr** values are missing. | Compare the external subtree result with the expected count, run the missing-attribute Filters above, and inspect skipped-entry messages in `apollo` logs. |
 | Connector creation succeeds but a directory user cannot log in. | Login | **Login Field** does not find exactly one entry, the account is excluded or disabled, or the representative credentials are invalid. | Query the representative login value with each configured login attribute, confirm exactly one result, retry in a separate browser session, and inspect `apollo` logs. |
 | Users synchronize but groups do not. | Group synchronization | **Group Attr** and **User Attr** do not represent the values stored in the group, or the Group Base DN or Filter is wrong. | Inspect one known group and reproduce `(<Group Attr>=<User Attr value>)` with an external subtree query, then inspect `apollo` group lookup messages. |
@@ -311,6 +323,8 @@ The tools in this section are external pre-integration diagnostics or advanced A
 
 The LDAP commands require an installed OpenLDAP client such as `ldapsearch` and `ldapwhoami`. They prompt for the bind password with `-W`. This option only prevents the password from appearing in the command line; it does not encrypt the network transport.
 
+The private-CA environment variables below were validated with a Linux OpenLDAP client. The built-in macOS `/usr/bin/ldapsearch` and `/usr/bin/ldapwhoami` use the macOS system trust store instead; use a Linux diagnostic host or Pod, or configure the CA in the macOS Keychain before using those built-in clients.
+
 For every `ldapwhoami` and `ldapsearch` command, use the same transport combination as the Connector being investigated:
 
 | Connector transport | Connector settings | OpenLDAP client transport | Bind credential protection |
@@ -318,7 +332,16 @@ For every `ldapwhoami` and `ldapsearch` command, use the same transport combinat
 | Plain LDAP | `insecureNoSSL: true`, `startTLS: false` | `-H ldap://ldap.example.com:389` without `-ZZ` | No TLS protection; use only when network policy permits |
 | LDAPS | `insecureNoSSL: false`, `startTLS: false` | `-H ldaps://ldap.example.com:636` without `-ZZ` | TLS starts when the connection is established |
 
-The query examples below use plain LDAP and therefore match only a Connector with `insecureNoSSL: true`. For LDAPS, replace the `-H` value with the matching row before running each example.
+The query examples below use plain LDAP and therefore match only a Connector with `insecureNoSSL: true`. For LDAPS, replace the `-H` value with the matching row before running each example. If the LDAP certificate is signed by a private CA, the diagnostic client must also trust that CA. On Linux OpenLDAP clients, prefix each `ldapwhoami` or `ldapsearch` command as follows:
+
+```bash
+LDAPTLS_REQCERT=demand \
+LDAPTLS_CACERT=/path/to/ldap-ca.pem \
+ldapwhoami -x -H ldaps://ldap.example.com:636 \
+  -D 'cn=reader,dc=example,dc=com' -W
+```
+
+Without the `LDAPTLS_CACERT` setting, the validated Linux client failed with `unable to get local issuer certificate`; with the CA file, the same bind succeeded.
 
 **External command: test TCP port reachability only**
 
@@ -394,11 +417,15 @@ ldapsearch -LLL -x -H ldap://ldap.example.com:389 \
   dn cn member
 ```
 
-**External command: inspect the LDAPS certificate chain**
+**External command: verify the LDAPS certificate chain with the intended CA**
 
 ```bash
-openssl s_client -connect ldap.example.com:636 -showcerts
+openssl s_client -connect ldap.example.com:636 \
+  -servername ldap.example.com \
+  -CAfile ldap-ca.pem -verify_return_error
 ```
+
+The certificate check passes only when the output reports successful verification, such as `Verify return code: 0 (ok)` or `Verification: OK`.
 
 ### External: Active Directory Queries with `ldapsearch`
 
@@ -410,7 +437,7 @@ The same OpenLDAP command-line client can inspect Active Directory without requi
 ldapsearch -LLL -x -H ldap://ad.example.com:389 \
   -D 'CN=ACP Reader,OU=Service Accounts,DC=example,DC=com' -W \
   -b 'OU=Employees,DC=example,DC=com' -s sub \
-  '(&(objectClass=user)(!(objectClass=computer))(sAMAccountName=*))' \
+  '(&(objectClass=user)(!(objectClass=computer))(sAMAccountName=*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))' \
   dn sAMAccountName displayName mail userAccountControl memberOf
 ```
 
