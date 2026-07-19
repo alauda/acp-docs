@@ -6,23 +6,17 @@ weight: 20
 
 ACP can redirect users to a standards-based OIDC identity provider and create or update their platform identity after successful login.
 
-| Situation | Recommended ACP configuration path |
-| --- | --- |
-| The provider returns standard `name`, `email`, and `email_verified` Claims and group synchronization is not required | Use the **Form** tab |
-| The provider does not return `name`, uses non-standard Claims, requires UserInfo, or must synchronize groups | Use the **YAML** tab and the targeted examples in [Advanced OIDC Configuration](#advanced-oidc-configuration) |
-
-OIDC is an identity layer based on OAuth 2.0. ACP uses it to authenticate users and map the returned identity Claims to platform users and groups.
+Use the **Form** tab for the initial integration. Use the **YAML** tab only when the returned username Claim must be selected explicitly, as described in [Add OIDC Using YAML](#add-oidc-using-yaml).
 
 ## Before You Begin
 
-Collect these values for the ACP form:
+Prepare these values:
 
 - Issuer URL, labeled in ACP as **Server Provider URL**.
 - Client ID.
 - Client Secret, labeled in ACP as **Client Key**.
-- Optional Logout URL.
-
-:::note Callback URL
+- One representative test account with an email address that is not already used by an ACP local user or another IDP.
+- A stable username Claim returned for that test account. The tested YAML fallback uses `preferred_username`.
 
 Register this exact callback with the upstream identity provider:
 
@@ -30,80 +24,57 @@ Register this exact callback with the upstream identity provider:
 https://<ACP_ADDRESS>/dex/callback
 ```
 
-ACP derives this address from the platform address, so the form does not contain a Redirect URI field.
+ACP derives the callback from the platform address. The form does not contain a Redirect URI field.
 
-:::
+**Server Provider URL** must be the Issuer root, not an authorization endpoint, token endpoint, or login page. Its discovery document is normally available at this path:
 
-Before rollout, identify a test user whose email does not collide with an existing local user or a user from another IDP.
+```text
+<ISSUER_URL>/.well-known/openid-configuration
+```
 
-## Upstream OIDC Requirements
+You can inspect discovery from a diagnostic host with ACP-equivalent reachability:
 
-The upstream identity provider must support:
+```bash
+curl -fsS 'https://idp.example.com/.well-known/openid-configuration'
+```
 
-- Authorization code flow.
-- Confidential-client authentication with a Client ID and Client Secret.
-- OIDC discovery from the Issuer URL.
-- The `sub`, `email`, and boolean `email_verified` Claims.
-- Preferably, the `name` Claim. If `name` is unavailable, expose a stable username Claim such as `preferred_username`.
-- A string or string-array group Claim only when group-based authorization is required.
-
-Creating the ACP connector does not require enabling password grant or creating a provider service account solely for validation. Acceptance testing uses an interactive browser authorization code login.
+This external query is preliminary evidence. ACP Connector creation is the cluster-side discovery and reachability check.
 
 ## Add OIDC Using the Form
 
 1. Go to **Users > IDP**.
 2. Click **Add OIDC**.
 3. Complete **Basic Info**: **Name**, **Display Name**, and optional **Description**.
-4. Complete **Server Setting**: **Server Provider URL**, **Client ID**, **Client Key**, and optional **Logout URL**.
-5. Click **Add**.
+4. Complete **Server Setting**: **Server Provider URL**, **Client ID**, and **Client Key**.
+5. Leave **Logout URL** empty for this validated integration workflow.
+6. Click **Add**.
 
-**Server Provider URL** is the Issuer root, not an authorization endpoint, token endpoint, or login page. ACP reads the required endpoints from OIDC discovery and generates `https://<ACP_ADDRESS>/dex/callback` as the callback address.
+During creation, ACP reads OIDC discovery from the Issuer URL. An invalid or unreachable Issuer is rejected at this stage. The current creation check does not prove that **Client Key** is correct: a Connector with an incorrect key can still be created and then fail during the browser callback. A real login is therefore required.
 
-The current form does not ask for an OIDC test username or password. Connector creation verifies discovery and client configuration, but it does not replace a real browser login test. After creation, ACP moves the submitted **Client Key** to a managed Secret. Leave **Logout URL** empty for the first integration unless the upstream logout behavior is already known.
+After creation, ACP moves the submitted **Client Key** to a managed Secret. The stored Connector references that Secret instead of retaining `clientSecret` in its configuration.
 
 ## Verify the Integration
 
-1. Start a browser session without an ACP login state.
+1. Start a separate browser session without an ACP login state.
 2. Open ACP and select the configured OIDC **Display Name**.
 3. Complete authentication at the upstream identity provider.
-4. Confirm that the browser returns to ACP.
-5. In **Users**, find the generated user and verify its IDP source, mapped email, non-empty username, and active state.
-6. Assign a minimal role with [Manage User Roles](../../user/functions/add_role.mdx), or assign a role to a synchronized group with [Manage User Group Roles](../../group/functions/add_role.mdx).
-7. Log in again and verify the intended permission.
+4. Confirm that the browser returns to ACP instead of an HTTP 500 error.
+5. In **Users**, find the generated user and verify its IDP source, email, username, and active state.
+6. If the username is empty because the upstream response does not contain the default `name` Claim, recreate or update the Connector with the YAML example below and repeat the login.
+7. Assign a minimal role with [Manage User Roles](../../user/functions/add_role.mdx).
+8. Log in again and confirm that the assigned ACP permission is available.
 
 :::warning Email identity collisions
 
-ACP uses the mapped email as the unique platform account identity. Test for collisions with existing local or other-IDP users before rollout.
+In the validated ACP behavior, logging in through another OIDC Connector with the same mapped email updated and reassociated the existing ACP user with the newer Connector. It did not create a second user or reject the collision. Use a dedicated, non-colliding account for acceptance testing, and check existing ACP users before rollout.
 
 :::
 
-Connector creation, upstream authentication, ACP user creation, and authorization are separate checkpoints. Verify each checkpoint independently when diagnosing an integration.
+Connector creation, upstream authentication, ACP user creation, and ACP authorization are separate checkpoints. Verify each checkpoint independently.
 
-## Advanced OIDC Configuration \{#advanced-oidc-configuration}
+## Add OIDC Using YAML \{#add-oidc-using-yaml}
 
-Use the **YAML** tab when the standard form mapping is insufficient.
-
-| Observed requirement or problem | Supported configuration |
-| --- | --- |
-| The upstream ID token does not contain `name`, but it contains `preferred_username` | Set `userNameKey: preferred_username` |
-| The ID token is thin and required Claims are available from UserInfo | Set `getUserInfo: true` |
-| Email or group data uses a non-standard Claim | Configure the corresponding nested `claimMapping` field |
-| A standard Claim is present but a custom Claim must take precedence | Set `overrideClaimMapping: true` with the custom mapping |
-| Group Claims must create or update ACP groups during login | Set `insecureEnableGroups: true` and map `claimMapping.groups` |
-| Only selected upstream groups may log in or be retained | With `insecureEnableGroups: true` and a usable mapped group Claim, configure `allowedGroups` with the mapped group strings |
-
-The current OIDC runtime has these identity and group behaviors:
-
-- `sub` is mandatory.
-- When the `email` scope is requested, `email` and boolean `email_verified` must be present.
-- The default ACP username source is `name`. Use `userNameKey` in YAML to select another Claim.
-- OIDC users and groups are created or updated during successful login. OIDC does not have LDAP-style manual or scheduled synchronization.
-- Group values must be strings or a string array. Check for duplicate values before assigning ACP roles.
-- The effective custom group mapping is the nested `claimMapping.groups` field.
-
-### Initial Connector YAML
-
-Use this minimal example when creating a connector through YAML:
+Use **Users > IDP > Add OIDC > YAML** when the upstream response has no usable `name` Claim but does return `preferred_username`.
 
 ```yaml
 apiVersion: dex.coreos.com/v1
@@ -125,90 +96,41 @@ spec:
     scopes:
       - profile
       - email
-```
-
-The Connector automatically adds the `openid` scope, so do not include it in `scopes`. The submitted `clientSecret` is used only for initial creation. Stored YAML later contains `clientSecretRef`, which points to the managed Secret.
-
-### Username Fallback
-
-If the ID token does not contain `name`, select another stable Claim:
-
-```yaml
-spec:
-  config:
     userNameKey: preferred_username
 ```
 
-### Group Processing
+Replace the Issuer, credentials, and ACP address before submission. Do not add `openid` to `scopes`; the Connector adds it to the authorization request. Confirm through a real login that the selected `userNameKey` Claim is present and produces the expected ACP username.
 
-Enable group processing and map the group Claim through nested `claimMapping.groups`:
+Submit this initial configuration through the ACP console YAML tab. ACP moves `clientSecret` to a managed Secret, and the stored Connector contains `clientSecretRef` instead. Do not use `kubectl apply` with an inline `clientSecret`: the Kubernetes last-applied annotation can retain the submitted secret in the Connector metadata.
 
-```yaml
-spec:
-  config:
-    insecureEnableGroups: true
-    claimMapping:
-      groups: groups
+## Login, Update, and Delete Behavior
+
+- OIDC users are created or updated after a successful browser login. OIDC does not provide LDAP-style manual or scheduled user synchronization.
+- After updating the username mapping, start a new browser session and log in again to verify the updated user.
+- Deleting the Connector through ACP without cleanup retains source users and marks them invalid.
+- Selecting **Clean up IDP users and User Groups** deletes the generated source users and the managed Secret with the Connector.
+
+Use the ACP console action or ACP product API for deletion. Deleting the underlying Connector custom resource directly with `kubectl` bypasses the tested ACP user-invalidation and cleanup behavior.
+
+## Logout Behavior
+
+In the validated current flow, ACP logout ended the ACP session and returned the browser to the ACP IDP chooser. Selecting the same OIDC entry again reused the still-active upstream session and signed the user in without another credential prompt. ACP logout therefore does not prove that the upstream session has ended.
+
+The tested flow did not use the configured **Logout URL** as a browser redirect. Leave this field empty and validate upstream session termination separately when the customer's security requirements require it.
+
+## Troubleshoot by Stage
+
+| Symptom | Proven stage | Next check |
+| --- | --- | --- |
+| ACP rejects the Connector during creation. | Discovery or cluster-side reachability did not complete. | Confirm that **Server Provider URL** is the Issuer root, retrieve its discovery document from an ACP-equivalent network path, and retry creation. |
+| Connector creation succeeds, but the callback returns HTTP 500 with `unauthorized_client` or `Invalid client secret`. | Discovery and the upstream authorization page worked; client authentication at the token endpoint failed. | Correct **Client Key**, then repeat the full login in a new browser session. Creation alone does not validate this value. |
+| Login succeeds, but the ACP username is empty. | ACP accepted the upstream identity and created the user. | Confirm that `preferred_username` is present, set `userNameKey: preferred_username` through YAML, and log in again. |
+| An existing user's IDP source or mapping changes after the test login. | The callback mapped an email already used by an ACP user. | Stop the rollout, choose a non-colliding test account, and review existing ACP users before retrying. |
+| ACP logout returns to the IDP chooser, but choosing OIDC signs in without another prompt. | The ACP session ended, while the upstream session remained active. | Treat ACP and upstream logout as separate acceptance checks; do not rely on the unverified **Logout URL** field. |
+| Users remain active after the Connector custom resource is deleted with `kubectl`. | The ACP product deletion workflow was bypassed. | Restore the test Connector if needed, then delete it with the ACP console action and select the required cleanup option. |
+
+For callback and user-mapping evidence, inspect the current ACP login component logs:
+
+```bash
+kubectl -n cpaas-system logs deployment/apollo --since=10m
 ```
-
-The core group mapping does not assume a group scope. Add a group scope only when the upstream identity provider requires and supports one, and use the exact scope documented by that service. For example, add `groups` to the existing `scopes` list only when the upstream documentation defines `groups` as its group scope.
-
-`allowedGroups` is evaluated only when `insecureEnableGroups: true` and a usable group Claim is available through the standard Claim or nested `claimMapping.groups`. Each `allowedGroups` value must match a mapped group string returned for the user.
-
-If generated YAML displays a top-level `groupsKey`, do not use it as the recommended custom mapping. Configure nested `claimMapping.groups` instead.
-
-### Non-standard Claims
-
-Use custom mappings when the upstream identity provider returns required data in non-standard Claims:
-
-```yaml
-spec:
-  config:
-    insecureEnableGroups: true
-    overrideClaimMapping: true
-    claimMapping:
-      email: preferred_email
-      groups: organization_groups
-```
-
-Mapping a non-standard group Claim does not enable group processing by itself; `insecureEnableGroups: true` is also required. Set `getUserInfo: true` under `spec.config` when the required Claims are available from UserInfo rather than the ID token. Use `allowedGroups` under `spec.config` only with enabled group processing and a usable mapped group Claim, and list the mapped group strings that are allowed.
-
-### Logout Destination
-
-Configure the optional logout destination with the lowercase `logoutUrl` key:
-
-```yaml
-spec:
-  config:
-    logoutUrl: https://idp.example.com/logout
-```
-
-Logout URL controls the browser destination after ACP logout. It does not guarantee that the upstream session is terminated unless the configured URL performs that action.
-
-:::caution Current certificate-verification limitation
-
-In the current ACP implementation, `insecureSkipVerify` cannot be used to enforce certificate verification for the upstream OIDC connection. Use a valid upstream certificate and a trusted network, and do not treat this field as a production hardening control.
-
-:::
-
-## Update or Delete OIDC
-
-On the OIDC list or details page, use the available action menu to update or delete the connector.
-
-- Updating the Connector changes subsequent OIDC authentication and mapped identity behavior.
-- Deleting the Connector without cleanup marks users from that source as invalid.
-- Selecting **Clean up IDP users and User Groups** deletes generated users and groups.
-- After re-integration, later successful logins recreate or update the users and groups.
-
-## Troubleshooting
-
-| Symptom | What ACP has already proven | Likely configuration issue | Next check |
-| --- | --- | --- | --- |
-| ACP cannot read the Issuer or discovery document | The connector settings were submitted, but discovery did not complete | **Server Provider URL** is not the Issuer root, the discovery document is unavailable, or ACP cannot reach it | Check the Issuer URL and retrieve its discovery document from the ACP network path using an external network diagnostic |
-| Connector creation reports client authentication failure | ACP read enough discovery data to attempt client validation | The Client ID or Client Key is incorrect, or the upstream client is not configured as a confidential client | Recheck the upstream client configuration and compare the submitted credentials without exposing the secret in logs |
-| The upstream service rejects the callback | The browser reached the upstream authorization step | The registered callback does not exactly match `https://<ACP_ADDRESS>/dex/callback` | Compare the registered callback character for character, including scheme, host, path, and any externally visible port |
-| Authentication returns to ACP but login fails because a required Claim is missing | The browser authorization and callback completed | `sub` is absent, or the `email` scope was requested and `email` or boolean `email_verified` is absent | Inspect the returned Claims with an external token diagnostic; ensure `sub` is present and, when requesting the `email` scope, ensure `email` and boolean `email_verified` are present |
-| The ACP user is created with an empty username | ACP accepted the identity and mapped its email | The default `name` Claim, or the Claim selected by `userNameKey`, is absent or empty | Confirm a stable username Claim is present, then set or correct `userNameKey` for that Claim |
-| Groups are absent, duplicated, or unexpected | User authentication completed, but the group values did not produce the intended ACP groups | Group scope, `insecureEnableGroups`, nested `claimMapping.groups`, `allowedGroups`, or the upstream value shape is incorrect | Inspect the group Claim externally, confirm string or string-array values, remove duplicates, and compare the YAML with the group-processing example |
-| ACP logout completes but the upstream session remains active | The ACP session ended | `logoutUrl` is empty or its destination does not terminate the upstream session | Verify the configured destination's behavior directly with the upstream service before relying on it for session termination |
-| An HTTPS Issuer works with an untrusted certificate and the administrator expected verification | The connection reached the Issuer despite the certificate condition | The current certificate-verification limitation makes `insecureSkipVerify` unsuitable as an enforcement control | Replace the upstream certificate with a valid trusted certificate and keep the connection on a trusted network |
