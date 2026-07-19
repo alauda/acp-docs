@@ -4,147 +4,148 @@ weight: 20
 
 # OIDC Management
 
-The platform supports the OIDC (OpenID Connect) protocol, enabling platform administrators to log in using third-party accounts after adding OIDC configuration. Platform administrators can also update and delete configured OIDC services.
+ACP can redirect users to a standards-based OIDC identity provider and create or update their platform identity after successful login.
 
-## Overview of OIDC
+Use the **Form** tab for the initial integration. Use the **YAML** tab only when the returned username Claim must be selected explicitly, as described in [Add OIDC Using YAML](#add-oidc-using-yaml).
 
-OIDC (OpenID Connect) is an identity authentication standard protocol based on the OAuth 2.0 protocol. It uses an OAuth 2.0 authorization server to provide user identity authentication for third-party clients and passes the corresponding identity authentication information to the client.
+## Before You Begin
 
-OIDC allows all types of clients (including server-side, mobile, and JavaScript clients) to request and receive authenticated sessions and end-user information. This specification suite is extensible, allowing participants to use optional features such as identity data encryption, OpenID Provider discovery, and session management when meaningful. For more information, refer to the [OIDC official documentation](https://openid.net/connect/).
+Prepare these values:
 
-## Adding OIDC
+- Issuer URL, labeled in ACP as **Server Provider URL**.
+- Client ID.
+- Client Secret, labeled in ACP as **Client Key**.
+- One representative test account with an email address that is not already used by an ACP local user or another IDP.
+- A stable username Claim returned for that test account. The tested YAML fallback uses `preferred_username`.
 
-By adding OIDC, you can use third-party platform accounts to log in to the platform.
+Register this exact callback with the upstream identity provider:
 
-**Note**: After OIDC users successfully log in to the platform, the platform will use the user's email attribute as the unique identifier. OIDC-supported third-party platform users must have an **email** attribute; otherwise, they will not be able to log in to the platform.
+```text
+https://<ACP_ADDRESS>/dex/callback
+```
 
-### Procedure of Operation
+ACP derives the callback from the platform address. The form does not contain a Redirect URI field.
 
-1. In the left navigation bar, click **Users** > **IDPs**.
+**Server Provider URL** must be the Issuer root, not an authorization endpoint, token endpoint, or login page. Its discovery document is normally available at this path:
 
+```text
+<ISSUER_URL>/.well-known/openid-configuration
+```
+
+You can inspect discovery from a diagnostic host with ACP-equivalent reachability:
+
+```bash
+curl -fsS 'https://idp.example.com/.well-known/openid-configuration'
+```
+
+For an upstream service that uses a private CA, independently verify the certificate chain with that CA:
+
+```bash
+curl -fsS --cacert /path/to/oidc-ca.pem \
+  'https://idp.example.com/.well-known/openid-configuration'
+```
+
+This external query is preliminary evidence. ACP Connector creation is the cluster-side discovery and reachability check.
+
+:::warning Upstream OIDC certificate verification limitation
+
+In this ACP release, Connector validation and the OIDC login runtime use `insecureSkipVerify: true`. ACP therefore does not verify the upstream OIDC server certificate. HTTPS still encrypts the connection, but successful Connector creation is not evidence that the certificate chain is trusted.
+
+If the customer's security policy requires upstream server certificate verification, this release does not meet that requirement. Resolve the product-version or security-policy requirement before rollout.
+
+:::
+
+## Add OIDC Using the Form
+
+1. Go to **Users > IDP**.
 2. Click **Add OIDC**.
+3. Complete **Basic Info**: **Name**, **Display Name**, and optional **Description**.
+4. Complete **Server Setting**: **Server Provider URL**, **Client ID**, and **Client Key**.
+5. Leave **Logout URL** empty for this integration workflow.
+6. Click **Add**.
 
-3. Configure the **Basic Information** parameters.
+During creation, ACP reads OIDC discovery from the Issuer URL. An invalid or unreachable Issuer is rejected at this stage. The current creation check does not prove that **Client Key** is correct or that the upstream TLS certificate is trusted: a Connector with an incorrect key can still be created and then fail during the browser callback, while an untrusted self-signed certificate can be accepted. A real login is therefore required for authentication, and certificate compliance must be assessed separately as described above.
 
-4. Configure the **OIDC Server Configuration** parameters:
+After creation, ACP moves the submitted **Client Key** to a managed Secret. The stored Connector references that Secret instead of retaining `clientSecret` in its configuration.
 
-    * **Identity Provider URL**: The issuer URL, which is the access address of the OIDC identity provider.
+## Verify the Integration
 
-    * **Client ID**: The client identifier for the OIDC client.
+1. Start a separate browser session without an ACP login state.
+2. Open ACP and select the configured OIDC **Display Name**.
+3. Complete authentication at the upstream identity provider.
+4. Confirm that the browser returns to ACP instead of an HTTP 500 error.
+5. In **Users**, find the generated user and verify its IDP source, email, username, and active state.
+6. If the username is empty because the upstream response does not contain the default `name` Claim, recreate or update the Connector with the YAML example below and repeat the login.
+7. Assign a minimal role with [Manage User Roles](../../user/functions/add_role.mdx).
+8. Log in again and confirm that the assigned ACP permission is available.
 
-    * **Client Secret**: The secret key for the OIDC client.
+:::warning Email identity collisions
 
-    * **Redirect URI**: The callback address after logging in to the third-party platform, which is the URL of the dex issuer + `/callback`.
+In this release, logging in through another OIDC Connector with the same mapped email updates and reassociates the existing ACP user with the newer Connector. It does not create a second user or reject the collision. Use a dedicated, non-colliding account for acceptance testing, and check existing ACP users before rollout.
 
-    * **Logout URL**: The address visited by the user after performing the **Logout** operation. If empty, the logout address will be the platform's initial login page.
+:::
 
-5. In the **IDP Service Configuration Validation** area, enter the **Username** and **Password** of a valid OIDC account to verify the configuration.
+Connector creation, upstream authentication, ACP user creation, and ACP authorization are separate checkpoints. Verify each checkpoint independently.
 
-    **Tip**: If the username and password are incorrect, an error will be reported during addition, indicating invalid credentials, and OIDC cannot be added.
+## Add OIDC Using YAML \{#add-oidc-using-yaml}
 
-6. Click **Create**.
-
-## Adding OIDC via YAML
-
-In addition to form configuration, the platform also supports adding OIDC through YAML, which allows for more flexible configuration of authentication parameters, claim mappings, user group synchronization, and other advanced features.
-
-### Example: Configuring OIDC Connector
-
-The following example demonstrates how to configure an OIDC connector for integrating with OIDC identity authentication services. This configuration example is suitable for the following scenarios:
-
-1. Need to integrate OIDC as an identity authentication server.
-
-2. Need to support user group information synchronization.
-
-3. Need to customize logout redirect address.
-
-4. Need to configure specific OIDC scopes.
-
-5. Need to customize claim mappings.
-
-{/* lint ignore code-block-split-list */}
+Use **Users > IDP > Add OIDC > YAML** when the upstream response has no usable `name` Claim but does return `preferred_username`.
 
 ```yaml
 apiVersion: dex.coreos.com/v1
 kind: Connector
-# Connector basic information
-id: oidc               # Connector unique identifier
-name: oidc             # Connector display name
-type: oidc             # Connector type is OIDC
+id: corporate-oidc
+name: Corporate OIDC
+type: oidc
 metadata:
-  annotations:
-    cpaas.io/description: "11"  # Connector description
-  name: oidc
+  name: corporate-oidc
   namespace: cpaas-system
+  labels:
+    cpaas.io/idp.version: v2
 spec:
   config:
-    # OIDC server configuration
-    # Configure server connection information, including server address, client credentials, and callback address
-    issuer: http://auth.com/auth/realms/master               # OIDC server address
-    clientID: dex                                            # Client ID
-    # Service account secret key, valid when creating Connector resources for the first time
-    clientSecret: xxxxxxx
-    redirectURI: https://example.com/dex/callback            # Callback address, must match the address registered by the OIDC client
-
-    # Security configuration
-    # Configure SSL verification and user information acquisition method
-    insecureSkipVerify: true                                # Whether to skip SSL verification, it is recommended to set to false in a production environment
-    getUserInfo: false                                      # Whether to obtain additional user information through the UserInfo endpoint
-
-    # Logout configuration
-    # Configure the redirect address after user logout
-    logoutURL: https://test.com                            # Logout redirect address, can be customized to the page jumped after user logout
-
-    # Scope configuration
-    # Configure the required authorization scope, ensure that the OIDC server supports these scopes
+    issuer: https://idp.example.com
+    clientID: <CLIENT_ID>
+    clientSecret: <CLIENT_SECRET>
+    redirectURI: https://acp.example.com/dex/callback
     scopes:
-      - openid                                             # Required, used for OIDC basic authentication
-      - profile                                            # Optional, used to obtain user basic information
-      - email                                              # Optional, used to obtain user email
-
-    # Claim mapping configuration
-    # Configure the mapping relationship between OIDC returned claims and platform user attributes
-    overrideClaimMapping: false                          # Whether to enforce the claimMapping rules when standard claims are also returned
-    claimMapping:
-      email: email                                         # Email mapping, used for user unique identification
-      groups: groups                                       # Group claim mapping. For non-standard claims, set it to the actual key, such as "cognito:groups"
-      phone: ""                                            # Phone mapping, optional
-      preferred_username: preferred_username               # Username mapping, used for display name
-
-    # Custom claimextra configuration
-    # External custom fields will be dynamically added to the user object spec.extra field
-    claimExtra:
-      - field: xxx            # Custom field name
-        type: string          # Field type value is consistent with the definition of golang language type. For example: string, int, bool, map[string]string, []string, []int
-
-    # User group configuration
-    # Configure user group synchronization related parameters, ensure that the token contains group information
-    groupsKey: groups                                      # Key name used to read group data. Keep it consistent with claimMapping.groups
-    insecureEnableGroups: false                           # Whether to enable group synchronization (group claims may be stale until ID token refresh)
+      - profile
+      - email
+    userNameKey: preferred_username
 ```
 
-### OIDC Group-Related Fields
+Replace the Issuer, credentials, and ACP address before submission. Do not add `openid` to `scopes`; the Connector adds it to the authorization request. Confirm through a real login that the selected `userNameKey` Claim is present and produces the expected ACP username.
 
-When you need to synchronize user groups from an OIDC provider, configure the following fields together:
+Submit this initial configuration through the ACP console YAML tab. ACP moves `clientSecret` to a managed Secret, and the stored Connector contains `clientSecretRef` instead. Do not use `kubectl apply` with an inline `clientSecret`: the Kubernetes last-applied annotation can retain the submitted secret in the Connector metadata.
 
-| Field | Description |
-|-------|-------------|
-| `overrideClaimMapping` | Controls whether the mappings in `claimMapping` override default claim selection behavior. Set this to `true` when your provider returns both standard and non-standard claims and you want to force custom mappings. |
-| `claimMapping.groups` | Maps a provider claim to the standard `groups` claim used by the platform. If your provider returns a non-standard key (for example `cognito:groups`), set this field to that key. |
-| `groupsKey` | Specifies which claim key is used to read group data for synchronization. To avoid mismatches, use the same value as `claimMapping.groups`. |
-| `insecureEnableGroups` | Enables group-claim processing for OIDC login. This should be enabled only when you need group synchronization and your provider returns group claims. |
+## Login, Update, and Delete Behavior
 
-**Notes**
+- OIDC users are created or updated after a successful browser login. OIDC does not provide LDAP-style manual or scheduled user synchronization.
+- After updating the username mapping, start a new browser session and log in again to verify the updated user.
+- Deleting the Connector through ACP without cleanup retains source users and marks them invalid.
+- Selecting **Clean up IDP users and User Groups** deletes the generated source users and the managed Secret with the Connector.
 
-- If the provider requires explicit group scope, include `groups` in `scopes`.
-- `claimMapping` may not override standard claims returned by the provider unless `overrideClaimMapping` is set to `true`.
-- Group claims are refreshed with ID token refresh. Group membership changes from the provider side may not be reflected immediately.
+Use the ACP console action or ACP product API for deletion. Deleting the underlying Connector custom resource directly with `kubectl` bypasses the ACP user-invalidation and cleanup behavior.
 
-## Relevant Operations
+## Logout Behavior
 
-You can click the ![](/113point.png) on the right in the list page or click **Actions** in the upper-right corner on the details page to update or delete OIDC as needed.
+In this release, ACP logout ends the ACP session and returns the browser to the ACP IDP chooser. Selecting the same OIDC entry again can reuse the still-active upstream session and sign the user in without another credential prompt. ACP logout therefore does not prove that the upstream session has ended.
 
-| Operation | Description |
-|-----------|-------------|
-| **Update OIDC** | Update the added OIDC configuration. After updating the OIDC configuration information, the original users and authentication methods will be reset and synchronized according to the current configuration. |
-| **Delete OIDC** | Delete OIDC that is no longer used by the platform. After deleting OIDC, all users synchronized to the platform through this OIDC will have an **Invalid** status (the binding relationship between users and roles remains unchanged), and they cannot log in to the platform. After re-integrating, users can be activated by successfully logging in to the platform.<br/><br/>**Tip**: After deleting IDP, if you need to delete users and user groups synchronized to the platform through OIDC, check the checkbox **Clean IDP Users and User Groups** below the prompt box. |
+The flow does not use the configured **Logout URL** as a browser redirect. Leave this field empty and validate upstream session termination separately when the customer's security requirements require it.
+
+## Troubleshoot by Stage
+
+| Symptom | Proven stage | Next check |
+| --- | --- | --- |
+| ACP rejects the Connector during creation. | Discovery or cluster-side reachability did not complete. | Confirm that **Server Provider URL** is the Issuer root, retrieve its discovery document from an ACP-equivalent network path, and retry creation. |
+| Connector creation succeeds, but the callback returns HTTP 500 with `unauthorized_client` or `Invalid client secret`. | Discovery and the upstream authorization page worked; client authentication at the token endpoint failed. | Correct **Client Key**, then repeat the full login in a new browser session. Creation alone does not validate this value. |
+| Login succeeds, but the ACP username is empty. | ACP accepted the upstream identity and created the user. | Confirm that `preferred_username` is present, set `userNameKey: preferred_username` through YAML, and log in again. |
+| An existing user's IDP source or mapping changes after the test login. | The callback mapped an email already used by an ACP user. | Stop the rollout, choose a non-colliding test account, and review existing ACP users before retrying. |
+| ACP logout returns to the IDP chooser, but choosing OIDC signs in without another prompt. | The ACP session ended, while the upstream session remained active. | Treat ACP and upstream logout as separate acceptance checks; do not rely on the unverified **Logout URL** field. |
+| Users remain active after the Connector custom resource is deleted with `kubectl`. | The ACP product deletion workflow was bypassed. | Restore the test Connector if needed, then delete it with the ACP console action and select the required cleanup option. |
+
+For callback and user-mapping evidence, inspect the current ACP login component logs:
+
+```bash
+kubectl -n cpaas-system logs deployment/apollo --since=10m
+```
