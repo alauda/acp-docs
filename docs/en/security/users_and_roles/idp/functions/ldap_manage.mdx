@@ -4,397 +4,475 @@ weight: 10
 
 # LDAP Management
 
-Platform administrators can add, update, and delete LDAP services on the platform.
+ACP can authenticate users from an LDAP directory and can optionally synchronize directory groups. The console workflow supports common OpenLDAP and Microsoft Active Directory layouts.
 
-## LDAP Overview
+An integration is complete only after all of the following checks pass:
 
-LDAP (Lightweight Directory Access Protocol) is a mature, flexible, and well-supported standard mechanism for interacting with directory servers. It organizes data in a hierarchical tree structure to store enterprise user and organization information, primarily used for implementing single sign-on (SSO).
+- ACP creates the LDAP IDP.
+- The expected users and, when enabled, groups are synchronized.
+- A representative directory user can log in and receives the intended ACP role.
 
-:::note
+This guide starts with the shortest console workflow. If the directory administrator has not provided the Base DN, Filter, or attribute mappings, use [Discover the Directory Settings](#discover-the-directory-settings) first.
 
-LDAP Key Features:
-- Enables communication between clients and LDAP servers
-- Supports data storage, retrieval, and search operations
-- Provides client authentication capabilities
-- Facilitates integration with other systems
+## Before You Begin
 
-:::
+Prepare these values before configuring ACP:
 
-For more information, refer to the [LDAP official documentation](https://ldap.com/?spm=a2c4g.11186623.2.12.38e87d4cjSb0uh).
+- LDAP server hostname and port reachable from the ACP cluster.
+- Bind DN and password with read permission for intended users and groups.
+- User Base DN and user Filter.
+- A stable, unique, non-empty user identity attribute.
+- One or more login attributes.
+- Optional group Base DN, group Filter, member attribute, user matching attribute, and group name attribute.
+- One representative user account for final login verification.
 
-## Supported LDAP Types
+A successful query from an engineer's laptop is not proof that ACP can connect. ACP Connector creation and synchronization are the cluster-side checks. If the directory administrator has already supplied and verified all required values, continue with [Add LDAP](#addldap).
 
-### OpenLDAP
+## Discover the Directory Settings \{#discover-the-directory-settings}
 
-OpenLDAP is an open-source implementation of LDAP. If your organization uses open-source LDAP for user authentication, you can configure the platform to communicate with the LDAP service by adding LDAP and configuring relevant parameters.
+Use this workflow when the Base DN, Filter, or attribute mappings are unknown. The command-line tools referenced here are external pre-integration diagnostic tools, not ACP features.
 
-:::note
+### 1. Run Checks from the Correct Network
 
-OpenLDAP Integration:
-- Enables platform authentication for LDAP users
-- Supports standard LDAP protocols
-- Provides flexible user management
+Run directory queries from a diagnostic host or Pod whose DNS, routing, firewall, and certificate trust are equivalent to the ACP cluster whenever possible. A laptop query is useful preliminary evidence, but ACP Connector creation and synchronization remain the authoritative cluster-side checks.
 
-:::
+### 2. Find the Directory Root
 
-For more information about OpenLDAP, refer to the [OpenLDAP official documentation](https://www.openldap.org/doc).
+Query the directory Root DSE and record the naming root:
 
-### Active Directory
+- OpenLDAP and compatible directories commonly publish `namingContexts`.
+- Active Directory publishes `defaultNamingContext`.
 
-Active Directory is Microsoft's LDAP-based software for providing directory storage services in Windows systems. If your organization uses Microsoft Active Directory for user management, you can configure the platform to communicate with the Active Directory service.
+Use the Root DSE examples in the final **On-Site Diagnostic Tools** section. The returned value, such as `dc=example,dc=com`, is the starting point for locating the user and group branches; it is not automatically the best User Base DN.
 
-:::note
+### 3. Choose the User and Group Base DNs
 
-Active Directory Integration:
-- Enables platform authentication for AD users
-- Supports Windows domain integration
-- Provides enterprise-level user management
+Treat the Base DN as the boundary below which ACP searches. For example:
 
-:::
+```text
+dc=example,dc=com
+|- ou=People
+|  |- ou=Engineering
+|  `- ou=Operations
+`- ou=Groups
+```
 
-## LDAP Terminology
+- If all intended users are under `ou=People,dc=example,dc=com`, use that as the User Base DN.
+- If intended users span branches outside `ou=People`, use their lowest common parent.
+- Use a separate Group Base DN when groups are stored under `ou=Groups`.
 
-### OpenLDAP Common Terms
+Before running a subtree query, use an external base-scope query to confirm that the bind account can read the candidate Base DN. The ACP form uses a subtree search below the configured Base DN. It does not expose a Search Scope field. YAML may use `scope: sub` or `scope: one`; an omitted scope defaults to `sub` in the current Connector runtime.
 
-| Term | Description | Example |
-|------|-------------|---------|
-| **dc (Domain Component)** | Domain component | `dc=example,dc=com` |
-| **ou (Organizational Unit)** | Organizational unit | `ou=People,dc=example,dc=com` |
-| **cn (Common Name)** | Common name | `cn=admin,dc=example,dc=com` |
-| **uid (User ID)** | User ID | `uid=example` |
-| **objectClass (Object Class)** | Object class | `objectClass=inetOrgPerson` |
-| **mail (Mail)** | Mail | `mail=example@126.com` |
-| **givenName (Given Name)** | Given name | `givenName=xq` |
-| **sn (Surname)** | Surname | `sn=ren` |
-| **objectClass: groupOfNames** | User group | `objectClass: groupOfNames` |
-| **member (Member)** | Group member attribute | `member=cn=admin,dc=example,dc=com` |
-| **memberOf** | User group membership attribute | `memberOf=cn=users,dc=example,dc=com` |
+### 4. Inspect Representative Users
 
-### Active Directory Common Terms
+Inspect at least three entries before choosing mappings:
 
-| Term | Description | Example |
-|------|-------------|---------|
-| **dc (Domain Component)** | Domain component | `dc=example,dc=com` |
-| **ou (Organizational Unit)** | Organizational unit | `ou=People,dc=example,dc=com` |
-| **cn (Common Name)** | Common name | `cn=admin,dc=example,dc=com` |
-| **sAMAccountName/userPrincipalName** | User identifier | `userPrincipalName=example` or `sAMAccountName=example` |
-| **objectClass: user** | AD user object class | `objectClass=user` |
-| **mail (Mail)** | Mail | `mail=example@126.com` |
-| **displayName** | Display name | `displayName=example` |
-| **givenName (Given Name)** | Given name | `givenName=xq` |
-| **sn (Surname)** | Surname | `sn=ren` |
-| **objectClass: group** | User group | `objectClass: group` |
-| **member (Member)** | Group member attribute | `member=CN=Admin,DC=example,DC=com` |
-| **memberOf** | User group membership attribute | `memberOf=CN=Users,DC=example,DC=com` |
+- A normal user who is expected to log in.
+- A user in another intended OU or directory branch.
+- A boundary case, such as a disabled user, a user with no groups, or a user missing an optional attribute.
+
+For OpenLDAP, request the DN, `objectClass`, `uid`, `cn`, and `mail`. For Active Directory, request the DN, `objectClass`, `sAMAccountName`, `displayName`, `mail`, `userAccountControl`, and `memberOf`. Confirm that the intended population is below the candidate Base DN before narrowing the Filter.
+
+### 5. Choose the Identity and Login Attributes
+
+| Purpose | OpenLDAP candidates | Active Directory candidates | Selection rule |
+| --- | --- | --- | --- |
+| ACP user identity | `uid` | `sAMAccountName` | Present for every intended user, unique, stable, and non-empty |
+| Login Field | `uid`, `mail` | `sAMAccountName` | Known to users and returns exactly one entry |
+| Display-only information | `cn` | `displayName` | May change and should not be the default identity |
+| Group member value | `member`, `memberUid` | `member` | Must match the value stored in a sample group entry |
+| Group name | `cn` | `cn` | Readable and stable for administrators |
+
+Do not use `cn`, `displayName`, or a user's DN as the default ACP identity merely because it is readable. These values can be duplicated, and they can change when a user is renamed or moved. Resolve missing or duplicate identity values in the directory before creating the Connector.
+
+### 6. Build the User Filter Incrementally
+
+Build and retest the Filter in this order:
+
+1. Select user entries by `objectClass`.
+2. Require the ACP identity and login attributes with `(attribute=*)`.
+3. Exclude computers, disabled accounts, service accounts, or system accounts when the customer's directory policy requires it.
+4. Add business restrictions only after the broad result matches the expected population.
+
+After each condition, rerun the external directory query and compare the count and representative entries with the expected population. Use these Filters to find entries that would be skipped because the proposed identity is absent:
+
+```text
+# OpenLDAP entries that would be skipped because uid is missing
+(&(objectClass=inetOrgPerson)(!(uid=*)))
+
+# Active Directory user objects missing sAMAccountName
+(&(objectClass=user)(!(objectClass=computer))(!(sAMAccountName=*)))
+
+# Optional Active Directory exclusion for disabled accounts
+(&(objectClass=user)(!(objectClass=computer))(sAMAccountName=*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))
+```
+
+The last expression is a copyable Active Directory LDAP Filter for excluding disabled accounts. Apply it only when that exclusion matches the customer's directory policy.
+
+### 7. Identify the Group Membership Model
+
+Inspect one known group and compare its stored membership values with the representative user:
+
+- When `member` contains full user DNs, use **Group Attr** `member` and **User Attr** `DN`.
+- When `memberUid` contains short user IDs, use **Group Attr** `memberUid` and **User Attr** `uid`.
+
+ACP evaluates group membership for each user as `(<Group Attr>=<User Attr value>)`. Reproduce that lookup with an external directory query, for example `(member=uid=alice,ou=People,dc=example,dc=com)` or `(memberUid=alice)`. Do not rely only on a user's `memberOf` value when validating this mapping.
+
+## Choose a Tested Mapping
+
+These mappings are validated starting points for the listed layouts. The Active Directory Filter excludes computer objects and disabled accounts. Change that Filter only when the customer's directory policy requires a different population, and repeat the external count, ACP synchronization, and login checks after the change.
+
+| Directory layout | User Filter | User Name Attr | Login Field | Group Attr | User Attr | Group Name Attr |
+| --- | --- | --- | --- | --- | --- | --- |
+| OpenLDAP `groupOfNames` | `(&(objectClass=inetOrgPerson)(uid=*))` | `uid` | `uid` | `member` | `DN` | `cn` |
+| OpenLDAP `posixGroup` | `(&(objectClass=inetOrgPerson)(uid=*))` | `uid` | `uid` | `memberUid` | `uid` | `cn` |
+| Active Directory | `(&(objectClass=user)(!(objectClass=computer))(sAMAccountName=*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))` | `sAMAccountName` | `sAMAccountName` | `member` | `DN` | `cn` |
+
+When Active Directory group synchronization uses **Group Attr** `member` and **User Attr** `DN`, use `(&(objectClass=group)(member=*))` as the Group Filter. ACP validates `member` against sampled group entries during creation. A broader `(objectClass=group)` Filter can sample empty groups that do not return a `member` attribute and reject an otherwise valid mapping.
 
 ## Add LDAP \{#addldap}
 
-:::tip
-
-After successful LDAP integration:
-- Users can log in to the platform using their enterprise accounts
-- Multiple additions of the same LDAP will overwrite previously synchronized users
-
-:::
-
-### Prerequisites
-
-Before adding LDAP, prepare the following information:
-- LDAP server address
-- Administrator username
-- Administrator password
-- Other required configuration details
-
-### Steps
-
-1. In the left navigation bar, click **Users** > **IDPs**
-2. Click **Add LDAP**
-3. Configure the following parameters:
-
-#### Basic Information
-
-| Parameter | Description |
-|-----------|-------------|
-| **Server Address** | LDAP server access address (e.g., `192.168.156.141:31758`) |
-| **Username** | LDAP administrator DN (e.g., `cn=admin,dc=example,dc=com`) |
-| **Password** | LDAP administrator account password |
-| **Login Box Username Prompt** | Prompt message for username input (e.g., "Please enter your username") |
-
-#### Search Settings
+1. Go to **Users > IDP**.
+2. Click **Add LDAP**.
+3. Complete **Basic Info**: **Name**, **Display Name**, and optional **Description**.
+4. Complete **LDAP Server Setting**: **Server Address**, **Admin Account**, and **Admin Password**.
+5. Complete **Search Setting**: **Filter** and **Base DN**.
+6. If group synchronization is required, enable **Group Search Setting** and enter **Filter**, **Base DN**, **Group Attr**, and **User Attr**.
+7. Complete **Field Mapping**: **User Name Attr**, optional **Group Name Attr**, **Login Field**, and **Username Tip In Login Box**. **User Name Attr** becomes the stable identity value used for the synchronized ACP user; it is not merely a display label. **Login Field** determines how ACP searches for a login account and supports comma-separated alternatives.
+8. Optionally open **Advanced Settings**, enable **Auto Sync**, and enter a five-field cron expression in **Sync Rules**. ACP evaluates the rule in UTC.
+9. Click **Add**.
 
 :::note
 
-Search Settings Purpose:
-- Matches LDAP user entries based on specified conditions
-- Extracts key user and group attributes
-- Maps LDAP attributes to platform user attributes
+During creation, ACP validates server connectivity, bind, Base DN, Filter, and mapped attributes. The current form does not authenticate a normal directory user during creation because it does not collect test-user credentials. The submitted bind password is moved to a managed Secret after creation.
 
 :::
 
-| Parameter | Description |
-|-----------|-------------|
-| **Object Type** | ObjectClass for users:<br/>- OpenLDAP: `inetOrgPerson`<br/>- Active Directory: `organizationalPerson`<br/>- Groups: `posixGroup` |
-| **Login Field** | Attribute used as login username:<br/>- OpenLDAP: `mail` (email address)<br/>- Active Directory: `userPrincipalName` |
-| **Filter Conditions** | LDAP filter conditions for user/group filtering<br/>Example: `(&(cn=John*)(givenName=*xq*))` |
-| **Search Starting Point** | Base DN for user/group search (e.g., `dc=example,dc=org`) |
-| **Search Scope** | Search scope:<br/>- `sub`: entire directory subtree<br/>- `one`: one level below starting point |
-| **Login Attribute** | Unique user identifier:<br/>- OpenLDAP: `uid`<br/>- Active Directory: `distinguishedName` |
-| **Name Attribute** | Object name attribute (default: `cn`) |
-| **Email Attribute** | Email attribute:<br/>- OpenLDAP: `mail`<br/>- Active Directory: `userPrincipalName` |
-| **Group Member Attribute** | Group member identifier (default: `uid`) |
-| **Group Attribute** | User group relationship attribute (default: `memberuid`) |
+## Verify the Integration
 
-4. In the **IDP Service Configuration Validation** section:
-   - Enter a valid LDAP account username and password
-   - The username must match the **Login Field** setting
-   - Click to verify the configuration
+1. Open the new LDAP IDP and select **Actions > Sync user**.
+2. Confirm the sync result and compare the synchronized user and group counts with the expected directory population.
+3. Open one synchronized user and verify that its source, identity value, and state are correct.
+4. Assign a minimal role using [Manage User Roles](../../user/functions/add_role.mdx) or [Manage User Group Roles](../../group/functions/add_role.mdx).
+5. Use a separate browser session without an ACP login state and log in with the representative directory account.
+6. Confirm that authentication succeeds and the assigned ACP permission is available.
 
-5. (Optional) Configure **LDAP Auto-Sync Policy**:
-   - Enable **Auto-Sync Users** switch
-   - Set synchronization rules
-   - Use [online tool](https://tool.lu/crontab/) to verify CRON expressions
+:::warning
 
-6. Click **Add**
-
-:::note
-
-After adding LDAP:
-- Users can log in before synchronization
-- User information syncs automatically on first login
-- Auto-sync occurs based on configured rules
+Overall synchronization can report success while entries missing **User Name Attr** are skipped. A user with no matching directory group does not by itself mean that user synchronization failed. Compare counts and inspect representative entries rather than relying only on the overall result.
 
 :::
 
-## LDAP Configuration Examples
+## Synchronization and Lifecycle
 
-### LDAP Connector Configuration
+### First-Login Synchronization
 
-The following example shows how to configure an LDAP connector:
+A directory user can log in before a full manual synchronization. After successful authentication, ACP synchronizes that individual LDAP user. Use the full acceptance path above to verify the expected inventory, group mapping, and authorization rather than treating first login as complete integration acceptance.
+
+### Manual Synchronization
+
+Open the LDAP IDP and select **Actions > Sync user** to synchronize and reconcile the directory population on demand. Review the result, counts, skipped-entry messages, and representative users and groups.
+
+### Automatic Synchronization
+
+Enable **Auto Sync** under **Advanced Settings** when scheduled reconciliation is required, and provide **Sync Rules**. Automatic synchronization uses the configured Base DNs, Filters, and mappings; it does not authenticate directory user passwords. ACP evaluates the five-field cron expression in UTC. For an acceptance test, `*/1 * * * *` runs every minute; replace this temporary rule after the scheduled run is observed.
+
+### Update the Connector
+
+Update the LDAP IDP when the server, search boundary, Filter, mapping, or automatic synchronization setting changes. Run a manual synchronization after the update to confirm the new configuration and reconcile existing source users and groups.
+
+### Reconcile Upstream-Deleted Users
+
+After manual or automatic reconciliation, a user deleted from the upstream directory becomes invalid in ACP and can no longer authenticate through that source.
+
+### Delete the Connector
+
+Deleting the Connector without cleanup retains users and groups from that source and marks the users invalid. If **Clean up IDP users and User Groups** is selected during deletion, ACP deletes the users and groups generated from that Connector.
+
+## Configure LDAP with YAML
+
+The following v2 `Connector` templates use `bindPW` only as an initial-creation input. Submit them through the ACP console YAML tab. ACP moves the submitted password to a managed Secret, and stored YAML later contains a managed `clientSecretRef` instead of `bindPW`. Do not use `kubectl apply` with an inline `bindPW`: the Kubernetes last-applied annotation can retain the submitted password in the Connector metadata. Replace every example value before use.
+
+### Strict-Verification OpenLDAP Template
+
+:::warning Certificate verification limitation on port 636
+
+In the ACP environment validated for this guide (`auth-controller2` v4.3.6), a Connector whose `host` ends in `:636` is stored with `insecureSkipVerify: true`, even when the submitted value is `false` and `rootCAData` contains the correct CA. Standard-port LDAPS traffic is encrypted, but ACP does not verify the LDAP server certificate.
+
+The template below is for a directory that exposes LDAPS on a non-636 port. This configuration was validated with `insecureSkipVerify: false` and `rootCAData` on a non-636 port. If certificate verification is required, coordinate the port with the directory and network administrators, then complete Connector creation, synchronization, and a real login before rollout.
+
+:::
 
 ```yaml
 apiVersion: dex.coreos.com/v1
 kind: Connector
-id: ldap        # Connector ID
-name: ldap      # Connector display name
-type: ldap      # Connector type is LDAP
+id: corporate-ldap
+name: Corporate LDAP
+type: ldap
 metadata:
-  name: ldap
+  name: corporate-ldap
   namespace: cpaas-system
+  labels:
+    cpaas.io/idp.version: v2
 spec:
   config:
-    # LDAP server address and port
-    host: ldap.example.com:636
-    # DN and password for the service account used by the connector.
-    # This DN is used to search for users and groups.
-    bindDN: uid=serviceaccount,cn=users,dc=example,dc=com
-    # Service account password, required when creating a connector.
-    bindPW: password
-
-    # Login account prompt. For example, username
-    usernamePrompt: SSO Username
-
-    # User search configuration
+    host: "<LDAPS_HOST>:<NON_636_LDAPS_PORT>"
+    bindDN: cn=reader,dc=example,dc=com
+    bindPW: <BIND_PASSWORD>
+    insecureNoSSL: false
+    insecureSkipVerify: false
+    startTLS: false
+    rootCAData: <BASE64_ENCODED_CA_CERTIFICATE_PEM>
+    usernamePrompt: Directory username
     userSearch:
-      # Start searching from the base DN
-      baseDN: cn=users,dc=example,dc=com
-      # LDAP query statement, used to search for users.
-      # For example: "(&(objectClass=person)(uid=<username>))"
-      filter: (&(objectClass=organizationalPerson))
-
-      # The following fields are direct mappings of user entry attributes.
-      # User ID attribute
+      baseDN: ou=People,dc=example,dc=com
+      filter: "(&(objectClass=inetOrgPerson)(uid=*))"
+      scope: sub
       idAttr: uid
-      # Required. Attribute to map to email
-      emailAttr: mail
-      # Required. Attribute to map to username
-      nameAttr: cn
-      # Login username attribute
-      # Filter condition will be converted to "(<attr>=<username>)", such as (uid=example).
+      nameAttr: uid
       username: uid
-
-      # Extended attributes
-      # phoneAttr: phone
-
-    # Group search configuration
     groupSearch:
-      # Start searching from the base DN
-      baseDN: cn=groups,dc=freeipa,dc=example,dc=com
-      # Group filter condition
-      # "(&(objectClass=group)(member=<user uid>))".
-      filter: "(objectClass=group)"
-      # User group matching field
-      # Group attribute
+      baseDN: ou=Groups,dc=example,dc=com
+      filter: "(objectClass=groupOfNames)"
       groupAttr: member
-      # User group member attribute
-      userAttr: uid
-      # 组显示名称
+      userAttr: DN
       nameAttr: cn
 ```
 
-### User Filter Examples
+### Active Directory Template
 
 ```yaml
-# 1. Basic filter: Find all users
-(&(objectClass=person))
-
-# 2. Multiple conditions combination: Find users in a specific department
-(&(objectClass=person)(departmentNumber=1000))
-
-# 3. Find enabled users (Active Directory)
-(&(objectClass=user)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))
-
-# 4. Find users with a specific email domain
-(&(objectClass=person)(mail=*@example.com))
-
-# 5. Find members of specific group
-(&(objectClass=person)(memberOf=cn=developers,ou=groups,dc=example,dc=com))
-
-# 6. Find recently logged in users (Active Directory)
-(&(objectClass=user)(lastLogon>=20240101000000.0Z))
-
-# 7. Exclude system accounts
-(&(objectClass=person)(!(uid=admin))(!(uid=system)))
-
-# 8. Find users with a specific attribute
-(&(objectClass=person)(mobile=*))
-
-# 9. Find users in multiple departments
-(&(objectClass=person)(|(ou=IT)(ou=HR)(ou=Finance)))
-
-# 10. Complex condition combination example
-(&
-  (objectClass=person)
-  (|(department=IT)(department=Engineering))
-  (!(title=Intern))
-  (manager=cn=John Doe,ou=People,dc=example,dc=com)
-)
+apiVersion: dex.coreos.com/v1
+kind: Connector
+id: corporate-ad
+name: Corporate Active Directory
+type: ldap
+metadata:
+  name: corporate-ad
+  namespace: cpaas-system
+  labels:
+    cpaas.io/idp.version: v2
+spec:
+  config:
+    host: ad.example.com:389
+    bindDN: CN=ACP Reader,OU=Service Accounts,DC=example,DC=com
+    bindPW: <BIND_PASSWORD>
+    insecureNoSSL: true
+    startTLS: false
+    usernamePrompt: AD username
+    userSearch:
+      baseDN: OU=Employees,DC=example,DC=com
+      filter: "(&(objectClass=user)(!(objectClass=computer))(sAMAccountName=*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
+      idAttr: sAMAccountName
+      nameAttr: sAMAccountName
+      username: sAMAccountName
+    groupSearch:
+      baseDN: OU=Groups,DC=example,DC=com
+      filter: "(&(objectClass=group)(member=*))"
+      groupAttr: member
+      userAttr: DN
+      nameAttr: cn
 ```
 
-### Group Search Configuration Examples
+Choose the transport flags as a set:
+
+| Transport | Typical port | `insecureNoSSL` | `startTLS` | Certificate verification |
+| --- | --- | --- | --- | --- |
+| Plain LDAP | 389 | `true` | `false` | Not applicable; use only on a trusted network when policy permits |
+| LDAPS on the standard port | 636 | `false` | `false` | The validated ACP implementation stores `insecureSkipVerify: true`; traffic is encrypted, but the LDAP server certificate is not verified |
+| LDAPS with strict certificate verification | A configured non-636 LDAPS port | `false` | `false` | Keep `insecureSkipVerify: false` and provide the trusted CA through `rootCAData`; this was validated on a non-636 port |
+
+The Active Directory template above uses the plain LDAP transport that was validated with ACP. Plain LDAP does not protect the bind password on the network. Use it only when the customer's network and security policy permit it. When TLS is required, first determine whether the policy also requires certificate verification: standard-port 636 provides encryption without server certificate verification in the validated implementation, while strict verification requires a non-636 LDAPS port and `rootCAData`. Complete an ACP LDAPS creation, synchronization, and login test before rollout.
+
+For strict certificate verification on a non-636 LDAPS port, encode the PEM CA certificate without line breaks and use the output as `rootCAData`:
+
+```bash
+openssl base64 -A -in ldap-ca.pem
+```
+
+For scheduled synchronization in YAML, add the supported metadata to the Connector:
 
 ```yaml
-# 1. Basic filter: Find all groups
-(objectClass=groupOfNames)
-
-# 2. Find groups with a specific prefix
-(&(objectClass=groupOfNames)(cn=dev-*))
-
-# 3. Find non-empty groups
-(&(objectClass=groupOfNames)(member=*))
-
-# 4. Find groups with a specific member
-(&(objectClass=groupOfNames)(member=uid=john,ou=People,dc=example,dc=com))
-
-# 5. Find nested groups (Active Directory)
-(&(objectClass=group)(|(groupType=-2147483646)(groupType=-2147483644)))
-
-# 6. Find groups with a specific description
-(&(objectClass=groupOfNames)(description=*admin*))
-
-# 7. Exclude system groups
-(&(objectClass=groupOfNames)(!(cn=system*)))
-
-# 8. Find groups with specific members
-(&(objectClass=groupOfNames)(|(cn=admins)(cn=developers)(cn=operators)))
-
-# 9. Find groups in a specific OU
-(&(objectClass=groupOfNames)(ou=IT))
-
-# 10. Complex condition combination example
-(&
-  (objectClass=groupOfNames)
-  (|(cn=prod-*)(cn=dev-*))
-  (!(cn=deprecated-*))
-  (owner=cn=admin,dc=example,dc=com)
-)
+metadata:
+  labels:
+    cpaas.io/ldap.autoSync: "true"
+  annotations:
+    cpaas.io/ldap.autoSyncRule: "*/1 * * * *"
 ```
 
-### Examples of AND(&) and OR(|) Operators in LDAP Filters
+The example rule is suitable only for observing an acceptance-test run. Replace it with the required UTC schedule after validation. The top-level `id` must equal `metadata.name`; current scheduled synchronization looks up the Connector by that identity.
 
-```yaml
-# AND operator (&) - All conditions must be met
-# Syntax: (&(condition1)(condition2)(condition3)...)
+## Troubleshoot by Symptom
 
-# Multiple attribute AND example
-(&
-  (objectClass=person)
-  (mail=*@example.com)
-  (title=Engineer)
-  (manager=*)
-)
+| Symptom | Product stage | Likely cause | Concrete check |
+| --- | --- | --- | --- |
+| ACP cannot create the Connector because it cannot connect. | Connector creation | Cluster DNS, routing, firewall, port, TLS mode, or certificate trust is incorrect. | From a host or Pod with ACP-equivalent reachability, run the external TCP or TLS checks below, then inspect `auth-controller2` logs. |
+| Bind succeeds but Base DN or Filter validation fails. | Connector creation and search validation | The Base DN does not exist for the bind account, the Filter is invalid, or the Filter returns no usable entries. | Run an external base-scope query for the Base DN, then run the exact subtree Filter and inspect `auth-controller2` logs. |
+| ACP rejects Active Directory **Group Attr** `member` and also suggests `member`. | Connector creation and group attribute validation | The Group Filter sampled empty groups that did not return a `member` attribute. | Use `(&(objectClass=group)(member=*))`, confirm that the external query returns the intended groups, and retry creation. |
+| Sync reports success but returns fewer users than expected. | Manual or scheduled synchronization | The Filter excludes users, users are outside the Base DN, or required **User Name Attr** values are missing. | Compare the external subtree result with the expected count, run the missing-attribute Filters above, and inspect skipped-entry messages in `apollo` logs. |
+| Connector creation succeeds but a directory user cannot log in. | Login | **Login Field** does not find exactly one entry, the account is excluded or disabled, or the representative credentials are invalid. | Query the representative login value with each configured login attribute, confirm exactly one result, retry in a separate browser session, and inspect `apollo` logs. |
+| Users synchronize but groups do not. | Group synchronization | **Group Attr** and **User Attr** do not represent the values stored in the group, or the Group Base DN or Filter is wrong. | Inspect one known group and reproduce `(<Group Attr>=<User Attr value>)` with an external subtree query, then inspect `apollo` group lookup messages. |
+| Identities collide or change unexpectedly. | User synchronization and reconciliation | **User Name Attr** is duplicated, empty, mutable, or based on a DN that changed after a rename or move. | Query the proposed identity attribute across the full User Base DN, check missing and duplicate values, and select a stable unique attribute. |
+| Automatic synchronization does not run. | Scheduled synchronization | Auto Sync metadata is absent or invalid, or top-level `id` differs from `metadata.name`. | Inspect the stored Connector metadata and identity, then inspect scheduled synchronization messages in `apollo` logs. |
 
-# OR operator (|) - At least one condition must be met
-# Syntax: (|(condition1)(condition2)(condition3)...)
+## On-Site Diagnostic Tools
 
-# Multiple attribute OR example
-(|
-  (department=IT)
-  (department=HR)
-  (department=Finance)
-)
+The tools in this section are external pre-integration diagnostics or advanced ACP evidence collection. They are not built-in ACP functions.
 
-# Combining AND and OR
-(&
-  (objectClass=person)
-  (|
-    (department=IT)
-    (department=R&D)
-  )
-  (employeeType=FullTime)
-)
+### External: Linux and macOS LDAP Tools
 
-# Complex condition combination
-(&
-  (objectClass=person)
-  (|
-    (&
-      (department=IT)
-      (title=*Engineer*)
-    )
-    (&
-      (department=R&D)
-      (title=*Developer*)
-    )
-  )
-  (!(status=Inactive))
-  (|(manager=*)(isManager=TRUE))
-)
+The LDAP commands require an installed OpenLDAP client such as `ldapsearch` and `ldapwhoami`. They prompt for the bind password with `-W`. This option only prevents the password from appearing in the command line; it does not encrypt the network transport.
+
+The private-CA environment variables below were validated with a Linux OpenLDAP client. The built-in macOS `/usr/bin/ldapsearch` and `/usr/bin/ldapwhoami` use the macOS system trust store instead; use a Linux diagnostic host or Pod, or configure the CA in the macOS Keychain before using those built-in clients.
+
+For every `ldapwhoami` and `ldapsearch` command, use the same transport combination as the Connector being investigated:
+
+| Connector transport | Connector settings | OpenLDAP client transport | Bind credential protection |
+| --- | --- | --- | --- |
+| Plain LDAP | `insecureNoSSL: true`, `startTLS: false` | `-H ldap://ldap.example.com:389` without `-ZZ` | No TLS protection; use only when network policy permits |
+| LDAPS | `insecureNoSSL: false`, `startTLS: false` | `-H ldaps://ldap.example.com:636` without `-ZZ` | TLS starts when the connection is established |
+
+The query examples below use plain LDAP and therefore match only a Connector with `insecureNoSSL: true`. For LDAPS, replace the `-H` value with the matching row before running each example. If the LDAP certificate is signed by a private CA, the diagnostic client must also trust that CA. On Linux OpenLDAP clients, prefix each `ldapwhoami` or `ldapsearch` command as follows:
+
+```bash
+LDAPTLS_REQCERT=demand \
+LDAPTLS_CACERT=/path/to/ldap-ca.pem \
+ldapwhoami -x -H ldaps://ldap.example.com:636 \
+  -D 'cn=reader,dc=example,dc=com' -W
 ```
 
-## Synchronize LDAP Users
+Without the `LDAPTLS_CACERT` setting, the validated Linux client failed with `unable to get local issuer certificate`; with the CA file, the same bind succeeded.
 
-After successfully synchronizing LDAP users to the platform, you can view the synchronized users in the user list.
+**External command: test TCP port reachability only**
 
-You can configure an automatic synchronization policy when [adding LDAP](#addldap) (which can be updated later) or manually trigger synchronization after adding LDAP successfully. Here's how to manually trigger a synchronization operation.
+```bash
+nc -vz ldap.example.com 389
+```
 
-**Notes**:
+This command checks only whether the TCP port is reachable. It does not validate TLS, bind credentials, or LDAP search behavior. Use port `636` instead when checking LDAPS port reachability.
 
-* Newly added users in the LDAP integrated with the platform can log in to the platform before performing the user synchronization operation. Once they successfully log in to the platform, their information will be automatically synchronized to the platform.
+**External command: validate the server, transport, and bind account**
 
-* Users deleted from LDAP will have an `Invalid` status after synchronization.
+```bash
+ldapwhoami -x -H ldap://ldap.example.com:389 \
+  -D 'cn=reader,dc=example,dc=com' -W
+```
 
-* The default validity period for newly synchronized users is **Permanent**.
+**External command: read the directory Root DSE**
 
-* Synchronized users with the same name as existing users (local users, IDP users) are automatically associated. Their permissions and validity period will be consistent with existing users. They can log in to the platform using the login method corresponding to their respective sources.
+```bash
+ldapsearch -LLL -x -H ldap://ldap.example.com:389 \
+  -D 'cn=reader,dc=example,dc=com' -W \
+  -b '' -s base '(objectClass=*)' namingContexts defaultNamingContext
+```
 
-### Procedure of Operation
+**External command: confirm that the candidate Base DN is readable**
 
-1. In the left navigation bar, click **Users** > **IDPs**.
+```bash
+ldapsearch -LLL -x -H ldap://ldap.example.com:389 \
+  -D 'cn=reader,dc=example,dc=com' -W \
+  -b 'ou=People,dc=example,dc=com' -s base \
+  '(objectClass=*)' dn
+```
 
-2. Click the ***LDAP name*** that you want to manually synchronize.
+**External command: reproduce the OpenLDAP user subtree search**
 
-3. Click **Actions** > **Sync user** in the upper-right corner.
+```bash
+ldapsearch -LLL -x -H ldap://ldap.example.com:389 \
+  -D 'cn=reader,dc=example,dc=com' -W \
+  -b 'ou=People,dc=example,dc=com' -s sub \
+  '(&(objectClass=inetOrgPerson)(uid=*))' \
+  dn uid cn mail objectClass
+```
 
-4. Click **Sync**.
+**External command: find OpenLDAP entries missing the proposed identity**
 
-    **Notes**: If you manually close the synchronization prompt dialog, a confirmation dialog will appear to confirm the closure. After closing the synchronization prompt dialog, the system will continue to synchronize users. If you remain on the user list page, you will receive synchronization result feedback. If you leave the user list page, you will not receive synchronization results.
+```bash
+ldapsearch -LLL -x -H ldap://ldap.example.com:389 \
+  -D 'cn=reader,dc=example,dc=com' -W \
+  -b 'ou=People,dc=example,dc=com' -s sub \
+  '(&(objectClass=inetOrgPerson)(!(uid=*)))' dn cn mail
+```
 
-## Relevant Operations
+**External command: print duplicate values for the proposed OpenLDAP identity**
 
-You can click the ![](/113point.png) on the right in the list page or click **Actions** in the upper-right corner on the details page to update or delete LDAP as needed.
+```bash
+ldapsearch -LLL -x -H ldap://ldap.example.com:389 \
+  -D 'cn=reader,dc=example,dc=com' -W \
+  -b 'ou=People,dc=example,dc=com' -s sub \
+  '(&(objectClass=inetOrgPerson)(uid=*))' uid | \
+  awk -F ': ' '$1 == "uid" { print $2 }' | \
+  LC_ALL=C sort -f | uniq -di
+```
 
-| Operation | Description |
-|-----------|-------------|
-| **Update LDAP** | Update the configuration information of the added LDAP or the **LDAP Auto-Sync Policy**.<br/><br/>**Note**: After updating LDAP, users currently synchronized to the platform through this LDAP will also be updated. Users removed from LDAP will become invalid in the platform user list. You can clean up junk data by executing the operation to clean up invalid users. |
-| **Delete LDAP** | After deleting LDAP, all users synchronized to the platform through this LDAP will have an **Invalid** status (the binding relationship between users and roles remains unchanged), and they cannot log in to the platform. After re-integrating, synchronization needs to be re-executed to activate users.<br/><br/>**Tips**: After deleting IDP, if you need to delete users and user groups synchronized to the platform through LDAP, check the checkbox **Clean IDP Users and User Groups** below the prompt box. |
+Replace `uid`, the Base DN, and the Filter when evaluating another candidate identity attribute. No output means that no duplicate values were found among the returned entries. As with the other `ldapsearch` examples, use the transport combination that matches the Connector.
 
+**External command: reproduce a `groupOfNames` membership lookup**
+
+```bash
+ldapsearch -LLL -x -H ldap://ldap.example.com:389 \
+  -D 'cn=reader,dc=example,dc=com' -W \
+  -b 'ou=Groups,dc=example,dc=com' -s sub \
+  '(&(objectClass=groupOfNames)(member=uid=alice,ou=People,dc=example,dc=com))' \
+  dn cn member
+```
+
+**External command: verify the LDAPS certificate chain with the intended CA**
+
+```bash
+openssl s_client -connect ldap.example.com:636 \
+  -servername ldap.example.com \
+  -CAfile ldap-ca.pem -verify_return_error
+```
+
+The certificate check passes only when the output reports successful verification, such as `Verify return code: 0 (ok)` or `Verification: OK`.
+
+### External: Active Directory Queries with `ldapsearch`
+
+The same OpenLDAP command-line client can inspect Active Directory without requiring Windows or RSAT. Use a directory account with read permission.
+
+**External command: inspect the intended Active Directory users**
+
+```bash
+ldapsearch -LLL -x -H ldap://ad.example.com:389 \
+  -D 'CN=ACP Reader,OU=Service Accounts,DC=example,DC=com' -W \
+  -b 'OU=Employees,DC=example,DC=com' -s sub \
+  '(&(objectClass=user)(!(objectClass=computer))(sAMAccountName=*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))' \
+  dn sAMAccountName displayName mail userAccountControl memberOf
+```
+
+**External command: reproduce an Active Directory group membership lookup**
+
+```bash
+ldapsearch -LLL -x -H ldap://ad.example.com:389 \
+  -D 'CN=ACP Reader,OU=Service Accounts,DC=example,DC=com' -W \
+  -b 'OU=Groups,DC=example,DC=com' -s sub \
+  '(&(objectClass=group)(member=CN=Alice,OU=Employees,DC=example,DC=com))' \
+  dn cn member
+```
+
+### Advanced: ACP Component Logs
+
+These deployment names are the current ACP component names. The commands require permission to read cluster logs.
+
+**Advanced ACP command: inspect Connector creation validation**
+
+```bash
+kubectl -n cpaas-system logs deployment/auth-controller2 --since=10m
+```
+
+`auth-controller2` covers Connector creation validation, including network connection, TLS, bind, Base DN, Filter, and mapped attributes.
+
+**Advanced ACP command: inspect synchronization and login behavior**
+
+```bash
+kubectl -n cpaas-system logs deployment/apollo --since=10m
+```
+
+`apollo` covers manual and scheduled synchronization, skipped entries, group lookups, and login behavior.
+
+:::note
+
+Success with an external tool does not prove that ACP can reach or use the directory. Complete the evidence chain with ACP Connector creation, expected synchronization results, and a real directory login with the intended ACP permission.
+
+:::
