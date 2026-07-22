@@ -6,7 +6,7 @@ weight: 20
 
 ACP can redirect users to a standards-based OIDC identity provider and create or update their platform identity after successful login.
 
-Use the **Form** tab for the initial integration. Use the **YAML** tab only when the returned username Claim must be selected explicitly, as described in [Add OIDC Using YAML](#add-oidc-using-yaml).
+Use the **Form** tab for the shortest initial integration. Use the **YAML** tab when the returned username Claim must be selected explicitly, Claims must be remapped, UserInfo must be queried, or OIDC groups and extra fields are required. See [Add OIDC Using YAML](#add-oidc-using-yaml).
 
 ## Before You Begin
 
@@ -47,6 +47,23 @@ curl -fsS --cacert /path/to/oidc-ca.pem \
 
 This external query is preliminary evidence. ACP Connector creation is the cluster-side discovery and reachability check.
 
+### Confirm the Returned Claims
+
+Ask the upstream identity administrator to provide the ID token or UserInfo Claim names for one representative account. Claim names are case-sensitive. ACP Connector creation validates discovery and client reachability, but it does not prove that a real user's token contains the required Claims.
+
+| Claim or setting | Required when | ACP use |
+| --- | --- | --- |
+| `sub` | Always | Stable upstream subject used by the OIDC protocol. It must be a string. |
+| `name` | No `userNameKey` is configured | Default source for the ACP username. |
+| Claim selected by `userNameKey` | The default `name` Claim is absent or unsuitable | Source for the ACP username. The validated fallback is `preferred_username`. |
+| `email` or the Claim selected by `claimMapping.email` | The `email` scope is requested | ACP user identity. It must be a string and should not collide with an existing ACP user. |
+| `email_verified` | The `email` scope is requested | Boolean verification flag required by the current login flow. |
+| Claim selected by `claimMapping.groups` | OIDC group processing is enabled | String or array of group names used to create and associate ACP groups. |
+| Claims selected by `claimMapping.phone` and `claimMapping.mail` | Those optional profile fields are configured | String values copied to the ACP user's mobile and mail fields. |
+| Claim listed in `claimExtra` | The extra value must be stored in ACP | Value copied to `spec.extra` when its configured type matches. This guide documents the validated `string` type. |
+
+Complete one real browser login before rollout and inspect the generated ACP user. That login is the authoritative check for Claim availability, mapping, collision behavior, and group restrictions.
+
 :::warning Upstream OIDC certificate verification limitation
 
 In this ACP release, Connector validation and the OIDC login runtime use `insecureSkipVerify: true`. ACP therefore does not verify the upstream OIDC server certificate. HTTPS still encrypts the connection, but successful Connector creation is not evidence that the certificate chain is trusted.
@@ -67,6 +84,20 @@ If the customer's security policy requires upstream server certificate verificat
 During creation, ACP reads OIDC discovery from the Issuer URL. An invalid or unreachable Issuer is rejected at this stage. The current creation check does not prove that **Client Key** is correct or that the upstream TLS certificate is trusted: a Connector with an incorrect key can still be created and then fail during the browser callback, while an untrusted self-signed certificate can be accepted. A real login is therefore required for authentication, and certificate compliance must be assessed separately as described above.
 
 After creation, ACP moves the submitted **Client Key** to a managed Secret. The stored Connector references that Secret instead of retaining `clientSecret` in its configuration.
+
+### Console Field Reference
+
+| ACP console field | YAML field | Product behavior |
+| --- | --- | --- |
+| **Name** | `id` and `metadata.name` | Use the same DNS-compatible value for both fields. |
+| **Display Name** | `name` | Name shown on the ACP IDP chooser. |
+| **Description** | `metadata.annotations["cpaas.io/description"]` | Optional operator-facing description. |
+| **Server Provider URL** | `spec.config.issuer` | Issuer root used for OIDC discovery. |
+| **Client ID** | `spec.config.clientID` | Client identifier registered upstream. |
+| **Client Key** | `spec.config.clientSecret` | Initial-creation input; ACP stores it in a managed Secret. |
+| **Logout URL** | `logoutURL` | Leave empty. The validated runtime did not use it as the post-logout redirect. |
+
+The form does not expose `redirectURI`, scopes, UserInfo, Claim mappings, group processing, or extra Claims. Configure those fields through YAML only after confirming the upstream response.
 
 ## Verify the Integration
 
@@ -89,7 +120,7 @@ Connector creation, upstream authentication, ACP user creation, and ACP authoriz
 
 ## Add OIDC Using YAML \{#add-oidc-using-yaml}
 
-Use **Users > IDP > Add OIDC > YAML** when the upstream response has no usable `name` Claim but does return `preferred_username`.
+Use **Users > IDP > Add OIDC > YAML** when the upstream response requires explicit Claim selection or advanced mapping. The complete example below assumes that the upstream response contains `sub`, `preferred_username`, `email`, `email_verified`, `groups`, and `phone_number`, and that the test user belongs to `acp-users`. Remove optional mappings and group restrictions that the real upstream response does not satisfy.
 
 ```yaml
 apiVersion: dex.coreos.com/v1
@@ -100,6 +131,8 @@ type: oidc
 metadata:
   name: corporate-oidc
   namespace: cpaas-system
+  annotations:
+    cpaas.io/description: Corporate OIDC
   labels:
     cpaas.io/idp.version: v2
 spec:
@@ -111,12 +144,84 @@ spec:
     scopes:
       - profile
       - email
+    getUserInfo: true
     userNameKey: preferred_username
+    overrideClaimMapping: true
+    claimMapping:
+      preferred_username: preferred_username
+      email: email
+      groups: groups
+      phone: phone_number
+      mail: email
+    claimExtra:
+      - field: preferred_username
+        type: string
+    insecureEnableGroups: true
+    allowedGroups:
+      - acp-users
 ```
 
-Replace the Issuer, credentials, and ACP address before submission. Do not add `openid` to `scopes`; the Connector adds it to the authorization request. Confirm through a real login that the selected `userNameKey` Claim is present and produces the expected ACP username.
+Replace the Issuer, credentials, ACP address, Claim names, and allowed group before submission. If the provider does not expose a UserInfo endpoint or all required Claims are already in the ID token, set `getUserInfo: false`. If group processing is not required, remove `insecureEnableGroups`, `allowedGroups`, and `claimMapping.groups`.
+
+Do not add `openid` to `scopes`; the Connector adds it to the authorization request. If the upstream provider requires a provider-specific scope for group Claims, add that scope only after confirming it in the discovery and provider configuration.
 
 Submit this initial configuration through the ACP console YAML tab. ACP moves `clientSecret` to a managed Secret, and the stored Connector contains `clientSecretRef` instead. Do not use `kubectl apply` with an inline `clientSecret`: the Kubernetes last-applied annotation can retain the submitted secret in the Connector metadata.
+
+### Complete OIDC Field Reference
+
+Top-level and metadata fields:
+
+| Field | Required | Product behavior |
+| --- | --- | --- |
+| `apiVersion` | Yes | Use `dex.coreos.com/v1`. |
+| `kind` | Yes | Use `Connector`. |
+| `id` | Yes | Connector identity. Keep it equal to `metadata.name`. |
+| `name` | Yes | Display name shown on the ACP login chooser. |
+| `type` | Yes | Use `oidc`. |
+| `metadata.name` | Yes | Kubernetes resource name and ACP Connector lookup key. |
+| `metadata.namespace` | Yes | Use `cpaas-system`. |
+| `metadata.annotations["cpaas.io/description"]` | No | Description shown by ACP. |
+| `metadata.labels["cpaas.io/idp.version"]` | Recommended | Use `v2`; current ACP also adds this label during creation. |
+
+Connection and login fields:
+
+| Field | Required | Product behavior |
+| --- | --- | --- |
+| `issuer` | Yes | Issuer root used to retrieve `/.well-known/openid-configuration`. |
+| `clientID` | Yes | Client identifier registered upstream. |
+| `clientSecret` | Initial creation | Plain input accepted by the ACP YAML page. ACP removes it and stores it in a managed Secret. |
+| `clientSecretRef` | Stored output | Managed Secret reference written by ACP. Do not submit it together with `clientSecret` or edit it manually. |
+| `redirectURI` | Yes | Exact ACP callback registered upstream: `https://<ACP_ADDRESS>/dex/callback`. |
+| `scopes` | No | Additional scopes such as `profile` and `email`. ACP automatically adds `openid`. |
+| `getUserInfo` | No | When `true`, requests the UserInfo endpoint and merges returned Claims before mapping. Verify that the provider supports this endpoint. |
+| `userNameKey` | No | Claim used as the ACP username instead of the default `name`; `preferred_username` is the validated fallback. |
+
+Claim and group fields:
+
+| Field | Required | Product behavior |
+| --- | --- | --- |
+| `overrideClaimMapping` | When forcing a custom mapping | Set to `true` when a standard Claim is also present but ACP must use the Claim selected below. |
+| `claimMapping.preferred_username` | No | Claim used as the preferred username. |
+| `claimMapping.email` | When remapping email | Claim used as the ACP primary identity. Check for collisions before rollout. |
+| `claimMapping.groups` | When group processing is enabled | Claim containing a string or array of group names. This nested field is the runtime group mapping. |
+| `claimMapping.phone` | No | String Claim copied to the ACP user's mobile field. |
+| `claimMapping.mail` | No | String Claim copied to the ACP user's mail field. |
+| `claimExtra[].field` | No | Claim copied to the ACP user's `spec.extra` map. |
+| `claimExtra[].type` | With `claimExtra[].field` | Use `string` for the validated workflow in this guide. Remove the entry when the Claim is absent or has another type. |
+| `insecureEnableGroups` | When group processing is required | Set to `true` to read the mapped group Claim and create or associate ACP groups during login. |
+| `allowedGroups` | No | When non-empty, login is rejected unless at least one mapped group matches. ACP retains only the matching allowed groups. |
+
+If `email` is present in `scopes`, the selected email Claim must be a string and `email_verified` must be a Boolean in the merged response. Missing either value causes login to fail.
+
+:::note ACP-managed and ineffective fields
+
+Stored YAML can contain controller-added defaults such as `issuerAlias: ""`, top-level `groupsKey: groups`, and `insecureSkipVerify: true`.
+
+- Configure group mapping with `claimMapping.groups`. The current runtime does not use the controller-added top-level `groupsKey` as the group Claim selector.
+- Do not use `insecureSkipVerify: false` as a certificate-trust control. The validated runtime does not verify the upstream certificate, as described in **Before You Begin**.
+- Leave `issuerAlias` out of the validated workflow unless a product-specific integration procedure explicitly requires it.
+
+:::
 
 ## Login, Update, and Delete Behavior
 
@@ -140,6 +245,10 @@ The flow does not use the configured **Logout URL** as a browser redirect. Leave
 | ACP rejects the Connector during creation. | Discovery or cluster-side reachability did not complete. | Confirm that **Server Provider URL** is the Issuer root, retrieve its discovery document from an ACP-equivalent network path, and retry creation. |
 | Connector creation succeeds, but the callback returns HTTP 500 with `unauthorized_client` or `Invalid client secret`. | Discovery and the upstream authorization page worked; client authentication at the token endpoint failed. | Correct **Client Key**, then repeat the full login in a new browser session. Creation alone does not validate this value. |
 | Login succeeds, but the ACP username is empty. | ACP accepted the upstream identity and created the user. | Confirm that `preferred_username` is present, set `userNameKey: preferred_username` through YAML, and log in again. |
+| Login fails with a missing email or `email_verified` message. | Authorization and token exchange completed, but required Claims were absent or had the wrong type. | Inspect the ID token and UserInfo response, correct `scopes` or `claimMapping.email`, and repeat login. |
+| Login fails with `user not a member of allowed groups`. | The mapped group Claim was read, but no value matched `allowedGroups`. | Confirm the exact case-sensitive group values, then correct the upstream membership, `claimMapping.groups`, or `allowedGroups`. |
+| Login succeeds, but no ACP groups are associated. | Authentication and user mapping completed without a usable group result. | Confirm that `insecureEnableGroups: true`, inspect the mapped group Claim type and values, and verify `claimMapping.groups`. |
+| A configured extra Claim is absent from the ACP user. | Login completed, but the Claim was missing or did not match the configured type. | Inspect the merged ID token and UserInfo Claims; for this guide, use `type: string` only for a string Claim. |
 | An existing user's IDP source or mapping changes after the test login. | The callback mapped an email already used by an ACP user. | Stop the rollout, choose a non-colliding test account, and review existing ACP users before retrying. |
 | ACP logout returns to the IDP chooser, but choosing OIDC signs in without another prompt. | The ACP session ended, while the upstream session remained active. | Treat ACP and upstream logout as separate acceptance checks; do not rely on the unverified **Logout URL** field. |
 | Users remain active after the Connector custom resource is deleted with `kubectl`. | The ACP product deletion workflow was bypassed. | Restore the test Connector if needed, then delete it with the ACP console action and select the required cleanup option. |
