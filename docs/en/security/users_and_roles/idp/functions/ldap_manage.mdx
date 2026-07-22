@@ -109,6 +109,21 @@ After each condition, rerun the external directory query and compare the count a
 
 The last expression is a copyable Active Directory LDAP Filter for excluding disabled accounts. Apply it only when that exclusion matches the customer's directory policy.
 
+### LDAP Filter Syntax Quick Reference
+
+Build Filters from the smallest expression that returns the intended entries. The operators below were exercised against the test directories used for this guide.
+
+| Need | Syntax | Example |
+| --- | --- | --- |
+| Exact value | `(attribute=value)` | `(uid=alice)` |
+| Attribute is present | `(attribute=*)` | `(mail=*)` |
+| All conditions match | `(&(condition1)(condition2))` | `(&(objectClass=inetOrgPerson)(uid=*))` |
+| Any condition matches | <code>(&#124;(condition1)(condition2))</code> | <code>(&#124;(uid=alice)(mail=alice@test.com))</code> |
+| Exclude a condition | `(!(condition))` | `(!(objectClass=computer))` |
+| Exclude disabled Active Directory accounts | `(!(userAccountControl:1.2.840.113556.1.4.803:=2))` | Use inside the Active Directory user Filter shown above |
+
+Do not put a `<username>` placeholder in the configured user Filter. Synchronization runs the configured Filter as written. During login, ACP combines that Filter with an equality lookup for each configured **Login Field** attribute.
+
 ### 7. Identify the Group Membership Model
 
 Inspect one known group and compare its stored membership values with the representative user:
@@ -148,6 +163,33 @@ During creation, ACP validates server connectivity, bind, Base DN, Filter, and m
 
 :::
 
+### Console Field Reference
+
+Use this table to translate values discovered with `ldapsearch` into the current ACP form and, when needed, the YAML fields described later.
+
+| ACP console field | YAML field | How to choose the value |
+| --- | --- | --- |
+| **Name** | `id` and `metadata.name` | Use the same DNS-compatible value for both fields. |
+| **Display Name** | `name` | Name shown on the ACP IDP chooser. |
+| **Description** | `metadata.annotations["cpaas.io/description"]` | Optional operator-facing description. |
+| **Server Address** | `spec.config.host` | Directory hostname or IP and port reachable from ACP. |
+| **Admin Account** | `spec.config.bindDN` | Bind account DN with read access to intended entries. |
+| **Admin Password** | `spec.config.bindPW` | Initial-creation input; ACP stores it in a managed Secret. |
+| User **Filter** | `spec.config.userSearch.filter` | Filter that returns only the intended user population. |
+| User **Base DN** | `spec.config.userSearch.baseDN` | Lowest directory branch containing all intended users. |
+| Group **Filter** | `spec.config.groupSearch.filter` | Filter for intended groups; require the member attribute when empty groups exist. |
+| Group **Base DN** | `spec.config.groupSearch.baseDN` | Lowest directory branch containing the intended groups. |
+| **Group Attr** | `spec.config.groupSearch.groupAttr` | Attribute on a group that stores member values, such as `member` or `memberUid`. |
+| **User Attr** | `spec.config.groupSearch.userAttr` | User value comparable with **Group Attr**, such as `DN` or `uid`. |
+| **User Name Attr** | `spec.config.userSearch.nameAttr` | Stable, unique, non-empty identity used for the v2 ACP username and primary identifier. |
+| **Group Name Attr** | `spec.config.groupSearch.nameAttr` | Readable group name, normally `cn`. |
+| **Login Field** | `spec.config.userSearch.username` | One or more comma-separated login attributes. Configure only attributes present on the filtered entries you validated. |
+| **Username Tip In Login Box** | `spec.config.usernamePrompt` | Prompt displayed on the LDAP login page. |
+| **Auto Sync** | `metadata.labels["cpaas.io/ldap.autoSync"]` | Enable only after manual synchronization is correct. |
+| **Sync Rules** | `metadata.annotations["cpaas.io/ldap.autoSyncRule"]` | Five-field cron expression evaluated in UTC. |
+
+The form does not expose `scope`, TLS flags, CA data, or optional profile mappings. Configure those fields through YAML only when required.
+
 ## Verify the Integration
 
 1. Open the new LDAP IDP and select **Actions > Sync user**.
@@ -173,6 +215,10 @@ A directory user can log in before a full manual synchronization. After successf
 
 Open the LDAP IDP and select **Actions > Sync user** to synchronize and reconcile the directory population on demand. Review the result, counts, skipped-entry messages, and representative users and groups.
 
+Newly synchronized LDAP users are active, valid, and have a default validity period of **Permanent** unless an administrator changes their validity later.
+
+Before synchronization starts, ACP warns that an IDP user with the same name as an existing local user can overwrite or reassociate that user while retaining the existing role assignments. Check the proposed **User Name Attr** for collisions with current ACP users before the first full synchronization. Do not use the built-in local administrator account as an integration test identity.
+
 ### Automatic Synchronization
 
 Enable **Auto Sync** under **Advanced Settings** when scheduled reconciliation is required, and provide **Sync Rules**. Automatic synchronization uses the configured Base DNs, Filters, and mappings; it does not authenticate directory user passwords. ACP evaluates the five-field cron expression in UTC. For an acceptance test, `*/1 * * * *` runs every minute; replace this temporary rule after the scheduled run is observed.
@@ -192,6 +238,14 @@ Deleting the Connector without cleanup retains users and groups from that source
 ## Configure LDAP with YAML
 
 The following v2 `Connector` templates use `bindPW` only as an initial-creation input. Submit them through the ACP console YAML tab. ACP moves the submitted password to a managed Secret, and stored YAML later contains a managed `clientSecretRef` instead of `bindPW`. Do not use `kubectl apply` with an inline `bindPW`: the Kubernetes last-applied annotation can retain the submitted password in the Connector metadata. Replace every example value before use.
+
+:::note Fields deliberately shown in the templates
+
+ACP adds `metadata.labels["cpaas.io/idp.version"]: v2` when a Connector is created. For a plain LDAP connection without `rootCAData`, ACP also persists `insecureNoSSL: true`, `insecureSkipVerify: true`, and `startTLS: false`. The templates show these values explicitly so that the submitted YAML describes the effective connection mode.
+
+ACP can infer some user and group attributes from the first `objectClass` in a Filter. Do not depend on that inference for customer delivery: it cannot determine the directory's actual identity and membership model. Set `idAttr`, `nameAttr`, `username`, `groupAttr`, `userAttr`, and the group `nameAttr` explicitly after inspecting representative entries. The templates also write `scope: sub` explicitly, although `sub` is the runtime default. `clientSecretRef` is not an input field in these templates because ACP writes it only after moving `bindPW` to the managed Secret.
+
+:::
 
 ### Strict-Verification OpenLDAP Template
 
@@ -234,6 +288,7 @@ spec:
     groupSearch:
       baseDN: ou=Groups,dc=example,dc=com
       filter: "(objectClass=groupOfNames)"
+      scope: sub
       groupAttr: member
       userAttr: DN
       nameAttr: cn
@@ -258,21 +313,149 @@ spec:
     bindDN: CN=ACP Reader,OU=Service Accounts,DC=example,DC=com
     bindPW: <BIND_PASSWORD>
     insecureNoSSL: true
+    insecureSkipVerify: true
     startTLS: false
     usernamePrompt: AD username
     userSearch:
       baseDN: OU=Employees,DC=example,DC=com
       filter: "(&(objectClass=user)(!(objectClass=computer))(sAMAccountName=*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
+      scope: sub
       idAttr: sAMAccountName
       nameAttr: sAMAccountName
       username: sAMAccountName
     groupSearch:
       baseDN: OU=Groups,DC=example,DC=com
       filter: "(&(objectClass=group)(member=*))"
+      scope: sub
       groupAttr: member
       userAttr: DN
       nameAttr: cn
 ```
+
+### Complete LDAP YAML Field Reference
+
+The following skeleton contains the ACP integration fields that are useful for a v2 LDAP Connector. Optional profile mappings are commented out so that the example remains valid when the directory does not provide those attributes. Remove unused optional fields instead of naming attributes that are absent from the filtered users.
+
+```yaml
+apiVersion: dex.coreos.com/v1
+kind: Connector
+id: corporate-ldap
+name: Corporate LDAP
+type: ldap
+metadata:
+  name: corporate-ldap
+  namespace: cpaas-system
+  annotations:
+    cpaas.io/description: Corporate directory
+    cpaas.io/ldap.autoSyncRule: "0 2 * * *"
+    # cpaas.io/idp.validation: "false"
+  labels:
+    cpaas.io/idp.version: v2
+    cpaas.io/ldap.autoSync: "true"
+spec:
+  config:
+    host: ldap.example.com:1636
+    bindDN: cn=reader,dc=example,dc=com
+    bindPW: <BIND_PASSWORD>
+    insecureNoSSL: false
+    insecureSkipVerify: false
+    startTLS: false
+    rootCAData: <BASE64_ENCODED_CA_CERTIFICATE_PEM>
+    usernamePrompt: Directory username
+    userSearch:
+      baseDN: ou=People,dc=example,dc=com
+      filter: "(&(objectClass=inetOrgPerson)(uid=*))"
+      scope: sub
+      idAttr: uid
+      nameAttr: uid
+      username: uid
+      # emailAttr: mail
+      # preferredUsernameAttr: cn
+      # phoneAttr: telephoneNumber
+      # emailSuffix: test.com
+    groupSearch:
+      baseDN: ou=Groups,dc=example,dc=com
+      filter: "(&(objectClass=groupOfNames)(member=*))"
+      scope: sub
+      groupAttr: member
+      userAttr: DN
+      nameAttr: cn
+```
+
+Top-level and metadata fields:
+
+| Field | Required | Product behavior |
+| --- | --- | --- |
+| `apiVersion` | Yes | Use `dex.coreos.com/v1`. |
+| `kind` | Yes | Use `Connector`. |
+| `id` | Yes | Connector identity. Keep it equal to `metadata.name`. |
+| `name` | Yes | Display name shown on the ACP login chooser. |
+| `type` | Yes | Use `ldap`. |
+| `metadata.name` | Yes | Kubernetes resource name and ACP Connector lookup key. |
+| `metadata.namespace` | Yes | Use `cpaas-system`. |
+| `metadata.annotations["cpaas.io/description"]` | No | Description shown by ACP. |
+| `metadata.annotations["cpaas.io/idp.validation"]` | Temporary troubleshooting only | String value `"false"` skips directory connectivity validation for this creation or spec-changing update; format validation still runs. Do not set it to `"true"`. |
+| `metadata.labels["cpaas.io/idp.version"]` | Yes | Use `v2` for the mappings documented here. |
+| `metadata.labels["cpaas.io/ldap.autoSync"]` | No | String value `"true"` or `"false"`; enables scheduled synchronization. |
+| `metadata.annotations["cpaas.io/ldap.autoSyncRule"]` | When auto sync is enabled | Five-field cron expression evaluated in UTC. |
+
+Connection and transport fields:
+
+| Field | Required | Product behavior |
+| --- | --- | --- |
+| `host` | Yes | Directory host and port reachable from the ACP cluster. |
+| `bindDN` | Yes | Bind account DN used to read users and groups. |
+| `bindPW` | Initial creation | Plain input accepted by the ACP YAML page. ACP removes it and stores the password in a managed Secret. |
+| `clientSecretRef` | Stored output | Managed Secret reference written by ACP. Do not submit it together with `bindPW` or edit it manually. |
+| `insecureNoSSL` | Yes | `true` selects plain LDAP; `false` selects TLS according to `startTLS`. |
+| `startTLS` | Yes | `false` with `insecureNoSSL: false` selects LDAPS. `true` selects StartTLS over LDAP. |
+| `insecureSkipVerify` | TLS connections | `false` requests server certificate verification, subject to the port-636 limitation below. |
+| `rootCAData` | Private-CA strict TLS | Base64-encoded PEM CA certificate used by the Connector trust pool. |
+| `usernamePrompt` | No | Text shown above the LDAP username field on the login page. |
+
+`userSearch` fields:
+
+| Field | Required | Product behavior |
+| --- | --- | --- |
+| `baseDN` | Yes | Search boundary for user entries. |
+| `filter` | Yes | LDAP Filter used to select the synchronized user population. |
+| `scope` | No | `sub` searches the full subtree and is the runtime default; `one` searches only one level below `baseDN`. |
+| `nameAttr` | Yes for v2 | Stable unique value used as the ACP username and primary identifier during synchronization. |
+| `idAttr` | Yes | Validation and compatibility identity field. For v2, set it to the same stable attribute as `nameAttr`. |
+| `username` | Yes | One or more comma-separated attributes used to find a user during login. |
+| `emailAttr` | No | Copies the directory value to the ACP user's `mail` field. Configure it only when the filtered users provide that attribute. |
+| `preferredUsernameAttr` | No | Supplies the preferred-username Claim during LDAP login; it does not replace the v2 synchronized identity from `nameAttr`. |
+| `phoneAttr` | No | Copies the directory value to the ACP user's mobile field. Configure it only when the filtered users provide that attribute. |
+| `emailSuffix` | No | During LDAP login, constructs the identity email as `<nameAttr>@<suffix>`; enter the suffix without `@`. |
+
+:::warning `emailSuffix` and v2 synchronization
+
+In the validated v2 behavior, `emailSuffix: test.com` produced `admin@test.com` for a first-login identity, while manual synchronization still stored `nameAttr` without the suffix as the primary identifier. Leave `emailSuffix` unset unless this difference has been tested against the customer's synchronization and collision requirements.
+
+:::
+
+`groupSearch` fields:
+
+| Field | Required when group synchronization is enabled | Product behavior |
+| --- | --- | --- |
+| `baseDN` | Yes | Search boundary for group entries. |
+| `filter` | Yes | LDAP Filter used to select groups. Requiring the membership attribute avoids validation against empty groups. |
+| `scope` | No | `sub` is the runtime default; `one` searches one level below `baseDN`. |
+| `groupAttr` | Yes | Attribute on the group entry containing member values. |
+| `userAttr` | Yes | Attribute or `DN` value from the user entry compared with `groupAttr`. |
+| `nameAttr` | Yes | Attribute used as the ACP group display name, normally `cn`. |
+
+Omit `groupSearch` entirely when ACP group synchronization is not required.
+
+:::warning Temporary validation bypass
+
+Use `cpaas.io/idp.validation: "false"` only when the Connector must be staged while the directory is temporarily unreachable. ACP still checks the configuration structure, but it skips network, TLS, bind, Base DN, Filter, and mapped-attribute checks. The resulting Connector can therefore exist even though synchronization and login cannot work.
+
+The admission webhook removes this annotation from the stored Connector and copies the skip marker to the managed credential Secret. A later spec-changing Connector update without the annotation runs normal Connector validation. To restore validation for future credential changes, update the credential through the Connector without the annotation; do not edit the managed Secret directly. Do not use `cpaas.io/idp.validation: "true"`; omit the annotation for normal validation.
+
+Before rollout, complete a normally validated creation or real corrective update, then run manual synchronization and a representative login. A metadata-only update is not evidence that normal validation ran.
+
+:::
 
 Choose the transport flags as a set:
 
