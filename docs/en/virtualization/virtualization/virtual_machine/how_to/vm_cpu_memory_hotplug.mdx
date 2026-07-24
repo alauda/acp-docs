@@ -4,14 +4,14 @@ weight: 22
 
 # CPU and Memory Hotplug
 
-This document describes how to add CPU and memory to a running virtual machine (VM) without shutting it down, and — equally important — how different guest operating systems react to the hotplug. The platform side is identical for every OS, but whether the guest actually *uses* the new resources depends on the guest kernel and its udev rules. All behavior described below was verified on a live cluster with CentOS 7.9, Ubuntu 20.04, and Debian 13 guests.
+This document describes how to add CPU and memory to a running virtual machine (VM) without shutting it down, and — equally important — how different guest operating systems react to the hotplug. The platform side is identical for every OS, but whether the guest actually *uses* the new resources depends on the guest kernel or driver. All behavior described below was verified on a live cluster with CentOS 7.9, Ubuntu 20.04, Debian 13, and Windows Server 2022 guests.
 
 ## How It Works
 
 The platform's virtualization is based on KubeVirt, which applies CPU and memory changes to running VMs through the `LiveUpdate` rollout strategy (the platform default):
 
-- **CPU hotplug** adds vCPUs by increasing the number of CPU **sockets**. The VM must declare headroom at boot via `maxSockets`; the extra sockets are pre-wired as empty slots that QEMU can populate later.
-- **Memory hotplug** grows guest memory through a **virtio-mem** device. The VM declares headroom via `maxGuest`; the delta between `guest` and `maxGuest` is backed by a virtio-mem device that can be resized at runtime.
+- **CPU hotplug** adds vCPUs by increasing the number of CPU **sockets**. The hotplug ceiling is `maxSockets`; the extra sockets are pre-wired as empty slots that QEMU can populate later.
+- **Memory hotplug** grows guest memory through a **virtio-mem** device. The ceiling is `maxGuest`; the delta between `guest` and `maxGuest` is backed by a virtio-mem device that can be resized at runtime — in both directions, as long as the size stays at or above the boot-time memory.
 - Both changes are delivered by an **automatic live migration**: after you edit the VM spec, the platform migrates the VM to a new `virt-launcher` pod whose resource allocation matches the new size. You do not trigger the migration yourself — just be aware that each hotplug produces one migration, and that a VM which cannot live-migrate cannot be hotplugged.
 
 Progress is reported on the VirtualMachineInstance (VMI):
@@ -19,13 +19,13 @@ Progress is reported on the VirtualMachineInstance (VMI):
 - Condition `HotVCPUChange` / `HotMemoryChange` — a hotplug is in flight.
 - `status.currentCPUTopology` — the CPU topology the domain currently has.
 - `status.memory` — `guestAtBoot` / `guestCurrent` / `guestRequested`; a pending memory hotplug shows `guestRequested` > `guestCurrent`.
-- Condition `RestartRequired` on the VM — the requested change cannot be applied live (for example, any *reduction* of CPU or memory).
+- Condition `RestartRequired` on the VM — the requested change cannot be applied live (for example, a CPU socket reduction, or memory below the boot-time value).
 
 ## Prerequisites
 
-- The VM must be **live-migratable** — all its disks on shared storage with `ReadWriteMany` access mode. Hotplug rides on live migration; a non-migratable VM cannot be resized online.
-- The VM spec must declare hotplug headroom (`maxSockets` / `maxGuest`, see below) **before** it is started. Changing the maximums requires a restart.
-- For **memory** hotplug, the guest kernel must support the virtio-mem feature set that the platform's QEMU offers. In practice this means guest kernel **5.16 or newer**. Kernels 5.8–5.15 include a virtio-mem driver but lack the `UNPLUGGED_INACCESSIBLE` feature that QEMU requires, so feature negotiation fails (see the verification results below). Check inside the guest after a hotplug attempt:
+- The VM must be **live-migratable**: the `LiveMigratable` condition on the VMI must be `True`. Hotplug rides on live migration; a non-migratable VM cannot be resized online. Storage-wise this means every **PVC/DataVolume-backed** disk needs shared storage with `ReadWriteMany` access mode — including CD-ROMs backed by an RWO PVC. Volumes that are not PVC-backed (`containerDisk`, cloud-init, `emptyDisk`) do not need RWX. Non-storage factors (host devices, certain CPU configurations) can also make a VM non-migratable; note the condition message reports only the *first* blocking reason it finds.
+- The VM must have hotplug headroom (`maxSockets` / `maxGuest`). The effective ceilings are fixed when the VMI starts — either from explicit values in the VM spec, or auto-computed by the platform when omitted (see below). They cannot be raised on a running VM: growing beyond the current ceiling requires a restart.
+- For **memory** hotplug, the guest must have a virtio-mem driver that can negotiate the feature set the platform's QEMU offers — in particular the `UNPLUGGED_INACCESSIBLE` feature. For Linux guests this is a kernel capability (see the per-OS results below); for Windows guests it is the `viomem` driver from the virtio-win package, which is **not installed by default** on existing VMs (see the Windows row below). Check inside a Linux guest after a hotplug attempt:
 
   ```shell
   dmesg | grep virtio_mem
@@ -54,12 +54,16 @@ spec:
           maxGuest: 8Gi     # hotplug ceiling: up to 8Gi without restart
 ```
 
-If `maxSockets` / `maxGuest` are omitted, the platform derives them from the current values (by default 4× the boot value). Setting them explicitly is recommended so the ceiling is a conscious choice.
+If `maxSockets` / `maxGuest` are omitted, the platform computes them automatically when the VMI starts (by default 4× the boot value; the ratio and absolute caps are configurable cluster-wide via `liveUpdateConfiguration`). The computed values land on the VMI, not on the VM spec — a VM created through the web console, whose template only carries `resources.requests` / `resources.limits`, still gets full hotplug headroom. Setting the maximums explicitly is still recommended so the ceiling is a conscious choice.
 
 Inside the guest this headroom is already visible at boot: a VM created with the spec above shows 1 CPU online and CPUs 1–3 as offline slots, and 2Gi of memory.
 
 :::warning
-A VM whose template expresses its size only through `resources.requests` / `resources.limits` — which is what the web console generates — has **no** `cpu` / `memory` fields in its spec. Hotplug patches target those fields, and *adding* them to a running VM counts as a non-live-updatable change: the VM gets `RestartRequired` (`a non-live-updatable field was changed in the template spec`) instead of hotplugging. The first resize of such a VM therefore requires one restart, which also converts the spec to the explicit form above; every subsequent increase is applied live. (Verified against a console-created VM.)
+For a VM whose template expresses its size only through `resources.requests` / `resources.limits` — which is what the web console generates — the *first* resize behaves differently per resource (verified against such a VM):
+
+- **Memory**: adding `domain.memory.guest` to the running VM is treated as a live update. The hotplug proceeds normally — no restart needed.
+- **CPU**: the template has no `cpu` block, and *adding one* (even just `cpu.sockets`) is a non-live-updatable change. The VM gets `RestartRequired` (`a non-live-updatable field was changed in the template spec`); the first CPU resize therefore needs one restart, after which the spec carries an explicit `cpu` block and every subsequent socket increase is applied live.
+- **Do not combine them**: if one patch adds both the `cpu` block and `memory.guest`, the CPU change sets `RestartRequired` and that condition also suppresses the (otherwise live-applicable) memory hotplug. Patch memory separately if you need it applied online.
 :::
 
 ## Step 2: Hotplug CPU
@@ -86,7 +90,7 @@ kubectl get vmi <vm-name> -n <namespace> \
 
 ### Guest OS Behavior — CPU
 
-The vCPU is hot-added at the hypervisor level for every OS. Whether it is **used** immediately depends on the guest's udev rules:
+The vCPU is hot-added at the hypervisor level for every OS. Whether it is **used** immediately depends on the guest:
 
 | Guest OS | Behavior (verified) |
 | --- | --- |
@@ -129,45 +133,56 @@ kubectl get vmi <vm-name> -n <namespace> -o jsonpath='{.status.memory}'
 
 ### Guest OS Behavior — Memory
 
-This is where guest kernel support decides everything. On a guest that cannot use virtio-mem the hotplug does not fail — it silently stays pending:
+This is where guest driver support decides everything. On a guest that cannot use virtio-mem the hotplug does not fail — it silently stays pending:
 
-| Guest OS | Kernel | Behavior (verified) |
+| Guest OS | Kernel / driver | Behavior (verified) |
 | --- | --- | --- |
 | Debian 13 | 6.12 | **Works.** `guestCurrent` reached the new size ~30 seconds after the patch. All hotplugged memory blocks are onlined automatically by the virtio-mem driver — no udev rule or manual step needed (unlike CPU hotplug). |
 | CentOS 7.9 | 3.10 | **Does not take effect.** No virtio-mem driver exists for this kernel. `guestRequested` stays above `guestCurrent` indefinitely; no error and no `RestartRequired` condition is raised. |
 | Ubuntu 20.04 | 5.4 (GA) | Same as CentOS 7 — the kernel predates virtio-mem entirely. |
-| Ubuntu 20.04 | 5.15 (HWE) | **Still does not work**, in a more subtle way: the `virtio_mem` module loads, but the device rejects it — `dmesg` shows `virtio_mem virtio1: virtio: device refuses features: 3`, because the platform's QEMU requires the `UNPLUGGED_INACCESSIBLE` feature that only kernel 5.16+ implements. Ubuntu 20.04 therefore cannot use memory hotplug at all; use Ubuntu 22.04+ if you need it. |
-| Windows Server 2022 | — | **Does not take effect.** There is no virtio-mem driver for Windows (the virtio-win driver package does not include one), so this is not fixable inside the guest. The virtio-mem PCI device (`PCI\VEN_1AF4&DEV_1058`) shows up in Device Manager with a driver error, `guestRequested` stays pending, and memory must be resized cold (change spec + restart). |
+| Ubuntu 20.04 | 5.15 (HWE) | **Still does not work**, in a more subtle way: the `virtio_mem` module loads, but the device rejects it — `dmesg` shows `virtio_mem virtio1: virtio: device refuses features: 3`, because the platform's QEMU requires the `UNPLUGGED_INACCESSIBLE` feature that this kernel lacks. Note Ubuntu 22.04's GA kernel is also 5.15 and does not carry the feature either — use the 22.04 HWE kernel or Ubuntu 24.04+. |
+| Windows Server 2022 | virtio-win `viomem` | **Works once the `viomem` driver is installed** — verified live: 8Gi → 10Gi applied online, with the guest reporting the new total immediately and no reboot. Without the driver the virtio-mem PCI device (`PCI\VEN_1AF4&DEV_1058`) sits in Device Manager with an error, and the request stays pending forever. The driver ships on the virtio-win ISO that the platform provides (verified with virtio-win 0.1.266): install it from an elevated shell, then retry or wait for the pending request to apply. |
+
+Installing the Windows driver from the attached virtio-win CD-ROM (drive letter may differ):
+
+```powershell
+pnputil /add-driver E:\viomem\2k22\amd64\viomem.inf /install
+# Get-PnpDevice | ? InstanceId -match 1058   ->  Status OK, "VirtIO Viomem Driver"
+```
+
+The full virtio-win guest-tools installer (`virtio-win-guest-tools.exe`, on the same ISO) also installs `viomem` by default in current versions, so VMs provisioned with a recent guest-tools run get memory hotplug support out of the box. The driver exists for x64 (and ARM64 on newer Windows) only.
 
 Notes on the pending state:
 
-- The pending request is **not lost**. It is applied as ordinary boot memory on the next restart of the VM (`guestAtBoot` becomes the requested size — verified on CentOS 7). For old-kernel guests, a memory "hotplug" degrades gracefully into a planned cold resize.
-- Administrators can confirm the mechanism from the node side: `virsh dumpxml <domain>` inside the virt-launcher pod shows a `<memory model='virtio-mem'>` device whose `requested` size grows with each hotplug while `current` reflects what the guest driver actually accepted (`current: 0` on guests without working virtio-mem).
+- The pending request is **not lost**. It is applied as ordinary boot memory on the next restart of the VM (`guestAtBoot` becomes the requested size — verified on CentOS 7). For guests without a working driver, a memory "hotplug" degrades gracefully into a planned cold resize. Alternatively, a pending request can be **cancelled** by setting `memory.guest` back to the current live value — the revert is accepted without `RestartRequired` because nothing actually shrinks below boot.
+- Administrators can confirm the mechanism from the node side: `virsh dumpxml <domain>` inside the virt-launcher pod shows a `<memory model='virtio-mem'>` device whose `requested` size follows each hotplug while `current` reflects what the guest driver actually accepted (`current: 0` on guests without working virtio-mem).
 
-## Scaling Down Requires a Restart
+## Scaling Down: What Works Live and What Needs a Restart
 
-Live *reduction* is not supported for either resource. Lowering `sockets` or `memory.guest` on a running VM leaves the VM untouched and sets the `RestartRequired` condition (verified on both CentOS and Ubuntu):
+The two resources behave differently (verified on Linux and Windows guests):
 
-```
-RestartRequired: Reduction of CPU socket count requires a restart
-```
+- **Memory can be scaled down live — but only as far as the boot-time value.** Lowering `memory.guest` to any value ≥ `guestAtBoot` is applied online exactly like a hotplug (one automatic live migration; the virtio-mem device shrinks and the guest's visible memory drops — verified 4Gi → 3Gi on Debian 13 and 10Gi → 9Gi → 8Gi on Windows Server 2022). In other words, live shrink can reclaim previously hotplugged memory, but never boot memory.
+- **Lowering memory below `guestAtBoot`** is not possible live: the VM gets `RestartRequired` (`memory updated in template spec to a value lower than what the VM started with`) and nothing changes until a restart.
+- **CPU cannot be scaled down live at all.** Any reduction of `sockets` sets `RestartRequired` (`Reduction of CPU socket count requires a restart`); the topology is untouched until a restart.
 
-Reverting the spec back to the current live value clears the condition. To actually shrink a VM, change the spec and restart the VM.
+Reverting the spec back to the current live value clears a pending `RestartRequired` condition.
 
 ## Verified Behavior Summary
 
 | Operation | Platform behavior | CentOS 7.9 (3.10) | Ubuntu 20.04 (5.4 / HWE 5.15) | Debian 13 (6.12) | Windows Server 2022 |
 | --- | --- | --- | --- | --- | --- |
 | CPU hotplug (sockets ↑) | Applied via automatic live migration | vCPU onlined automatically | Added but offline — manual online or udev rule | Added but offline — manual online or udev rule | Used automatically, no reboot |
-| Memory hotplug (guest ↑) | virtio-mem resize via automatic live migration | Pending forever; applies on next restart | Pending forever (5.15 fails feature negotiation); applies on next restart | Online in ~30s, blocks auto-onlined | Pending forever (no Windows virtio-mem driver); applies on next restart |
-| CPU hot-unplug (sockets ↓) | Not supported live — `RestartRequired` | — | — | — | — |
-| Memory hot-unplug (guest ↓) | Not supported live — `RestartRequired` | — | — | — | — |
+| Memory hotplug (guest ↑) | virtio-mem resize via automatic live migration | Pending forever; applies on next restart | Pending forever (5.15 fails feature negotiation); applies on next restart | Online in ~30s, blocks auto-onlined | Online with `viomem` driver installed; pending forever without it |
+| Memory scale-down (guest ↓, ≥ boot value) | Applied live via automatic live migration | — (no working driver) | — (no working driver) | Applied online | Applied online (with `viomem`) |
+| Memory scale-down (guest ↓, < boot value) | Not supported live — `RestartRequired` | — | — | — | — |
+| CPU scale-down (sockets ↓) | Not supported live — `RestartRequired` | — | — | — | — |
 
-Practical guidance: for workloads that rely on memory hotplug, use a guest OS with kernel **5.16+** (Debian 12+, Ubuntu 22.04+, RHEL 9+, or similar) — Windows guests cannot use it at all. For CPU hotplug any OS works at the hypervisor level; RHEL-family and Windows guests use the new vCPUs without extra configuration, while Debian/Ubuntu need the udev rule above. A pending (never-applied) memory request can be cancelled by setting `memory.guest` back to the current live value — the spec change is accepted without `RestartRequired` because nothing actually shrinks.
+Practical guidance for memory hotplug: what matters is whether the guest driver supports the `UNPLUGGED_INACCESSIBLE` virtio-mem feature, and distribution kernels backport it independently of their version number — so do not judge by `uname -r` alone. Known-good guests include Debian 12+, Ubuntu 24.04+ (or 22.04 with the HWE kernel — the GA 5.15 kernel does not work), and RHEL-family releases that backport the feature (Red Hat documents virtio-mem guest support for RHEL 9.4+ and 8.10); Windows guests work once the `viomem` driver from the platform's virtio-win ISO is installed. When in doubt, test one hotplug and check `dmesg` / Device Manager as shown above. For CPU hotplug any OS works at the hypervisor level; RHEL-family and Windows guests use the new vCPUs without extra configuration, while Debian/Ubuntu need the udev rule above.
 
 ## Troubleshooting
 
-- **Hotplug appears stuck** — check that the VM can live-migrate (`LiveMigratable` condition on the VMI, migration events in the namespace). Hotplug is delivered by live migration, so anything that blocks migration (RWO disks, node constraints) blocks hotplug.
-- **`guestCurrent` never reaches `guestRequested`** — the guest kernel cannot drive virtio-mem. Run `dmesg | grep virtio_mem` in the guest: no output means no driver (kernel < 5.8); `device refuses features` means the driver is too old for the device (kernel < 5.16). Upgrade the guest OS, or plan a restart to apply the memory cold.
+- **Hotplug appears stuck** — check that the VM can live-migrate (`LiveMigratable` condition on the VMI, migration events in the namespace). Hotplug is delivered by live migration, so anything that blocks migration (RWO-backed PVC disks, node constraints) blocks hotplug. The condition message shows only the first blocking reason — fixing one may reveal another.
+- **`guestCurrent` never reaches `guestRequested`** (Linux) — the guest kernel cannot drive the virtio-mem device. Run `dmesg | grep virtio_mem` in the guest: `device refuses features` means the driver lacks the `UNPLUGGED_INACCESSIBLE` feature; no output at all means the driver never bound — a kernel without virtio-mem support, but also possibly a module that simply is not loaded, so check `lsmod | grep virtio_mem` before concluding the kernel is too old. Upgrade the guest kernel, or plan a restart to apply the memory cold.
+- **`guestCurrent` never reaches `guestRequested`** (Windows) — the `viomem` driver is missing: Device Manager shows an errored PCI device (`PCI\VEN_1AF4&DEV_1058`). Install the driver from the virtio-win ISO as shown above; the pending request then applies without a reboot.
 - **New vCPU not visible in `nproc`** — it is hot-added but offline. Check `cat /sys/devices/system/cpu/online` vs `offline`, and online it manually or via udev rule as shown above.
-- **`RestartRequired` on the VM** — the requested change cannot be applied live (typically a reduction). Either revert the spec to clear it, or restart the VM to apply it.
+- **`RestartRequired` on the VM** — the requested change cannot be applied live (CPU reduction, memory below the boot value, first-time addition of a `cpu` block, or raising `maxSockets`/`maxGuest`). Either revert the spec to clear it, or restart the VM to apply it.
