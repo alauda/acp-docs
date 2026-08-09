@@ -29,7 +29,7 @@ A global cluster upgrade is staged across a timeline. Most of the work is comple
 
 | Phase | When | What happens | Cluster impact |
 | --- | --- | --- | --- |
-| 1. Sync artifacts | Any time before the window | `upgrade.sh --only-sync-image` uploads Core artifacts; `violet` publishes the target packages for installed Aligned plugins and any Agnostic plugins planned for the window. | None — images and catalog entries are published, but no running plugin is changed; no downtime. |
+| 1. Sync artifacts | Any time before the window | `upgrade.sh --only-sync-image` uploads Core artifacts and the eleven packages that you manually place in `plugins/`; `violet` publishes the other Aligned and Agnostic packages needed for the window. | None — images and catalog entries are published, but no running plugin is changed; no downtime. |
 | 2. Preflight | 1–2 weeks before the window | `upgrade.sh --preflight` validates upgrade readiness. Resolve every blocking item before the window opens. | None — read-only validation. |
 | 3. Upgrade | During the maintenance window | `upgrade.sh --skip-sync-image` deploys or updates the cluster version operator (CVO); the upgrade is then requested and observed. | The cluster is upgraded. |
 
@@ -41,13 +41,25 @@ Phase 1 and Phase 2 do not change cluster state — run them early so the mainte
 
 **When:** any time before the maintenance window. This step uploads artifacts to the registry and does not change cluster state.
 
-From the extracted core package directory, run `upgrade.sh` in sync-only mode:
+The Core Package does not contain the Aligned packages from **ACP Upgrade to v4.5**. Copy each of the eleven separately downloaded packages listed in [Pre-Upgrade Preparation](./pre-upgrade.mdx#download-acp-upgrade-to-v45) into the `plugins/` directory of the extracted Core Package. Run the following command once for each package:
+
+```bash
+cp <path-to-upgrade-extension-package> ./plugins/
+```
+
+Confirm that the directory contains all eleven packages before synchronization:
+
+```bash
+ls -1 ./plugins/
+```
+
+From the extracted Core Package directory, run `upgrade.sh` in sync-only mode:
 
 ```bash
 bash upgrade.sh --only-sync-image
 ```
 
-`--only-sync-image` uploads images and plugin artifacts without deploying the cluster version operator. The CVO is deployed later, inside the maintenance window — see [Deploy the cluster version operator](#deploy-the-cluster-version-operator).
+`--only-sync-image` uploads Core images and the packages that you manually placed in `plugins/`, without deploying the cluster version operator or changing running applications. The CVO is deployed later, inside the maintenance window — see [Deploy the cluster version operator](#deploy-the-cluster-version-operator).
 
 `upgrade.sh` synchronizes the artifacts required by the CVO-based workflow, including:
 
@@ -57,21 +69,24 @@ bash upgrade.sh --only-sync-image
 | CVO image        | `cluster-version-operator` | Used to deploy or update the cluster version operator.                     |
 | Plugin artifacts | `plugins/*.tgz`            | Used by the upgrade plan when plugin artifacts are required.               |
 
-`upgrade.sh` covers <Term name="productShort" /> Core. Aligned and Agnostic plugins are not pushed by `upgrade.sh`; push them with `violet` before the upgrade request, using the packages downloaded in [Pre-Upgrade Preparation](./pre-upgrade.mdx).
+For the eleven Aligned applications from **ACP Upgrade to v4.5**, the `plugins/` directory and `upgrade.sh` workflow is the supported publication path. CVO upgrades an application only when it is already installed; synchronizing a package for an application that is not installed does not install it.
 
-| Lifecycle type | Push tool | Cluster plugins | Operators |
-| --- | --- | --- | --- |
-| Aligned plugins | `violet push` | Required for every installed Aligned cluster plugin. Push the package selected for the target ACP Distribution Version once to the global tier; it then becomes available to every cluster. | Required for every installed Aligned operator. Push the target package to the global tier and to each workload cluster that runs the operator. |
-| Agnostic plugins | `violet push` | Push when you plan to upgrade the plugin in the same window. Missing Agnostic packages do not block CVO. | Same; push the package to each cluster where you plan to upgrade the operator. |
+Use `violet push` for the other packages downloaded from the `violet list` inventory:
+
+| Package group | Publication path | Requirement |
+| --- | --- | --- |
+| Other Aligned cluster plugins | `violet push` to the global tier | Required for each installed plugin that is not part of **ACP Upgrade to v4.5**. |
+| Other Aligned operators | `violet push` to the global tier and each workload cluster where the operator is installed | Required before upgrading each cluster that runs the operator. |
+| Agnostic cluster plugins and operators | `violet push` to the clusters where you plan to upgrade them | Optional for CVO; required before starting their separate Marketplace or operator upgrade. |
 
 ```bash
-# Push Aligned plugins (cluster plugins) — global only
-violet push <path/to/aligned-cluster-plugin-package> \
+# Publish another cluster plugin to the global tier
+violet push <path-to-other-cluster-plugin-package> \
   --platform-address "https://<your-platform-domain>" \
   --platform-token "<platform_token>"
 
-# Push Aligned or Agnostic operators — to global, and to each workload cluster that runs the operator
-violet push <path/to/operator-package> \
+# Publish another operator to global and each workload cluster that runs it
+violet push <path-to-other-operator-package> \
   --platform-address "https://<your-platform-domain>" \
   --platform-token "<platform_token>" \
   --clusters "global,<workload-cluster-1>,<workload-cluster-2>"
@@ -80,7 +95,7 @@ violet push <path/to/operator-package> \
 Pushing every operator package to every <Term name="productShort" /> cluster from the global window is the recommended pattern. If the global window has already passed and you discover a workload cluster missing an operator package, you can still push to that workload cluster before the workload upgrade — see [Upgrade workload clusters](./upgrade_workload_cluster.mdx#operator-push-fallback).
 
 :::warning
-Before requesting the upgrade, publish the target package for every Aligned plugin installed on the cluster. CVO does not require packages for Aligned plugins that are not installed. If an installed Aligned cluster plugin's package is missing or has not become ready, CVO stalls the upgrade and reports a message such as `required ModulePluginConfig "<component>-<version>" not found` or `ModulePluginConfig "<component>-<version>" is not Ready`.
+Before requesting the upgrade, make the target package available for every Aligned plugin installed on the cluster. Use `upgrade.sh` for applications from **ACP Upgrade to v4.5**, and `violet` for the other Aligned packages. CVO does not install an absent plugin merely because its package was synchronized. If an installed Aligned cluster plugin's package is missing or has not become ready, CVO stalls the upgrade and reports a missing or not-ready `ModulePluginConfig`.
 :::
 
 Registry behavior depends on how the environment is configured:
@@ -359,10 +374,10 @@ kubectl -n cpaas-system get cvsh global \
 
 If `Stalled=True` and the condition message names a missing or not-ready `ModulePluginConfig`, an installed Aligned cluster plugin does not yet have its target package available:
 
-1. Identify the component and required version from the `Stalled` condition message.
-2. Download the package that the Customer Portal provides for the target ACP Distribution Version.
-3. Use `violet push` as described in [Sync upgrade artifacts](#sync-upgrade-artifacts) to publish the cluster plugin package to the global tier.
-4. Continue observing the existing upgrade request. CVO watches the package readiness and resumes automatically after the package becomes ready; do not clear or resubmit `desiredUpdate`.
+1. Identify the application and required version from the `Stalled` condition and the Customer Portal.
+2. If the application is listed in **ACP Upgrade to v4.5**, download its package, copy it into the extracted Core Package's `plugins/` directory, and rerun `upgrade.sh --only-sync-image`.
+3. For another Aligned cluster plugin, publish the package to the global tier with `violet push` as described in [Sync upgrade artifacts](#sync-upgrade-artifacts).
+4. Continue observing the existing upgrade request. CVO watches package readiness and resumes automatically after the package becomes ready; do not clear or resubmit `desiredUpdate`.
 
 The commands above track the cluster-level (Core and Aligned) upgrade. To observe an individual plugin or operator module — for example while upgrading an Agnostic plugin — read its `ModuleInfo` instead:
 
@@ -408,7 +423,7 @@ If you skipped pushing an Agnostic plugin during pre-upgrade and the Marketplace
 
 - If the source release is earlier than ACP 4.3 and PKCE hardening has not already been completed, wait until all workload clusters reach the target Distribution Version, then follow [Disabling the PKCE Plain Method](/security/platform_security_configurations/disable_pkce_plain_method.mdx).
 
-- When upgrading from a release earlier than ACP 4.3, an API authentication change introduced in ACP 4.3 requires the following L5 plugins to be upgraded to versions compatible with the target ACP release. Otherwise, their UI pages may fail to open:
+- When upgrading from a release earlier than ACP 4.3, an API authentication change introduced in ACP 4.3 requires the following Agnostic plugins to be upgraded to versions compatible with the target ACP release. Otherwise, their UI pages may fail to open:
   - `Alauda DevOps v3`
   - `Alauda AI Essentials`
   - `Alauda Hyperflux`
