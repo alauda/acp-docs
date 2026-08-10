@@ -1,0 +1,178 @@
+---
+weight: 25
+---
+
+# Prepare an External Platform Image Registry
+
+For new production deployments, you can use a customer-managed external image registry as the central image source for <Term name="productShort" /> Core, managed clusters, and Extensions. The registry must contain the complete target-version payload before you start the installer.
+
+<Directive type="warning" title="Prepare the Registry Before Installation">
+When an external registry is selected, the installer does not deploy the platform built-in Registry and does not copy missing images or packages into the external registry. Complete both upload modes on this page before running `setup.sh`.
+</Directive>
+
+## Understand the Registry Roles
+
+The following registry roles are independent:
+
+| Role | Purpose | Lifecycle owner |
+| --- | --- | --- |
+| Platform built-in Registry | Stores platform Core images and Extension artifacts when the `global` cluster is installed with **Platform Deployment** as its image repository. | <Term name="productShort" /> deploys the service; the platform administrator operates its capacity and backup. |
+| External platform image registry | Replaces the platform built-in Registry as the image source for Core, managed clusters, and Extensions. | You provide and operate the registry, and you upload every required target-version payload. |
+| Registry v2 | An optional application image service for developers and workloads. | Installed and managed separately. It does not automatically become the platform image source. |
+
+The platform built-in Registry remains supported for existing environments and non-production evaluation. This page does not describe an online migration from the built-in Registry to an external registry.
+
+## Registry Requirements
+
+Prepare a registry that meets all of the following requirements:
+
+- Supports the OCI Distribution Specification or Docker Registry HTTP API V2.
+- Is available through HTTPS. The certificate subject must match the registry DNS name, and the complete certificate chain must be trusted by the installation node and every current or future `global` and workload-cluster node.
+- Uses a stable DNS name that resolves from the installation node and all cluster nodes. Include a non-default port in the address when required, for example `registry.example.com:5000`. Do not include `https://` in the installer registry address.
+- Is reachable through the required firewalls, proxies, and network routes from the installation node, `global` cluster nodes, and workload-cluster nodes.
+- Provides an account that can push and pull the target repositories. If authentication is enabled, use the same username and password for the upload commands and `setup.sh`; the two values must be provided together.
+- Has enough capacity for the Core payload, the required Aligned Extensions, any additional Extensions, every required CPU architecture, and the retained versions needed for rollback and node recovery.
+- Has production-appropriate availability, monitoring, backup, and recovery. Registry availability is required when new Pods start, nodes are replaced, clusters are created or upgraded, and Extensions are installed or upgraded.
+- Uses a retention policy that does not delete manifests or digests still referenced by installed platform versions, clusters, or Extensions.
+
+<Directive type="note" title="Customer-Managed Service">
+<Term name="productShort" /> consumes the external registry but does not install, upgrade, back up, monitor, or repair it. Follow your registry vendor's administration documentation for those operations.
+</Directive>
+
+## Prepare the Target-Version Payload
+
+Use the Core Package that exactly matches the <Term name="productShort" /> Distribution Version and CPU architecture that you will install. Do not reuse a payload from another version or architecture.
+
+1. Complete [Download](./download.mdx), extract the Core Package, and change to its `installer/` directory.
+2. Copy the required Aligned Extension packages into `plugins/` as described in [Installing](../installing.mdx). The `all` upload mode processes the packages currently present in this directory.
+3. Set the registry address and credentials in the current shell. Read the password without writing it into shell history:
+
+   ```bash
+   export REGISTRY_ADDRESS="registry.example.com"
+   export REGISTRY_USERNAME="<registry-username>"
+   read -rsp "Registry password: " REGISTRY_PASSWORD
+   export REGISTRY_PASSWORD
+   printf '\n'
+   ```
+
+   For a registry that allows anonymous push and pull, set both `REGISTRY_USERNAME` and `REGISTRY_PASSWORD` to empty values. Do not provide only one of them.
+
+4. From the extracted `installer/` directory, upload all packaged artifacts and then the bootstrap artifacts:
+
+   ```bash
+   bash res/upload.sh all \
+     "$REGISTRY_ADDRESS" "$REGISTRY_USERNAME" "$REGISTRY_PASSWORD"
+
+   bash res/upload.sh necessary \
+     "$REGISTRY_ADDRESS" "$REGISTRY_USERNAME" "$REGISTRY_PASSWORD"
+   ```
+
+   Both commands must finish successfully:
+
+   - `all` uploads the product image, the cluster version operator image, and every `*.tgz` package currently in `plugins/`.
+   - `necessary` uploads the product image, the cluster version operator image, the installer artifact, and the bootstrap plugins required to create the `global` cluster.
+
+5. In the registry administration interface or API, confirm that the newly uploaded repositories and manifests are present and are not immediately eligible for cleanup.
+
+## Start the Installer \{#start-the-installer}
+
+Start the installer from the same extracted `installer/` directory. For an authenticated registry, provide the username and password together:
+
+```bash
+bash setup.sh \
+  --registry "$REGISTRY_ADDRESS" \
+  --username "$REGISTRY_USERNAME" \
+  --password "$REGISTRY_PASSWORD"
+```
+
+For a registry that permits anonymous pull, omit both `--username` and `--password`:
+
+```bash
+bash setup.sh --registry "$REGISTRY_ADDRESS"
+```
+
+Add other required installer options to the same command, such as `--ip-family ipv6` for an IPv6 single-stack `global` cluster. Continue with [Installing](../installing.mdx#start_installer) and keep **Image Repository** set to **External** with the same address and credentials.
+
+After `setup.sh` no longer needs the shell variable, remove the password from the current shell:
+
+```bash
+unset REGISTRY_PASSWORD
+```
+
+## Validate the External Registry Configuration
+
+After installation completes, run the following checks from an administrative machine with access to the `global` cluster.
+
+Confirm that `ProductBase` records the expected address and marks the registry as external:
+
+```bash
+kubectl get productbase base \
+  -o jsonpath='{.spec.registry.address}{"\t"}{.spec.registry.external}{"\n"}'
+```
+
+The output must contain the configured address followed by `true`.
+
+For an authenticated registry, confirm that the pull Secret exists without printing its contents:
+
+```bash
+kubectl -n cpaas-system get secret global-registry-auth
+```
+
+Confirm that the `global` cluster records the same registry address. Check only whether the password annotation exists; do not print its value:
+
+```bash
+kubectl get cluster global \
+  -o jsonpath='{.metadata.annotations.cpaas\.io/registry-address}{"\n"}'
+
+kubectl get cluster global -o json \
+  | jq -e '.metadata.annotations | has("cpaas.io/registry-password")'
+```
+
+Confirm that every discovered artifact is ready. No output is expected from this command:
+
+```bash
+kubectl get productbase base -o json | jq -r '
+  .status.artifacts[] as $artifact
+  | $artifact.channels[]
+  | select(.artifactStatus != "Ready")
+  | [$artifact.name, .channel, .tag, .artifactStatus]
+  | @tsv'
+```
+
+Confirm that the Extension catalog was created and that running Pods are not blocked by image pulls:
+
+```bash
+kubectl get moduleplugins
+
+kubectl get pods --all-namespaces \
+  | awk '$4 ~ /ImagePullBackOff|ErrImagePull/'
+```
+
+The Pod command must produce no output. Complete the remaining installation checks in [Validation](../validation.mdx).
+
+## Prepare the Registry Before an Upgrade \{#prepare-the-registry-before-an-upgrade}
+
+An environment installed with an external registry keeps using that registry during upgrades. Before every upgrade:
+
+1. Download and extract the Core Package for the exact target Distribution Version and architecture.
+2. Prepare the required target-version Aligned packages as described in [Pre-Upgrade Preparation](../../upgrade/pre-upgrade.mdx).
+3. From the target Core Package's `installer/` directory, run both `res/upload.sh all` and `res/upload.sh necessary` against the external registry, using the commands on this page.
+4. Use `violet push` to publish the other Aligned and Agnostic Extension packages required for the upgrade. See [Upload Packages](../../extend/upload_package.mdx).
+5. Repeat the artifact, ModulePlugin, registry reachability, and image-pull checks before opening the maintenance window.
+
+<Directive type="warning" title="External Registries Skip Automatic Synchronization">
+When `ProductBase.spec.registry.external` is `true`, `upgrade.sh` automatically skips image synchronization. Do not interpret a successful skip as confirmation that the target payload exists. Upload and validate the target Core and Extension payload before continuing with [Upgrade the global cluster](../../upgrade/upgrade_global_cluster.mdx).
+</Directive>
+
+## Troubleshooting \{#troubleshooting}
+
+| Symptom | Likely cause | Action |
+| --- | --- | --- |
+| `x509: certificate signed by unknown authority` | The registry CA or an intermediate certificate is not trusted. | Install the complete CA chain on the installation node and every cluster node that pulls images, then retry. Do not replace HTTPS with an insecure registry as a production workaround. |
+| Certificate name mismatch | The registry address does not match the certificate subject alternative names. | Use the registry DNS name covered by the certificate or replace the certificate. |
+| `unauthorized` or `authentication required` | Credentials are incorrect, only one credential value was provided, or the account lacks permission. | Verify the account, provide username and password together, and confirm push and pull permissions for the target repositories. |
+| `denied` or repository creation fails | The upload account cannot create or update the required repository paths. | Grant the account the required repository permissions and rerun both upload modes. |
+| A required package is reported as not found | The Core Package is incomplete, the wrong version or architecture was extracted, or required Extension packages were not copied into `plugins/`. | Verify the package checksum, version, architecture, and `plugins/` contents before retrying. |
+| An artifact reports `Absent` | A target manifest or package was not uploaded, was uploaded under a different address, or was removed by retention. | Rerun both upload modes from the matching Core Package and restore any separately delivered Extension package. |
+| Pods report `ImagePullBackOff` or `ErrImagePull` | Node DNS, routing, firewall, CA trust, credentials, or a referenced manifest is missing. | Run `kubectl describe pod <pod> -n <namespace>`, test the registry from the failing node, and correct the specific pull error. |
+| Installation or upgrade succeeds initially but later node recovery fails | Registry availability or retention removed an image still required by the installed version. | Restore the referenced digest and review registry HA, backup, and retention policies. |
