@@ -112,7 +112,7 @@ violet push <path-to-other-operator-package> \
 Pushing every operator package to every <Term name="productShort" /> cluster from the global window is the recommended pattern. If the global window has already passed and you discover a workload cluster missing an operator package, you can still push to that workload cluster before the workload upgrade — see [Upgrade workload clusters](./upgrade_workload_cluster.mdx#operator-push-fallback).
 
 :::warning
-Before requesting the upgrade, make the target package available for every Aligned plugin installed on the cluster. Use `upgrade.sh` for applications from **ACP Upgrade to v4.4**, and `violet` for the other Aligned packages. CVO does not install an absent plugin merely because its package was synchronized. If an installed Aligned cluster plugin's package is missing or has not become ready, CVO stalls the upgrade and reports a missing or not-ready `ModulePluginConfig`.
+Before requesting the upgrade, make the target package available for every Aligned plugin installed on the cluster. Use `upgrade.sh` for applications from **ACP Upgrade to v4.4**, and `violet` for the other Aligned packages. Synchronizing a package does not install an application that is not currently installed. For an installed Aligned cluster plugin, CVO requires the matching target `ModulePluginConfig` to be Ready; otherwise, CVO cannot build the upgrade plan, reports the error through `ClusterVersionShadow`, and retries the existing request. An installed Aligned operator requires a matching target `InstallPlan` from its catalog.
 :::
 
 Registry behavior depends on how the environment is configured:
@@ -138,21 +138,14 @@ To bypass artifact validation when it is known to be redundant, add `--skip-chec
 Do not open the maintenance window until image and plugin synchronization is complete.
 :::
 
-Before running preflight, confirm that the registry configuration is still correct and that no discovered target artifact is missing:
+Before running preflight, confirm that the registry configuration is still correct:
 
 ```bash
 kubectl get productbase base \
   -o jsonpath='{.spec.registry.address}{"\t"}{.spec.registry.external}{"\n"}'
-
-kubectl get productbase base -o json | jq -r '
-  .status.artifacts[] as $artifact
-  | $artifact.channels[]
-  | select(.artifactStatus != "Ready")
-  | [$artifact.name, .channel, .tag, .artifactStatus]
-  | @tsv'
 ```
 
-The artifact command must produce no output. For an external registry, also confirm the newly uploaded manifests in the registry administration interface or API; automatic synchronization is intentionally skipped.
+Use successful completion of the selected publication commands and the registry administration interface or API as the Phase 1 evidence. Confirm that the expected target repositories and tags exist, and compare the published Extension set with the installed inventory exported to `apps.yaml`. Do not use `ProductBase.status.artifacts` as a zero-output target-version gate: it represents the current catalog and can legitimately contain `Absent` entries for optional or uninstalled packages.
 
 ### Run preflight checks
 
@@ -202,6 +195,28 @@ bash upgrade.sh --skip-sync-image
 ```
 
 This deploys or updates the cluster version operator (CVO) and completes the remaining preparation. The CVO drives the Core and Aligned plugin upgrade once the upgrade is requested in the next step.
+
+After the command completes, inspect the target `ProductManifest` before requesting the upgrade:
+
+```bash
+kubectl get productmanifest v<target-version> \
+  -o jsonpath='{range .status.conditions[*]}{.type}{"\t"}{.status}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
+
+kubectl get productmanifest v<target-version> -o json | jq -r '
+  .status.artifacts[] as $artifact
+  | $artifact.channels[]
+  | select(.artifactStatus != "Ready")
+  | [$artifact.name, .channel, .tag, .artifactStatus]
+  | @tsv'
+```
+
+The per-artifact output is diagnostic and is not required to be empty. The target manifest can include optional, Agnostic, or uninstalled entries that are legitimately not Ready. Compare the output with the installed Core and Aligned inventory. For an installed Aligned `ModulePlugin`, inspect the matching target `ModulePluginConfig` when its channel is not Ready:
+
+```bash
+kubectl get modulepluginconfig <modulepluginconfig-name> -o yaml
+```
+
+Use the component name and channel tag from the target `ProductManifest`, or the name reported in the `ClusterVersionShadow` error, to identify the `ModulePluginConfig`. The component version in this name is not necessarily the ACP Distribution Version. Do not treat `artifactStatus: Absent` alone as proof that the registry manifest is missing; use the `ModulePluginConfig` condition and its `.spec.image` to distinguish a missing manifest from authentication, CA, network, or package-content failures.
 
 ### Request the upgrade
 
