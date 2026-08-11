@@ -14,13 +14,33 @@ When moving the platform to a new ACP Distribution Version, the upgrade normally
 
 A workload cluster can be upgraded only to a Distribution Version that the global tier has already reached. In environments with **global disaster recovery (DR)**, this means both the standby and primary global clusters must reach the target Distribution Version before workload clusters are upgraded to that Distribution Version. Before upgrading the global tier, verify that every workload cluster is within the target Distribution Version's **Compatible Versions** in the [Kubernetes Support Matrix](../overview/kubernetes-support-matrix.mdx#version-support-matrix). This prerequisite is separate from the sequencing rule.
 
+## Upgrade Workflow
+
+Follow the pages in this order:
+
+1. [Pre-Upgrade Preparation](./pre-upgrade.mdx): confirm the supported path, cluster readiness, and complete target-version package set.
+2. [Upgrade the global cluster](./upgrade_global_cluster.mdx), or [Upgrade Global Clusters in a DR Environment](./upgrade_global_dr.mdx) when global DR is enabled.
+3. [Upgrade Workload Clusters](./upgrade_workload_cluster.mdx) after the global tier reaches the target Distribution Version.
+4. [Upgrade Validation](./validation.mdx): accept the Distribution Version, Kubernetes, Core, Aligned plugins, Pods, artifacts, CVO history, and Web UI.
+5. [Upgrade Troubleshooting](./troubleshooting.mdx): use this only when preflight or execution reports a block or stall.
+
+Plan the maintenance timeline so preparation finishes before the change window:
+
+| Phase | Recommended timing | State change |
+| --- | --- | --- |
+| Download and publish artifacts | Before the maintenance window | No running component is upgraded. |
+| Run preflight and resolve blocks | 1–2 weeks before the window | Read-only checks; remediation can change the environment separately. |
+| Upgrade the global tier | First maintenance window | Core, Kubernetes, and installed Aligned plugins move to the target. |
+| Upgrade workload clusters | After the global tier | Each selected workload cluster moves in its own controlled window. |
+| Validate and complete follow-up work | Before closing each window | Confirms acceptance and completes required post-upgrade actions. |
+
 ## Key Concepts
 
 - **ClusterVersionShadow (`cvsh`)**: The upgrade resource used to track current version, desired version, preflight results, execution stages, and history.
 - **Distribution Version**: The ACP version currently reached by a cluster. A workload cluster can be upgraded only to a Distribution Version that the global tier has already reached.
 - **Preflight**: Validation checks that run before the upgrade starts applying the target version. For workload clusters, review preflight results from the upgrade status output after the upgrade request is submitted.
 - **Available upgrade targets**: The upgrade versions that are currently offered for a cluster. In the Web Console, the target version for the current upgrade flow is determined by the platform.
-- **upgrade.sh**: The preparation script for global cluster upgrades. It synchronizes Core artifacts and any required Aligned Extension packages that you manually place in the extracted Core Package's `plugins/` directory. Artifact synchronization and preflight checks can be run ahead of the maintenance window; the cluster version operator is deployed inside the window, just before the upgrade is requested.
+- **upgrade.sh**: The preparation script for global cluster upgrades. With the platform built-in Registry, it synchronizes Core artifacts and packages staged in `plugins/`. With an external Registry, synchronization is skipped and the target payload is uploaded separately. The script also runs preflight and deploys CVO at the appropriate stages.
 - **Global DR environment**: An environment with both a primary global cluster and a standby global cluster.
 - **Primary global cluster**: The global cluster that the platform access domain currently resolves to.
 - **Standby global cluster**: The other global cluster in the DR pair. After a failover, the roles of the two clusters are swapped.
@@ -33,16 +53,16 @@ A single cluster upgrade window covers four kinds of work:
 
 | Work item | Required? | How it is upgraded | If you run immutable OS |
 |---|---|---|---|
-| <Term name="productShort" /> Core (the platform itself) | Required | CVO, driven by `upgrade.sh`-prepared artifacts | Same control flow; the Kubernetes step is handled separately, see below |
-| Aligned plugins (cluster plugins and operators released together with the matching ACP version) | Required for each installed plugin | For the Aligned applications provided through **ACP Upgrade to v4.5**, manually copy their separately downloaded packages into the extracted Core Package's `plugins/` directory and synchronize them with `upgrade.sh`. Publish other installed Aligned packages with `violet`. CVO then upgrades each installed Aligned plugin as part of the cluster upgrade. | Same |
+| <Term name="productShort" /> Core (the platform itself) | Required | CVO, driven by artifacts prepared through [Sync upgrade artifacts](./upgrade_global_cluster.mdx#sync-upgrade-artifacts) | Same control flow; the Kubernetes step is handled separately, see below |
+| Aligned plugins (cluster plugins and operators released together with the matching ACP version) | Required for each installed plugin | For the Aligned applications provided through **ACP Upgrade to v4.5**, manually copy their packages into `plugins/` and publish them through [Sync upgrade artifacts](./upgrade_global_cluster.mdx#sync-upgrade-artifacts). Publish other installed Aligned packages with `violet`. CVO then upgrades each installed Aligned plugin as part of the cluster upgrade. | Same |
 | Kubernetes | Required in the same window | On traditional-OS clusters, CVO upgrades Kubernetes in place on the existing nodes as part of the same cluster upgrade; nodes are not replaced. | Kubernetes is rolled out by replacing nodes from a new Alauda OS-based image through Cluster API rolling updates, not upgraded in place. The procedure lives in the immutable infrastructure documentation; see <ExternalSiteLink name="immutable-infra" href="/upgrade-cluster/huawei-dcs.html" children="Upgrading Clusters on Huawei DCS" />, <ExternalSiteLink name="immutable-infra" href="/upgrade-cluster/vmware-vsphere.html" children="Upgrading Clusters on VMware vSphere" />, or <ExternalSiteLink name="immutable-infra" href="/upgrade-cluster/huawei-cloud-stack.html" children="Upgrading Clusters on Huawei Cloud Stack" /> |
 | Agnostic plugins (independently released cluster plugins and operators) | Optional, per plugin | Upgrade each cluster plugin or operator from **Marketplace > Cluster Plugins** or the operator's own workflow after the cluster reaches the target Distribution Version | Same |
 
 A few rules govern when each piece moves:
 
 - The platform requires that a cluster's Kubernetes version is upgraded together with its Core and Aligned versions; mixing a new Core release with an old Kubernetes minor version is not validated.
-- Before requesting an upgrade, make the target-version package available for every Aligned plugin already installed on that cluster. Use `upgrade.sh` for the packages from **ACP Upgrade to v4.5**, and use `violet` for other Aligned packages. A missing package for an installed Aligned plugin stalls the CVO upgrade. Packages for Aligned plugins that are not installed on the cluster do not cause those plugins to be installed.
-- Cluster plugins are global resources. A package made available through the global-tier `upgrade.sh` or `violet` workflow can be used by every cluster in the platform; you do not publish the same cluster plugin again per workload cluster.
+- Before requesting an upgrade, make the target-version package available for every Aligned plugin already installed on that cluster. Use the `plugins/` publication path in [Sync upgrade artifacts](./upgrade_global_cluster.mdx#sync-upgrade-artifacts) for packages from **ACP Upgrade to v4.5**, and use `violet` for other Aligned packages. A missing package for an installed Aligned plugin stalls the CVO upgrade. Packages for Aligned plugins that are not installed on the cluster do not cause those plugins to be installed.
+- Cluster plugins are global resources. A package made available through the global-tier artifact publication or `violet` workflow can be used by every cluster in the platform; you do not publish the same cluster plugin again per workload cluster.
 - Operators are scoped to each cluster. Pushing operators to the global tier is recommended but not sufficient on its own; the same operator must be available on each workload cluster before the workload upgrade. If you forgot to push an operator during the global window, you can push it again before the workload upgrade as a fallback.
 - Workload-cluster upgrades are only required when a workload cluster falls outside the target ACP release's [Kubernetes Support Matrix](../overview/kubernetes-support-matrix.html). Workload clusters that stay within the supported range can keep their existing Kubernetes version after the global tier moves; the platform will continue to manage them.
 
@@ -52,7 +72,7 @@ The Cluster Version Operator (CVO) decides which kinds of upgrades it drives end
 
 | Lifecycle type | Driven by CVO? | Notes |
 |---|---|---|
-| Core | Yes, CVO is the only supported path | Core upgrades require the artifacts that `upgrade.sh` prepares; CVO consumes those artifacts. |
+| Core | Yes, CVO is the only supported path | Core upgrades require the artifacts prepared through the global-cluster sync workflow; CVO consumes those artifacts. |
 | Aligned plugins | Yes by default | The cluster plugin or operator workflow can also upgrade an individual Aligned plugin out of band — for example, to apply a critical security fix without moving the cluster to a new Distribution Version. |
 | Agnostic plugins | No | CVO does not manage these. Upgrade each cluster plugin from **Marketplace > Cluster Plugins** and each operator from its own workflow after the cluster reaches the target Distribution Version. |
 
@@ -71,15 +91,12 @@ On **Immutable Infrastructure** clusters (DCS, vSphere, HCS), Kube-OVN is driven
 - **Global clusters**: Follow the validated `upgrade.sh`-based procedure. After the preparation phase completes, request the upgrade from the Web Console through the two-step RPCH review flow, use ACP CLI, or update `ClusterVersionShadow.spec.desiredUpdate` directly.
 - **Workload clusters**: Use the Web Console through the two-step RPCH review flow or use ACP CLI after the target Distribution Version becomes available for the workload cluster.
 
-## Post-upgrade Security Hardening
-
-If the environment is upgrading from a release earlier than ACP 4.3 and has not completed PKCE security hardening, complete [Disabling the PKCE Plain Method](/security/platform_security_configurations/disable_pkce_plain_method.mdx) after the global cluster and all workload clusters reach the target Distribution Version.
-
-If the environment is upgrading from a release earlier than ACP 4.3, complete the required Agnostic plugin compatibility upgrades in [Upgrade the global cluster](./upgrade_global_cluster.mdx).
-
 ## Related Documentation
 
 - [Pre-upgrade](./pre-upgrade.mdx)
 - [Upgrade the global cluster](./upgrade_global_cluster.mdx)
+- [Upgrade global clusters in a DR environment](./upgrade_global_dr.mdx)
 - [Upgrade workload clusters](./upgrade_workload_cluster.mdx)
+- [Upgrade validation](./validation.mdx)
+- [Upgrade troubleshooting](./troubleshooting.mdx)
 - [Global Cluster Disaster Recovery](/install/global_dr.mdx)
