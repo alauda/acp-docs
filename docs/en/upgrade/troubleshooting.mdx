@@ -1,0 +1,131 @@
+---
+weight: 60
+---
+
+# Upgrade Troubleshooting
+
+Use this page when preflight reports a blocking check, CVO reports `Ready=False`, `Reconciling=True`, or `Stalled=True`, or a Core or Aligned module does not reach its target version.
+
+## Inspect Upgrade State
+
+Replace `<cluster>` with `global` or the workload cluster name:
+
+```bash
+kubectl -n cpaas-system get cvsh <cluster> \
+  -o jsonpath='{range .status.conditions[*]}{.type}{"\t"}{.status}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
+
+kubectl -n cpaas-system get cvsh <cluster> \
+  -o jsonpath='{.status.preflight.observedAt}{"\n"}{range .status.preflight.checks[*]}{.name}{"\t"}{.policy}{"\t"}{.state}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
+
+kubectl -n cpaas-system get cvsh <cluster> \
+  -o jsonpath='{range .status.history[*]}{.version}{"\t"}{.state}{"\t"}{.startedTime}{"\t"}{.completionTime}{"\n"}{end}'
+```
+
+Resolve the first failing preflight check or the relevant `Ready`, `Reconciling`, or `Stalled` condition before changing the upgrade request.
+
+## Handle Preflight Blocks \{#handle-preflight-blocks-when-needed}
+
+If `ResourcePatchUpgradeable` fails with `reason=UnexemptResourcePatches`, inspect the named `ResourcePatch` and add the required target-version exemption only after reviewing the patch:
+
+```bash
+kubectl -n cpaas-system get cvsh <cluster> \
+  -o jsonpath='{range .status.preflight.checks[?(@.name=="ResourcePatchUpgradeable")]}{.state}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
+
+kubectl get resourcepatches <rp-name> -o yaml
+kubectl annotate resourcepatches <rp-name> \
+  config.cpaas.io/exempt-for-ver=<target-version> \
+  --overwrite
+```
+
+Common preflight blocks:
+
+| Check | What it validates | Resolution |
+| --- | --- | --- |
+| `KubernetesVersionSupported` | The cluster's Kubernetes version is within the target release's supported range. | Follow the [Kubernetes Support Matrix](/overview/kubernetes-support-matrix.html); do not disable the check. |
+| `VersionUpgradePath` | The current patch can reach the requested target through a supported edge. | Use a target in `availableUpdates` or follow an offered intermediate target. |
+| `ClusterRunning` | The cluster is healthy and reconciled. | Inspect `kubectl get clusterview <cluster>` and resolve unhealthy nodes or components. |
+| `DockerRuntimeUnsupported` | No node uses the unsupported Docker runtime. | Migrate affected nodes to `containerd`. |
+| `ClusterModuleStable`, `ModuleInfoStable` | Core and installed Aligned modules are stable. | Follow [Verify Module Stability Before You Upgrade](./pre-upgrade.mdx#module-stability-self-check). |
+
+Do not disable `VersionUpgradePath`, `KubernetesVersionSupported`, or `AdminAckRequired` to force an unsupported upgrade. If technical support instructs you to disable another check temporarily, disable only the named check in `cpaas-system/cvo-config`.
+
+## Handle Administrator Acknowledgement Gates
+
+If `AdminAckRequired` fails, inspect the keys supplied by the target release:
+
+```bash
+kubectl -n cpaas-system get configmap admin-gates -o yaml
+```
+
+Complete the action described by the applicable gate. For a Kubernetes 1.35 or later node-readiness gate, complete [Kubernetes 1.35 or Later Node Readiness](./pre-upgrade.mdx#kubernetes-135-node-readiness) on every production node.
+
+Copy the applicable key from `admin-gates`, record the acknowledgement, and rerun preflight:
+
+```bash
+ACK_KEY='<key-from-admin-gates>'
+kubectl -n cpaas-system patch configmap admin-acks --type merge \
+  -p "{\"data\":{\"${ACK_KEY}\":\"true\"}}"
+
+bash upgrade.sh --preflight
+```
+
+## Recover a Missing Aligned Package \{#recover-missing-aligned-package}
+
+An unavailable Aligned package does not change the application's current installed state. Depending on the package type and reconciliation stage, CVO can report the problem through `Ready=False` or `Reconciling=True` rather than `Stalled=True`.
+
+### Aligned Cluster Plugins
+
+If a `ClusterVersionShadow` condition contains `required ready ModulePluginConfig for installed platform-aligned component`, identify the target `ProductManifest` and the named `ModulePluginConfig`:
+
+```bash
+kubectl get productmanifest v<target-version> -o yaml
+
+kubectl get modulepluginconfig <modulepluginconfig-name> \
+  -o jsonpath='{.spec.image}{"\n"}{range .status.conditions[*]}{.type}{"\t"}{.status}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
+```
+
+For a ModulePlugin channel, `artifactStatus: Absent` in the target `ProductManifest` means that the matching target `ModulePluginConfig` is not fully Ready. It does not mean that the currently installed application became absent, and it does not by itself prove that the image is missing from the registry.
+
+Use the `ModulePluginConfig` condition and the exact image in `.spec.image` to select the recovery:
+
+| Evidence | Recovery |
+| --- | --- |
+| The named `ModulePluginConfig` does not exist | Inspect the target `ProductManifest` conditions and controller reconciliation. A missing object does not by itself prove that the package image is absent. |
+| `ResolveDigestFailed` reports `manifest unknown` or `not found`, or the registry confirms that `.spec.image` is absent | Republish the exact target package by using the applicable method below. |
+| The condition reports `unauthorized`, `denied`, or another authentication error | Correct the registry credentials or repository permissions, then let the existing request retry. |
+| The condition reports an `x509` or certificate trust error | Correct the registry certificate chain or node trust configuration. |
+| The condition reports DNS, routing, timeout, or connection errors | Restore registry reachability from the component that performs the resolution. |
+| `LoadModulePluginFailed` | Inspect the package contents and `module-plugin.yaml`; publish a corrected package only after confirming the package is invalid. |
+
+- For an application in **ACP Upgrade to v4.5**, copy its package into the target Core Package's `plugins/` directory. With the platform built-in Registry, rerun `upgrade.sh --only-sync-image`. With an external registry, rerun both modes in [Prepare the Target-Version Payload](../install/prepare/external-platform-image-registry.mdx#prepare-the-target-version-payload).
+- For another Aligned cluster plugin, publish the target package to the global tier with `violet push`.
+
+### Aligned Operators
+
+Aligned operators do not use `ModulePluginConfig`. If an installed operator does not advance, inspect its `Subscription`, target `InstallPlan`, catalog, and `ModuleInfo` on the affected cluster:
+
+```bash
+kubectl get subscription -A
+kubectl get installplan -A
+kubectl get moduleinfo -l cpaas.io/cluster-name=<cluster>
+```
+
+If the target operator package is missing, publish it to every cluster where that operator is installed. If only one workload cluster is missing it, push to that cluster with `--clusters "<workload-cluster-name>"`. If the package exists, resolve the `Subscription`, `InstallPlan`, catalog, or `ModuleInfo` condition actually reported by CVO.
+
+Continue observing the existing request after correcting the problem. CVO retries automatically; do not clear or resubmit `desiredUpdate`.
+
+## Diagnose a Module That Does Not Advance
+
+```bash
+kubectl get moduleinfo -l cpaas.io/cluster-name=<cluster> \
+  -o custom-columns='MODULE:.metadata.labels.cpaas\.io/module-name,CURRENT:.status.version,TARGET:.spec.version,NEW:.status.availableVersions[0].version,PHASE:.status.phase'
+
+kubectl get moduleinfo <name> \
+  -o jsonpath='{range .status.conditions[*]}{.type}{"\t"}{.status}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
+```
+
+Inspect the named resource and related Events. For image-pull failures, verify registry reachability, CA trust, pull credentials, and the referenced manifest from the affected node.
+
+## Collect Evidence Before Escalation
+
+Capture the `cvsh` conditions, preflight checks, stages and history, the affected `ModuleInfo` or `ModulePluginConfig`, related Events, and the exact source and target versions. Do not include platform tokens, registry passwords, or Secret contents.
