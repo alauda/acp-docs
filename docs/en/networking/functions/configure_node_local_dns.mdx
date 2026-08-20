@@ -16,23 +16,17 @@ NodeLocal DNSCache is a cluster plugin that improves cluster DNS performance by 
 ## Important Notes
 
 :::warning
-**Production and Deployment Considerations:**
-
-Use NodeLocal DNSCache cautiously in production or production-like clusters. Before enabling it for business workloads, evaluate the following host port and node-level DNS availability risks. If these risks are not acceptable for your workload, continue to use CoreDNS directly instead of enabling NodeLocal DNSCache.
+**Deployment Considerations:**
 
 1. **Kube-OVN Underlay Mode**: The plugin does not support deployment in Kube-OVN Underlay mode. If deployed, it may cause DNS query failures.
 
 2. **Kubelet Restart**: Deploying this plugin will cause the kubelet to restart.
 
-3. **Host Port 8080 Usage**: The `node-cache` container uses `hostNetwork: true` and listens on `127.0.0.1:8080` for its health endpoint. This can conflict with node-level services or workloads that use `hostNetwork` or `hostPort` and bind `127.0.0.1:8080` or `0.0.0.0:8080`.
+3. **Pod Restart Required**: After the plugin is successfully deployed, it will not affect running Pods, but will only take effect on newly created Pods. When the CNI is Kube-OVN, you need to manually add the parameter "--node-local-dns-ip=(IP address of the local DNS cache server)" to the kube-ovn-controller.
 
-4. **Node-Level DNS Availability**: After the plugin takes effect, Pods on a node use the local NodeLocal DNSCache endpoint for DNS resolution. If the NodeLocal DNSCache Pod on that node crashes, is evicted, cannot pull its image, or is restarted during an upgrade, DNS resolution for all Pods on that node may fail. Pods do not automatically fall back to CoreDNS.
+4. **NetworkPolicy Configuration**: If NetworkPolicy is configured in the cluster, you need to additionally allow both from and to directions for the node CIDR and nodeLocalDNSIP in the networkPolicy to ensure proper communication.
 
-5. **Pod Restart Required**: After the plugin is successfully deployed, it will not affect running Pods, but will only take effect on newly created Pods. When the CNI is Kube-OVN, you need to manually add the parameter "--node-local-dns-ip=(IP address of the local DNS cache server)" to the kube-ovn-controller.
-
-6. **NetworkPolicy Configuration**: If NetworkPolicy is configured in the cluster, you need to additionally allow both from and to directions for the node CIDR and nodeLocalDNSIP in the networkPolicy to ensure proper communication.
-
-7. **Cluster Upgrade via Rebuilding**: If the cluster is upgraded by rebuilding nodes (re-provisioning), kubelet configuration changes will be lost. To make the NodeLocal DNS configuration persistent across upgrades, you need to add the `--cluster-dns` parameter to `kubeletExtraArgs` in the following three places of the cluster template:
+5. **Cluster Upgrade via Rebuilding**: If the cluster is upgraded by rebuilding nodes (re-provisioning), kubelet configuration changes will be lost. To make the NodeLocal DNS configuration persistent across upgrades, you need to add the `--cluster-dns` parameter to `kubeletExtraArgs` in the following three places of the cluster template:
    - `KubeadmControlPlane` → `initConfiguration` → `nodeRegistration` → `kubeletExtraArgs`
    - `KubeadmControlPlane` → `joinConfiguration` → `nodeRegistration` → `kubeletExtraArgs`
    - `KubeadmConfigTemplate` → `template` → `spec` → `joinConfiguration` → `nodeRegistration` → `kubeletExtraArgs`
@@ -128,3 +122,131 @@ spec:
         - protocol: TCP
           port: 53
 ```
+
+## Known Risks and Temporary Workarounds
+
+Treat this capability as Alpha for production readiness. It is recommended for test or pre-production environments. For production or production-like clusters, evaluate the following risks before enabling NodeLocal DNSCache. If these risks are not acceptable for your workloads, continue to use CoreDNS directly.
+
+Before related parameters are exposed on the plugin installation page, use the following temporary workarounds only after validating them in the target environment.
+
+### Risk 1: Host network port conflict
+
+The `node-cache` Pod runs in the host network namespace. Its health endpoint uses a host network port, which can conflict with workloads or node-level processes that use the same port. For example, the default health endpoint listens on port `8080`.
+
+Before installation, confirm that workloads on the target nodes do not depend on the same host network port, for example port `8080`:
+
+```bash
+ss -lntp | grep ':8080'
+```
+
+Edit the NodeLocal DNSCache ConfigMap:
+
+```bash
+kubectl -n <namespace> edit cm <configmap-name>
+```
+
+Change the Corefile `health` port to the same unused port, for example:
+
+```text
+health 127.0.0.1:18080
+```
+
+Edit the NodeLocal DNSCache DaemonSet:
+
+```bash
+kubectl -n <namespace> edit ds <daemonset-name>
+```
+
+Change the `node-cache` container probe port to the same port:
+
+```yaml
+livenessProbe:
+  httpGet:
+    host: 127.0.0.1
+    path: /health
+    port: 18080
+```
+
+Wait for the DaemonSet rolling update to complete:
+
+```bash
+kubectl -n <namespace> rollout status ds/<daemonset-name>
+```
+
+If the current plugin version does not expose a health port parameter on the installation page, use a site-specific patch to keep the Corefile `health` port and the DaemonSet probe port consistent.
+
+:::warning
+**Important:** this is a temporary site patch, not persistent plugin configuration. Plugin upgrade, reinstall, or platform reconciliation can regenerate the ConfigMap and DaemonSet and overwrite your custom port setting. If you still need the non-default health port after those operations, reapply the patch before treating the plugin as ready.
+:::
+
+### Risk 2: Node-level DNS dependency
+
+After NodeLocal DNSCache takes effect, Pods on a node use the local `node-cache` Pod for DNS resolution. If that Pod is unavailable during plugin upgrades, eviction, or crashes, DNS resolution for Pods on the same node may fail. Configure monitoring and alerting for `node-cache` readiness.
+
+If DNS resolution has already failed and no fallback DNS server was configured in advance, temporarily point kubelet `cluster-dns` back to the CoreDNS ClusterIP and recreate the affected Pods.
+
+You can configure kubelet `cluster-dns` with both the NodeLocal DNSCache IP and the CoreDNS ClusterIP. On each node that needs the change, edit the kubelet argument file:
+
+```bash
+vi /var/lib/kubelet/kubeadm-flags.env
+```
+
+Change `--cluster-dns` from the single NodeLocal DNSCache IP to both the NodeLocal DNSCache IP and the CoreDNS ClusterIP:
+
+```text
+--cluster-dns=169.254.20.10,10.96.0.10
+```
+
+Restart kubelet after saving the file:
+
+```bash
+systemctl restart kubelet
+```
+
+This change only affects newly created Pods. Recreate the affected Pods so that their `/etc/resolv.conf` is regenerated, for example:
+
+```bash
+kubectl -n <namespace> rollout restart deployment/<deployment-name>
+```
+
+CoreDNS can be used as a fallback when NodeLocal DNSCache is unavailable, but this is not transparent failover. With the glibc resolver, DNS failover may wait for timeout across multiple `search` queries before using the next DNS server. musl-based images, such as Alpine Linux, usually do not have this delay because musl can query nameservers in parallel.
+
+If the workload is sensitive to DNS resolution delay, tune resolver `timeout` and `attempts` for that workload. For example:
+
+```yaml
+spec:
+  dnsConfig:
+    options:
+      - name: timeout
+        value: "1"
+      - name: attempts
+        value: "1"
+```
+
+:::warning
+**Important:** editing kubelet files on nodes is also a temporary site change. Node rebuilds, re-provisioning, or any workflow that regenerates kubelet configuration can drop the multi-DNS setting completely. If you still need the CoreDNS fallback after those operations, reapply the kubelet change and then recreate the affected Pods again.
+:::
+
+### Risk 3: Metrics collection through node IP
+
+If external monitoring cannot collect `node-cache` metrics through the node IP, edit the NodeLocal DNSCache ConfigMap:
+
+```bash
+kubectl -n <namespace> edit cm <configmap-name>
+```
+
+In the Corefile, remove the IP binding from the `prometheus` directive. Do not change the DNS service port.
+
+```text
+prometheus 169.254.20.10:9253
+```
+
+```text
+prometheus :9253
+```
+
+Restart the `node-cache` Pods or roll the DaemonSet so that the updated Corefile takes effect.
+
+:::warning
+**Important:** this is also a temporary site patch, not persistent plugin configuration. If you patch the generated ConfigMap directly, plugin upgrade, reinstall, or platform reconciliation can overwrite the `prometheus` binding and bring the metric endpoint back to the previous default. Reapply the change after those operations if you still need external metrics collection through the node IP.
+:::
