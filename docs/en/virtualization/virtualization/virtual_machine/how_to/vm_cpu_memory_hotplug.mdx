@@ -1,0 +1,292 @@
+---
+weight: 22
+---
+
+# CPU and Memory Hotplug
+
+This page describes how to add CPU and memory to a running virtual machine (VM)
+on ACP 4.3. KubeVirt applies the control-plane update through an automatic
+live migration. Whether the guest operating system uses the new resources
+depends on its kernel or device driver.
+
+:::note ACP 4.3 validation
+
+The procedure was verified on an ACP 4.3 cluster with KubeVirt
+`v1.7.0-alauda.3`, HCO `Available=True`, and
+`vmRolloutStrategy: LiveUpdate`. The validation VM used a CentOS 7.9 guest
+with a 3.10 kernel.
+
+CPU socket hotplug worked after an explicit CPU topology was initialized. The
+CentOS 7.9 guest did not support virtio-mem, so a memory grow request remained
+pending in the guest. Do not treat a pending memory request as a successful
+memory hotplug.
+
+:::
+
+## How It Works
+
+- CPU hotplug increases the number of CPU sockets. `maxSockets` is the CPU
+  hotplug ceiling.
+- Memory hotplug uses a virtio-mem device. `maxGuest` is the memory ceiling.
+- ACP 4.3 creates an automatic `VirtualMachineInstanceMigration` and moves
+  the VM to a new `virt-launcher` pod.
+- A VM that cannot live-migrate cannot use CPU or memory hotplug online.
+
+The relevant VMI status fields are:
+
+- `status.currentCPUTopology`: the CPU topology currently active in the guest.
+- `status.memory.guestAtBoot`: memory assigned at boot.
+- `status.memory.guestCurrent`: memory currently accepted by the guest.
+- `status.memory.guestRequested`: memory requested by the VM spec.
+- `HotVCPUChange` and `HotMemoryChange`: transient update conditions.
+- `RestartRequired` on the VM: a requested change cannot be applied live.
+
+## Prerequisites
+
+The VM must meet all of the following conditions:
+
+- The VMI has `LiveMigratable=True` and `Ready=True`.
+- Every PVC or DataVolume-backed disk uses shared storage with
+  `ReadWriteMany`. A PVC-backed CD-ROM also needs shared storage. Container
+  disks, cloud-init disks, and empty disks do not need RWX for migration.
+- Set `maxSockets` and `maxGuest` explicitly in the VM template so the
+  effective ceilings are predictable.
+- For memory hotplug, the guest has a virtio-mem driver that supports the
+  feature set exposed by the platform QEMU, including
+  `UNPLUGGED_INACCESSIBLE`.
+
+Check the migration prerequisites before changing the VM:
+
+```shell
+kubectl get vmi <vm-name> -n <namespace> \
+  -o jsonpath='{.status.phase}{"\n"}{.status.conditions}{"\n"}'
+kubectl get vm <vm-name> -n <namespace> \
+  -o jsonpath='{.status.conditions}{"\n"}'
+```
+
+The VM and VMI must not report a blocking `LiveMigratable=False` condition.
+
+## Step 1: Create Headroom Explicitly
+
+For a new VM, define the CPU topology and memory ceiling in the template:
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+spec:
+  template:
+    spec:
+      domain:
+        cpu:
+          sockets: 1 # current vCPU count = sockets x cores x threads
+          cores: 1
+          threads: 1
+          maxSockets: 4 # CPU can grow to four sockets without a restart
+        memory:
+          guest: 2Gi # current guest memory
+          maxGuest: 8Gi # memory can grow to 8Gi without a restart
+```
+
+On ACP 4.3, do not rely on an omitted CPU block or omitted CPU socket fields
+when preparing an existing VM. A VM created with only
+`resources.requests.memory` may receive a default `maxGuest` on its VMI,
+but the first explicit CPU socket change can still require a restart. Explicit
+fields make the intended headroom visible and portable.
+
+### Existing VM without explicit sockets
+
+First inspect the effective CPU topology:
+
+```shell
+kubectl get vmi <vm-name> -n <namespace> \
+  -o jsonpath='cpu={.spec.domain.cpu}{"\n"}topology={.status.currentCPUTopology}{"\n"}'
+```
+
+If the VMI does not have an explicit `sockets` value, initialize the topology
+with the current socket count and the desired ceiling. For a one-socket VM:
+
+```shell
+kubectl patch vm <vm-name> -n <namespace> --type=merge \
+  -p '{"spec":{"template":{"spec":{"domain":{"cpu":{"sockets":1,"maxSockets":4}}}}}}'
+```
+
+On ACP 4.3 this change sets `RestartRequired`, including when the VM already
+has a `cpu.cores` block but no `cpu.sockets` field. This is expected: the
+explicit CPU topology is being initialized. Apply the restart before trying
+the actual hotplug:
+
+```shell
+# Preserve the VM's original runStrategy and restore it after the restart.
+kubectl patch vm <vm-name> -n <namespace> --type=merge \
+  -p '{"spec":{"runStrategy":"Halted"}}'
+kubectl wait --for=delete vmi/<vm-name> -n <namespace> --timeout=60s
+kubectl patch vm <vm-name> -n <namespace> --type=merge \
+  -p '{"spec":{"runStrategy":"Always"}}'
+kubectl wait --for=condition=Ready vmi/<vm-name> -n <namespace> --timeout=120s
+```
+
+This initialization causes a planned outage. It is required only once for a
+VM whose CPU topology is not explicit. Do not combine this CPU initialization
+patch with a memory patch: the `RestartRequired` CPU change can suppress an
+otherwise live-applicable memory update.
+
+## Step 2: Hotplug CPU
+
+After `sockets` and `maxSockets` are active in the VMI, increase the socket
+count on the running VM:
+
+```shell
+kubectl patch vm <vm-name> -n <namespace> --type=merge \
+  -p '{"spec":{"template":{"spec":{"domain":{"cpu":{"sockets":2}}}}}}'
+```
+
+The following occurs without stopping the VM:
+
+1. KubeVirt reports a transient `HotVCPUChange` condition.
+2. ACP creates an automatic workload-update migration.
+3. The new `virt-launcher` pod becomes active.
+4. `status.currentCPUTopology` reports the new socket count.
+
+Check the result:
+
+```shell
+kubectl get vmi <vm-name> -n <namespace> \
+  -o jsonpath='{.status.currentCPUTopology}{"\n"}'
+kubectl get vmim -n <namespace> -o wide
+```
+
+The migration object may be `Succeeded` after completion. An active migration
+is not required after the update finishes.
+
+### Guest CPU behavior
+
+The hypervisor can add the vCPU even when the guest does not automatically
+online it. Check inside the guest:
+
+```shell
+nproc
+cat /sys/devices/system/cpu/online
+cat /sys/devices/system/cpu/offline
+```
+
+The CentOS 7.9 image used for ACP 4.3 validation onlined the additional vCPU
+automatically. Other Linux distributions may require a manual online operation
+or a udev rule:
+
+```shell
+cat <<'EOF' >/etc/udev/rules.d/99-kvm-cpu-hotplug.rules
+SUBSYSTEM=="cpu", ACTION=="add", TEST=="online", ATTR{online}=="0", ATTR{online}="1"
+EOF
+udevadm control --reload
+```
+
+## Step 3: Hotplug Memory
+
+Apply a memory change separately from CPU topology initialization or any other
+non-live field:
+
+```shell
+kubectl patch vm <vm-name> -n <namespace> --type=merge \
+  -p '{"spec":{"template":{"spec":{"domain":{"memory":{"guest":"4Gi"}}}}}}'
+```
+
+Track both the control-plane migration and the guest result:
+
+```shell
+kubectl get vmi <vm-name> -n <namespace> \
+  -o jsonpath='{.status.memory}{"\n"}'
+kubectl get vmim -n <namespace> -o wide
+```
+
+A successful guest-side update looks like:
+
+```text
+{"guestAtBoot":"2Gi","guestCurrent":"4Gi","guestRequested":"4Gi"}
+```
+
+If the guest cannot use virtio-mem, the control plane can still accept the
+request and complete the automatic migration. The request then remains
+pending, for example:
+
+```text
+{"guestAtBoot":"2Gi","guestCurrent":"2Gi","guestRequested":"4Gi"}
+```
+
+### CentOS 7.9 on ACP 4.3
+
+The validated CentOS 7.9 guest uses a 3.10 kernel and has no `virtio_mem`
+module. A memory grow request therefore does not increase `guestCurrent` and
+does not set `RestartRequired`:
+
+```shell
+# Run inside the guest after a memory request remains pending.
+lsmod | grep virtio_mem
+dmesg | grep virtio_mem
+```
+
+No output from both checks is consistent with the CentOS 7.9 result. This is a
+guest limitation, not a failed ACP migration. To cancel the pending request,
+set `domain.memory.guest` back to the current live value and verify that
+`guestRequested` equals `guestCurrent`:
+
+```shell
+kubectl patch vm <vm-name> -n <namespace> --type=merge \
+  -p '{"spec":{"template":{"spec":{"domain":{"memory":{"guest":"2Gi"}}}}}}'
+```
+
+If CentOS 7.9 must run with more memory, use a planned cold resize and verify
+the memory after restarting the VM. Do not report this as memory hotplug.
+
+### Guests with virtio-mem support
+
+For a Linux guest, inspect the driver and kernel messages after a pending
+request:
+
+```shell
+lsmod | grep virtio_mem
+dmesg | grep virtio_mem
+cat /sys/devices/system/memory/auto_online_blocks
+```
+
+The driver must bind successfully and the guest must online the added memory
+blocks. A message such as `device refuses features` indicates that the guest
+kernel does not support the feature set required by the platform QEMU. A
+Windows guest needs the `viomem` driver from the virtio-win package.
+
+## Scaling Down and Restart Requirements
+
+- Increasing CPU sockets is live only after an explicit CPU topology and
+  `maxSockets` are active in the VMI.
+- Decreasing CPU sockets is not live and sets `RestartRequired`.
+- Increasing memory is live only when the guest accepts virtio-mem memory.
+- Decreasing memory to a value greater than or equal to `guestAtBoot` is a
+  best-effort live request on guests that support memory unplugging. Confirm
+  `guestCurrent` and `guestRequested`; a partially completed request is
+  possible.
+- Decreasing memory below `guestAtBoot` requires a restart.
+- Increasing `maxSockets` or `maxGuest` for an already running VMI requires a
+  restart. Set the ceilings before starting the VM.
+
+When `RestartRequired` is present, either revert the template to the current
+live value or restart the VM to apply the change. Do not assume that a
+successful API patch means that the guest has accepted the new resource.
+
+## Troubleshooting
+
+- **Hotplug does not start:** check `LiveMigratable`, shared PVC access modes,
+  node scheduling, and migration events.
+- **`currentCPUTopology` does not change:** check whether the VMI has explicit
+  `sockets` and `maxSockets`. If not, initialize the topology and perform
+  the one required restart.
+- **`guestRequested` is greater than `guestCurrent`:** inspect the guest
+  `virtio_mem` driver, feature negotiation messages, and memory block online
+  policy. On CentOS 7.9 this is expected because the kernel has no virtio-mem
+  support.
+- **The CPU or memory change is suppressed:** do not combine first-time CPU
+  topology initialization with a memory patch. Apply the changes separately.
+- **A new vCPU is not visible to applications:** compare the guest CPU online
+  and offline lists, then online the CPU manually or install a suitable udev
+  rule.
+- **`RestartRequired` remains after a revert:** verify that the VM template
+  matches the current VMI topology and memory, then restart if the requested
+  topology was intentionally changed.
