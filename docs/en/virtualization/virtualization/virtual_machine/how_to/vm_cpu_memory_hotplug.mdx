@@ -14,12 +14,17 @@ depends on its kernel or device driver.
 The procedure was verified on an ACP 4.3 cluster with KubeVirt
 `v1.7.0-alauda.3`, HCO `Available=True`, and
 `vmRolloutStrategy: LiveUpdate`. The validation VM used a CentOS 7.9 guest
-with a 3.10 kernel.
+with a 3.10 kernel. An Ubuntu 22.04 guest was also used to check guest-side
+CPU and memory behavior.
 
 CPU socket hotplug worked after an explicit CPU topology was initialized. The
-CentOS 7.9 guest did not support virtio-mem, so a memory grow request remained
-pending in the guest. Do not treat a pending memory request as a successful
-memory hotplug.
+Ubuntu guest received the additional vCPU from KubeVirt but left it offline
+until it was manually onlined. Both guests accepted the control-plane memory
+update and completed the automatic migration, but the tested CentOS 7.9 and
+Ubuntu 22.04 kernels did not accept the virtio-mem feature set exposed by the
+ACP 4.3 QEMU. Their memory grow requests therefore remained pending in the
+guest. Do not treat a completed migration or a successful API patch as a
+successful guest-side memory hotplug.
 
 :::
 
@@ -36,7 +41,8 @@ The relevant VMI status fields are:
 
 - `status.currentCPUTopology`: the CPU topology currently active in the guest.
 - `status.memory.guestAtBoot`: memory assigned at boot.
-- `status.memory.guestCurrent`: memory currently accepted by the guest.
+- `status.memory.guestCurrent`: memory currently accepted by the guest, not
+  merely the amount configured in QEMU.
 - `status.memory.guestRequested`: memory requested by the VM spec.
 - `HotVCPUChange` and `HotMemoryChange`: transient update conditions.
 - `RestartRequired` on the VM: a requested change cannot be applied live.
@@ -53,7 +59,8 @@ The VM must meet all of the following conditions:
   effective ceilings are predictable.
 - For memory hotplug, the guest has a virtio-mem driver that supports the
   feature set exposed by the platform QEMU, including
-  `UNPLUGGED_INACCESSIBLE`.
+  `UNPLUGGED_INACCESSIBLE`. Having a `virtio_mem` module is not sufficient;
+  verify feature negotiation after the memory device is created.
 
 Check the migration prerequisites before changing the VM:
 
@@ -170,8 +177,15 @@ cat /sys/devices/system/cpu/offline
 ```
 
 The CentOS 7.9 image used for ACP 4.3 validation onlined the additional vCPU
-automatically. Other Linux distributions may require a manual online operation
-or a udev rule:
+automatically. The Ubuntu 22.04 guest used for the same validation exposed the
+new vCPU but left it offline. Other Linux distributions may require a manual
+online operation or a udev rule:
+
+```shell
+echo 1 | sudo tee /sys/devices/system/cpu/cpu1/online
+```
+
+Install a udev rule if the guest must online future vCPUs automatically:
 
 ```shell
 cat <<'EOF' >/etc/udev/rules.d/99-kvm-cpu-hotplug.rules
@@ -212,11 +226,24 @@ pending, for example:
 {"guestAtBoot":"2Gi","guestCurrent":"2Gi","guestRequested":"4Gi"}
 ```
 
-### CentOS 7.9 on ACP 4.3
+### ACP 4.3 guest compatibility
 
 The validated CentOS 7.9 guest uses a 3.10 kernel and has no `virtio_mem`
-module. A memory grow request therefore does not increase `guestCurrent` and
-does not set `RestartRequired`:
+module. The Ubuntu 22.04 guest uses a 5.15 kernel and loads the `virtio_mem`
+module, but its kernel logs the following feature-negotiation failure:
+
+```text
+virtio_mem virtio5: virtio: device refuses features: 3
+```
+
+In both cases, a memory grow request does not increase `guestCurrent` and does
+not set `RestartRequired`:
+
+```text
+{"guestAtBoot":"2Gi","guestCurrent":"2Gi","guestRequested":"4Gi"}
+```
+
+Check the driver and kernel messages inside the guest:
 
 ```shell
 # Run inside the guest after a memory request remains pending.
@@ -224,18 +251,20 @@ lsmod | grep virtio_mem
 dmesg | grep virtio_mem
 ```
 
-No output from both checks is consistent with the CentOS 7.9 result. This is a
-guest limitation, not a failed ACP migration. To cancel the pending request,
-set `domain.memory.guest` back to the current live value and verify that
-`guestRequested` equals `guestCurrent`:
+No module output is consistent with the CentOS 7.9 result. A loaded module
+with a `device refuses features` message is the Ubuntu 22.04 result. Both are
+guest compatibility limitations, not failed ACP migrations. To cancel a
+pending request, set `domain.memory.guest` back to the current live value and
+verify that `guestRequested` equals `guestCurrent`:
 
 ```shell
 kubectl patch vm <vm-name> -n <namespace> --type=merge \
   -p '{"spec":{"template":{"spec":{"domain":{"memory":{"guest":"2Gi"}}}}}}'
 ```
 
-If CentOS 7.9 must run with more memory, use a planned cold resize and verify
-the memory after restarting the VM. Do not report this as memory hotplug.
+If the guest cannot negotiate the platform feature set, use a planned cold
+resize and verify the memory after restarting the VM. Do not report this as
+memory hotplug.
 
 ### Guests with virtio-mem support
 
@@ -250,8 +279,9 @@ cat /sys/devices/system/memory/auto_online_blocks
 
 The driver must bind successfully and the guest must online the added memory
 blocks. A message such as `device refuses features` indicates that the guest
-kernel does not support the feature set required by the platform QEMU. A
-Windows guest needs the `viomem` driver from the virtio-win package.
+kernel does not support the feature set required by the platform QEMU, even if
+`lsmod` shows `virtio_mem`. A Windows guest needs the `viomem` driver from the
+virtio-win package.
 
 ## Scaling Down and Restart Requirements
 
@@ -260,9 +290,9 @@ Windows guest needs the `viomem` driver from the virtio-win package.
 - Decreasing CPU sockets is not live and sets `RestartRequired`.
 - Increasing memory is live only when the guest accepts virtio-mem memory.
 - Decreasing memory to a value greater than or equal to `guestAtBoot` is a
-  best-effort live request on guests that support memory unplugging. Confirm
-  `guestCurrent` and `guestRequested`; a partially completed request is
-  possible.
+  best-effort live request only on guests that support memory unplugging and
+  the platform feature set. Confirm `guestCurrent` and `guestRequested`; a
+  partially completed request is possible.
 - Decreasing memory below `guestAtBoot` requires a restart.
 - Increasing `maxSockets` or `maxGuest` for an already running VMI requires a
   restart. Set the ceilings before starting the VM.
@@ -280,8 +310,10 @@ successful API patch means that the guest has accepted the new resource.
   the one required restart.
 - **`guestRequested` is greater than `guestCurrent`:** inspect the guest
   `virtio_mem` driver, feature negotiation messages, and memory block online
-  policy. On CentOS 7.9 this is expected because the kernel has no virtio-mem
-  support.
+  policy. A loaded module is not enough; `device refuses features` means that
+  the guest kernel and platform QEMU are incompatible. This was observed with
+  Ubuntu 22.04 on ACP 4.3. CentOS 7.9 has no virtio-mem module and shows the
+  same pending control-plane state.
 - **The CPU or memory change is suppressed:** do not combine first-time CPU
   topology initialization with a memory patch. Apply the changes separately.
 - **A new vCPU is not visible to applications:** compare the guest CPU online
