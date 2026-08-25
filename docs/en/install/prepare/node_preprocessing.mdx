@@ -17,11 +17,12 @@ The following table lists the supported operating systems, their validated versi
 The platform enforces strict version matching policies for official support:
 
 - **OS Version (x.y.z)**: Patch versions (`z`) can vary, but major and minor versions (`x` and `y`) must strictly match the validated versions. Modifying `x` or `y` is not officially supported.
-- **Kernel Version (x.y.z-build)**: The build suffix (`build`) can vary, but the core kernel version (`x.y.z`) must strictly match the tested versions. Modifying `x.y.z` is not officially supported.
+- **Kernel Version (x.y.z-build)**: The build suffix (`build`) can vary, but the core kernel version (`x.y.z`) must strictly match the tested versions. Modifying `x.y.z` is not officially supported. When the list names an operating system release without a kernel value, use the official kernel shipped with that release.
 
 :::info
 - Only the kernel version shipped with the official operating system is supported. If the OS, kernel version, or CPU architecture does not meet the requirements, please contact technical support.
-- Kylin V10, V10-SP1, and V10-SP2 have known kernel issues that may cause **NodePort network access failures**, it is recommended to upgrade to **Kylin V10-SP3**.
+- Kylin V10, V10-SP1, and V10-SP2 have known kernel issues that may cause **NodePort network access failures**, it is recommended to upgrade to **Kylin V10 SP3**.
+- When using Kylin V10 SP3, it is recommended to use kernel build `4.19.90-89.11.v2401` or later.
 :::
 
 ### x86
@@ -29,8 +30,7 @@ The platform enforces strict version matching policies for official support:
 <Tabs>
   <Tab label="Red Hat Enterprise Linux (RHEL)">
   - RHEL 7.8: `3.10.0-1127.el7.x86_64`
-  - RHEL 8.0: `4.18.0-80.el8.x86_64`
-  - RHEL 8.6: `4.18.0-372.9.1.el8.x86_64`
+  - RHEL 8.0 to 8.6: `4.18.0-80.el8.x86_64` and `4.18.0-372.9.1.el8.x86_64`
   - RHEL 8.10: `4.18.0-553`
   - RHEL 9.6: `5.14.0-570.12.1`
 
@@ -51,7 +51,8 @@ The platform enforces strict version matching policies for official support:
   </Tab>
 
   <Tab label="Kylin Linux Advanced Server">
-  - Kylin V10 SP3: `4.19.90-52.22.v2207.ky10.x86_64`
+  - Kylin V10 SP3 2403: `4.19.90-89.11.v2401.ky10.x86_64`
+  - Kylin V11 2503: official kernel shipped with the release
   </Tab>
 </Tabs>
 
@@ -59,7 +60,8 @@ The platform enforces strict version matching policies for official support:
 
 <Tabs>
   <Tab label="Kylin Linux Advanced Server">
-  - Kylin V10 SP3: `4.19.90-52.22.v2207.ky10.aarch64`
+  - Kylin V10 SP3 2403: `4.19.90-89.11.v2401.ky10.aarch64`
+  - Kylin V11 2503: official kernel shipped with the release
 
   **Note:** ARM architecture only supports `Kunpeng 920`. For other models, please contact technical support.
   </Tab>
@@ -98,7 +100,10 @@ The following is the list of checks:
   - ✅ Check whether the kernel modules `ip_vs`, `ip_vs_rr`, `ip_vs_wrr`, and `ip_vs_sh` are enabled.
   - ⚠️ When the kernel version is lower than 4.19.0 (or RHEL is lower than 4.18.0), check whether the kernel modules `nf_conntrack_ipv4` and (for IPv6) `nf_conntrack_ipv6` are enabled.
   - ⚠️ If the `global` cluster plans to use `Kube-OVN` CNI, the kernel modules `geneve` and `openvswitch` must be enabled.
-  - ✅ Disable apparmor/selinux and firewall.
+  - ✅ SELinux, AppArmor, and the host firewall must be disabled, unless your security policy requires one of them to stay enabled. In that case the node must be configured as described in [Hardened Node Security Configuration](#hardened_node_security) before you install the platform.
+    - `init.sh` disables all three. To keep one of them enabled, pass the matching `--skip-` argument to `init.sh` instead of turning the mechanism back on afterwards.
+    - Keeping a mechanism enabled is a non-default configuration. The platform does not manage the traditional operating system, so an enabled security mechanism can cause unexpected failures on the node or in the cluster. You are responsible for operating and troubleshooting the nodes in this configuration.
+    - When the host firewall is enabled, you configure and maintain the port rules on every node. For the ports that the platform requires, see [Communication Matrix](./communication_matrix.mdx).
   - ✅ Disable `swap` .
 
 - **Users and Permissions**
@@ -146,6 +151,75 @@ The following is the list of checks:
   - ✅ The time zones of all nodes must be unified, and the time synchronization error must be ≤ 10 seconds.
 
 ## Appendix
+
+### Hardened Node Security Configuration \{#hardened_node_security}
+
+Use this section only when a mandatory security policy, such as a STIG baseline, requires SELinux, AppArmor, or a host firewall to stay enabled on cluster nodes. Keeping all three disabled is the default and recommended node configuration, and it is what `init.sh` produces when you run it without arguments. Enabling any of them is a non-default configuration that you own, and it has not been validated on every operating system in the support list for this version, so validate it in a non-production environment before you apply it to production nodes.
+
+#### Keep the Mechanism Enabled Instead of Turning It Back On
+
+`init.sh` can skip individual steps. Pass the matching `--skip-` argument so that the script never disables the mechanism your policy requires:
+
+| Mechanism | Argument |
+| --- | --- |
+| SELinux | `--skip-disable_selinux` |
+| AppArmor | `--skip-disable_apparmor` |
+| `firewalld` | `--skip-disable_firewalld` |
+| `ufw` | `--skip-disable_ufw` |
+
+Combine the arguments you need. For example, to keep SELinux and `firewalld` enabled on a RHEL node:
+
+```bash
+bash init.sh --skip-disable_selinux --skip-disable_firewalld
+```
+
+This is the recommended path. The node keeps the state it was installed with, so no file system relabel and no extra reboot are required, and `init.sh` still performs every other node preparation step.
+
+SELinux must end up in `enforcing` mode. `permissive` logs denials without blocking them, so it does not satisfy a policy that requires SELinux enforcement. It is still the safe intermediate step when you recover a node on which SELinux was already disabled, as described below.
+
+#### Order of Operations
+
+Configure the node before the platform installation, not after. A policy or firewall problem then surfaces while the installer runs, instead of after the cluster carries workloads.
+
+1. Run `init.sh` with the `--skip-` arguments for the mechanisms you want to keep enabled.
+2. Configure the host firewall rules if a host firewall is enabled.
+3. Verify the resulting state on the node, for example with `getenforce`, `aa-status`, and the status command of your firewall implementation.
+4. Install the platform.
+
+#### If a Node Already Ran the Full `init.sh`
+
+Use this path only when the mechanisms were already disabled and you have to turn them back on. It is more work than skipping the steps in the first place.
+
+**SELinux.** A full `init.sh` run sets `SELINUX=disabled` and reboots the node. While SELinux is disabled the kernel does not maintain security labels, so files written to disk in that state carry no label. Editing `/etc/selinux/config` alone is not enough, and booting straight into `enforcing` on a file system that has only just been relabelled can leave the node unreachable: if the relabel is interrupted, or an early-boot file such as `/etc/shadow` or the `sshd` host keys ends up mislabelled, the node fails to boot or refuses SSH logins. Relabel under `permissive` first, and switch to `enforcing` only after the node comes back cleanly:
+
+1. Set `SELINUX=permissive` in `/etc/selinux/config`.
+2. Run `touch /.autorelabel` to request a full file system relabel on the next boot.
+3. Reboot the node and wait for the relabel to finish. The node reboots again once the relabel completes, and comes up in `permissive` mode.
+4. Review the denials logged during and after the relabel, for example with `ausearch -m avc -ts boot`, and resolve them before you continue.
+5. Set `SELINUX=enforcing` in `/etc/selinux/config` and reboot the node.
+6. Run `getenforce` and confirm that it returns `Enforcing`.
+
+**AppArmor.** A full `init.sh` run stops and disables `apparmor.service`, and it can also add `apparmor=0` to the kernel command line. Starting the service alone is therefore not always sufficient:
+
+1. Check the kernel command line for `apparmor=0`. If it is present, remove it from the boot loader configuration and reboot the node.
+2. Enable and start the service, for example with `systemctl enable --now apparmor`.
+3. Run `aa-status` and confirm that the distribution default profiles are loaded and in enforce mode.
+
+#### Host Firewall
+
+The platform does not require a specific host firewall implementation. RHEL, CentOS, and Kylin Linux Advanced Server nodes typically use `firewalld`, and Ubuntu nodes typically use `ufw`. Whichever implementation you use, allow the same set of ports. For the port list, see [Communication Matrix](./communication_matrix.mdx).
+
+<Directive type="danger" title="DANGER">
+The communication matrix lists the ports that the nodes listen on. Pod-to-Pod and Pod-to-Service traffic uses arbitrary ports and is not covered by that list, so a firewall that allows only the listed ports breaks cluster networking. When the host firewall is enabled, also treat the Pod CIDR, the Service CIDR, and the network interfaces created by the CNI plugin as trusted sources, so that cluster-internal traffic is not filtered by port. The interface names depend on the CNI plugin and on the environment, so read them from the node instead of assuming a fixed name.
+</Directive>
+
+The node that runs the installer also uses `8080`, `12080`, `12443`, and `16443`. Allow these ports on that node before you start the installation.
+
+#### Policy Sets
+
+Distribution default policy sets are the supported path: the operating system vendor's `targeted` policy for SELinux, and the distribution default profiles for AppArmor.
+
+Policy sets hardened beyond the distribution defaults, such as the STIG profile provided by Ubuntu Security Guide, and custom SELinux modules or booleans, are outside the validated range. Assess and validate them yourself before you apply them to cluster nodes.
 
 ### Remove Conflicting Packages \{#remove_conflicting_packages}
 
