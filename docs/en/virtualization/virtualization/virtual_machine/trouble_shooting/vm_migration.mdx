@@ -3,130 +3,75 @@ weight: 10
 sourceSHA: 3d791c547ee8bff0e3592416035cefeed5ee2724f1f110bea063d072f76dd378
 ---
 
-# Pod Migration and Recovery from Abnormal Shutdown of Virtual Machine Nodes
+# VM Migration and Recovery from a Node Failure
 
-## Problem Description
+There are two different node events, and they require different procedures:
 
-Whether the node is **gracefully shut down** or experiences an **abnormal crash**, the virtual machine Pods running on that node will not automatically migrate to other healthy nodes.
+- For **planned maintenance**, first cordon the node and live-migrate its VMs
+  while it is still healthy. Follow [KubeVirt Node Maintenance](../how_to/vm_node_maintenance.mdx).
+- For an **unexpected node failure**, first fence the node. KubeVirt cannot
+  tell a powered-off node from a temporary network partition, so recreating a
+  VM before fencing can run two copies of the same guest.
 
-## Cause Analysis
+Do not use the failure procedure for a planned drain, and do not use a planned
+drain to recover a node that is no longer reachable.
 
-The platform implements a virtual machine solution based on the open-source component KubeVirt. However, from the perspective of KubeVirt, it cannot differentiate between an actual virtual machine crash and a connection failure caused by network or other issues. If virtual machines are migrated to other nodes indiscriminately, it may lead to multiple instances of the same virtual machine existing concurrently.
+## Planned maintenance
 
-## Solutions
+The node-maintenance how-to is the authoritative procedure for a graceful
+change window. It checks capacity and `LiveMigratable=True`, cordons the source
+node, migrates one VM at a time, and verifies the VMIM, VMI, and launcher before
+the node is drained. In particular, do not force-delete a launcher Pod to make
+the drain return successfully.
 
-When maintaining virtual machine nodes, manual actions are required according to this document. For both **graceful shutdown** and **abnormal crash** situations, virtual machine Pods must be manually evicted or forcibly deleted.
+## Recovery from an unexpected node failure
 
-**Note**: The following commands must be executed on the Master node of the corresponding cluster.
+### 1. Preserve diagnostics
 
-### Migration of Virtual Machine Pods during Graceful Shutdown
+Record the node, VMIs, launcher Pods, and volume attachments before changing
+resources:
 
-1. In the CLI tool, execute the following command to obtain node information. The `NAME` field in the returned information is the `Node-Name`.
+```bash
+kubectl get node <failed-node> -o yaml
+kubectl get vmi -A -o wide
+kubectl get pod -A -l kubevirt.io=virt-launcher -o wide
+kubectl get volumeattachment -o wide
+kubectl get events -A --sort-by=.lastTimestamp
+```
 
-   ```bash
-   kubectl get nodes
-   ```
+### 2. Fence the failed node
 
-   Output:
+Use the approved out-of-band power isolation or the cluster's node-remediation
+stack (for example, the configured Node Health Check/Self Node Remediation
+workflow). Confirm that the old node cannot execute the guest and cannot
+write to its storage before recovering the VM.
 
-   ```bash
-   NAME             STATUS   ROLES                  AGE   VERSION
-   1.1.1.211   Ready    control-plane,master   99d   v1.28.8
-   ```
+Do not treat `NotReady`, a lost API connection, or a stale Pod phase as proof
+that the guest has stopped. Do not remove a `virt-launcher` Pod or a
+`VolumeAttachment` before fencing.
 
-2. (Optional) Execute the following command to view the virtual machine instances under the node.
+### 3. Run the approved remediation
 
-   ```bash
-   kubectl get vmis --all-namespaces -o wide | grep <Node-Name>  # Replace <Node-Name> in the command with the Node-Name obtained in step 1
-   ```
+After fencing, follow the remediation runbook for the installed Kubernetes,
+CSI, and node-remediation versions. That runbook may apply the
+`node.kubernetes.io/out-of-service` taint or remove stale resources so that
+volumes can detach. The exact action depends on the storage driver and must
+not be replaced by an unreviewed `kubectl delete` command.
 
-   Output:
+### 4. Verify one replacement VMI
 
-   ```bash
-   test-test         vm-t-export-clone   13d     Running      1.1.1.1   1.1.1.211   True    False   
-   ```
+Wait for the VM controller to create one replacement VMI on a healthy node.
+Verify the VM remains in the intended running state, the new VMI is `Ready`,
+and only one active launcher exists:
 
-3. Before the graceful shutdown, execute the following command to evict all virtual machine Pods on the node to be shut down. If the output appears as follows, it indicates that the eviction was successful.
+```bash
+kubectl get vm -A -o wide
+kubectl get vmi -A -o wide
+kubectl get pod -A -l kubevirt.io=virt-launcher -o wide
+kubectl get volumeattachment -o wide
+```
 
-   ```bash
-   kubectl drain <Node-Name> --delete-local-data --ignore-daemonsets=true --force --pod-selector=kubevirt.io=virt-launcher   # Replace <Node-Name> in the command with the Node-Name of the node to be shut down
-   ```
-
-   Output:
-
-   ```bash
-   Flag --delete-local-data has been deprecated, This option is deprecated and will be deleted. Use --delete-emptydir-data.
-   node/1.1.1.211 cordoned
-   evicting pod test-test/virt-launcher-vm-t-export-clone-hmnkk
-   pod/virt-launcher-vm-t-export-clone-hmnkk evicted
-   node/1.1.1.211 drained
-   ```
-
-4. After all virtual machines are started on other nodes, shut down the node.
-
-5. After the node is shut down and rebooted, execute the following command to mark the node as schedulable.
-
-   ```bash
-   kubectl uncordon <Node-Name> # Replace <Node-Name> in the command with the Node-Name of the shut down and rebooted node
-   ```
-
-   Output:
-
-   ```bash
-   node/1.1.1.211 uncordoned
-   ```
-
-6. At this point, the original virtual machine instances on that node have been migrated to other healthy nodes, and this node is now available for new Pod scheduling after rebooting.
-
-### Recovery from Abnormal Shutdown
-
-1. In the CLI tool, execute the following command to obtain node information. The `NAME` field in the returned information is the `Node-Name`.
-
-   ```bash
-   kubectl get nodes
-   ```
-
-   Output:
-
-   ```bash
-   NAME             STATUS   ROLES                  AGE   VERSION
-   1.1.1.211   Ready    control-plane,master   99d   v1.28.8
-   ```
-
-2. Execute the following command to forcibly delete all virtual machine Pods on the node.
-
-   ```bash
-   kubectl get po -A -l kubevirt.io=virt-launcher -o wide | grep <Node-Name> | awk '{print "kubectl delete pod --force -n " $1, $2}'  | bash  # Replace <Node-Name> in the command with the Node-Name of the node that crashed abnormally.
-   ```
-
-3. Execute the following command to delete the volume attachments on that node.
-
-   ```bash
-   kubectl get volumeattachments.storage.k8s.io | grep <Node-Name> | awk '{print $1}' | xargs kubectl delete volumeattachments.storage.k8s.io  # Replace <Node-Name> in the command with the Node-Name of the node that crashed abnormally.
-   ```
-
-4. Execute the following command to query if there are Pods with the label kubevirt.io=virt-api on the node that crashed abnormally.
-
-   ```bash
-   kubectl -n kubevirt get po -l kubevirt.io=virt-api -o wide | grep <Node-Name> # Replace <Node-Name> in the command with the Node-Name of the node that crashed abnormally.
-   ```
-
-   If they exist, execute the following command to delete the Pods.
-
-   ```bash
-   kubectl -n kubevirt get po -l kubevirt.io=virt-api -o name | xargs kubectl -n kubevirt delete --force --grace-period=0
-   ```
-
-5. Execute the following command to query if there are Pods with the label kubevirt.io=virt-controller on the node that crashed abnormally.
-
-   ```bash
-   kubectl -n kubevirt get po -l kubevirt.io=virt-controller -o wide | grep <Node-Name> # Replace <Node-Name> in the command with the Node-Name of the node that crashed abnormally.
-   ```
-
-   If they exist, execute the following command to delete the Pods.
-
-   ```bash
-   kubectl -n kubevirt get po -l kubevirt.io=virt-controller -o name | xargs kubectl -n kubevirt delete --force --grace-period=0
-   ```
-
-6. At this point, the virtual machine instances will be migrated to other healthy nodes after the node experiences an abnormal shutdown.
+If a VMI remains stuck, preserve its events and condition messages and return
+to the fencing/remediation runbook. Do not use `--force` or
+`--grace-period=0` as a first response; those options can create split-brain
+VMs or leave storage in an unsafe state.
