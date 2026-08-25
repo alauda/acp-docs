@@ -57,9 +57,13 @@ During an in-place operating system upgrade, the operating system package manage
 
 If conflicting packages are found, prepare an application migration plan and back up the affected data before uninstalling them.
 
-### Step 3: Record the current runtime and node component versions
+### Step 3: Record the current node baseline
 
-Record the versions before the operating system upgrade. Use the records for comparison after the node is upgraded.
+Record the node state before the operating system upgrade. Use the records for comparison after the node is upgraded.
+
+Run the `Base node configuration check` block from [Step 2: Verify base node configuration](#verify_base_node_configuration) on the node now, and keep its output. It captures the SELinux mode, the AppArmor and host firewall state, and the firewall rules in use. The post-upgrade checks compare against exactly this output, so a node without it cannot be verified.
+
+Record the runtime and node component versions as well:
 
 ```bash
 containerd --version
@@ -142,26 +146,48 @@ uname -r
 
 Compare the output with the supported matrix and your approved maintenance plan.
 
-### Step 2: Verify base node configuration
+### Step 2: Verify base node configuration \{#verify_base_node_configuration}
 
 Verify that the operating system upgrade did not revert required node settings.
 
 ```bash
 echo "=== Base node configuration check ==="
 
-# SELinux must be disabled on systems that use SELinux.
-getenforce 2>/dev/null || echo "SELinux command not available"
+# SELinux mode. Both Disabled and Enforcing are valid states; the value has to
+# match the one recorded before the upgrade.
+if command -v getenforce >/dev/null; then
+  echo "SELinux: $(getenforce)"
+else
+  echo "SELinux: getenforce not available on this system"
+fi
 
-# AppArmor must be disabled on systems that use AppArmor.
-systemctl status apparmor 2>/dev/null || echo "AppArmor service not installed"
+# AppArmor. A missing unit means the system has no AppArmor at all, which is not
+# the same as AppArmor being present but turned off.
+if systemctl list-unit-files --no-legend apparmor.service 2>/dev/null | grep -q .; then
+  echo "AppArmor: enabled=$(systemctl is-enabled apparmor.service 2>&1) active=$(systemctl is-active apparmor.service 2>&1)"
+else
+  echo "AppArmor: unit not present on this system"
+fi
+
+# firewalld. Same distinction as AppArmor.
+if systemctl list-unit-files --no-legend firewalld.service 2>/dev/null | grep -q .; then
+  echo "firewalld: enabled=$(systemctl is-enabled firewalld.service 2>&1) active=$(systemctl is-active firewalld.service 2>&1)"
+  firewall-cmd --list-all 2>/dev/null || true
+else
+  echo "firewalld: unit not present on this system"
+fi
+
+# ufw. The unit reports active (exited) once it has ever run, so the unit state
+# does not show whether the ruleset is enabled. Only ufw status does.
+if command -v ufw >/dev/null; then
+  ufw status verbose
+else
+  echo "ufw: not installed"
+fi
 
 # Swap must be disabled.
 swapon --show
 free -h | grep Swap
-
-# Firewall services must be disabled according to your cluster network plan.
-systemctl status firewalld 2>/dev/null || echo "firewalld not installed"
-systemctl status ufw 2>/dev/null || echo "ufw not installed"
 
 # /tmp must not be mounted with noexec.
 mount | grep " /tmp "
@@ -172,7 +198,7 @@ systemctl show --property=DefaultTasksMax
 
 If `swap` is enabled after the operating system upgrade, disable it and remove the swap entry from `/etc/fstab` according to your operating system policy.
 
-If SELinux or AppArmor is enabled after the operating system upgrade, disable it according to your operating system policy and the <Term name="productShort" /> node requirements.
+SELinux, AppArmor, and the host firewall must return to the state that the cluster was installed with. If the cluster was installed with these mechanisms disabled and the operating system upgrade re-enabled any of them, disable it again. If the cluster runs with any of them enabled, confirm that it is still enabled and that its policy and firewall rules are complete after the upgrade. For the required configuration and the port list, see [Hardened Node Security Configuration](/install/prepare/node_preprocessing.mdx#hardened_node_security) and [Communication Matrix](/install/prepare/communication_matrix.mdx).
 
 ### Step 3: Verify runtime and node component versions
 
@@ -249,7 +275,7 @@ Then validate the business services that were affected by the node drain. Procee
 | The node stays `NotReady` | `kubelet`, container runtime, CNI, DNS, or node network configuration changed | Check `systemctl status kubelet`, `systemctl status containerd`, and node events | Restore the changed configuration or contact technical support |
 | Cluster components report TLS errors | Node time drifted during or after the upgrade | Check `timedatectl` and compare `date` across nodes | Synchronize time before continuing |
 | DNS resolution fails | `/etc/resolv.conf` was overwritten | Check `cat /etc/resolv.conf` | Restore the approved DNS configuration |
-| `kubelet` fails with security policy errors | SELinux or AppArmor was re-enabled | Check `getenforce` or `systemctl status apparmor` | Disable the service according to node requirements |
+| `kubelet` fails with security policy errors | The mechanism was turned on or off by the operating system upgrade, or the vendor shipped a new policy and the file labels no longer match it | Run the `Base node configuration check` block and compare it with the pre-upgrade record, then list the denials with `ausearch -m avc -ts boot` | If the state changed, restore the state the cluster was installed with. If the state is unchanged, the policy or the file labels changed: restore the labels on the paths named in the denials with `restorecon -Rv <path>`, or run `touch /.autorelabel` and reboot if the labels are wrong across the file system. Contact technical support if the denials persist |
 | Workloads cannot be scheduled after uncordon | The node is still unhealthy, tainted, or resource-constrained | Check `kubectl describe node <node-name>` | Resolve node conditions before continuing |
 
 ## Operation Checklist
@@ -263,6 +289,7 @@ Use this checklist during the maintenance window and keep the completed record a
 | Pre-upgrade | Check and resolve conflicting packages | | |
 | Pre-upgrade | Record `containerd`, `runc`, `crictl`, and `kubelet` versions | | |
 | Pre-upgrade | Record DNS, time synchronization, `/etc/fstab`, and runtime configuration | | |
+| Pre-upgrade | Record whether SELinux, AppArmor, and the host firewall are enabled, and record the firewall rules in use | | |
 | Pre-upgrade | Confirm that the cluster has enough capacity for drained workloads | | |
 | Pre-upgrade | Drain the target node and confirm workload impact | | |
 | Control plane only | Back up etcd data | | |
@@ -270,9 +297,9 @@ Use this checklist during the maintenance window and keep the completed record a
 | Upgrade | Run the operating system vendor's supported upgrade procedure | | |
 | Upgrade | Reboot the node if required by the vendor procedure | | |
 | Post-upgrade | Confirm operating system and kernel versions | | |
-| Post-upgrade | Confirm SELinux or AppArmor is disabled as required | | |
+| Post-upgrade | Confirm that SELinux and AppArmor match the cluster installation configuration | | |
 | Post-upgrade | Confirm swap is disabled | | |
-| Post-upgrade | Confirm firewall services match the cluster network plan | | |
+| Post-upgrade | Confirm that the host firewall matches the cluster installation configuration | | |
 | Post-upgrade | Confirm `/tmp` is not mounted with `noexec` | | |
 | Post-upgrade | Confirm `DefaultTasksMax` is `infinity` | | |
 | Post-upgrade | Confirm runtime and node component versions were not overwritten | | |
