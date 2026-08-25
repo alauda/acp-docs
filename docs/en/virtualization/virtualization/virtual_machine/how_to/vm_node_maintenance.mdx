@@ -29,6 +29,148 @@ node. Do not use `--force`, `--disable-eviction`, `--grace-period=0`, or
 can bypass the KubeVirt eviction path and interrupt the guest.
 :::
 
+## Prepare the environment for future maintenance
+
+Complete this section when the cluster and VMs are commissioned, not after a
+node has been cordoned. Treat changes to HCO or a running VM as normal
+configuration changes: apply them before the maintenance window, wait for
+reconciliation, and test a live migration before considering the VM protected.
+
+### Choose the scope of the eviction policy
+
+Use `LiveMigrate` at one of these scopes:
+
+- **HCO cluster default**: use this when all VMs without an explicit VM-level
+  policy should live-migrate during eviction. A non-migratable VM then blocks
+  drain instead of being stopped.
+- **VM-level policy**: use this for selected or critical VMs. This is preferred
+  when the cluster contains workloads with different availability
+  requirements, because it does not change the behavior of unrelated VMs.
+
+A VM-level value overrides the HCO default. Do not use
+`LiveMigrateIfPossible` for a VM that must remain available: it falls back to
+ordinary eviction when migration is unavailable and can stop or restart the
+VM.
+
+#### Set the HCO cluster default
+
+Use the path exposed by the installed HCO schema. In the ACP 4.4 HCO v1
+storage schema the field is
+`spec.virtualization.evictionStrategy`; an installation that still uses the
+served v1beta1 schema can expose the converted field at
+`spec.evictionStrategy`. Check the served and storage versions and both paths
+before applying a cluster-wide change:
+
+```bash
+kubectl get crd hyperconvergeds.hco.kubevirt.io \
+  -o jsonpath='{range .spec.versions[*]}{.name}{" served="}{.served}{" storage="}{.storage}{"\n"}{end}'
+kubectl explain hyperconverged.spec.virtualization.evictionStrategy \
+  --api-version=hco.kubevirt.io/v1
+kubectl explain hyperconverged.spec.evictionStrategy \
+  --api-version=hco.kubevirt.io/v1beta1
+```
+
+After approving the cluster-wide change, apply **one** patch matching the
+path that `kubectl explain` confirms:
+
+```bash
+# HCO v1: nested field
+kubectl patch hyperconverged.v1.hco.kubevirt.io kubevirt-hyperconverged -n kubevirt \
+  --type=merge \
+  --patch '{"spec":{"virtualization":{"evictionStrategy":"LiveMigrate"}}}'
+
+# HCO v1beta1 installations: root-level converted field
+kubectl patch hyperconverged.v1beta1.hco.kubevirt.io kubevirt-hyperconverged -n kubevirt \
+  --type=merge \
+  --patch '{"spec":{"evictionStrategy":"LiveMigrate"}}'
+```
+
+Do not apply both patches, and do not infer the path from the release number
+alone. If neither schema path is served, stop and use the installed HCO
+release documentation.
+
+Wait until HCO has observed the new generation and is stable, and verify that
+the policy has propagated to the KubeVirt configuration:
+
+```bash
+kubectl get hyperconverged kubevirt-hyperconverged -n kubevirt \
+  -o jsonpath='generation={.metadata.generation}{" observedGeneration="}{.status.observedGeneration}{"\n"}{range .status.conditions[*]}{.type}={.status}{" "}{end}{"\n"}'
+kubectl get kubevirt -n kubevirt \
+  -o jsonpath='{range .items[*]}{.metadata.name}{" evictionStrategy="}{.spec.configuration.evictionStrategy}{"\n"}{end}'
+```
+
+Continue only when `generation` equals `observedGeneration`, HCO reports
+`Available=True`, `Progressing=False`, and `Degraded=False`, and the KubeVirt
+configuration reports `LiveMigrate`. Confirm that these condition types are
+actually present in the installed HCO status; empty output is not success.
+Setting the policy does not make an otherwise incompatible VM migratable.
+
+#### Protect a selected VM explicitly
+
+For a VM that is expected to stay running and restart automatically after an
+interruption, keep these fields in its source manifest:
+
+```yaml
+spec:
+  runStrategy: Always
+  template:
+    spec:
+      evictionStrategy: LiveMigrate
+      # Keep the existing domain, networks, and volumes here.
+```
+
+For a VM that does not have the deprecated `spec.running` field, and whose
+source of truth is not going to overwrite a direct patch, the same change can
+be applied with a merge patch:
+
+```bash
+kubectl patch vm <vm-name> -n <vm-namespace> \
+  --type=merge \
+  --patch '{"spec":{"runStrategy":"Always","template":{"spec":{"evictionStrategy":"LiveMigrate"}}}}'
+```
+
+If `spec.running` is present, it can remain as-is (`running: true` is
+equivalent to `runStrategy: Always` for this purpose). Converting it is an
+optional, separately approved configuration change: update the VM's source
+manifest, remove `spec.running`, and add the equivalent `runStrategy`. Never
+set both fields. A direct patch can be reverted by GitOps or another
+controller, so update that source of truth first. `runStrategy: Always`
+controls the desired power state after a VMI is (re)created; it does not by
+itself make a VM live-migratable or guarantee an interruption-free recovery.
+
+The VM template is used when a VMI is created. A running VMI might therefore
+keep its old eviction strategy after the VM template is changed. Check both
+objects:
+
+```bash
+kubectl get vm <vm-name> -n <vm-namespace> \
+  -o jsonpath='running={.spec.running}{" runStrategy="}{.spec.runStrategy}{" templateEvictionStrategy="}{.spec.template.spec.evictionStrategy}{"\n"}'
+kubectl get vmi <vmi-name> -n <vm-namespace> \
+  -o jsonpath='currentVmiEvictionStrategy={.spec.evictionStrategy}{"\n"}'
+```
+
+Only an already-existing explicit value in the running VMI is effective
+immediately; changing the VM template does not update that VMI. If the VMI
+value is empty, the propagated KubeVirt cluster default is effective. If the
+VMI still reports `None` or `LiveMigrateIfPossible`, schedule an approved
+restart before the maintenance window so that a new VMI is created from the
+updated VM template. Do not try to patch a running VMI directly.
+
+### Design and test the VM for migration
+
+An eviction policy controls what KubeVirt attempts; the VM must also be able
+to run on another node. Before putting a critical VM into service:
+
+- provide at least two eligible workers with sufficient CPU, memory, and a
+  compatible CPU model;
+- use storage, networks, and devices supported for live migration by the
+  installed KubeVirt version, and avoid placement rules that bind the VM to one
+  node;
+- verify `Ready=True` and `LiveMigratable=True`, then perform and monitor a
+  controlled live migration to another worker;
+- repeat the migration test after changing the VM's storage, network, devices,
+  CPU model, affinity, or tolerations.
+
 ## Before the maintenance window
 
 ### Confirm capacity and scheduling
@@ -60,9 +202,10 @@ For every VMI on the maintenance node, confirm all of the following:
   interruption, use `spec.runStrategy: Always`. If an existing VM uses the
   deprecated `spec.running: true` field, do not add `spec.runStrategy` during
   this maintenance; the two fields are mutually exclusive.
-- The **effective** eviction strategy is `LiveMigrate`: use the VM template's
-  `spec.template.spec.evictionStrategy` when it is set, otherwise use the HCO
-  cluster default. A VM-level value overrides the HCO default.
+- The **effective** eviction strategy is `LiveMigrate`: use the running VMI's
+  `spec.evictionStrategy` when it is set, otherwise use the propagated
+  KubeVirt cluster default. Also confirm that the VM template is configured for
+  the next VMI.
 - The VMI is `Running`, has `Ready=True`, and has `LiveMigratable=True`.
 - PVCs are bound and the VM's storage, network, CPU model, host devices, and
   placement constraints allow migration. Shared `ReadWriteMany` storage is a
@@ -71,8 +214,8 @@ For every VMI on the maintenance node, confirm all of the following:
 - No migration is already in progress for the VM.
 
   ```bash
-  kubectl get vm <vm-name> -n <vm-namespace> -o jsonpath='runStrategy={.spec.runStrategy}{"\n"}evictionStrategy={.spec.template.spec.evictionStrategy}{"\n"}'
-  kubectl get vmi <vmi-name> -n <vm-namespace> -o jsonpath='{.metadata.uid}{"\n"}{.status.phase}{"\n"}{.status.nodeName}{"\n"}{.status.conditions}{"\n"}'
+  kubectl get vm <vm-name> -n <vm-namespace> -o jsonpath='runStrategy={.spec.runStrategy}{"\n"}templateEvictionStrategy={.spec.template.spec.evictionStrategy}{"\n"}'
+  kubectl get vmi <vmi-name> -n <vm-namespace> -o jsonpath='uid={.metadata.uid}{"\n"}phase={.status.phase}{"\n"}node={.status.nodeName}{"\n"}evictionStrategy={.spec.evictionStrategy}{"\n"}'
   kubectl get vmi <vmi-name> -n <vm-namespace> -o jsonpath='{range .status.conditions[?(@.type=="LiveMigratable")]}LiveMigratable={.status} reason={.reason} message={.message}{"\n"}{end}'
   kubectl get pvc -n <vm-namespace>
   kubectl get virtualmachineinstancemigration -n <vm-namespace>
@@ -84,19 +227,24 @@ node work. Do not change the VM to `LiveMigrateIfPossible` just to make a drain
 finish: when migration is unavailable, that strategy falls back to ordinary
 eviction and can stop or restart the VM.
 
-### Check the cluster default without changing it
+### Confirm the cluster default without changing it
 
-The ACP 4.4 HCO v1 field is
-`spec.virtualization.evictionStrategy`. A VM-level strategy takes precedence.
-On a multi-worker cluster the usual default is `LiveMigrate`, but verify the
-installed resource before relying on a default. Do not patch the cluster-wide
-HCO setting as part of an individual node-maintenance window; a change there
-affects every VMI and triggers reconciliation.
+A VM-level strategy takes precedence over the cluster default. On a
+multi-worker cluster the usual default is `LiveMigrate`, but verify the
+installed resource and the HCO API path selected above before relying on it.
+Do not patch the cluster-wide HCO setting as part of an individual
+node-maintenance window; a change there affects every VMI and triggers
+reconciliation.
 
 ```bash
+# Use the v1 path when discovery/explain reports it.
 kubectl get hyperconverged kubevirt-hyperconverged -n kubevirt \
   -o jsonpath='{.spec.virtualization.evictionStrategy}{"\n"}'
-kubectl explain hyperconverged.spec.virtualization.evictionStrategy
+# If only the v1beta1 root path is served, inspect this field instead.
+kubectl get hyperconverged.v1beta1.hco.kubevirt.io kubevirt-hyperconverged -n kubevirt \
+  -o jsonpath='{.spec.evictionStrategy}{"\n"}'
+kubectl get kubevirt -n kubevirt \
+  -o jsonpath='{range .items[*]}{.metadata.name}{" evictionStrategy="}{.spec.configuration.evictionStrategy}{"\n"}{end}'
 ```
 
 The HCO strategies have different operational consequences:
