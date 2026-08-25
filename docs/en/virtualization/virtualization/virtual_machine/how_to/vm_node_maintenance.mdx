@@ -1,0 +1,189 @@
+---
+weight: 25
+i18n:
+  title:
+    en: KubeVirt Node Maintenance
+    zh: KubeVirt 节点维护
+---
+
+# KubeVirt Node Maintenance
+
+This procedure is for an ACP 4.4.0 cluster with at least two worker nodes. It
+uses KubeVirt live migration when a node is drained, so a running VM can keep
+serving traffic while its `virt-launcher` Pod is recreated on another node.
+
+> The commands in this page are intentionally version-aware. Run the schema
+> checks before relying on a field: KubeVirt and Kubernetes API versions can
+> change the accepted fields and default values.
+
+## Prerequisites
+
+- The cluster has two or more schedulable worker nodes and virtualization is
+  healthy.
+- The VM uses storage and devices that support live migration. PVC-backed
+  disks normally need shared `ReadWriteMany` storage; `ReadWriteOnce`, host
+  devices, and some network configurations can make a VM non-migratable.
+- The VM has a controller-managed run strategy (`Always` or an ACP VM with
+  `spec.running: true`) and an eviction strategy of `LiveMigrate` or
+  `LiveMigrateIfPossible`.
+- A node failure procedure has a fencing mechanism. Never force-delete a
+  launcher Pod while the old node might still be running the guest.
+
+Record the versions and confirm that the fields used by this page exist:
+
+```bash
+kubectl version -o yaml | sed -n '/serverVersion:/,/^[^ ]/p'
+
+KUBEVIRT_NAME=$(kubectl get kubevirt -n kubevirt \
+  -o jsonpath='{.items[0].metadata.name}')
+kubectl get kubevirt "$KUBEVIRT_NAME" -n kubevirt \
+  -o jsonpath='KubeVirt={.status.observedKubeVirtVersion}{"\n"}'
+kubectl get hco kubevirt-hyperconverged -n kubevirt \
+  -o jsonpath='HCO phase={.status.phase} available={.status.conditions[?(@.type=="Available")].status}{"\n"}'
+kubectl explain vm.spec.template.spec.evictionStrategy
+```
+
+ACP 4.4 clusters normally expose the preferred `hco.kubevirt.io/v1beta1`
+shape (`hco.spec.evictionStrategy`). If discovery exposes only the older v1
+shape, use `hco.spec.virtualization.evictionStrategy` instead. Check which
+path is served before changing the HCO; if neither path is discoverable, stop
+the procedure and update this page and its compatibility test for the
+installed API version.
+
+```bash
+if kubectl explain hco.spec.evictionStrategy >/dev/null 2>&1; then
+  echo "using hco.spec.evictionStrategy"
+else
+  if ! kubectl explain hco.spec.virtualization.evictionStrategy; then
+    echo "no supported HCO evictionStrategy path was found" >&2
+    exit 1
+  fi
+  echo "using hco.spec.virtualization.evictionStrategy"
+fi
+```
+
+## Configure the Eviction Strategy
+
+The cluster-level HCO setting is the default for VMIs. A VM-level setting
+overrides it. `LiveMigrate` blocks a drain for a non-migratable VM; use
+`LiveMigrateIfPossible` only when planned downtime for such VMs is acceptable.
+
+Inspect the current setting before changing it:
+
+```bash
+kubectl get vm -A -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,RUNNING:.spec.running,RUN_STRATEGY:.spec.runStrategy,EVICTION:.spec.template.spec.evictionStrategy'
+```
+
+Use exactly one of the following HCO branches, matching the successful
+`kubectl explain` check above. Do not combine the two patch shapes.
+
+Preferred `hco.spec.evictionStrategy` path:
+
+```bash
+kubectl get hco kubevirt-hyperconverged -n kubevirt \
+  -o jsonpath='{.spec.evictionStrategy}{"\n"}'
+kubectl patch hco kubevirt-hyperconverged -n kubevirt --type=merge \
+  -p '{"spec":{"evictionStrategy":"LiveMigrate"}}'
+```
+
+Legacy `hco.spec.virtualization.evictionStrategy` path:
+
+```bash
+kubectl get hco kubevirt-hyperconverged -n kubevirt \
+  -o jsonpath='{.spec.virtualization.evictionStrategy}{"\n"}'
+kubectl patch hco kubevirt-hyperconverged -n kubevirt --type=merge \
+  -p '{"spec":{"virtualization":{"evictionStrategy":"LiveMigrate"}}}'
+```
+
+Wait for HCO and KubeVirt to reconcile, then re-check the status. Set a VM
+override only when that VM has been individually validated:
+
+```bash
+kubectl patch vm <vm-name> -n <vm-namespace> --type=merge \
+  -p '{"spec":{"template":{"spec":{"evictionStrategy":"LiveMigrate"}}}}'
+```
+
+## Planned Node Maintenance
+
+1. Identify the node and the VMIs currently running there:
+
+   ```bash
+   kubectl get nodes -o wide
+   kubectl get vmi -A -o wide
+   kubectl get pod -A -l kubevirt.io=virt-launcher -o wide
+   ```
+
+2. For every VMI on the node, confirm `Ready=True` and
+   `LiveMigratable=True`. Also confirm that its PVCs are bound and usable from
+   another worker:
+
+   ```bash
+   kubectl get vmi <vmi-name> -n <vm-namespace> -o jsonpath='{.status.conditions}{"\n"}'
+   kubectl get pvc -n <vm-namespace>
+   ```
+
+3. Cordon and drain the node. The eviction API invokes the configured
+   KubeVirt eviction strategy; do not add `--force` for a planned maintenance:
+
+   ```bash
+   kubectl cordon <node-name>
+   kubectl drain <node-name> --ignore-daemonsets --delete-emptydir-data \
+     --timeout=30m
+   ```
+
+4. In a second terminal, watch the migration and the VMI placement:
+
+   ```bash
+   kubectl get vmim -A -w
+   kubectl get vmi -A -o wide -w
+   kubectl get pod -A -l kubevirt.io=virt-launcher -o wide -w
+   ```
+
+   A successful migration has a `VirtualMachineInstanceMigration` phase of
+   `Succeeded`, a new `virt-launcher` node, and the VM remains `Running`.
+
+5. Perform the node work only after all VMIs and other important workloads
+   have left the node. When the node is healthy again, make it schedulable:
+
+   ```bash
+   kubectl uncordon <node-name>
+   kubectl get node <node-name>
+   ```
+
+## Unexpected Node Failure
+
+KubeVirt cannot distinguish a powered-off node from a temporary network
+partition. Automatically recreating a VM before the old guest is fenced can
+create two copies of the same VM. For an unexpected failure:
+
+1. Mark the node unavailable and verify the out-of-band or cluster fencing
+   system has isolated it from storage and the network.
+2. Inspect the node, VMI, launcher Pod, and volume attachments. Preserve the
+   output for the incident record:
+
+   ```bash
+   kubectl get node <node-name> -o yaml
+   kubectl get vmi -A -o wide
+   kubectl get pod -A -l kubevirt.io=virt-launcher -o wide
+   kubectl get volumeattachment -o wide
+   ```
+
+3. Only after fencing is confirmed, follow the cluster's node-remediation
+   runbook to remove stale VMI/launcher and volume-attachment objects. Then
+   verify that the VM controller creates one replacement VMI on a healthy node.
+   Do not use `kubectl delete pod --force` as a first response.
+
+## Verification Checklist
+
+Capture the following evidence for a release validation or an E2E test:
+
+- Kubernetes server version and `.status.observedKubeVirtVersion`.
+- HCO `Available=True` and the effective eviction strategy.
+- Source node and target node from VMI/launcher Pod status.
+- A `VirtualMachineInstanceMigration` reaching `Succeeded` (or an explicit,
+  expected failure reason).
+- VM remains `Running` and exactly one launcher Pod is active after migration.
+
+These checks should be run on every ACP/KubeVirt upgrade. A missing
+`kubectl explain` field, changed condition type, or changed migration phase is
+a documentation compatibility failure, not evidence that the VM migrated.
