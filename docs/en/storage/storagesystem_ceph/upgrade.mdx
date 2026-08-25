@@ -1,0 +1,149 @@
+---
+weight: 25
+queries:
+  - how to upgrade Alauda Build of Rook-Ceph
+  - set Rook-Ceph Subscription installPlanApproval to Manual
+  - patch CephCluster cephVersion image after Operator upgrade
+  - approve InstallPlan for rook-operator
+---
+
+# Upgrade
+
+Use this procedure when you publish a new **Alauda Build of Rook-Ceph** Operator version into OperatorHub on an existing internal-mode cluster.
+
+The Operator CSV upgrade and the Ceph data-plane upgrade are two separate steps. Approving the Operator `InstallPlan` updates the Rook Operator and CSI components. It does **not** change `CephCluster.spec.cephVersion.image`. Ceph daemons keep the previous image until you patch that field.
+
+:::warning
+Set the Operator **Upgrade Strategy** to **Manual** before you upload the new package. If the `Subscription` is `Automatic`, OLM starts the Operator upgrade as soon as the new version appears in the catalog, before you are ready to patch the Ceph image.
+:::
+
+## Before you start
+
+- This page is for **internal mode** (a local Ceph cluster in the current cluster). External-mode clusters do not run local Ceph daemons; complete the Operator CSV upgrade only and do not patch a local Ceph image on a `CephCluster` with `spec.external.enable: true`.
+- Confirm `CephCluster` is `Ready` and `status.ceph.health` is `HEALTH_OK`.
+- Download the new **Alauda Build of Rook-Ceph** Operator package that matches the cluster architecture.
+- Identify the namespace of the Rook Operator. The default namespace created by the Distributed Storage wizard is `rook-ceph`.
+- Do not edit generated CSV manifests as a persistent customization. Subsequent OLM reconciles can overwrite those edits. See [Architecture](./architecture.mdx).
+
+## Procedure
+
+### 1. Set the Operator upgrade strategy to Manual
+
+Change `Subscription.spec.installPlanApproval` to `Manual` **before** the new Operator version is uploaded.
+
+From the console:
+
+1. Log in and switch to the **Administrator** view.
+2. Click **Marketplace** > **OperatorHub**.
+3. Open **Alauda Build of Rook-Ceph**.
+4. Set **Upgrade Strategy** to **Manual**. If the page does not expose this field after installation, use `kubectl`.
+
+With `kubectl`:
+
+```bash
+kubectl -n rook-ceph get subscription
+```
+
+Patch the Rook Operator `Subscription`. Replace `rook-operator` if `kubectl get subscription` shows a different name:
+
+```bash
+kubectl -n rook-ceph patch subscription rook-operator --type merge \
+  -p '{"spec":{"installPlanApproval":"Manual"}}'
+```
+
+Confirm:
+
+```bash
+kubectl -n rook-ceph get subscription rook-operator \
+  -o jsonpath='{.spec.installPlanApproval}{"\n"}'
+```
+
+The output must be `Manual`.
+
+### 2. Upload the new Operator package
+
+Upload the new **Alauda Build of Rook-Ceph** package with `violet`, then confirm the target version is visible in OperatorHub.
+
+Follow [Upload Packages](../../extend/upload_package.mdx) and the OperatorHub steps in [Operator](../../extend/operator.mdx).
+
+After the upload succeeds, OperatorHub shows the new version as available. Do not approve the upgrade yet if the `Subscription` was still `Automatic` when you uploaded the package. Confirm `installPlanApproval` is `Manual` first.
+
+### 3. Approve the Operator upgrade
+
+OLM creates an `InstallPlan` for the new CSV. Approve it only after the strategy is `Manual` and you are ready to upgrade the Operator control plane.
+
+From the console:
+
+1. Open **Marketplace** > **OperatorHub** > **Alauda Build of Rook-Ceph**.
+2. Approve the pending upgrade.
+
+With `kubectl`:
+
+```bash
+kubectl -n rook-ceph get subscription rook-operator \
+  -o jsonpath='{.status.state}{"\n"}{.status.installedCSV}{"\n"}{.status.currentCSV}{"\n"}{.status.installPlanRef.name}{"\n"}'
+```
+
+`UpgradePending` and `InstallPlanPending=True` mean the plan is waiting for approval. Approve it:
+
+```bash
+PLAN="$(kubectl -n rook-ceph get subscription rook-operator -o jsonpath='{.status.installPlanRef.name}')"
+kubectl -n rook-ceph patch installplan "$PLAN" --type merge \
+  -p '{"spec":{"approved":true}}'
+```
+
+Wait until the new CSV is `Succeeded` and the `Subscription` is `AtLatestKnown`:
+
+```bash
+kubectl -n rook-ceph get csv
+kubectl -n rook-ceph get subscription rook-operator \
+  -o jsonpath='{.status.state}{"\t"}{.status.installedCSV}{"\n"}'
+```
+
+At this point the Rook Operator and CSI images are on the new version. Ceph monitor, manager, OSD, and MDS pods may still use the previous Ceph image.
+
+### 4. Patch the Ceph version on CephCluster
+
+Copy the Ceph daemon image from the new CSV `relatedImages` list. Use the image that belongs to the Ceph daemons, not the Rook Operator image and not a CSI image.
+
+```bash
+CSV="$(kubectl -n rook-ceph get subscription rook-operator -o jsonpath='{.status.installedCSV}')"
+kubectl -n rook-ceph get csv "$CSV" \
+  -o jsonpath='{range .spec.relatedImages[*]}{.image}{"\n"}{end}'
+```
+
+List `CephCluster` objects and patch `spec.cephVersion.image` to that Ceph image. Replace `<cephcluster-name>` and `<ceph-image-from-csv>`:
+
+```bash
+kubectl -n rook-ceph get cephcluster
+
+kubectl -n rook-ceph patch cephcluster <cephcluster-name> --type merge \
+  -p '{"spec":{"cephVersion":{"image":"<ceph-image-from-csv>"}}}'
+```
+
+The source of the image value is the new CSV `relatedImages` list, not a UI display name.
+
+### 5. Verify the data plane
+
+Wait until `CephCluster` is `Ready` and healthy, and the Ceph daemon pods use the patched image:
+
+```bash
+kubectl -n rook-ceph get cephcluster <cephcluster-name> \
+  -o jsonpath='phase={.status.phase} health={.status.ceph.health} image={.spec.cephVersion.image}{"\n"}'
+
+kubectl -n rook-ceph get pods -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .spec.containers[*]}{.image}{" "}{end}{"\n"}{end}'
+```
+
+Confirm:
+
+- `phase=Ready` and `health=HEALTH_OK`.
+- `spec.cephVersion.image` matches the Ceph image from the new CSV.
+- `rook-ceph-mon-*`, `rook-ceph-mgr-*`, and `rook-ceph-osd-*` pods (and MDS or RGW pods, if present) use that Ceph image.
+- Existing PVCs remain `Bound`.
+
+## Related topics
+
+- [Architecture](./architecture.mdx) — OLM upgrade overview
+- [Upload Packages](../../extend/upload_package.mdx) — upload the Operator package
+- [Operator](../../extend/operator.mdx) — `Subscription`, `InstallPlan`, and approval strategy
+- [Deploying in Internal Mode](./installation/create_service_stand.mdx) — install-time **Upgrade Strategy**
