@@ -147,32 +147,19 @@ The following fields exist in the chart but are not surfaced as plugin install p
 
 | Chart field | Default | Purpose |
 | --- | --- | --- |
-| `etcdEncryption.deterministic.activationPolicy` | `timed-approval` | Controls how a new derived key becomes active. `timed-approval` waits for a delay before activation. |
-| `etcdEncryption.deterministic.approvalDelay` | `30m` | Delay applied under `timed-approval`. The plugin form maps this as `approval_delay_minutes` (integer minutes) internally. |
+| `etcdEncryption.deterministic.activationPolicy` | `timed-approval` | Controls how a new derived key becomes active. Set to `manual` for Global clusters — see [Approving a Deterministic Key Rotation](#approving-a-deterministic-key-rotation). |
+| `etcdEncryption.deterministic.approvalDelay` | `30m` | Delay applied under `timed-approval`. Only relevant when `activationPolicy` is `timed-approval`. |
 | `etcdEncryption.deterministic.derivationAlgorithm` | `hkdf-sha512-v1` | Algorithm used to derive per-revision keys from the root Secret. |
 | `etcdEncryption.deterministic.dimension` | `default` | Additional HKDF domain separator. Leave at the default unless you need to fork a key lineage on purpose. |
 | `etcdEncryption.deterministic.rootSecretRef.namespace` | `kube-system` | Fixed; not exposed by the form. |
 
 </details>
 
-#### Recommended Global configuration
+<Directive type="warning" title="Set activationPolicy to manual for Global clusters">
 
-For a Global Active/Standby pair, use `deterministic` keys and set the activation policy to `manual`. The following is the effective configuration to verify after installation (the plugin form may use different parameter names):
+For a Global Active/Standby pair, explicitly set `activationPolicy` to `manual`. A new key revision must not become active on the Active cluster until an operator has confirmed that the matching revision is ready on the Standby cluster. If `activationPolicy` is omitted, the chart defaults to `timed-approval` with a `30m` delay — see [Timed Approval](#timed-approval) for the risks this carries.
 
-```yaml
-spec:
-  keyStrategy: deterministic
-  deterministic:
-    replicationGroupID: <one-opaque-id-shared-by-both-clusters>
-    dimension: default
-    rootSecretRef:
-      name: etcd-derivation-root
-      namespace: kube-system
-    derivationAlgorithm: hkdf-sha512-v1
-    activationPolicy: manual
-```
-
-`manual` is the recommended policy because a key revision must not become active on the Active cluster until an operator has confirmed that the matching revision is ready on the Standby cluster. If `activationPolicy` is omitted, the controller uses `timed-approval` with a default `30m` delay; explicitly set `manual` for Global clusters.
+</Directive>
 
 ---
 
@@ -258,87 +245,142 @@ status:
   revision: 3
 ```
 
-### Approving a Global rotation
+### Approving a Deterministic Key Rotation
 
-The approval workflow is designed for an operator who can inspect both clusters before allowing a new key to become active. Approval is local to the Active cluster. Do not patch the Standby object, and do not edit a resource `status` field.
+When the encryption manager rotates a key in `deterministic` mode, the new revision enters a `WaitingApproval` phase on the Active cluster. The key does not take effect until the operator approves it. This gate exists because the Active cluster must not encrypt data with a key that the Standby cluster has not yet loaded — otherwise a failover would leave Standby unable to decrypt the new ciphertext.
 
-#### Manual approval (recommended)
+Approval is always performed on the **Active cluster only**. Do not patch the Standby's `EtcdKeySeedBundleState`, and do not edit any resource's `status` field directly.
 
-Use the following workflow for every pending deterministic revision:
+#### Manual Approval (Recommended) \{#manual-approval}
 
-1. Set contexts for the Active and Standby clusters. Use an existing privileged operations account; no additional approver RBAC is required.
-
-   ```bash
-   export ACTIVE_CONTEXT=<active-context>
-   export STANDBY_CONTEXT=<standby-context>
-   export REVISION="$(kubectl --context "$ACTIVE_CONTEXT" get eec default -o jsonpath='{.status.pendingApprovalRevision}')"
-   test -n "$REVISION" && test "$REVISION" != "0" || { echo "No pending revision" >&2; exit 1; }
-   export STATE="seed-bundle-state-${REVISION}"
-   export BUNDLE="seed-bundle-${REVISION}"
-   ```
-
-2. Confirm that the Active cluster is waiting for this revision and that its policy snapshot is `manual`:
-
-   ```bash
-   kubectl --context "$ACTIVE_CONTEXT" get eksbs "$STATE" \
-     -o custom-columns='NAME:.metadata.name,BUNDLE:.spec.bundleName,REVISION:.spec.revision,PHASE:.status.phase,POLICY:.status.approvalPolicy,APPROVED:.spec.approved'
-   ```
-
-   The output must show `PHASE=WaitingApproval`, `POLICY=manual`, `APPROVED=false`, and the expected bundle and revision. Stop if another unexpected revision is also waiting for approval.
-
-3. Confirm that the same revision is fully prepared on Standby before approving it on Active:
-
-   ```bash
-   kubectl --context "$STANDBY_CONTEXT" get eksbs "$STATE" \
-     -o custom-columns='NAME:.metadata.name,BUNDLE:.spec.bundleName,REVISION:.spec.revision,PHASE:.status.phase,PREPARED_AT:.status.preparedAt'
-   ```
-
-   The output must show the expected bundle and revision with `PHASE=Prepared`. If the object is missing, still `Preparing`, or `Failed`, stop and restore the etcd Synchronizer path before approving.
-
-4. Compare the deterministic inputs on both clusters. The `replicationGroupID`, `dimension`, and `derivationAlgorithm` must match exactly; the root Secret must contain the same bytes on both clusters.
-
-   ```bash
-   kubectl --context "$ACTIVE_CONTEXT" get eksb "$BUNDLE" \
-     -o custom-columns='REVISION:.spec.revision,GROUP:.spec.replicationGroupID,DIMENSION:.spec.dimension,ALGORITHM:.spec.derivationAlgorithm'
-   kubectl --context "$STANDBY_CONTEXT" get eksb "$BUNDLE" \
-     -o custom-columns='REVISION:.spec.revision,GROUP:.spec.replicationGroupID,DIMENSION:.spec.dimension,ALGORITHM:.spec.derivationAlgorithm'
-   ```
-
-5. Approve only the Active cluster's local state object:
-
-   ```bash
-   kubectl --context "$ACTIVE_CONTEXT" patch eksbs "$STATE" \
-     --type=merge -p '{"spec":{"approved":true}}'
-   ```
-
-   A successful patch only records the approval. It does not mean that deployment or migration has completed.
-
-6. Wait for the Active cluster to finish activation and migration:
-
-   ```bash
-   kubectl --context "$ACTIVE_CONTEXT" get eksbs "$STATE" \
-     -o custom-columns='REVISION:.spec.revision,PHASE:.status.phase,MESSAGE:.status.message'
-   kubectl --context "$ACTIVE_CONTEXT" get eec default \
-     -o custom-columns='REVISION:.status.revision,MIGRATION_STATE:.status.migration.state,MIGRATION_REVISION:.status.migration.revision'
-   kubectl --context "$ACTIVE_CONTEXT" get eec default \
-     -o go-template='{{range $node, $status := .status.deployStatus}}{{printf "%s\t%s\t%d\t%s\n" $node $status.state $status.revision $status.message}}{{end}}'
-   ```
-
-   The bundle must reach `Active`, `eec/default.status.revision` must equal `$REVISION`, every current control-plane node must report `state=Success` for that revision, and `status.migration.state` must be `Success` for the same revision. A bundle that remains `Activating` is still in progress or retrying after a deployment or migration failure.
-
-#### Timed approval (exception)
-
-`timed-approval` automatically starts activation when the approval deadline expires (the default delay is `30m`). It is not recommended for a Global Active/Standby pair: the deadline can expire while the Standby is still synchronizing or preparing the bundle. The Active cluster may then use the new key while Standby has not loaded the matching key, increasing the risk that a failover cannot read encrypted data.
-
-Use timed approval only when the operations team has an explicit cross-cluster readiness monitor and an agreed response before the deadline. Never treat the absence of an alert as proof that Standby is ready.
-
-If the Standby is not `Prepared`, switch the Active configuration to `manual` before the deadline to apply the emergency brake:
+Set up your shell with contexts for both clusters:
 
 ```bash
-kubectl --context "$ACTIVE_CONTEXT" patch eec default \
-  --type=merge -p '{"spec":{"deterministic":{"activationPolicy":"manual"}}}'
-kubectl --context "$ACTIVE_CONTEXT" get eksbs "$STATE" \
-  -o custom-columns='PHASE:.status.phase,POLICY:.status.approvalPolicy,DEADLINE:.status.approvalDeadline'
+export ACTIVE_CONTEXT=<active-context>
+export STANDBY_CONTEXT=<standby-context>
 ```
 
-Confirm that the current waiting bundle shows `POLICY=manual` and no deadline. Switching the configuration back to `timed-approval` affects only a future bundle; the current bundle remains manual. Do not set `spec.approved=true` merely to clear a timed-approval alert. If the bundle is already `Activating`, the deadline has taken effect; follow the activation and failure checks above and do not assume that changing the policy rolls it back.
+**Step 1 — Identify the pending revision.**
+
+```bash
+kubectl --context "$ACTIVE_CONTEXT" get eksbs \
+  -o custom-columns='NAME:.metadata.name,REVISION:.spec.revision,PHASE:.status.phase,APPROVED:.spec.approved'
+```
+
+Find the row with `PHASE=WaitingApproval` and `APPROVED=false`. Record its revision number:
+
+```bash
+export REVISION=<revision-number>
+export STATE="seed-bundle-state-${REVISION}"
+export BUNDLE="seed-bundle-${REVISION}"
+```
+
+**Step 2 — Verify Standby readiness.**
+
+```bash
+kubectl --context "$STANDBY_CONTEXT" get eksbs "$STATE" \
+  -o custom-columns='REVISION:.spec.revision,PHASE:.status.phase,PREPARED_AT:.status.preparedAt'
+```
+
+The output must show `PHASE=Prepared` for the expected revision. **Stop** if the object is missing, still `Preparing`, or `Failed` — investigate the etcd Synchronizer path before proceeding.
+
+**Step 3 — Cross-check derivation inputs.**
+
+Confirm that `replicationGroupID`, `dimension`, and `derivationAlgorithm` match across both clusters:
+
+```bash
+kubectl --context "$ACTIVE_CONTEXT" get eksb "$BUNDLE" \
+  -o custom-columns='REVISION:.spec.revision,GROUP:.spec.replicationGroupID,DIMENSION:.spec.dimension,ALGORITHM:.spec.derivationAlgorithm'
+kubectl --context "$STANDBY_CONTEXT" get eksb "$BUNDLE" \
+  -o custom-columns='REVISION:.spec.revision,GROUP:.spec.replicationGroupID,DIMENSION:.spec.dimension,ALGORITHM:.spec.derivationAlgorithm'
+```
+
+**Step 4 — Approve.**
+
+```bash
+kubectl --context "$ACTIVE_CONTEXT" patch eksbs "$STATE" \
+  --type=merge -p '{"spec":{"approved":true}}'
+```
+
+The patch records the approval. Activation, deployment to control-plane nodes, and data migration happen asynchronously after this point.
+
+**Step 5 — Confirm activation completes.**
+
+```bash
+kubectl --context "$ACTIVE_CONTEXT" get eksbs "$STATE" \
+  -o custom-columns='REVISION:.spec.revision,PHASE:.status.phase,MESSAGE:.status.message'
+kubectl --context "$ACTIVE_CONTEXT" get eec default \
+  -o custom-columns='REVISION:.status.revision,MIGRATION_STATE:.status.migration.state,MIGRATION_REVISION:.status.migration.revision'
+```
+
+The rotation is complete when:
+
+* The bundle state reaches `PHASE=Active`.
+* `eec/default` shows the new `REVISION` with `MIGRATION_STATE=Success`.
+
+To check per-node deployment progress:
+
+```bash
+kubectl --context "$ACTIVE_CONTEXT" get eec default \
+  -o go-template='{{range $node, $status := .status.deployStatus}}{{printf "%s\t%s\t%d\t%s\n" $node $status.state $status.revision $status.message}}{{end}}'
+```
+
+Every control-plane node must report `state=Success` for the new revision. A bundle that remains `Activating` indicates deployment or migration is still in progress (or retrying after a failure).
+
+#### Timed Approval (Not Recommended) \{#timed-approval}
+
+<Directive type="warning" title="Timed approval risks data loss during failover">
+
+`timed-approval` is **not recommended** for Global Active/Standby pairs. The `approvalDelay` timer (default `30m`) is a local countdown on the Active cluster — it does not check whether the Standby has actually loaded the new key. If etcd synchronization is slow, the Standby network is partitioned, or the Standby control plane is under maintenance, the deadline can expire while the Standby is still unprepared. A failover during this window leaves Standby unable to decrypt data encrypted with the new key.
+
+</Directive>
+
+When `activationPolicy` is set to `timed-approval`, the controller automatically approves the pending revision once `approvalDelay` elapses after the `EtcdKeySeedBundleState` is created. The delay must be long enough for the full Standby preparation pipeline to complete:
+
+| Phase | What happens | Typical duration |
+| --- | --- | --- |
+| Sync | etcd Synchronizer replicates the SeedBundle to Standby | Seconds (depends on cross-region latency) |
+| Reconcile | Standby controller derives the key and updates local EncryptionConfig | Seconds |
+| Deploy | Deployer writes the new provider config to all Standby control-plane nodes | Seconds to minutes (scales with node count) |
+| Reload | Standby kube-apiserver loads the new provider | Seconds to minutes (depends on `--encryption-provider-config-automatic-reload`) |
+
+The default `30m` provides margin for typical single-region deployments with a small control plane. Increase it if your setup involves cross-region replication, large control planes, or clusters without automatic provider reload.
+
+##### Required monitoring
+
+If you choose `timed-approval`, you **must** set up monitoring to detect when the Standby fails to reach `Prepared` before the Active's approval deadline. The encryption manager does not expose Prometheus metrics in the current version, so monitoring must be built on the CRD status fields.
+
+Set up a periodic check (e.g., via a CronJob, an external monitoring script, or a custom Prometheus exporter) that:
+
+1. Lists `EtcdKeySeedBundleState` objects on both clusters and compares their phases:
+
+   ```bash
+   # On Active: find bundles approaching auto-approval
+   kubectl --context "$ACTIVE_CONTEXT" get eksbs \
+     -o custom-columns='REVISION:.spec.revision,PHASE:.status.phase,AGE:.metadata.creationTimestamp'
+
+   # On Standby: check if the same revision is Prepared
+   kubectl --context "$STANDBY_CONTEXT" get eksbs \
+     -o custom-columns='REVISION:.spec.revision,PHASE:.status.phase,PREPARED_AT:.status.preparedAt'
+   ```
+
+2. **Alerts** when any of the following conditions hold:
+   * Active has a bundle in `WaitingApproval` and the corresponding Standby bundle is not `Prepared` — especially as the object's age approaches `approvalDelay`.
+   * The Standby bundle is `Failed`.
+   * The Standby bundle does not exist (etcd Synchronizer may be down).
+
+3. **Response**: if the Standby is not ready before the deadline, switch the Active to `manual` to halt auto-approval:
+
+   ```bash
+   kubectl --context "$ACTIVE_CONTEXT" patch eec default \
+     --type=merge -p '{"spec":{"deterministic":{"activationPolicy":"manual"}}}'
+   ```
+
+   Verify the current pending bundle has switched:
+
+   ```bash
+   kubectl --context "$ACTIVE_CONTEXT" get eksbs "$STATE" \
+     -o custom-columns='REVISION:.spec.revision,PHASE:.status.phase,APPROVED:.spec.approved'
+   ```
+
+   The bundle must still show `APPROVED=false`. Switching back to `timed-approval` later affects only future bundles — the current bundle remains under manual control. If the bundle has already moved to `Activating`, the deadline has already taken effect; follow the [activation checks](#manual-approval) above and do not assume that changing the policy rolls it back.
