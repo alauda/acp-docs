@@ -155,6 +155,25 @@ The following fields exist in the chart but are not surfaced as plugin install p
 
 </details>
 
+#### Recommended Global configuration
+
+For a Global Active/Standby pair, use `deterministic` keys and set the activation policy to `manual`. The following is the effective configuration to verify after installation (the plugin form may use different parameter names):
+
+```yaml
+spec:
+  keyStrategy: deterministic
+  deterministic:
+    replicationGroupID: <one-opaque-id-shared-by-both-clusters>
+    dimension: default
+    rootSecretRef:
+      name: etcd-derivation-root
+      namespace: kube-system
+    derivationAlgorithm: hkdf-sha512-v1
+    activationPolicy: manual
+```
+
+`manual` is the recommended policy because a key revision must not become active on the Active cluster until an operator has confirmed that the matching revision is ready on the Standby cluster. If `activationPolicy` is omitted, the controller uses `timed-approval` with a default `30m` delay; explicitly set `manual` for Global clusters.
+
 ---
 
 ## How it Works
@@ -238,3 +257,88 @@ status:
     state: Success
   revision: 3
 ```
+
+### Approving a Global rotation
+
+The approval workflow is designed for an operator who can inspect both clusters before allowing a new key to become active. Approval is local to the Active cluster. Do not patch the Standby object, and do not edit a resource `status` field.
+
+#### Manual approval (recommended)
+
+Use the following workflow for every pending deterministic revision:
+
+1. Set contexts for the Active and Standby clusters. Use an existing privileged operations account; no additional approver RBAC is required.
+
+   ```bash
+   export ACTIVE_CONTEXT=<active-context>
+   export STANDBY_CONTEXT=<standby-context>
+   export REVISION="$(kubectl --context "$ACTIVE_CONTEXT" get eec default -o jsonpath='{.status.pendingApprovalRevision}')"
+   test -n "$REVISION" && test "$REVISION" != "0" || { echo "No pending revision" >&2; exit 1; }
+   export STATE="seed-bundle-state-${REVISION}"
+   export BUNDLE="seed-bundle-${REVISION}"
+   ```
+
+2. Confirm that the Active cluster is waiting for this revision and that its policy snapshot is `manual`:
+
+   ```bash
+   kubectl --context "$ACTIVE_CONTEXT" get eksbs "$STATE" \
+     -o custom-columns='NAME:.metadata.name,BUNDLE:.spec.bundleName,REVISION:.spec.revision,PHASE:.status.phase,POLICY:.status.approvalPolicy,APPROVED:.spec.approved'
+   ```
+
+   The output must show `PHASE=WaitingApproval`, `POLICY=manual`, `APPROVED=false`, and the expected bundle and revision. Stop if another unexpected revision is also waiting for approval.
+
+3. Confirm that the same revision is fully prepared on Standby before approving it on Active:
+
+   ```bash
+   kubectl --context "$STANDBY_CONTEXT" get eksbs "$STATE" \
+     -o custom-columns='NAME:.metadata.name,BUNDLE:.spec.bundleName,REVISION:.spec.revision,PHASE:.status.phase,PREPARED_AT:.status.preparedAt'
+   ```
+
+   The output must show the expected bundle and revision with `PHASE=Prepared`. If the object is missing, still `Preparing`, or `Failed`, stop and restore the etcd Synchronizer path before approving.
+
+4. Compare the deterministic inputs on both clusters. The `replicationGroupID`, `dimension`, and `derivationAlgorithm` must match exactly; the root Secret must contain the same bytes on both clusters.
+
+   ```bash
+   kubectl --context "$ACTIVE_CONTEXT" get eksb "$BUNDLE" \
+     -o custom-columns='REVISION:.spec.revision,GROUP:.spec.replicationGroupID,DIMENSION:.spec.dimension,ALGORITHM:.spec.derivationAlgorithm'
+   kubectl --context "$STANDBY_CONTEXT" get eksb "$BUNDLE" \
+     -o custom-columns='REVISION:.spec.revision,GROUP:.spec.replicationGroupID,DIMENSION:.spec.dimension,ALGORITHM:.spec.derivationAlgorithm'
+   ```
+
+5. Approve only the Active cluster's local state object:
+
+   ```bash
+   kubectl --context "$ACTIVE_CONTEXT" patch eksbs "$STATE" \
+     --type=merge -p '{"spec":{"approved":true}}'
+   ```
+
+   A successful patch only records the approval. It does not mean that deployment or migration has completed.
+
+6. Wait for the Active cluster to finish activation and migration:
+
+   ```bash
+   kubectl --context "$ACTIVE_CONTEXT" get eksbs "$STATE" \
+     -o custom-columns='REVISION:.spec.revision,PHASE:.status.phase,MESSAGE:.status.message'
+   kubectl --context "$ACTIVE_CONTEXT" get eec default \
+     -o custom-columns='REVISION:.status.revision,MIGRATION_STATE:.status.migration.state,MIGRATION_REVISION:.status.migration.revision'
+   kubectl --context "$ACTIVE_CONTEXT" get eec default \
+     -o go-template='{{range $node, $status := .status.deployStatus}}{{printf "%s\t%s\t%d\t%s\n" $node $status.state $status.revision $status.message}}{{end}}'
+   ```
+
+   The bundle must reach `Active`, `eec/default.status.revision` must equal `$REVISION`, every current control-plane node must report `state=Success` for that revision, and `status.migration.state` must be `Success` for the same revision. A bundle that remains `Activating` is still in progress or retrying after a deployment or migration failure.
+
+#### Timed approval (exception)
+
+`timed-approval` automatically starts activation when the approval deadline expires (the default delay is `30m`). It is not recommended for a Global Active/Standby pair: the deadline can expire while the Standby is still synchronizing or preparing the bundle. The Active cluster may then use the new key while Standby has not loaded the matching key, increasing the risk that a failover cannot read encrypted data.
+
+Use timed approval only when the operations team has an explicit cross-cluster readiness monitor and an agreed response before the deadline. Never treat the absence of an alert as proof that Standby is ready.
+
+If the Standby is not `Prepared`, switch the Active configuration to `manual` before the deadline to apply the emergency brake:
+
+```bash
+kubectl --context "$ACTIVE_CONTEXT" patch eec default \
+  --type=merge -p '{"spec":{"deterministic":{"activationPolicy":"manual"}}}'
+kubectl --context "$ACTIVE_CONTEXT" get eksbs "$STATE" \
+  -o custom-columns='PHASE:.status.phase,POLICY:.status.approvalPolicy,DEADLINE:.status.approvalDeadline'
+```
+
+Confirm that the current waiting bundle shows `POLICY=manual` and no deadline. Switching the configuration back to `timed-approval` affects only a future bundle; the current bundle remains manual. Do not set `spec.approved=true` merely to clear a timed-approval alert. If the bundle is already `Activating`, the deadline has taken effect; follow the activation and failure checks above and do not assume that changing the policy rolls it back.
