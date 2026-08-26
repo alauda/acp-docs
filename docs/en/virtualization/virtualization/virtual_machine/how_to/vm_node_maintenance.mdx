@@ -9,10 +9,11 @@ i18n:
 # KubeVirt Node Maintenance
 
 Use this runbook for **planned maintenance of one healthy worker node**. It
-cordons the node, asks Kubernetes to drain it, and lets KubeVirt evacuate
-live-migratable VMs before the node is taken out of service. The VM remains
-running during a successful live migration, although a short guest pause and
-additional CPU, memory, and network usage are possible.
+cordons the node, asks Kubernetes to drain it, and lets KubeVirt evacuate the
+VMs before the node is taken out of service. A VM that can live migrate stays
+running throughout, although a short guest pause and additional CPU, memory,
+and network usage are possible. A VM that cannot live migrate is restarted on
+another node, so identify those before the window rather than during it.
 
 This runbook is not a recovery procedure for a failed or partitioned node. In
 that case, fence the node first and follow [VM Migration and Recovery from a
@@ -50,28 +51,45 @@ pod/virt-launcher-centos-vm-qvkfn evicted
 The effective eviction strategy is read from the VMI first and otherwise from
 the KubeVirt cluster configuration:
 
-| Strategy | Drain behavior | Use for low-impact maintenance |
+| Strategy | Drain behavior | When to use it |
 | --- | --- | --- |
-| `LiveMigrate` | Migrates a live-migratable VMI. A non-migratable VMI blocks the drain. | **Recommended**. Fix or separately handle every blocked VMI. |
-| `LiveMigrateIfPossible` | Migrates when possible; otherwise evicts and follows the VM run strategy. | Use only when an outage is explicitly approved. |
-| `None` | Does not request migration. | Not suitable for keeping the VM running. |
+| `LiveMigrateIfPossible` | Migrates every migratable VMI; evicts the rest and follows their run strategy. The drain always completes. | **Recommended, and what the bundle ships.** Know which VMs cannot migrate and accept their restart. |
+| `LiveMigrate` | Migrates a live-migratable VMI. A single non-migratable VMI blocks the drain indefinitely. | Only when no VM may be stopped and blocking node maintenance is the lesser risk. |
+| `None` | Does not request migration; the VM is stopped with the node. | Not suitable for keeping the VM running. |
 | `External` | Blocks eviction for an external controller. | Use only with that controller and its runbook. |
 
+In practice VMs become non-migratable for many reasons — RWO storage, host
+devices, certain network bindings, a CPU model the destination cannot satisfy.
+`LiveMigrateIfPossible` keeps those cases from turning a routine node
+maintenance into a blocked one: the VMs that can move are migrated with no
+interruption, and only the ones that genuinely cannot are restarted elsewhere.
+
 :::warning
-**On ACP the cluster-level default is `None`.** HCO derives its default from the
-OpenShift `Infrastructure` resource, which ACP clusters do not have, so
-`hco.status.infrastructureHighlyAvailable` reports `false` even on a multi-node
-cluster and the cluster-level `evictionStrategy` stays `None`. Unless a VM
-carries its own `evictionStrategy`, a drain **stops** that VM instead of
-migrating it. Read the effective values with the commands in step 2 before you
-schedule any maintenance.
+**Check the cluster-level value on an existing cluster; it may be `None`.** The
+bundle ships `spec.evictionStrategy: LiveMigrateIfPossible`, so a fresh install
+is drain-safe. A `HyperConverged` created before that, or created from an empty
+`spec`, has no explicit value — and HCO's own fallback resolves to `None` on
+ACP, because it derives the default from the OpenShift `Infrastructure`
+resource that ACP clusters do not have, leaving
+`hco.status.infrastructureHighlyAvailable` at `false` even on a multi-node
+cluster. On such a cluster a drain **stops** every VM that has no VM-level
+strategy. Read the effective values with the commands in step 2 before you
+schedule any maintenance, and set the cluster-level value if it is still empty
+or `None`:
+
+```bash
+kubectl patch hyperconverged kubevirt-hyperconverged -n kubevirt --type=merge \
+  -p '{"spec":{"evictionStrategy":"LiveMigrateIfPossible"}}'
+```
 :::
 
 ## Before the maintenance window
 
 Do this validation before scheduling the change. A drain is not a test of VM
-compatibility: if a VM cannot migrate, `LiveMigrate` deliberately leaves the
-node undrained.
+compatibility: under `LiveMigrateIfPossible` a VM that cannot migrate is
+restarted on another node without warning you first, and under `LiveMigrate` it
+leaves the node undrained. Either way you want the list of non-migratable VMs
+before the window, not during it.
 
 ### 1. Confirm worker capacity
 
@@ -125,11 +143,13 @@ stop and update this page and its compatibility test for the installed API
 version instead of guessing another field path.
 
 An empty `evictionStrategy` on both the VMI and the VM means the cluster-level
-value applies — and as noted above, that value is `None` on a stock ACP
-cluster.
+value applies — which is what the bundle sets, or `None` on a cluster that
+predates it.
 
-For a VM that must stay running, set `LiveMigrate` in the VM template in its
-source of truth (GitOps manifest, form, or API) before the window. Set
+Most VMs need no VM-level value: inheriting the cluster's
+`LiveMigrateIfPossible` is the intended behavior. Set one explicitly only for a
+VM whose handling must differ from the cluster's, and set it in that VM's source
+of truth (GitOps manifest, form, or API) before the window. Set
 `runStrategy: Always` when the VM must be recreated and started after an
 interruption. Do not add `runStrategy` to a VM that still has the deprecated
 `spec.running` field; update the source manifest and use only one of them.
@@ -141,25 +161,26 @@ spec:
   runStrategy: Always
   template:
     spec:
-      evictionStrategy: LiveMigrate
+      evictionStrategy: LiveMigrateIfPossible
 ```
 
 Keep the VM's existing domain, networks, volumes, and placement settings when
 applying this change. A direct patch is acceptable only when the VM is not
 managed by GitOps or another controller; otherwise update that source of truth.
 
-Changing the VM template does not change an already-running VMI. Recreate or
-restart it during an approved window if its effective VMI strategy is still
-`None` or `LiveMigrateIfPossible`. Never patch a running VMI to force this
-change.
+Changing the VM template does not change an already-running VMI. If a running
+VMI's effective strategy is still `None`, it will be stopped by the drain no
+matter what the VM template now says; recreate or restart that VM during an
+approved window to pick the new value up. Never patch a running VMI to force
+this change.
 
-### 3. Confirm every VMI is migratable
+### 3. List the VMs that cannot migrate
 
-For every VMI currently on the maintenance node, require `Running`,
-`Ready=True`, and `LiveMigratable=True`. Check that PVCs are bound and that
-storage, networks, devices, CPU model, and placement rules allow a destination.
-Shared storage such as RWX is common, but the `LiveMigratable` condition is the
-authoritative check for the installed KubeVirt version.
+For every VMI currently on the maintenance node, read `Ready` and
+`LiveMigratable`. Check that PVCs are bound and that storage, networks, devices,
+CPU model, and placement rules allow a destination. Shared storage such as RWX
+is common, but the `LiveMigratable` condition is the authoritative check for the
+installed KubeVirt version.
 
 ```bash
 kubectl get vmi <vmi-name> -n <vm-namespace> -o wide
@@ -169,9 +190,13 @@ kubectl get pvc -n <vm-namespace>
 kubectl get vmim -n <vm-namespace>
 ```
 
-If any VM is not migratable, stop. Fix it, move it in an approved downtime
-window, or postpone the node work. Do not change it to
-`LiveMigrateIfPossible` merely to bypass the drain.
+A VMI with `LiveMigratable=False` will be **stopped and restarted on another
+node** under `LiveMigrateIfPossible`. That is the intended trade-off — one
+stubborn VM must not block node maintenance — but it is only acceptable when it
+is a known, communicated restart rather than a surprise. For each such VM,
+read the condition's `reason` and `message`, then decide before the window:
+fix the blocker (for example move it to RWX storage), accept the restart and
+tell its owner, or move the VM off the node yourself beforehand.
 
 ### 4. Budget the drain against the migration limits
 
@@ -227,13 +252,19 @@ the drain then reports the VM as still present.
    kubectl get events -A --sort-by=.lastTimestamp
    ```
 
-   For each VM, accept the move only when a matching VMIM is `Succeeded`, its
-   `status.migrationState.sourceNode` is the maintenance node and
-   `targetNode` is another worker, the VMI UID is unchanged, the VMI remains
+   For a VM you expect to migrate, accept the move only when a matching VMIM is
+   `Succeeded`, its `status.migrationState.sourceNode` is the maintenance node
+   and `targetNode` is another worker, the VMI UID is unchanged, the VMI remains
    `Running` and `Ready`, and only one active launcher remains. A changed Pod
    name, a 429 response, or a descheduler/eviction log alone is not migration
    evidence. An **unchanged VMI UID** is the decisive check: a UID that changed
    means the VM was recreated rather than live-migrated.
+
+   Under `LiveMigrateIfPossible` a non-migratable VM produces **no VMIM at all**
+   — it is evicted and recreated, so its VMI UID changes and it briefly leaves
+   `Running`. Confirm that every such VM is on your step 3 list; a VM that
+   restarts without being on that list means the migration failed for a reason
+   you have not accounted for, so investigate before continuing.
 
    After a migration the source launcher stays listed in a `Completed` phase
    for a while. Filter on running Pods so this does not read as a second active
