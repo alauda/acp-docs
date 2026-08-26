@@ -50,11 +50,24 @@ Cluster Plugins**, as described in [Workload Rebalancing
 (Descheduler)](../../../../developer/building_application/operation_maintaining/descheduler.mdx).
 Verify the ModulePlugin and discover the rendered policy ConfigMap across all
 namespaces. The namespace is normally `descheduler`; do not assume
-`kube-system`:
+`kube-system`.
+
+These two checks run against **different clusters**. `ModuleInfo` is served
+only by the `global` (management) cluster; running it against a workload
+cluster fails with `the server doesn't have a resource type "moduleinfo"`. The
+policy ConfigMap and the CronJob or Deployment live on the **workload cluster**
+where the VMs run. Use the matching kubeconfig or context for each command.
+
+On the `global` cluster:
 
 ```bash
 kubectl get moduleinfo -A -l cpaas.io/module-name=descheduler \
   -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,PHASE:.status.phase,VERSION:.spec.version'
+```
+
+On the workload cluster that runs the VMs:
+
+```bash
 kubectl get configmap -A -l app.kubernetes.io/name=descheduler
 kubectl get cronjob,deployment -A -l app.kubernetes.io/name=descheduler
 ```
@@ -76,9 +89,12 @@ OpenShift CR fields to `policy.yaml`.
 
 ## Enable Background Evictions
 
-Inspect the actual CronJob or Deployment arguments. The KubeVirt admission
-webhook may return an asynchronous eviction response, so the workload that
-runs Descheduler must include this feature gate:
+An eviction request for a `virt-launcher` Pod is **always denied with HTTP
+429** by `virt-launcher-eviction-interceptor.kubevirt.io`, which marks the VMI
+for evacuation and lets KubeVirt live-migrate it in the background. The Pod is
+never evicted by that first request. A Descheduler that treats the 429 as a
+failed eviction therefore neither waits for nor tracks the migration it just
+started, so the workload that runs Descheduler must include this feature gate:
 
 ```bash
 kubectl get cronjob,deployment -A -l app.kubernetes.io/name=descheduler \
@@ -95,6 +111,17 @@ reconciled. Do not hand-edit a generated CronJob or Deployment as a permanent
 fix. If the installed package cannot render this feature gate, stop: the
 package is not ready for a KubeVirt rebalance test, even if its generic policy
 is valid.
+
+KubeVirt also recognizes the `requested-by: sigs.k8s.io/descheduler`
+annotation that Descheduler sets on its eviction requests, and records
+`kubevirt.io/eviction-source: descheduler` on the VMI it marks. Use that
+annotation to tell a Descheduler-triggered migration apart from one caused by a
+node drain:
+
+```bash
+kubectl get vmi <vmi-name> -n <vm-namespace> \
+  -o jsonpath='{.metadata.annotations.kubevirt\.io/eviction-source}{"\n"}'
+```
 
 ## Configure a Conservative Raw Policy
 

@@ -29,11 +29,23 @@ KubeVirt's evacuation path and interrupt the guest.
 
 `virt-launcher` is a Kubernetes Pod, but the guest is a KubeVirt VMI. When the
 Kubernetes Eviction API receives an eviction request for a launcher, the
-KubeVirt admission webhook marks a migratable VMI for evacuation. The first
-request commonly returns HTTP 429 because migration has been started; the
-launcher is protected by a PodDisruptionBudget while migration runs. A later
-retry is allowed after the migration completes. `kubectl drain` performs these
-retries automatically.
+`virt-launcher-eviction-interceptor.kubevirt.io` admission webhook marks a
+migratable VMI for evacuation and **denies that request with HTTP 429**, so the
+eviction itself never stops the guest. KubeVirt live-migrates the VMI in the
+background. The eviction is allowed only after the migration has completed and
+the launcher on the source node is no longer the active one. `kubectl drain`
+performs these retries automatically, which is why a 429 during a drain is
+expected progress rather than a failure.
+
+A drain that is migrating a VM prints the interceptor's messages until the
+migration finishes:
+
+```text
+evicting pod default/virt-launcher-centos-vm-qvkfn
+error when evicting pods/"virt-launcher-centos-vm-qvkfn" -n "default" (will retry after 5s): admission webhook "virt-launcher-eviction-interceptor.kubevirt.io" denied the request: Evacuation in progress: Eviction triggered evacuation of VMI "default/centos-vm"
+evicting pod default/virt-launcher-centos-vm-qvkfn
+pod/virt-launcher-centos-vm-qvkfn evicted
+```
 
 The effective eviction strategy is read from the VMI first and otherwise from
 the KubeVirt cluster configuration:
@@ -44,6 +56,16 @@ the KubeVirt cluster configuration:
 | `LiveMigrateIfPossible` | Migrates when possible; otherwise evicts and follows the VM run strategy. | Use only when an outage is explicitly approved. |
 | `None` | Does not request migration. | Not suitable for keeping the VM running. |
 | `External` | Blocks eviction for an external controller. | Use only with that controller and its runbook. |
+
+:::warning
+**On ACP the cluster-level default is `None`.** HCO derives its default from the
+OpenShift `Infrastructure` resource, which ACP clusters do not have, so
+`hco.status.infrastructureHighlyAvailable` reports `false` even on a multi-node
+cluster and the cluster-level `evictionStrategy` stays `None`. Unless a VM
+carries its own `evictionStrategy`, a drain **stops** that VM instead of
+migrating it. Read the effective values with the commands in step 2 before you
+schedule any maintenance.
+:::
 
 ## Before the maintenance window
 
@@ -71,10 +93,9 @@ been approved.
 
 For each VMI on the node, inspect the explicit VMI/VM value. If it is empty,
 inspect the installed KubeVirt configuration; do not assume a value from the
-ACP release number. In ACP 4.4's served `v1beta1` schema the HCO field is
-`spec.evictionStrategy`; older or alternate served schemas can place it under
-`spec.virtualization.evictionStrategy`. Use API discovery and `kubectl explain`
-to confirm both the served version and the field path before reading or changing it.
+ACP release number. The HCO field is `spec.evictionStrategy`. Discover the
+served CRD version rather than hard-coding it, so the check keeps working if a
+later release serves a different version.
 
 ```bash
 kubectl get vmi <vmi-name> -n <vm-namespace> \
@@ -91,19 +112,21 @@ HCO_VERSION="$(
     | awk '$2 == "true" { print $1; exit }'
 )"
 test -n "$HCO_VERSION" || { echo "no served HCO CRD version found" >&2; exit 1; }
-HCO_PATH=hyperconverged.spec.evictionStrategy
-if ! kubectl explain "$HCO_PATH" --api-version="hco.kubevirt.io/${HCO_VERSION}" >/dev/null 2>&1; then
-  HCO_PATH=hyperconverged.spec.virtualization.evictionStrategy
-fi
-kubectl explain "$HCO_PATH" \
+kubectl explain hyperconverged.spec.evictionStrategy \
   --api-version="hco.kubevirt.io/${HCO_VERSION}"
+kubectl get hyperconverged kubevirt-hyperconverged -n kubevirt \
+  -o jsonpath='hco evictionStrategy={.spec.evictionStrategy}{" HA="}{.status.infrastructureHighlyAvailable}{"\n"}'
 ```
 
-Do not hard-code `hco.kubevirt.io/v1` or a single field path in this command.
-The ACP 4.4 CRD is served as `hco.kubevirt.io/v1beta1`; a later release can
-serve another version or move the field. The command selects the served
-storage version, probes the current root path, and falls back to the nested
-path before calling `kubectl explain`.
+On ACP 4.4 the CRD is served as `hco.kubevirt.io/v1beta1` and the command above
+prints the `None`/`LiveMigrate`/`LiveMigrateIfPossible`/`External` enum. If
+`kubectl explain` cannot resolve `spec.evictionStrategy` on the served version,
+stop and update this page and its compatibility test for the installed API
+version instead of guessing another field path.
+
+An empty `evictionStrategy` on both the VMI and the VM means the cluster-level
+value applies — and as noted above, that value is `None` on a stock ACP
+cluster.
 
 For a VM that must stay running, set `LiveMigrate` in the VM template in its
 source of truth (GitOps manifest, form, or API) before the window. Set
@@ -150,6 +173,28 @@ If any VM is not migratable, stop. Fix it, move it in an approved downtime
 window, or postpone the node work. Do not change it to
 `LiveMigrateIfPossible` merely to bypass the drain.
 
+### 4. Budget the drain against the migration limits
+
+The migration settings decide whether a drain can finish inside its timeout.
+KubeVirt migrates a limited number of VMs out of one node at a time, so a node
+with many VMs drains in waves, not in parallel:
+
+```bash
+kubectl get hyperconverged kubevirt-hyperconverged -n kubevirt \
+  -o jsonpath='{.spec.liveMigrationConfig}{"\n"}'
+kubectl get kubevirt -n kubevirt \
+  -o jsonpath='{range .items[*]}{.spec.configuration.migrations}{"\n"}{end}'
+```
+
+The defaults are `parallelOutboundMigrationsPerNode: 2`,
+`parallelMigrationsPerCluster: 5`, `completionTimeoutPerGiB: 150`, and
+`progressTimeout: 150`. With the default of two outbound migrations per node,
+draining ten VMs takes at least five waves; size `--timeout` accordingly, or
+raise the limits in `hco.spec.liveMigrationConfig` for the maintenance window
+and restore them afterwards. A migration that exceeds
+`completionTimeoutPerGiB` or stalls past `progressTimeout` is cancelled, and
+the drain then reports the VM as still present.
+
 ## Drain the node
 
 1. Record the node name, each VMI UID, and current VMI node before changing the
@@ -187,7 +232,17 @@ window, or postpone the node work. Do not change it to
    `targetNode` is another worker, the VMI UID is unchanged, the VMI remains
    `Running` and `Ready`, and only one active launcher remains. A changed Pod
    name, a 429 response, or a descheduler/eviction log alone is not migration
-   evidence.
+   evidence. An **unchanged VMI UID** is the decisive check: a UID that changed
+   means the VM was recreated rather than live-migrated.
+
+   After a migration the source launcher stays listed in a `Completed` phase
+   for a while. Filter on running Pods so this does not read as a second active
+   launcher:
+
+   ```bash
+   kubectl get pod -A -l kubevirt.io=virt-launcher -o wide \
+     --field-selector=status.phase=Running
+   ```
 
 5. Start OS or hardware work only after `kubectl drain` reports success and no
    VMI or launcher Pod is assigned to the node:
