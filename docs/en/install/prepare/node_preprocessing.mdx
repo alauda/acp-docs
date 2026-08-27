@@ -107,9 +107,10 @@ The following is the list of checks:
   - ✅ The machine's grub boot configuration must have the `transparent_hugepage=never` parameter.
   - ✅ Check whether the kernel modules `ip_vs`, `ip_vs_rr`, `ip_vs_wrr`, and `ip_vs_sh` are enabled.
   - ⚠️ If the `global` cluster plans to use `Kube-OVN` CNI, the kernel modules `geneve` and `openvswitch` must be enabled.
-  - ✅ SELinux, AppArmor, and the host firewall must be disabled, unless your security policy requires one of them to stay enabled. In that case the node must be configured as described in [Hardened Node Security Configuration](#hardened_node_security) before you install the platform.
-    - `init.sh` disables all three. To keep one of them enabled, pass the matching `--skip-` argument to `init.sh` instead of turning the mechanism back on afterwards.
-    - Keeping a mechanism enabled is a non-default configuration. The platform does not manage the traditional operating system, so an enabled security mechanism can cause unexpected failures on the node or in the cluster. You are responsible for operating and troubleshooting the nodes in this configuration.
+  - ✅ SELinux and AppArmor must be disabled. They cannot be kept enabled on a node that runs a traditional operating system; see [Why SELinux and AppArmor Must Be Disabled](#selinux_apparmor_disabled).
+  - ✅ The host firewall must be disabled, unless your security policy requires it to stay enabled. In that case the node must be configured as described in [Hardened Node Security Configuration](#hardened_node_security) before you install the platform.
+    - `init.sh` disables the host firewall. To keep it enabled, pass the matching `--skip-` argument to `init.sh` instead of turning it back on afterwards.
+    - Keeping the host firewall enabled is a non-default configuration. The platform does not manage the traditional operating system, so an enabled host firewall can cause unexpected failures on the node or in the cluster. You are responsible for operating and troubleshooting the nodes in this configuration.
     - When the host firewall is enabled, you configure and maintain the port rules on every node. For the ports that the platform requires, see [Communication Matrix](./communication_matrix.mdx).
   - ✅ Disable `swap` .
 
@@ -161,58 +162,61 @@ The following is the list of checks:
 
 ## Appendix
 
+### Why SELinux and AppArmor Must Be Disabled \{#selinux_apparmor_disabled}
+
+On a node that runs a traditional operating system, SELinux and AppArmor must be disabled. This is a platform requirement for this release, not a hardening recommendation. `init.sh` disables both, and the node join procedure disables them again when a node joins a cluster.
+
+**SELinux.** Platform components mount host paths into containers. The image registry installer bind-mounts the host `/proc/mounts` file into its container, and the registry and object storage components keep their data under host directories such as `/cpaas` and `/etc/kubernetes`, which carry the operating system's default file labels. On a traditional operating system the container runtime is configured without SELinux labeling, so these mounts are evaluated against the host policy, and they are denied when SELinux runs in `enforcing` mode. The container runtime then fails to create the container before its process starts, the image registry component never finishes installing, and the platform installation or upgrade stops.
+
+`permissive` mode is not an alternative: it changes what is logged, not the requirement. A node that is switched back to `enforcing` after the installation is outside the supported configuration.
+
+**AppArmor.** Node preparation disables AppArmor, and the platform is not validated with AppArmor profiles enforced on cluster nodes. Running a node with AppArmor enabled is outside the supported configuration for this release.
+
+A hardened operating system profile, such as the STIG profile provided by Ubuntu Security Guide, enables these mechanisms. Applying such a profile to a cluster node is outside the supported configuration for the same reason.
+
+**If your security policy requires these mechanisms to stay enabled.** Use Alauda OS, the immutable operating system delivered with the platform. On Alauda OS, SELinux and the host firewall are enabled by default, and the platform maintains the policy and the port rules for you. See <ExternalSiteLink name="immutable-infra" href="/global/install.html" children="the Immutable Infrastructure documentation" />.
+
+Support for running Red Hat Enterprise Linux 9.6 with SELinux in `enforcing` mode is planned for a future release. Contact technical support for its status.
+
 ### Hardened Node Security Configuration \{#hardened_node_security}
 
-Use this section only when a mandatory security policy, such as a STIG baseline, requires SELinux, AppArmor, or a host firewall to stay enabled on cluster nodes. Keeping all three disabled is the default and recommended node configuration, and it is what `init.sh` produces when you run it without arguments. Enabling any of them is a non-default configuration that you own, so validate it in a non-production environment before you apply it to production nodes.
+Use this section only when a mandatory security policy, such as a STIG baseline, requires a host firewall to stay enabled on cluster nodes. Keeping the host firewall disabled is the default and recommended node configuration, and it is what `init.sh` produces when you run it without arguments. Enabling it is a non-default configuration that you own, so validate it in a non-production environment before you apply it to production nodes.
 
-#### Keep the Mechanism Enabled Instead of Turning It Back On
+SELinux and AppArmor are a different case: they must stay disabled. See [Why SELinux and AppArmor Must Be Disabled](#selinux_apparmor_disabled).
 
-`init.sh` can skip individual steps. Pass the matching `--skip-` argument so that the script never disables the mechanism your policy requires:
+#### Keep the Host Firewall Enabled Instead of Turning It Back On
 
-| Mechanism | Argument |
+`init.sh` can skip individual steps. Pass the matching `--skip-` argument so that the script never disables the host firewall your policy requires:
+
+| Implementation | Argument |
 | --- | --- |
-| SELinux | `--skip-disable_selinux` |
-| AppArmor | `--skip-disable_apparmor` |
 | `firewalld` | `--skip-disable_firewalld` |
 | `ufw` | `--skip-disable_ufw` |
 
-Combine the arguments you need. For example, to keep SELinux and `firewalld` enabled on a RHEL node:
+For example, to keep `firewalld` enabled on a RHEL node:
 
 ```bash
-bash init.sh --skip-disable_selinux --skip-disable_firewalld
+bash init.sh --skip-disable_firewalld
 ```
 
-This is the recommended path. The node keeps the state it was installed with, so no file system relabel and no extra reboot are required, and `init.sh` still performs every other node preparation step.
-
-SELinux must end up in `enforcing` mode. `permissive` logs denials without blocking them, so it does not satisfy a policy that requires SELinux enforcement. It is still the safe intermediate step when you recover a node on which SELinux was already disabled, as described below.
+This is the recommended path. The node keeps the state it was installed with, and `init.sh` still performs every other node preparation step.
 
 #### Order of Operations
 
-Configure the node before the platform installation, not after. A policy or firewall problem then surfaces while the installer runs, instead of after the cluster carries workloads.
+Configure the node before the platform installation, not after. A firewall problem then surfaces while the installer runs, instead of after the cluster carries workloads.
 
-1. Run `init.sh` with the `--skip-` arguments for the mechanisms you want to keep enabled.
-2. Configure the host firewall rules if a host firewall is enabled.
-3. Verify the resulting state on the node, for example with `getenforce`, `aa-status`, and the status command of your firewall implementation.
+1. Run `init.sh` with the `--skip-` argument for the host firewall implementation you use.
+2. Configure the host firewall rules.
+3. Verify the resulting state on the node with the status command of your firewall implementation, for example `firewall-cmd --list-all` or `ufw status verbose`.
 4. Install the platform.
 
 #### If a Node Already Ran the Full `init.sh`
 
-Use this path only when the mechanisms were already disabled and you have to turn them back on. It is more work than skipping the steps in the first place.
+Use this path only when the host firewall was already disabled and you have to turn it back on. It is more work than skipping the step in the first place.
 
-**SELinux.** A full `init.sh` run sets `SELINUX=disabled` and reboots the node. While SELinux is disabled the kernel does not maintain security labels, so files written to disk in that state carry no label. Editing `/etc/selinux/config` alone is not enough, and booting straight into `enforcing` on a file system that has only just been relabelled can leave the node unreachable: if the relabel is interrupted, or an early-boot file such as `/etc/shadow` or the `sshd` host keys ends up mislabelled, the node fails to boot or refuses SSH logins. Relabel under `permissive` first, and switch to `enforcing` only after the node comes back cleanly:
-
-1. Set `SELINUX=permissive` in `/etc/selinux/config`.
-2. Run `touch /.autorelabel` to request a full file system relabel on the next boot.
-3. Reboot the node and wait for the relabel to finish. The node reboots again once the relabel completes, and comes up in `permissive` mode.
-4. Review the denials logged during and after the relabel, for example with `ausearch -m avc -ts boot`, and resolve them before you continue.
-5. Set `SELINUX=enforcing` in `/etc/selinux/config` and reboot the node.
-6. Run `getenforce` and confirm that it returns `Enforcing`.
-
-**AppArmor.** A full `init.sh` run stops and disables `apparmor.service`, and it can also add `apparmor=0` to the kernel command line. Starting the service alone is therefore not always sufficient:
-
-1. Check the kernel command line for `apparmor=0`. If it is present, remove it from the boot loader configuration and reboot the node.
-2. Enable and start the service, for example with `systemctl enable --now apparmor`.
-3. Run `aa-status` and confirm that the distribution default profiles are loaded and in enforce mode.
+1. Enable and start the service, for example with `systemctl enable --now firewalld`, or with `ufw enable` on Ubuntu.
+2. Configure the port rules as described below.
+3. Confirm the resulting rule set with `firewall-cmd --list-all` or `ufw status verbose`.
 
 #### Host Firewall
 
@@ -223,12 +227,6 @@ The communication matrix lists the ports that the nodes listen on. Pod-to-Pod an
 </Directive>
 
 The node that runs the installer also uses `8080`, `12080`, `12443`, and `16443`. Allow these ports on that node before you start the installation.
-
-#### Policy Sets
-
-Distribution default policy sets are the supported path: the operating system vendor's `targeted` policy for SELinux, and the distribution default profiles for AppArmor.
-
-Policy sets hardened beyond the distribution defaults, such as the STIG profile provided by Ubuntu Security Guide, and custom SELinux modules or booleans, are outside the validated range. Assess and validate them yourself before you apply them to cluster nodes.
 
 ### Remove Conflicting Packages \{#remove_conflicting_packages}
 
