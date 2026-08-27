@@ -1,0 +1,259 @@
+---
+weight: 27
+i18n:
+  title:
+    en: Rebalance KubeVirt VMs with Descheduler
+    zh: 使用 Descheduler 重新平衡 KubeVirt 虚拟机
+---
+
+# Rebalance KubeVirt VMs with Descheduler
+
+The ACP Descheduler plugin can request eviction of a `virt-launcher` Pod.
+KubeVirt can then live-migrate the VMI instead of stopping the VM. Use this
+as a secondary, bounded rebalancing mechanism. For a failed or intentionally
+maintained node, follow [KubeVirt Node Maintenance](./vm_node_maintenance.mdx)
+first.
+
+This page describes the ACP ModulePlugin package (Alauda Build of Descheduler).
+The installed package version, policy schema, and workload type must be read
+from the live cluster because they can change between ACP releases. The ACP
+package is configured with a policy ConfigMap and a CronJob or Deployment; it
+does not install the OpenShift `KubeDescheduler` CRD. The optional OpenShift
+CRD variant is a separate API and is covered at the end of this page.
+
+## Safety Requirements
+
+The VM must be live-migratable, have storage that is usable from the target
+worker (for example, shared RWX storage), and use `LiveMigrate` or
+`LiveMigrateIfPossible` as its effective eviction strategy. Confirm the VMI
+condition before triggering an eviction:
+
+```bash
+kubectl get vmi <vmi-name> -n <vm-namespace> -o wide
+kubectl get vmi <vmi-name> -n <vm-namespace> \
+  -o jsonpath='{.status.conditions}{"\n"}'
+kubectl get vm <vm-name> -n <vm-namespace> \
+  -o jsonpath='{.spec.template.spec.evictionStrategy}{"\n"}'
+```
+
+Do not enable eviction of Pods with local storage for this test. Keep the
+Descheduler limits to one VM eviction per node, namespace, and test run while
+validating the workflow. A KubeVirt eviction is asynchronous: a successful
+Eviction API request is not evidence that migration has completed. Without
+background-eviction handling, a generic policy such as `LowNodeUtilization`
+can nominate the same launcher again and cause repeated migrations.
+
+## Install and Discover the ACP Plugin
+
+Install **Alauda Build of Descheduler** from **Administrator > Marketplace >
+Cluster Plugins**, as described in [Workload Rebalancing
+(Descheduler)](../../../../developer/building_application/operation_maintaining/descheduler.mdx).
+Verify the ModulePlugin and discover the rendered policy ConfigMap across all
+namespaces. The namespace is normally `descheduler`; do not assume
+`kube-system`.
+
+These two checks run against **different clusters**. `ModuleInfo` is served
+only by the `global` (management) cluster; running it against a workload
+cluster fails with `the server doesn't have a resource type "moduleinfo"`. The
+policy ConfigMap and the CronJob or Deployment live on the **workload cluster**
+where the VMs run. Use the matching kubeconfig or context for each command.
+
+On the `global` cluster:
+
+```bash
+kubectl get moduleinfo -A -l cpaas.io/module-name=descheduler \
+  -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,PHASE:.status.phase,VERSION:.spec.version'
+```
+
+On the workload cluster that runs the VMs:
+
+```bash
+kubectl get configmap -A -l app.kubernetes.io/name=descheduler
+kubectl get cronjob,deployment -A -l app.kubernetes.io/name=descheduler
+```
+
+Read the policy from the ConfigMap and verify that it is a structured
+Descheduler policy before changing it:
+
+```bash
+kubectl get configmap <policy-configmap> -n <descheduler-namespace> \
+  -o jsonpath='{.data.policy\.yaml}'
+```
+
+The document must contain `apiVersion`, `kind: DeschedulerPolicy`, and one or
+more `profiles`. A generic profile in this file only proves that the
+Descheduler policy parses; it does not prove KubeVirt live migration support.
+The raw ACP policy API has no `KubeVirtRelieveAndMigrate` profile,
+`evictionLimits.node`, or `mode: Predictive` field. Do not add those
+OpenShift CR fields to `policy.yaml`.
+
+## Enable Background Evictions
+
+An eviction request for a `virt-launcher` Pod is **always denied with HTTP
+429** by `virt-launcher-eviction-interceptor.kubevirt.io`, which marks the VMI
+for evacuation and lets KubeVirt live-migrate it in the background. The Pod is
+never evicted by that first request. A Descheduler that treats the 429 as a
+failed eviction therefore neither waits for nor tracks the migration it just
+started, so the workload that runs Descheduler must include this feature gate:
+
+```bash
+kubectl get cronjob,deployment -A -l app.kubernetes.io/name=descheduler \
+  -o yaml | grep -E -A1 -- '--feature-gates'
+```
+
+The argument can be rendered as either
+`--feature-gates=EvictionsInBackground=true` or the two-argument form
+`--feature-gates`, `EvictionsInBackground=true`. Check every container in the
+policy-consuming workload, including the Job template used by a CronJob. Set
+the gate through the ModulePlugin/Helm values or the supported plugin
+configuration mechanism, then wait for the CronJob/Deployment to be
+reconciled. Do not hand-edit a generated CronJob or Deployment as a permanent
+fix. If the installed package cannot render this feature gate, stop: the
+package is not ready for a KubeVirt rebalance test, even if its generic policy
+is valid.
+
+KubeVirt also recognizes the `requested-by: sigs.k8s.io/descheduler`
+annotation that Descheduler sets on its eviction requests, and records
+`kubevirt.io/eviction-source: descheduler` on the VMI it marks. Use that
+annotation to tell a Descheduler-triggered migration apart from one caused by a
+node drain:
+
+```bash
+kubectl get vmi <vmi-name> -n <vm-namespace> \
+  -o jsonpath='{.metadata.annotations.kubevirt\.io/eviction-source}{"\n"}'
+```
+
+## Configure a Conservative Raw Policy
+
+Back up the generated ConfigMap before a test. Preserve the existing profile
+and change only the documented policy fields supported by the installed
+Descheduler version. For a temporary test, the upstream `LowNodeUtilization`
+strategy can create an imbalance, but it is not KubeVirt-aware by itself. Keep
+the eviction limits small:
+
+```bash
+kubectl get configmap <policy-configmap> -n <descheduler-namespace> -o yaml \
+  > descheduler-policy.before-vm-rebalance.yaml
+kubectl edit configmap <policy-configmap> -n <descheduler-namespace>
+```
+
+In `data.policy.yaml`, merge a conservative fragment into the existing
+policy. The following fields belong to the raw ACP policy API. The exact
+`apiVersion` must match the policy schema rendered by the installed package:
+
+```yaml
+apiVersion: descheduler/v1alpha2
+kind: DeschedulerPolicy
+maxNoOfPodsToEvictPerNode: 1
+maxNoOfPodsToEvictPerNamespace: 1
+maxNoOfPodsToEvictTotal: 1
+profiles:
+  - name: default
+    pluginConfig:
+      - name: DefaultEvictor
+        args:
+          nodeFit: true
+      - name: LowNodeUtilization
+        args:
+          thresholds:
+            cpu: 20
+            memory: 20
+            pods: 20
+          targetThresholds:
+            cpu: 50
+            memory: 50
+            pods: 50
+    plugins:
+      balance:
+        enabled:
+          - LowNodeUtilization
+```
+
+Do not replace the generated policy wholesale: retain its namespace filters,
+Pod protections, and other strategies unless the test plan explicitly changes
+them. Check that the test launcher is eligible under those protections before
+expecting an eviction. Validate the resulting ConfigMap and let the plugin
+reconcile its workload before starting the VM test. Do not apply an
+`operator.openshift.io/v1 KubeDescheduler` object to this ConfigMap-only
+installation; the API is a different package.
+
+## Validate Rebalancing
+
+Run the test in a disposable namespace with at least two schedulable workers:
+
+1. Record the source worker, VMI UID, effective eviction strategy, and the
+   `LiveMigratable=True` condition.
+2. Create a bounded, reversible imbalance so the Descheduler has a valid
+   destination. Do not remove scheduler safety constraints or use a production
+   node.
+3. Watch the policy workload, VMI, and migration together:
+
+   ```bash
+   kubectl get cronjob,deployment -A -l app.kubernetes.io/name=descheduler
+   kubectl get vmi <vmi-name> -n <vm-namespace> -o wide -w
+   kubectl get vmim -n <vm-namespace> -w
+   kubectl get events -A --sort-by=.lastTimestamp | grep -i -E 'evict|migrat'
+   kubectl logs -n <descheduler-namespace> \
+     -l app.kubernetes.io/name=descheduler --tail=100
+   ```
+
+4. Pass only when the VMI is running on a different worker, one
+   `VirtualMachineInstanceMigration` reaches `Succeeded` with the expected
+   source and target nodes, the VMI UID is unchanged, the VM remains
+   `Running`/`Ready`, and no duplicate active launcher remains. A Descheduler
+   eviction log, an Eviction API response, or a changed Pod name alone is not
+   a migration result.
+
+## Stop and Roll Back
+
+Suspend the CronJob (or scale the Deployment to zero through the supported
+plugin configuration) if migrations repeat or remain pending. Restore the
+backed-up ConfigMap/policy through the same supported configuration path, then
+wait for all migrations to settle. Re-enable the workload only after the
+policy and VM state are healthy:
+
+```bash
+kubectl patch cronjob <descheduler-cronjob> -n <descheduler-namespace> \
+  --type=merge -p '{"spec":{"suspend":true}}'
+kubectl get vmim -A
+```
+
+Do not switch a raw ACP installation to an OpenShift `Predictive` mode. That
+mode belongs to the optional `KubeDescheduler` CRD/operator variant described
+below, not to this chart.
+
+## Optional OpenShift CRD Variant
+
+Some OpenShift environments separately install
+`cluster-kube-descheduler-operator`, which serves the
+`operator.openshift.io/v1 KubeDescheduler` API. Only when that CRD is present
+and its live schema accepts the fields may an administrator use the
+operator-specific KubeVirt profile and background-eviction customization.
+Check the live schema first:
+
+```bash
+kubectl get crd kubedeschedulers.operator.openshift.io
+kubectl explain kubedescheduler.spec.profiles
+kubectl explain kubedescheduler.spec.profileCustomizations.devEnableEvictionsInBackground
+```
+
+The CRD variant is independent of the ACP ConfigMap procedure. Do not report
+CRD profile support for an ACP installation that exposes only `policy.yaml`.
+
+## Compatibility Checks
+
+The HCO compatibility suite backing this page validates, when the optional
+plugin is installed:
+
+- a labeled Descheduler ConfigMap exists and `data.policy.yaml` parses as a
+  `DeschedulerPolicy` with profiles;
+- a CronJob or Deployment consumes that policy and enables
+  `EvictionsInBackground=true`;
+- if the separate `KubeDescheduler` CRD is served, its profile and field schema
+  are checked independently;
+- KubeVirt HCO and VM eviction-strategy paths remain discoverable.
+
+The live rebalance result still requires a real two-worker KubeVirt cluster.
+Record the ACP release, Kubernetes server version, KubeVirt version, HCO
+version, and Descheduler plugin version with each run. Update this page and
+the compatibility test together when any API or argument changes.
