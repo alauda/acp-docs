@@ -1,0 +1,185 @@
+---
+weight: 18
+---
+
+# Configure Gateway API ListenerSet \{#configure_gatewayapi_listenerset}
+
+## Overview
+
+`ListenerSet` is an experimental Gateway API resource that lets a namespace
+provide additional listeners for an existing `Gateway`. ACP supports both
+listeners defined directly on a Gateway and listeners defined in a
+ListenerSet.
+
+A Gateway must explicitly allow ListenerSets. By default, a Gateway accepts no
+external ListenerSets.
+
+## Prerequisites
+
+Before creating a ListenerSet, make sure that:
+
+1. The Envoy Gateway Operator is installed and an `EnvoyGateway` resource is
+   ready.
+2. The cluster is running the ACP 4.5 networking components.
+3. The Gateway API `ListenerSet` CRD is installed.
+4. The `XListenerSet` feature is enabled in the Envoy Gateway configuration.
+5. You have permission to read and modify the target Gateway namespace and
+   the ListenerSet namespace.
+
+Enable the feature in the Envoy Gateway configuration:
+
+```yaml
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyGateway
+spec:
+  gatewayAPI:
+    enabled:
+      - XListenerSet
+```
+
+## Allow ListenerSets on a Gateway
+
+Configure `Gateway.spec.allowedListeners.namespaces.from` to control which
+ListenerSet namespaces may attach to the Gateway.
+
+| Value | Behavior |
+| --- | --- |
+| `None` | Reject all ListenerSets. This is the default. |
+| `Same` | Accept ListenerSets in the Gateway namespace. |
+| `Selector` | Accept ListenerSets in namespaces matching `selector`. |
+| `All` | Accept ListenerSets in every namespace. |
+
+For multi-tenant clusters, prefer `Same` or `Selector`. Use `All` only when
+cross-namespace ownership is intentional.
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: edge
+  namespace: gateway-system
+spec:
+  gatewayClassName: envoy-gateway
+  allowedListeners:
+    namespaces:
+      from: Selector
+      selector:
+        matchLabels:
+          cpaas.io/project: demo
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+```
+
+## Create a ListenerSet
+
+A ListenerSet uses `spec.parentRef` to identify its parent Gateway. Listener
+names only need to be unique within that ListenerSet.
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata:
+  name: app-listeners
+  namespace: app-demo
+spec:
+  parentRef:
+    name: edge
+    namespace: gateway-system
+  listeners:
+    - name: app-http
+      protocol: HTTP
+      port: 8080
+      allowedRoutes:
+        namespaces:
+          from: Same
+```
+
+For a cross-namespace attachment, the Gateway's `allowedListeners` rule must
+accept the ListenerSet namespace. Listener hostname, Route namespace,
+certificate references, and `ReferenceGrant` rules are checked independently.
+
+After applying the resource, check:
+
+- `Gateway.status.attachedListenerSets` for the number of attached
+  ListenerSets;
+- ListenerSet `Accepted` and `Programmed` conditions;
+- per-listener status conditions when an individual listener is rejected.
+
+## Attach a Route
+
+A Route can attach to a Gateway listener or a ListenerSet listener. To attach
+to a ListenerSet, set the parent reference kind to `ListenerSet` and select a
+listener with `sectionName`.
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: app-route
+  namespace: app-demo
+spec:
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: ListenerSet
+      namespace: app-demo
+      name: app-listeners
+      sectionName: app-http
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /app
+      backendRefs:
+        - name: app-service
+          port: 80
+```
+
+The selected ListenerSet listener's `allowedRoutes` controls which Route
+namespaces may attach. A Route is accepted only when its protocol, hostname,
+namespace, and selected listener all match.
+
+The Envoy Gateway `v1.8.0` line supports ListenerSet listeners for the Route
+types and compatible protocols supported by the Gateway API installation,
+including HTTP, gRPC, TCP, UDP, and TLS listeners.
+
+## Policy behavior
+
+ListenerSet listeners are merged into the parent Gateway's configuration, so
+Gateway-level policies without `sectionName` also apply to attached
+ListenerSet listeners.
+
+On the ACP 4.5 / Envoy Gateway `v1.8.0` line, these policies support Gateway
+targets with an optional `sectionName`, but do not support a direct
+`ListenerSet` target:
+
+- `SecurityPolicy`
+- `ClientTrafficPolicy`
+- `BackendTrafficPolicy`
+- `EnvoyExtensionPolicy`
+
+`EnvoyPatchPolicy` targets a Gateway or GatewayClass and is not a
+ListenerSet-specific policy entry point.
+
+Use a Gateway-level policy when the behavior should cover the Gateway and its
+attached ListenerSet listeners. Use a Route-level policy when the behavior
+belongs to a particular Route. Do not create a policy with
+`targetRefs[].kind: ListenerSet` on this release.
+
+## Configure in the Web Console
+
+The Web Console provides the following ListenerSet workflows:
+
+1. In the Gateway details page, configure which ListenerSet namespaces are
+   allowed and view attached ListenerSets.
+2. In the ListenerSets page, create or edit a ListenerSet and select its parent
+   Gateway.
+3. In the Route form, select either a Gateway listener or a ListenerSet
+   listener as the Route parent.
+4. In the Policy form, use Gateway or Route targets according to the policy
+   scope. ListenerSet is not offered as a direct target in this release.
+
+For troubleshooting, inspect the Gateway and ListenerSet status conditions
+first, then verify namespace selectors, listener `allowedRoutes`, hostname
+intersection, and cross-namespace `ReferenceGrant` resources.
