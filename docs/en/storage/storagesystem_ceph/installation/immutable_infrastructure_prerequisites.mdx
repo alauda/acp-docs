@@ -13,7 +13,7 @@ queries:
 
 This page describes the prerequisites for deploying Alauda Build of Rook-Ceph on Immutable Infrastructure clusters.
 
-This page covers only the storage persistence and node-replacement requirements that are specific to deploying Alauda Build of Rook-Ceph on Immutable Infrastructure. For general Ceph requirements such as node count, CPU and memory, networking, time synchronization, capacity, versions, and health checks, see [Planning Your Deployment](../planning.mdx) and the applicable installation documentation. Immutable Infrastructure updates the operating system, Kubernetes, and node configuration by replacing nodes, so storage data must not depend on temporary state local to a node.
+This page covers only the storage persistence and node-replacement requirements that are specific to deploying Alauda Build of Rook-Ceph on Immutable Infrastructure. The requirements for persistent MON/Rook data and local OSD disks apply to Internal Mode, where the Ceph daemons run on the cluster nodes. External Mode uses a remote Ceph data plane and follows the persistence requirements of that remote system. For general Ceph requirements such as node count, CPU and memory, networking, time synchronization, capacity, versions, and health checks, see [Planning Your Deployment](../planning.mdx) and the applicable installation documentation. Immutable Infrastructure updates the operating system, Kubernetes, and node configuration by replacing nodes, so storage data must not depend on temporary state local to a node.
 
 The following infrastructure types are covered:
 
@@ -24,17 +24,19 @@ The following infrastructure types are covered:
 
 For the global cluster, create and update the MachineTemplate, ConfigPool, MachineDeployment, and related resources in the global cluster, normally in the `cpaas-system` namespace. For an overview, see <ExternalSiteLink name="immutable-infra" href="/overview/index.html" children="About Immutable Infrastructure" />. For the provider contract, see <ExternalSiteLink name="immutable-infra" href="/infrastructure/index.html" children="Immutable Infrastructure Resources" />, <ExternalSiteLink name="immutable-infra" href="/manage-nodes/index.html" children="Managing Nodes" />, and <ExternalSiteLink name="immutable-infra" href="/apis/index.html" children="API Reference" />.
 
+The provider examples below show only the fields that establish persistent storage for Ceph. They are not complete, apply-ready manifests; supply the remaining required provider fields from the provider documentation for your environment.
+
 ## Immutable Infrastructure Requirements
 
 ### Persistence and Node Replacement
 
 #### MON/Rook Data Directory
 
-The MON database and Rook management data are stored under `dataDirHostPath`. This directory must survive node replacement, so it must be on a persistent file system managed by the provider. It must not be located on the node system disk, a temporary disk, or a raw OSD device.
+When the Ceph cluster uses host-path MON storage, the MON database and Rook management data are stored under `dataDirHostPath`. This directory must survive node replacement, so it must be on a persistent file system managed by the provider. It must not be located on the node system disk, a temporary disk, or a raw OSD device. If a MON PVC template is used instead, follow the persistence and scheduling requirements of that CSI-backed volume.
 
 Choose one of the following configurations:
 
-- Mount the persistent file system at the product-supported default path `/var/lib/rook` and set `spec.dataDirHostPath: /var/lib/rook` in the StorageCluster/CephCluster configuration. This is the supported path for the Internal Mode installation flow.
+- Mount the persistent file system at the product-supported default path `/var/lib/rook` and set `CephCluster.spec.dataDirHostPath: /var/lib/rook`. This is the supported path for the Internal Mode installation flow.
 - A custom path, such as `/var/cpaas/rook`, is supported only when configuring the resource through YAML/API. The Internal Mode UI does not provide a control for changing this path; do not use a custom path with the UI installation flow.
 
   ```yaml
@@ -42,7 +44,7 @@ Choose one of the following configurations:
     dataDirHostPath: /var/cpaas/rook
   ```
 
-Treat `dataDirHostPath` as immutable after the storage cluster is created. Select the final persistent mount path before creating the StorageCluster/CephCluster.
+Treat `CephCluster.spec.dataDirHostPath` as immutable after the Ceph cluster is created. Select the final persistent mount path before creating the `CephCluster`.
 
 The persistent file system can use a dedicated disk or share a disk with other non-OSD persistent directories. Size it according to the general Ceph planning requirements.
 
@@ -50,7 +52,7 @@ The persistent file system can use a dedicated disk or share a disk with other n
 
 OSD data disks must be managed by the provider's persistent-disk mechanism and remounted on the corresponding worker after node replacement. Use a disk UUID, URN, slot, or an equivalent provider-defined identity to confirm that the same disk is used before and after replacement.
 
-OSD data disks must use raw block mode and must not also provide the file system that contains `dataDirHostPath`. After the provider mounts or attaches the persistent disk, add the independent OSD device to Ceph through the Rook/ACP storage configuration. The exact device configuration depends on the current ACP Storage/Rook deployment mode. Capacities in the provider examples illustrate provider fields only and are not general sizing recommendations.
+OSD data disks must use raw block mode and must not also provide the file system that contains `dataDirHostPath`. The provider must present the independent raw device to the node before the Internal Mode Ceph installation is created. Capacities in the provider examples illustrate provider fields only and are not general sizing recommendations.
 
 In the Internal Mode wizard, add the provider-presented raw disk to an OSD device class using the stable device path supplied by the provider, preferably `/dev/disk/by-id/...`. Do not use the MON/Rook file-system disk as an OSD device. See [Deploying in Internal Mode](./create_service_stand.mdx) for the device-class configuration.
 
@@ -61,7 +63,7 @@ In the Internal Mode wizard, add the provider-presented raw disk to an OSD devic
 
 ### Rolling Node Replacement
 
-When Ceph data disks are managed by an Immutable Infrastructure provider pool, the worker MachineDeployment must use a fixed-slot model. `maxSurge: 0` and `maxUnavailable: 1` are mandatory because a surge VM cannot safely claim the same hostname, IP, or persistent-disk slot as the node it replaces, while more than one unavailable worker would remove multiple storage slots at once:
+When Ceph data disks are managed by an Immutable Infrastructure provider pool, the worker `MachineDeployment` must use a fixed-slot model. `maxSurge: 0` and `maxUnavailable: 1` are mandatory because a surge VM cannot safely claim the same hostname, IP, or persistent-disk slot as the node it replaces, while more than one unavailable worker would remove multiple storage slots at once. Apply the equivalent delete-before-create rollout settings required by the control-plane controller; do not copy the worker `MachineDeployment` fields to a `KubeadmControlPlane` without checking that controller's API:
 
 ```yaml
 strategy:
@@ -76,7 +78,9 @@ Also ensure that:
 - The Kubernetes Eviction API, PDBs, and the Rook disruption controller remain in the protection path.
 - Replacement is not forced by deleting PDBs or finalizers, or by forcibly cleaning up OSDs.
 
-For newly created built-in storage clusters, keep the product default PDB protection enabled (`managePodBudgets: true`). Do not explicitly disable it for an Immutable Infrastructure worker pool. Existing clusters with PDB management disabled must be corrected before replacement. For the general PDB behavior, see [Using PodDisruptionBudgets](../../../developer/building_application/operation_maintaining/pod_disruption_budget.mdx).
+For a newly created Internal Mode `CephCluster`, keep PDB management enabled (`disruptionManagement.managePodBudgets: true`). Do not explicitly disable it when the cluster will use Immutable Infrastructure replacement. An existing cluster with PDB management disabled is not universally invalid, but it does not meet the protected replacement requirements in this page and must be reviewed before replacement. PDBs protect the Eviction API path only; force deletion, direct Pod or Machine deletion, and node failure are outside that protection. For the general PDB behavior, see [Using PodDisruptionBudgets](../../../developer/building_application/operation_maintaining/pod_disruption_budget.mdx).
+
+Before replacing a node, confirm that the Ceph cluster is healthy, all OSDs are `up` and `in`, placement groups are not degraded, and the relevant PDB allows the eviction. Replace one storage node at a time. After the replacement, confirm that the provider remounted the original persistent disks, the OSD identity is unchanged, the OSD is again `up` and `in`, and recovery has completed before continuing. Stop the rollout if any check fails; do not purge the OSD or remove the Ceph node entry as a shortcut.
 
 ## Huawei DCS
 
@@ -136,7 +140,7 @@ spec:
           datastoreClusterName: worker-datastore-cluster
 ```
 
-The corresponding `DCSMachineTemplate` must reference this pool through `ipHostPoolRef`:
+When a DCS machine template uses this pool, it must reference the pool through `ipHostPoolRef`. The snippet omits other required template fields, including the VM template selection:
 
 ```yaml
 apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
@@ -147,6 +151,7 @@ metadata:
 spec:
   template:
     spec:
+      vmTemplateName: <vm-template-name>
       ipHostPoolRef:
         name: ceph-worker-pool
       # Other VM, network, and resource settings omitted
@@ -262,7 +267,7 @@ spec:
     - hostname: worker-01
       network:
         primary:
-          ip: 192.0.2.101
+          ip: 192.0.2.101/24
           gateway: 192.0.2.1
           dns:
             - 192.0.2.53
@@ -283,7 +288,7 @@ spec:
     - hostname: worker-02
       network:
         primary:
-          ip: 192.0.2.102
+          ip: 192.0.2.102/24
           gateway: 192.0.2.1
           dns:
             - 192.0.2.53
@@ -304,7 +309,7 @@ spec:
     - hostname: worker-03
       network:
         primary:
-          ip: 192.0.2.103
+          ip: 192.0.2.103/24
           gateway: 192.0.2.1
           dns:
             - 192.0.2.53
@@ -324,20 +329,7 @@ spec:
           wipeFilesystem: false
 ```
 
-The worker `VSphereMachineTemplate` must reference this pool:
-
-```yaml
-apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: VSphereMachineTemplate
-metadata:
-  name: ceph-worker-template
-  namespace: cpaas-system
-spec:
-  template:
-    spec:
-      machineConfigPoolRef:
-        name: ceph-worker-pool
-```
+Use the vSphere provider's documented machine-template-to-pool reference for the installed provider API. The provider API reference and creation workflow must agree before this resource is applied; this page does not duplicate that provider-specific template schema.
 
 Key requirements:
 
@@ -350,104 +342,24 @@ Key requirements:
 
 ## Bare Metal
 
-Bare Metal environments must provide persistence equivalent to the Immutable Infrastructure node replacement model. Configure the resource in the global cluster, normally in `cpaas-system`. See <ExternalSiteLink name="immutable-infra" href="/apis/providers/bare-metal/index.html" children="Bare Metal Provider APIs" />, <ExternalSiteLink name="immutable-infra" href="/manage-nodes/bare-metal.html" children="Bare Metal Node Management" />, and <ExternalSiteLink name="immutable-infra" href="/apis/providers/bare-metal/machineinventorypool.html" children="MachineInventoryPool API" />:
+Bare Metal environments must provide persistence equivalent to the Immutable Infrastructure node replacement model. Before creating the `CephCluster`, confirm with the provider's documented inventory and reprovision workflow that:
 
-The network fields in this example only express the relationship between nodes and inventory. Use the actual network configuration from your environment. The exact bare-metal network management model is determined by the provider and machine configuration.
+- the MON/Rook file system is persistent, mounted at the selected `CephCluster.spec.dataDirHostPath`, and writable before Ceph Pods start;
+- each OSD device is a stable raw device that is not formatted or reclaimed during node reinstallation or replacement; and
+- the same device identity is rediscovered on the replacement host.
 
-This provider binds fixed inventory entries to stable device identities through `MachineInventoryPool.spec.machineInventories[].diskBindings[]`:
-
-```yaml
-apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: MachineInventoryPool
-metadata:
-  name: ceph-worker-pool
-  namespace: cpaas-system
-spec:
-  clusterName: demo-cluster
-  machineInventories:
-    - name: worker-01
-      hostname: worker-01
-      diskBindings:
-        - volumeName: cpaas-data
-          selector:
-            byID: /dev/disk/by-id/wwn-0x5000c50000010101
-          expected:
-            minimumSize: 30Gi
-        - volumeName: rook-osd
-          selector:
-            byID: /dev/disk/by-id/wwn-0x5000c50000010102
-          expected:
-            minimumSize: 300Gi
-    - name: worker-02
-      hostname: worker-02
-      diskBindings:
-        - volumeName: cpaas-data
-          selector:
-            byID: /dev/disk/by-id/wwn-0x5000c50000010201
-          expected:
-            minimumSize: 30Gi
-        - volumeName: rook-osd
-          selector:
-            byID: /dev/disk/by-id/wwn-0x5000c50000010202
-          expected:
-            minimumSize: 300Gi
-    - name: worker-03
-      hostname: worker-03
-      diskBindings:
-        - volumeName: cpaas-data
-          selector:
-            byID: /dev/disk/by-id/wwn-0x5000c50000010301
-          expected:
-            minimumSize: 30Gi
-        - volumeName: rook-osd
-          selector:
-            byID: /dev/disk/by-id/wwn-0x5000c50000010302
-          expected:
-            minimumSize: 300Gi
-```
-
-The `BaremetalMachineTemplate` references this pool through `machineInventoryPoolRef` and declares mount and reclaim policies in `storage.volumes[]`:
-
-```yaml
-apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: BaremetalMachineTemplate
-metadata:
-  name: ceph-worker-template
-  namespace: cpaas-system
-spec:
-  template:
-    spec:
-      machineInventoryPoolRef:
-        name: ceph-worker-pool
-      storage:
-        volumes:
-          - name: cpaas-data
-            filesystem:
-              type: xfs
-              initializePolicy: IfEmpty
-              adoptPolicy: IfMatch
-            mount:
-              path: /var/lib/rook
-              required: true
-              options: [noatime]
-            reclaimPolicy: Retain
-          - name: rook-osd
-            reclaimPolicy: Retain
-```
-
-The inventory and `diskBindings.selector.byID` preserve persistent-disk identity, while `storage.volumes[].reclaimPolicy: Retain` prevents data disks from being reclaimed during node reconfiguration. In this example, `cpaas-data` is the MON/Rook data-directory disk and `rook-osd` is an independent OSD disk. When the provider presents the OSD disk as a raw block device, do not format it or use it for `dataDirHostPath`. The example mounts the MON data disk at `/var/lib/rook`; configure `CephCluster.spec.dataDirHostPath: /var/lib/rook` explicitly.
-
-The bare-metal provider must rediscover the original OSD disk by its stable device identity and preserve it during node reinstallation or replacement. Use the <ExternalSiteLink name="immutable-infra" href="/apis/providers/bare-metal/machineinventorypool.html" children="MachineInventoryPool API" /> and <ExternalSiteLink name="immutable-infra" href="/manage-nodes/bare-metal.html" children="Bare Metal Node Management" /> procedures for device discovery and cleanup policies.
+Do not infer disk persistence from `MachineInventoryPool` membership, and do not use provider fields that are not present in the target provider CRD. This page does not define a bare-metal disk-binding schema. See <ExternalSiteLink name="immutable-infra" href="/apis/providers/bare-metal/index.html" children="Bare Metal Provider APIs" /> and <ExternalSiteLink name="immutable-infra" href="/manage-nodes/bare-metal.html" children="Bare Metal Node Management" /> for the provider's supported inventory and reprovision behavior.
 
 ## Pre-installation Checklist
 
 Before installing Rook-Ceph, verify the following items for Immutable Infrastructure:
 
 - [ ] The provider manages OSD disks as persistent raw block disks, separate from the node system disk.
-- [ ] The MON/Rook data directory is configured as `dataDirHostPath: /var/lib/rook` for the supported Internal Mode flow, or explicitly configured through YAML/API when using another path; it is on a provider-managed persistent file system, is writable on the node, and does not use a raw OSD device.
+- [ ] The MON/Rook data directory is configured as `CephCluster.spec.dataDirHostPath: /var/lib/rook` for the supported Internal Mode flow, or explicitly configured through YAML/API when using another path; it is on a provider-managed persistent file system, is writable on the node, and does not use a raw OSD device.
 - [ ] The stable identity and remount process for data disks after node replacement have been confirmed.
 - [ ] The worker MachineDeployment uses `maxSurge: 0` and `maxUnavailable: 1`.
-- [ ] No finite `nodeDrainTimeout` is configured, `managePodBudgets: true` is retained for newly created built-in storage clusters, and the PDB, Eviction API, and Rook disruption controller protection path is preserved.
+- [ ] No finite `nodeDrainTimeout` is configured, `disruptionManagement.managePodBudgets: true` is retained for a newly created Internal Mode CephCluster, and the PDB, Eviction API, and Rook disruption controller protection path is preserved.
+- [ ] Persistence has been validated as node-replacement protection, not treated as a substitute for Ceph or application-consistent backups.
 - [ ] The Immutable Infrastructure resource configuration documentation for the target provider version has been reviewed.
 
-After these conditions are met, create the storage resources in the target business cluster and continue with [Deploying in Internal Mode](./create_service_stand.mdx). The provider MachineTemplate, ConfigPool, and MachineDeployment resources described above belong to the global cluster, normally in `cpaas-system`; the StorageCluster/CephCluster is created in the business cluster. The Internal Mode UI uses `/var/lib/rook`; use YAML/API configuration instead if you need a custom `dataDirHostPath`.
+After these conditions are met, create the `CephCluster` in the target business cluster and continue with [Deploying in Internal Mode](./create_service_stand.mdx). The provider MachineTemplate, ConfigPool, and MachineDeployment resources described above belong to the global cluster, normally in `cpaas-system`. The Internal Mode UI uses `/var/lib/rook`; use YAML/API configuration instead if you need a custom `CephCluster.spec.dataDirHostPath`.
