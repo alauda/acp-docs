@@ -1,0 +1,255 @@
+---
+weight: 76
+---
+
+# Monitoring Ceph RGW with the Ceph RGW Exporter
+
+**Alauda Build of Ceph RGW Exporter** is an Operator that collects usage, bucket, and user metrics from the Ceph RGW (RADOS Gateway) Admin Ops API and exposes them in Prometheus format. Rook's built-in monitoring covers the health of the Ceph cluster itself, but not object-storage tenants: how much data each user stores, how many objects a bucket holds, or whether a quota is about to be exhausted. This Operator fills that gap.
+
+Once installed, the Operator watches every `CephObjectStore` in the cluster and automatically deploys one exporter per object store, together with a read-only RGW user and a `ServiceMonitor`. No credentials need to be handled manually.
+
+## Terminology
+
+| Term | Description |
+| :--- | :--- |
+| **CephRGWExporter** | Custom resource (`ceph.alauda.io/v1alpha1`) that declares one exporter instance. Each instance targets one `CephObjectStore`. |
+| **Exporter** | The Pod that queries the RGW Admin Ops API and serves `/metrics`. The Operator and the exporter share the same container image and differ only in their startup arguments. |
+| **CephObjectStoreUser** | Rook resource that provisions an RGW user. The exporter reads the RGW endpoint, access key, and secret key from the Secret that Rook creates for this user. |
+| **Admin Ops API** | The RGW administrative REST API (`/admin/usage`, `/admin/bucket`, `/admin/user`). All requests from the exporter are signed with AWS Signature V4. |
+
+## Prerequisites
+
+- **Alauda Build of Rook-Ceph** is installed and at least one `CephObjectStore` is in the `Ready` phase. See [Ceph Distributed Storage](../index.mdx).
+- The **Alauda Build of Ceph RGW Exporter** Operator package is available in **OperatorHub**. On air-gapped clusters, upload it first as described in [Upload Packages](../../../extend/upload_package.mdx).
+- To view the metrics in the platform, the monitoring plugin (Prometheus or VictoriaMetrics) is installed on the cluster. See [Monitoring Installation](../../../observability/monitor/install_monitor.mdx). The exporter works without it, but nothing scrapes the metrics.
+
+## How it works
+
+1. The Operator watches `CephObjectStore` resources. For each object store `<store>` it creates, in the same namespace:
+   - a `CephObjectStoreUser` named `rgw-exporter-user-<store>` with read-only `bucket`, `user`, `metadata`, and `usage` capabilities;
+   - a `CephRGWExporter` named `rgw-exporter-<store>`, annotated with `ceph.alauda.io/auto-created: "true"`.
+2. For each `CephRGWExporter`, the Operator reconciles a Deployment, a Service (port `9242`, named `http-metrics`), a ServiceAccount with a namespace-scoped Role, and a `ServiceMonitor`, all sharing the CR's name.
+3. At startup the exporter resolves the referenced `CephObjectStoreUser`, reads `Endpoint`, `AccessKey`, and `SecretKey` from its Secret, and starts polling the RGW Admin Ops API. The Operator itself never reads the keys.
+4. When a `CephObjectStore` is deleted, the auto-created `CephRGWExporter` and `CephObjectStoreUser` are removed with it. Resources you created manually are left untouched.
+
+## Procedure
+
+<Steps>
+
+### Install the Operator
+
+1. Go to **Administrator**.
+
+2. In the left navigation bar, click **Marketplace** > **OperatorHub**.
+
+3. Find **Alauda Build of Ceph RGW Exporter** and click **Install**. Select the `alpha` channel, install it into the `rook-ceph` namespace (the namespace where Rook-Ceph runs), and set the upgrade approval to **Manual**. For a detailed description of the installation dialog, refer to [Operator](../../../extend/operator.mdx).
+
+   Alternatively, apply a `Subscription` from the command line on the **control node** of the cluster. The `rook-ceph` namespace already contains an `OperatorGroup` created by Rook-Ceph, so no new one is needed.
+
+   ```yaml
+   cat << EOF | kubectl apply -f -
+   apiVersion: operators.coreos.com/v1alpha1
+   kind: Subscription
+   metadata:
+     name: ceph-rgw-exporter
+     namespace: rook-ceph
+   spec:
+     channel: alpha
+     installPlanApproval: Manual
+     name: ceph-rgw-exporter
+     source: platform
+     sourceNamespace: cpaas-system
+   EOF
+   ```
+
+   Approve the generated `InstallPlan`:
+
+   ```bash
+   ip=$(kubectl -n rook-ceph get subscription ceph-rgw-exporter -o jsonpath='{.status.installPlanRef.name}')
+   kubectl -n rook-ceph patch installplan $ip --type=merge -p '{"spec":{"approved":true}}'
+   ```
+
+4. Verify that the Operator is running.
+
+   ```bash
+   kubectl -n rook-ceph get csv | grep ceph-rgw-exporter
+   kubectl -n rook-ceph get deploy ceph-rgw-exporter-operator
+   ```
+
+   Expected output:
+
+   ```
+   ceph-rgw-exporter.v1.0.3   Alauda Build of Ceph RGW Exporter   1.0.3   Succeeded
+   NAME                         READY   UP-TO-DATE   AVAILABLE   AGE
+   ceph-rgw-exporter-operator   1/1     1            1           3m
+   ```
+
+### Verify the auto-discovered exporters
+
+Within about a minute of the Operator starting, one exporter exists for each `CephObjectStore`.
+
+1. List the exporters.
+
+   ```bash
+   kubectl -n rook-ceph get cephrgwexporters
+   ```
+
+   Expected output (`ceph-cluster-object` is the object store name in this example):
+
+   ```
+   NAME                               PHASE     READY   ENDPOINT                                                      AGE
+   rgw-exporter-ceph-cluster-object   Running   1       http://rook-ceph-rgw-ceph-cluster-object.rook-ceph.svc:7480   2m
+   ```
+
+   `PHASE` is `Pending` while the exporter Pod starts, `Running` when it is ready, and `Failed` if the referenced `CephObjectStoreUser` or its Secret cannot be resolved. Details are recorded in `status.conditions`.
+
+2. Confirm the read-only RGW user that was provisioned for the exporter.
+
+   ```bash
+   kubectl -n rook-ceph get cephobjectstoreuser rgw-exporter-user-ceph-cluster-object -o jsonpath='{.spec.capabilities}{"\n"}{.status.phase}{"\n"}'
+   ```
+
+   Expected output:
+
+   ```
+   {"bucket":"read","metadata":"read","usage":"read","user":"read"}
+   Ready
+   ```
+
+3. Confirm the child resources.
+
+   ```bash
+   kubectl -n rook-ceph get deploy,svc,servicemonitor -l app.kubernetes.io/name=ceph-rgw-exporter
+   ```
+
+### Verify the metrics
+
+1. Forward the exporter Service to a local port and request the metrics endpoint.
+
+   ```bash
+   kubectl -n rook-ceph port-forward svc/rgw-exporter-ceph-cluster-object 9242:9242 &
+   curl -s http://localhost:9242/-/ready
+   curl -s http://localhost:9242/metrics | grep -v '^#' | head
+   ```
+
+   Expected output:
+
+   ```
+   ok
+   radosgw_usage_ops_total{bucket="bucket_root",category="list_buckets",owner="anonymous",store="ceph-cluster-object"} 142126
+   radosgw_usage_scrape_duration_seconds 0.271208467
+   radosgw_usage_user_quota_enabled{store="ceph-cluster-object",user="rgw-exporter-user-ceph-cluster-object"} 0
+   radosgw_usage_user_total_bytes{store="ceph-cluster-object",user="rgw-exporter-user-ceph-cluster-object"} 0
+   ...
+   ```
+
+   Bucket metrics (`radosgw_usage_bucket_*`) only appear once at least one bucket exists in the object store.
+
+2. If the monitoring plugin is installed, the `ServiceMonitor` is discovered automatically: it carries the `prometheus: kube-prometheus` label that the platform uses to select scrape targets, and scrapes the `http-metrics` port every `300s` by default. After one scrape interval, query `radosgw_usage_scrape_duration_seconds` in the platform's monitoring dashboards or through PromQL to confirm the data is being ingested. See [Management of Metrics](../../../observability/monitor/functions/manage_metrics.mdx) for how to work with custom metrics.
+
+</Steps>
+
+## Customizing an exporter
+
+The auto-created `CephRGWExporter` uses default settings. You can edit its `spec` in place, or create your own `CephRGWExporter` (any name that is not `rgw-exporter-<store>`) when you need a different configuration. Manually created resources are never modified or deleted by the auto-discovery logic.
+
+```yaml
+cat << EOF | kubectl apply -f -
+apiVersion: ceph.alauda.io/v1alpha1
+kind: CephRGWExporter
+metadata:
+  name: <name>
+  namespace: rook-ceph
+spec:
+  cephObjectStoreUserRef:
+    name: <cephObjectStoreUser>
+    namespace: rook-ceph
+  store: <store>
+  port: 9242
+  timeout: 60
+  logLevel: INFO
+  tagList:
+    - team
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  serviceMonitor:
+    enabled: true
+    interval: 300s
+EOF
+```
+
+**Parameters**
+
+| **Parameter** | **Description** |
+| :--- | :--- |
+| **cephObjectStoreUserRef** | Required. The `CephObjectStoreUser` whose credentials the exporter uses. The user must have at least `read` capability on `bucket`, `user`, `metadata`, and `usage`; see [Create Ceph Object Store User](./create_object_user.mdx). `namespace` defaults to the namespace of the `CephRGWExporter`. When the user lives in another namespace, the Operator creates the Role and RoleBinding needed to read its Secret there. |
+| **store** | Value of the `store` label on every metric, and the region used for AWS Signature V4 signing. Use the `CephObjectStore` name. Defaults to `us-east-1`. |
+| **adminEntry** | Path prefix of the RGW Admin Ops API. Defaults to `admin`. Change it only if `rgw_admin_entry` was customized on the gateway. |
+| **port** | Port the exporter listens on. Also used by the Service and the probes. Defaults to `9242`. |
+| **timeout** | Timeout in seconds for each request to RGW. Defaults to `60`. Increase it on object stores with many users or buckets. |
+| **insecure** | Skip TLS certificate verification when the RGW endpoint uses a self-signed certificate. Defaults to `false`. |
+| **logLevel** | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. Defaults to `INFO`. `DEBUG` logs every request URL sent to RGW. |
+| **tagList** | Bucket tag keys to expose as additional labels on bucket metrics. Missing tags are emitted as empty strings so that the label set stays stable. Defaults to none. |
+| **replicas**, **resources**, **nodeSelector**, **tolerations**, **image**, **imagePullSecrets** | Standard Pod template settings for the exporter Deployment. `image` defaults to the Operator's own image. |
+| **serviceMonitor** | `enabled` (default `true`) controls whether a `ServiceMonitor` is created; setting it to `false` deletes an existing one. `interval` (default `300s`) is the scrape interval. `labels` adds extra labels to the `ServiceMonitor`. |
+
+## Metrics reference
+
+All metrics carry the `store` label. Usage and bucket metrics additionally carry `bucket` and `owner`, plus one label per key in `tagList`.
+
+| Metric | Description |
+| :--- | :--- |
+| `radosgw_usage_ops_total` | Total number of operations, per owner, bucket, and category. |
+| `radosgw_usage_successful_ops_total` | Number of successful operations. |
+| `radosgw_usage_sent_bytes_total` | Bytes sent by RGW to clients. |
+| `radosgw_usage_received_bytes_total` | Bytes received by RGW from clients. |
+| `radosgw_usage_bucket_bytes` | Size of the bucket in bytes. |
+| `radosgw_usage_bucket_utilized_bytes` | Bytes actually used by the bucket. |
+| `radosgw_usage_bucket_objects` | Number of objects in the bucket. |
+| `radosgw_usage_bucket_shards` | Number of index shards of the bucket. |
+| `radosgw_usage_bucket_quota_enabled`, `radosgw_usage_bucket_quota_size`, `radosgw_usage_bucket_quota_size_bytes`, `radosgw_usage_bucket_quota_size_objects` | Bucket quota settings. |
+| `radosgw_usage_user_total_objects` | Number of objects owned by the user. |
+| `radosgw_usage_user_total_bytes` | Bytes stored by the user. |
+| `radosgw_usage_user_quota_enabled`, `radosgw_usage_user_quota_size`, `radosgw_usage_user_quota_size_bytes`, `radosgw_usage_user_quota_size_objects` | User quota settings. |
+| `radosgw_usage_user_bucket_quota_enabled`, `radosgw_usage_user_bucket_quota_size`, `radosgw_usage_user_bucket_quota_size_bytes`, `radosgw_usage_user_bucket_quota_size_objects` | Per-user default bucket quota settings. |
+| `radosgw_usage_scrape_duration_seconds` | Time spent collecting all metrics from RGW during the last scrape. |
+
+A quota size of `-1` means the quota is unlimited.
+
+Example queries:
+
+```text
+# Storage used per RGW user
+sum by (user) (radosgw_usage_user_total_bytes{store="ceph-cluster-object"})
+
+# Ten largest buckets
+topk(10, radosgw_usage_bucket_bytes)
+
+# Request rate by category over the last 5 minutes
+sum by (category) (rate(radosgw_usage_ops_total[5m]))
+```
+
+## Troubleshooting
+
+| Symptom | Cause and action |
+| :--- | :--- |
+| `CephRGWExporter` stays `Pending` and the Pod logs `must contain Endpoint, AccessKey, and SecretKey` | The referenced `CephObjectStoreUser` is not `Ready` yet or its Secret is missing. Check `kubectl -n rook-ceph get cephobjectstoreuser` and wait for Rook to provision the user. |
+| Metrics endpoint returns only `radosgw_usage_scrape_duration_seconds` | The RGW user lacks Admin Ops capabilities, or the `store` value does not match the gateway's region convention, so requests are rejected. Set `logLevel: DEBUG` and inspect the exporter logs. Note that Rook applies `capabilities` only at user creation time; recreate the user to change them. |
+| Scrapes time out on large object stores | The exporter issues one request per RGW user. Raise `timeout` and increase `serviceMonitor.interval`. |
+| No data in the platform dashboards although `curl /metrics` works | The monitoring plugin is not installed on this cluster, or `serviceMonitor.enabled` was set to `false`. |
+
+## Uninstalling
+
+Delete the Operator from **Marketplace** > **OperatorHub**, or delete the `Subscription` and `ClusterServiceVersion` from the `rook-ceph` namespace. Exporter Deployments, Services, and `ServiceMonitor` objects are owned by their `CephRGWExporter` and are garbage-collected when the custom resources are deleted. The auto-created RGW users are not removed automatically; delete them explicitly if they are no longer needed:
+
+```bash
+kubectl -n rook-ceph delete cephrgwexporters --all
+kubectl -n rook-ceph get cephobjectstoreusers | grep rgw-exporter-user-
+kubectl -n rook-ceph delete cephobjectstoreuser rgw-exporter-user-<store>
+```
