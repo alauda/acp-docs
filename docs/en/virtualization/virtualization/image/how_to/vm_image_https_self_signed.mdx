@@ -1,0 +1,235 @@
+---
+weight: 15
+---
+
+# Importing a Virtual Machine Image from an HTTPS Server with a Self-Signed Certificate
+
+Use this procedure when the virtual machine image (`qcow2` or `raw`) is served over **HTTPS by a
+server whose certificate is self-signed or issued by a private CA** — a common setup for an
+internal file server. CDI (Containerized Data Importer), which downloads the image, verifies the
+server's TLS certificate and **has no option to skip that verification** for HTTP sources. An
+untrusted certificate makes the import fail with:
+
+```text
+Unable to connect to http data source: HTTP request errored:
+Get "https://images.example.internal/centos.qcow2": tls: failed to verify certificate:
+x509: certificate signed by unknown authority
+```
+
+The supported way to make such an import succeed is to **give CDI the certificate** through a
+`ConfigMap` referenced from the `DataVolume` with `spec.source.http.certConfigMap`. The importer
+adds the certificate to its trust store and verifies the server against it — hostname
+verification stays on, nothing is bypassed.
+
+## How it works
+
+- `spec.source.http.certConfigMap` names a `ConfigMap` **in the same namespace as the
+  `DataVolume`**. It cannot point to another namespace.
+- CDI mounts the `ConfigMap` into the importer pod and loads **every key** in it as PEM
+  certificates (keys starting with `.` are ignored). The key name is free — `ca.crt` is used
+  below. One key may hold several concatenated PEM blocks, so a private CA chain (root plus
+  intermediates) can be supplied in one key.
+- The certificate is **added to** the importer's system trust store, so public HTTPS sources keep
+  working from the same importer.
+- The field works the same in a standalone `DataVolume` and inside a `VirtualMachine`
+  `dataVolumeTemplates` entry, and is available on every CDI version shipped with Alauda Container
+  Platform (it predates CDI 1.62).
+
+## Constraints
+
+- **The web console's HTTP image source cannot carry a certificate.** An image source added under
+  **Administrator** > **Virtualization** > **Images** > **Image Source** with an HTTPS URL of a
+  self-signed server is accepted, but a virtual machine created from it gets a
+  `dataVolumeTemplates` entry with only `http.url` and fails with the `x509` error above. For
+  console users, import the image once as a **golden image** in `kube-public` (Step 4) — it then
+  appears as an **Image Instance**, and virtual machines created from it are clones that never
+  contact the HTTPS server.
+- There is no cluster-wide "trust this CA for all imports" setting: CDI only consults extra
+  certificates when the `DataVolume` itself references a `ConfigMap`.
+- The certificate's Subject Alternative Name (SAN) must contain the host you use in the URL — a DNS
+  name or an IP address. A certificate without a matching SAN is rejected even when it is trusted
+  (see [Troubleshooting](#troubleshooting)).
+- A `DataVolume` `spec` is immutable. To add a missing certificate, delete the `DataVolume` (or
+  the virtual machine that owns it) and create it again.
+
+## Prerequisites
+
+- The server's certificate in PEM format: for a self-signed server the server certificate
+  itself; for a private CA, the CA certificate (and intermediates, if any). Ask the server owner
+  for the file, or fetch it from the server (Step 1).
+- The `kubectl` command-line tool, configured to access the cluster where virtualization runs.
+- A `StorageClass` for the virtual machine disk.
+- The HTTPS server is reachable from the cluster nodes (CDI downloads from an importer pod).
+
+## Procedure
+
+<Steps>
+
+### Obtain and check the certificate
+
+If you do not already have the PEM file, download the certificate the server presents:
+
+```bash
+openssl s_client -showcerts -connect images.example.internal:443 </dev/null 2>/dev/null \
+  | openssl x509 -outform PEM > server.crt
+```
+
+For a private CA, use the CA certificate the server owner provides instead of the server
+certificate. Then confirm that the host you will put in the image URL is listed in the SAN:
+
+```bash
+openssl x509 -in server.crt -noout -subject -ext subjectAltName
+# subject=CN=images.example.internal
+# X509v3 Subject Alternative Name:
+#     DNS:images.example.internal, IP Address:192.168.10.20
+```
+
+Use a host from that list in the URL — `https://images.example.internal/...` or
+`https://192.168.10.20/...` in this example. If the address you need is missing, have the
+certificate re-issued with it; CDI does not relax hostname checks.
+
+### Create the certificate ConfigMap
+
+Create the `ConfigMap` in the namespace where the `DataVolume` (or the virtual machine) will live:
+
+```bash
+kubectl create configmap image-server-ca -n demo --from-file=ca.crt=server.crt
+```
+
+For a CA chain, concatenate the PEM files into one before creating the `ConfigMap`
+(`cat intermediate.crt root.crt > chain.crt`, then `--from-file=ca.crt=chain.crt`).
+
+### Create a virtual machine that imports the image directly
+
+Reference the `ConfigMap` from the virtual machine's `dataVolumeTemplates`. Deleting the virtual
+machine also deletes the imported disk.
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: centos-https
+  namespace: demo
+spec:
+  runStrategy: Always
+  dataVolumeTemplates:
+    - metadata:
+        name: centos-https-rootdisk
+      spec:
+        source:
+          http:
+            url: https://images.example.internal/centos.qcow2
+            certConfigMap: image-server-ca   # ConfigMap from Step 2, same namespace
+            # secretRef: image-server-auth   # only if the server needs basic auth
+        storage:
+          storageClassName: sc-ceph-cluster-block
+          resources:
+            requests:
+              storage: 20Gi                  # >= the image's virtual disk size
+  template:
+    spec:
+      domain:
+        devices:
+          disks:
+            - name: rootdisk
+              disk:
+                bus: virtio
+        resources:
+          requests:
+            memory: 2Gi
+      volumes:
+        - name: rootdisk
+          dataVolume:
+            name: centos-https-rootdisk
+```
+
+```bash
+kubectl apply -f centos-https.yaml
+kubectl get dv -n demo -w
+# NAME                    PHASE              PROGRESS   RESTARTS
+# centos-https-rootdisk   ImportInProgress   37.51%
+# centos-https-rootdisk   Succeeded          100.0%
+kubectl get vmi -n demo centos-https
+# NAME           AGE   PHASE     IP            NODENAME   READY
+# centos-https   1m    Running   10.180.0.15   node-1     True
+```
+
+A `DataVolume` alone works the same way — put the same `source.http` block under
+`spec.source` of a `DataVolume` object.
+
+### (Optional) Import once as a golden image for the console
+
+To let console users create virtual machines from this image, import it once into `kube-public`
+and publish it as a `DataSource`. The labels make it show up under **Administrator** >
+**Virtualization** > **Images** > **Image Instance** and in the **Create VM** form's
+**Provision Method** > **Image Instance** picker; the `ConfigMap` is created in `kube-public`
+because the `DataVolume` lives there.
+
+```bash
+kubectl create configmap image-server-ca -n kube-public --from-file=ca.crt=server.crt
+```
+
+```yaml
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: centos-7-9
+  namespace: kube-public
+spec:
+  source:
+    http:
+      url: https://images.example.internal/centos.qcow2
+      certConfigMap: image-server-ca
+  storage:
+    storageClassName: sc-ceph-cluster-block
+    resources:
+      requests:
+        storage: 20Gi
+---
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataSource
+metadata:
+  name: centos-7-9
+  namespace: kube-public
+  labels:
+    virtualization.cpaas.io/image-os-type: centos   # centos | ubuntu | ...; drives the OS filter
+    virtualization.cpaas.io/image-os-arch: amd64    # amd64 | arm64
+spec:
+  source:
+    pvc:
+      name: centos-7-9
+      namespace: kube-public
+```
+
+```bash
+kubectl apply -f centos-7-9.yaml
+kubectl get dv,datasource -n kube-public centos-7-9
+# datavolume.cdi.kubevirt.io/centos-7-9   Succeeded   100.0%
+# datasource.cdi.kubevirt.io/centos-7-9   ...  Ready
+```
+
+Virtual machines created from the Image Instance clone the `kube-public` volume
+(`dataVolumeTemplates[].spec.sourceRef` pointing at the `DataSource`); the HTTPS server and its
+certificate are only involved in this one-time import.
+
+</Steps>
+
+## Troubleshooting \{#troubleshooting}
+
+Read the importer's error from the `DataVolume` conditions — the phase stays `ImportInProgress`
+while CDI retries and the `RESTARTS` column keeps growing:
+
+```bash
+kubectl get dv <name> -n <namespace> -o jsonpath='{range .status.conditions[*]}{.type}={.status}: {.message}{"\n"}{end}'
+```
+
+| Message | Cause | Fix |
+| :-- | :-- | :-- |
+| `x509: certificate signed by unknown authority` | No `certConfigMap` on the `DataVolume`, the `ConfigMap` holds the wrong certificate, or a private-CA chain is incomplete. | Put the server certificate (self-signed) or the full CA chain in the `ConfigMap` and re-create the `DataVolume` with `certConfigMap` set. |
+| `x509: certificate is valid for a.example.com, not images.example.internal` | The host in the URL is not in the certificate's SAN. | Use a host that is in the SAN, or re-issue the certificate. |
+| `x509: cannot validate certificate for 192.168.10.20 because it doesn't contain any IP SANs` | The URL uses an IP address but the certificate has no IP SAN. | Use the DNS name from the SAN, or re-issue the certificate with an `IP:` SAN. |
+| Importer pod stuck in `ContainerCreating`, event `configmap "image-server-ca" not found` | The `ConfigMap` is missing or in another namespace. | Create it in the `DataVolume`'s namespace. |
+| `x509: certificate has expired or is not yet valid` | The certificate's validity window does not cover the current time, or the node clock is wrong. | Renew the certificate, or fix node time synchronisation. |
+
+Because the `DataVolume` `spec` cannot be edited, apply the fix by deleting and re-creating the
+`DataVolume` (or the virtual machine that owns it through `dataVolumeTemplates`).
