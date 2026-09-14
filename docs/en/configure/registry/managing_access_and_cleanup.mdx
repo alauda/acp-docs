@@ -13,7 +13,7 @@ Use this page for administrator and namespace administrator tasks, including nam
 
 | Task | Use when |
 | --- | --- |
-| [Grant namespace permissions](#grant-namespace-permissions) | A user or service account needs pull, push, delete, or prune access in an image namespace. |
+| [Grant namespace permissions](#grant-namespace-permissions) | A user or service account needs pull, push, delete, or image catalog access in an image namespace. |
 | [View usage](#view-usage) | An administrator needs image or ImageStream usage information. |
 | [Verify image signatures](#verify-image-signatures) | An administrator needs to check or save trusted image signature conditions. |
 | [Prune images](#prune-images) | An administrator needs to remove unused image metadata after reviewing a dry run. |
@@ -25,6 +25,17 @@ Use this page for administrator and namespace administrator tasks, including nam
 - You have `kubectl` and `ac` access to the target cluster.
 - You have permission to create RoleBindings in the image namespace.
 - You have administrator permissions for usage reporting, image pruning, registry garbage collection, and signature verification.
+
+Select the ACP 4.4 Registry backend before using the `ac` administrative commands:
+
+```bash
+ac config set-registry-mode modern
+```
+
+Expected result:
+
+- Subsequent `ac` Image API, pruning, garbage-collection, and signature commands use the ACP 4.4
+  Registry.
 
 ## Grant Namespace Permissions \{#grant-namespace-permissions}
 
@@ -84,7 +95,33 @@ The Registry uses ImageStream layer authorization:
 | Pull | `system:image-puller` | `image.alauda.io` `imagestreams/layers` `get` |
 | Push | `system:image-pusher` | `image.alauda.io` `imagestreams/layers` `update` |
 | Delete | `system:image-deleter` | Image API delete permissions for the target image metadata |
-| Prune | `system:image-pruner` | Image API prune and layer inspection permissions |
+| Write signatures | `system:image-signature-writer` | `image.alauda.io` `imagesignatures` `create`, `delete` |
+| Read the image catalog | `system:image-registry-catalog-reader` | `image.alauda.io` `imagestreams` `list` |
+| Read Registry metrics | `system:image-registry-metrics-reader` | `image.alauda.io` `registry/metrics` `get` |
+
+The `system:image-pruner` ClusterRole is reserved for the Operator-managed `pruner` ServiceAccount.
+It is not a namespace access role. Manual pruning and garbage collection require the corresponding
+administrator permissions.
+
+For roles other than Pull and Push, grant the corresponding platform role or ClusterRole according to
+your authorization model, then verify the effective permission. The metrics permission is
+cluster-scoped; the other checks are scoped to the image namespace where applicable:
+
+```bash
+kubectl auth can-i delete images.image.alauda.io \
+  --as=<username>
+kubectl auth can-i create imagesignatures.image.alauda.io \
+  --as=<username>
+kubectl auth can-i list imagestreams.image.alauda.io \
+  -n <image-namespace> \
+  --as=<username>
+kubectl auth can-i get registry/metrics.image.alauda.io \
+  --as=<username>
+```
+
+Expected result:
+
+- Each command returns `yes` only for a principal that has the corresponding role.
 
 ## View Usage \{#view-usage}
 
@@ -136,11 +173,28 @@ Expected result:
 
 - The Image object contains the trusted signature condition saved by the verification command.
 
-Saving trust conditions changes Image API metadata. To roll back a saved condition, edit the Image object and remove the saved condition, or restore the Image object from a known-good backup.
+Saving trust conditions changes Image API metadata. To roll back a saved condition, edit the Image
+object and remove the saved condition, or restore the Image object from a known-good backup.
+
+Remove all signature records from an Image object only when the records are no longer required:
+
+```bash
+ac adm verify-image-signature sha256:<digest> --remove-all
+```
+
+> **Warning:** `--remove-all` removes every signature record from the Image object. This operation
+> is not reversible through the Registry. Verify the Image object after the command and restore the
+> metadata from a known-good backup if the records were removed by mistake.
+
+```bash
+ac get images.image.alauda.io sha256:<digest> -o yaml
+```
 
 ## Prune Images \{#prune-images}
 
-Confirmed pruning can permanently remove unused image metadata. If you also run registry garbage collection, unreferenced blobs can be permanently reclaimed from storage. Run these commands during a maintenance window, keep required backups, and review dry-run output before adding `--confirm`.
+Confirmed pruning can permanently remove unused image metadata. If you also run registry garbage
+collection, unreferenced blobs can be permanently reclaimed from storage. Run these commands during
+a maintenance window, keep required backups, and review dry-run output before adding `--confirm`.
 
 Preview image pruning:
 
@@ -183,23 +237,32 @@ ac adm prune images \
 
 For scheduled pruning, see [Setting up and configuring the registry](./setting_up_and_configuring_the_registry.mdx#configure-scheduled-image-pruning).
 
-Confirmed pruning is not automatically reversible. Restore pruned metadata from backup, recreate metadata from a trusted image source, or re-import the image when recovery is required.
+Confirmed pruning is not automatically reversible. Restore pruned metadata from backup, recreate
+metadata from a trusted image source, or re-import the image when recovery is required.
 
 ## Run Registry Garbage Collection \{#run-registry-garbage-collection}
 
 Registry garbage collection reclaims unreferenced blobs from Registry storage. Blob reclamation is not reversible from the Registry after it is confirmed.
 
-Run registry garbage collection after metadata cleanup:
+Preview registry garbage collection after metadata cleanup:
 
 ```bash
 ac adm registry gc
+```
+
+Expected result:
+
+- The command previews eligible unreferenced blobs and does not delete them.
+
+Run registry garbage collection only after reviewing the preview:
+
+```bash
 ac adm registry gc --confirm
 ```
 
-Expected results:
+Expected result:
 
-- Without `--confirm`, the command previews garbage-collection candidates.
-- With `--confirm`, the command removes eligible unreferenced blobs from storage.
+- The command removes eligible unreferenced blobs from Registry storage.
 
 You can also trigger registry garbage collection as part of pruning:
 
@@ -207,12 +270,18 @@ You can also trigger registry garbage collection as part of pruning:
 ac adm prune images --confirm --prune-registry
 ```
 
-Both `ac adm prune images` and `ac adm registry gc` are dry-run by default. Review the preview before adding `--confirm`.
+Both `ac adm prune images` and `ac adm registry gc` are dry-run by default. Review the preview before
+adding `--confirm`. Confirmed blob reclamation is irreversible from the Registry; restore data from a
+storage backup or copy the image again from a trusted source if a required blob was reclaimed.
 
 After confirmed garbage collection, verify critical images by pulling or inspecting them:
 
 ```bash
-ac image info registry.example.com/team-a/demo:latest
-```
+mkdir -p /tmp/registry-auth
+ac registry login \
+  --registry registry.example.com \
+  --to /tmp/registry-auth/config.json
 
-If a required blob was reclaimed, restore it from backend storage backup or copy the image again from a trusted source.
+ac image info registry.example.com/team-a/demo:latest \
+  --registry-config=/tmp/registry-auth/config.json
+```
