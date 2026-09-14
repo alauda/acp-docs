@@ -40,23 +40,49 @@ kubectl -n image-registry-system get ingress default-route
 Get the generated host:
 
 ```bash
-REGISTRY_HOST="$(
+REGISTRY_RULE_HOST="$(
   kubectl -n image-registry-system get ingress default-route \
     -o jsonpath='{.spec.rules[0].host}'
 )"
 
-echo "$REGISTRY_HOST"
+REGISTRY_STATUS_ADDRESS="$(
+  kubectl -n image-registry-system get ingress default-route \
+    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+)"
+if [ -z "$REGISTRY_STATUS_ADDRESS" ]; then
+  REGISTRY_STATUS_ADDRESS="$(
+    kubectl -n image-registry-system get ingress default-route \
+      -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+  )"
+fi
+
+printf 'Ingress rule host: %s\n' "$REGISTRY_RULE_HOST"
+printf 'Ingress status address: %s\n' "$REGISTRY_STATUS_ADDRESS"
 ```
 
 Expected results:
 
 - `Config/cluster.spec.defaultRoute` is `true`.
 - The `default-route` Ingress exists in `image-registry-system`.
-- `REGISTRY_HOST` contains the hostname assigned to the default route.
+- A non-empty `spec.rules[].host` is a usable Registry hostname. An empty rule host means that the
+  Ingress is a catch-all rule; a status address identifies the Ingress controller endpoint and is not
+  automatically a Registry DNS name.
 
-If the Ingress certificate is signed by a private CA, add the CA certificate to the trust store of the external client and the OCI client before logging in. Verify the TLS chain from the external client:
+If the default Ingress has no usable hostname, configure a custom secure host instead. Do not use an
+empty rule host as the value of `--registry`.
+
+When a usable host is available, assign it to `REGISTRY_HOST`. If the client uses a private CA,
+configure that CA before running the TLS check. The check must succeed with the client's normal trust
+settings before logging in:
 
 ```bash
+REGISTRY_HOST="$REGISTRY_RULE_HOST"
+
+test -n "$REGISTRY_HOST" || {
+  echo "No usable Registry hostname was found; configure a custom secure host." >&2
+  exit 1
+}
+
 openssl s_client \
   -connect "$REGISTRY_HOST:443" \
   -servername "$REGISTRY_HOST" \
@@ -74,7 +100,16 @@ ac registry login \
 
 Create or provide a TLS Secret in `image-registry-system`, then configure `Config.spec.routes[]`.
 
-The TLS Secret must exist in `image-registry-system` when `secretName` is set.
+Create the Secret from a certificate whose Subject Alternative Name matches the custom hostname:
+
+```bash
+kubectl -n image-registry-system create secret tls registry-tls \
+  --cert=/path/to/registry.example.com.crt \
+  --key=/path/to/registry.example.com.key
+```
+
+The TLS Secret must exist in `image-registry-system` when `secretName` is set. Create a DNS record
+for `registry.example.com` that resolves to the Ingress controller.
 
 The generated Ingress uses the registry service as the backend and sets the backend protocol to HTTPS.
 
@@ -118,7 +153,8 @@ Expected results:
 - The `public-registry` Ingress uses `registry.example.com`.
 - The Ingress references the `registry-tls` Secret.
 
-Verify TLS trust and login:
+Configure client trust as described in [Configure Client Trust](#configure-client-trust), then verify
+TLS trust and login:
 
 ```bash
 openssl s_client \
@@ -130,7 +166,7 @@ ac registry login \
   --registry registry.example.com
 ```
 
-## Configure Client Trust
+## Configure Client Trust \{#configure-client-trust}
 
 If the Ingress certificate is signed by a private CA, add the CA to each external client's trust store before login and push or pull operations.
 
