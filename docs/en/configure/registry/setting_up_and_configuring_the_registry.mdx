@@ -18,7 +18,10 @@ image limits, and scheduled image cleanup for <Term name="productShort" /> Regis
 
 ## Configure Development Storage
 
-`emptyDir` stores image data on ephemeral Pod storage. Use it only for development or test environments where all pushed image data can be discarded when the Registry Pod is recreated. Do not use `emptyDir` for production or for any environment that must retain images.
+> **Warning:** `emptyDir` stores image data on ephemeral Pod storage. It is deleted when the
+> Registry Pod is removed from its node and cannot be used with more than one Registry replica. Use
+> it only for development or test environments where all pushed image data can be discarded. Do not
+> use `emptyDir` for production or for any environment that must retain images.
 
 Patch `Config/cluster`. The `null` fields remove mutually exclusive storage backends from the current configuration:
 
@@ -32,7 +35,11 @@ kubectl patch configs.imageregistry.operator.alauda.io cluster \
       "storage": {
         "emptyDir": {},
         "pvc": null,
-        "s3": null
+        "s3": null,
+        "swift": null,
+        "gcs": null,
+        "ibmcos": null,
+        "azure": null
       },
       "resources": {
         "requests": {
@@ -62,7 +69,9 @@ Expected results:
 
 ## Configure PVC Storage
 
-Use a persistent backend for production. Create a file named `image-registry-pvc.yaml`:
+Use a persistent backend for production. The example uses `ReadWriteOnce`, one Registry replica, and
+the `Recreate` rollout strategy required by the Operator for RWO storage. Create a file named
+`image-registry-pvc.yaml`:
 
 ```yaml
 apiVersion: v1
@@ -98,13 +107,18 @@ kubectl patch configs.imageregistry.operator.alauda.io cluster \
     "spec": {
       "managementState": "Managed",
       "replicas": 1,
+      "rolloutStrategy": "Recreate",
       "storage": {
         "managementState": "Unmanaged",
         "emptyDir": null,
         "pvc": {
           "claim": "image-registry"
         },
-        "s3": null
+        "s3": null,
+        "swift": null,
+        "gcs": null,
+        "ibmcos": null,
+        "azure": null
       },
       "resources": {
         "requests": {
@@ -141,7 +155,8 @@ Create the user-managed storage Secret before configuring `Config/cluster`. The 
 ```bash
 kubectl -n image-registry-system create secret generic image-registry-private-configuration-user \
   --from-literal=REGISTRY_STORAGE_S3_ACCESSKEY=<access-key-id> \
-  --from-literal=REGISTRY_STORAGE_S3_SECRETKEY=<secret-access-key>
+  --from-literal=REGISTRY_STORAGE_S3_SECRETKEY=<secret-access-key> \
+  --dry-run=client -o yaml | kubectl apply -f -
 ```
 
 | Placeholder | Description |
@@ -149,7 +164,40 @@ kubectl -n image-registry-system create secret generic image-registry-private-co
 | `<access-key-id>` | Access key ID for the S3-compatible storage account. Obtain it from the storage administrator. |
 | `<secret-access-key>` | Secret access key for the S3-compatible storage account. Store it only in the Kubernetes Secret. |
 
+Verify the Secret without printing its contents:
+
+```bash
+kubectl -n image-registry-system get secret image-registry-private-configuration-user \
+  -o jsonpath='{.type}{"\n"}'
+kubectl -n image-registry-system get secret image-registry-private-configuration-user \
+  -o jsonpath='{.data}' | wc -c
+```
+
+Expected results:
+
+- The Secret exists in `image-registry-system`.
+- The second command returns a non-zero byte count. Do not print or decode the Secret data.
+
 Use `disableRedirect: true` when clients cannot reach the object storage endpoint directly and all content must be served through the Registry.
+
+If the S3 endpoint uses a private CA, create the referenced ConfigMap with the required key:
+
+```bash
+kubectl -n image-registry-system create configmap <trusted-ca-configmap> \
+  --from-file=ca-bundle.crt=/path/to/ca-bundle.crt \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+Verify the ConfigMap key without displaying the certificate:
+
+```bash
+kubectl -n image-registry-system get configmap <trusted-ca-configmap> \
+  -o jsonpath='{.data.ca-bundle\.crt}' | wc -c
+```
+
+Expected result:
+
+- The command returns a non-zero byte count for `ca-bundle.crt`.
 
 Patch `Config/cluster`. The `null` fields remove mutually exclusive storage backends from the current configuration:
 
@@ -164,6 +212,10 @@ kubectl patch configs.imageregistry.operator.alauda.io cluster \
         "managementState": "Unmanaged",
         "emptyDir": null,
         "pvc": null,
+        "swift": null,
+        "gcs": null,
+        "ibmcos": null,
+        "azure": null,
         "s3": {
           "bucket": "<bucket-name>",
           "region": "<region>",
@@ -182,8 +234,11 @@ kubectl patch configs.imageregistry.operator.alauda.io cluster \
 | --- | --- |
 | `<bucket-name>` | Existing object storage bucket or bucket-equivalent container used for Registry blobs. |
 | `<region>` | Region value required by the storage backend. Use the provider value, or the value required by the S3-compatible service. |
-| `<s3-endpoint>` | S3-compatible endpoint reachable from the Registry Pod, without the bucket name. |
+| `<s3-endpoint>` | S3-compatible endpoint host and optional port reachable from the Registry Pod, without `https://` and without the bucket name. The example supplies the `https://` scheme. |
 | `<trusted-ca-configmap>` | ConfigMap in `image-registry-system` that contains the CA certificate for the object storage endpoint. Omit `trustedCA` when the endpoint uses a public CA trusted by the Registry Pod. |
+
+The current operator supports the following storage fields: `emptyDir`, `pvc`, `s3`, `swift`, `gcs`,
+`ibmcos`, and `azure`. Do not configure other storage fields.
 
 Verify the configuration and rollout:
 
@@ -197,6 +252,69 @@ Expected results:
 
 - `Config/cluster` reports `Available=True`, `Progressing=False`, and `Degraded=False`.
 - The Registry logs do not show storage authentication, bucket, endpoint, or certificate errors.
+
+## Configure Cloud Storage Backends
+
+The Operator can use Swift, GCS, IBM COS, or Azure storage when the corresponding platform
+integration and credentials are available. Configure exactly one storage field in
+`Config/cluster.spec.storage`; use the same merge-patch pattern shown above and set the other
+supported storage fields to `null`.
+
+| Backend | Main `Config/cluster.spec.storage` fields | Required user-managed Secret data |
+| --- | --- | --- |
+| Swift | `swift.authURL`, `swift.authVersion`, `swift.container`, `swift.domain`, `swift.domainID`, `swift.tenant`, `swift.tenantID`, and `swift.regionName` | `REGISTRY_STORAGE_SWIFT_USERNAME` and `REGISTRY_STORAGE_SWIFT_PASSWORD`, or the application credential keys `REGISTRY_STORAGE_SWIFT_APPLICATIONCREDENTIALID`, `REGISTRY_STORAGE_SWIFT_APPLICATIONCREDENTIALNAME`, and `REGISTRY_STORAGE_SWIFT_APPLICATIONCREDENTIALSECRET`, or `REGISTRY_STORAGE_SWIFT_TOKENID`. |
+| GCS | `gcs.bucket`, `gcs.region`, `gcs.projectID`, and optional `gcs.keyID` | `REGISTRY_STORAGE_GCS_KEYFILE` containing the service-account key file. |
+| IBM COS | `ibmcos.bucket`, `ibmcos.location`, `ibmcos.resourceGroupName`, `ibmcos.resourceKeyCRN`, and `ibmcos.serviceInstanceCRN` | `REGISTRY_STORAGE_IBMCOS_IAMAPIKEY`. |
+| Azure | `azure.accountName`, `azure.container`, `azure.cloudName`, and optional `azure.networkAccess` | `REGISTRY_STORAGE_AZURE_ACCOUNTKEY`. |
+
+Provider integrations can populate platform-specific values such as region, project, account, or
+endpoint information. Confirm the required provider resources and credentials with the storage
+administrator. After configuring a backend, verify the `Config/cluster` conditions and the Registry
+rollout as shown in the storage procedures above. Do not print Secret data while troubleshooting.
+
+## Configure Request Handling
+
+Use `Config/cluster.spec.readOnly` to reject image pushes and deletes. Use the `requests` settings
+to limit concurrent reads and writes, queued requests, and queue wait time:
+
+```bash
+kubectl patch configs.imageregistry.operator.alauda.io cluster \
+  --type=merge \
+  -p '{
+    "spec": {
+      "readOnly": false,
+      "requests": {
+        "read": {
+          "maxRunning": 100,
+          "maxInQueue": 500,
+          "maxWaitInQueue": "30s"
+        },
+        "write": {
+          "maxRunning": 50,
+          "maxInQueue": 200,
+          "maxWaitInQueue": "30s"
+        }
+      }
+    }
+  }'
+```
+
+The `proxy.http`, `proxy.https`, and `proxy.noProxy` fields configure Registry egress when the
+cluster proxy settings are not sufficient. `logLevel` accepts `Normal`, `Debug`, `Trace`, or
+`TraceAll`. Resource requests and limits, node selection, tolerations, affinity, and topology spread
+are also supported by `Config/cluster.spec`.
+
+Verify request handling settings and the rollout:
+
+```bash
+kubectl get configs.imageregistry.operator.alauda.io cluster -o yaml
+kubectl -n image-registry-system rollout status deployment/image-registry --timeout=300s
+```
+
+Expected results:
+
+- `Config/cluster.spec.readOnly` and `Config/cluster.spec.requests` contain the requested values.
+- The Registry Deployment rolls out successfully.
 
 ## Configure Managed Service Account Pull Secrets
 
@@ -233,6 +351,28 @@ kubectl get configs.imageregistry.operator.alauda.io cluster -o yaml
 Expected result:
 
 - `Config/cluster.spec.imagePullSecret` contains the configured management state, additional hosts, and ignored namespace settings.
+
+The controller reconciles pull credentials asynchronously. Verify the managed RoleBinding and a
+ServiceAccount after the controller has had time to reconcile:
+
+```bash
+kubectl -n <workload-namespace> get rolebinding image-registry-system-image-pullers -o yaml
+kubectl -n <workload-namespace> get serviceaccount default \
+  -o jsonpath='{.imagePullSecrets[*].name}{"\n"}'
+kubectl -n <workload-namespace> get secret \
+  -l imageregistry.operator.alauda.io/managed-pull-secret=true -o name
+```
+
+Expected results:
+
+- The RoleBinding grants the `system:image-puller` ClusterRole to service accounts in the namespace.
+- The ServiceAccount lists at least one managed pull Secret after asynchronous reconciliation.
+- At least one Secret with the managed-pull-secret label exists. Use `kubectl get secret` to inspect
+  metadata only; do not print or decode credential data.
+
+| Placeholder | Description |
+| --- | --- |
+| `<workload-namespace>` | Namespace where managed ServiceAccount pull credentials should be injected. It must not be listed in `ignoredNamespaces` and must satisfy `ignoreSystemNamespaces`. |
 
 ## Configure Image Limits
 
@@ -340,7 +480,11 @@ Expected results:
 - `ImagePruner/cluster` contains the configured schedule and retention policy.
 - The Operator renders the `image-pruner` CronJob in `image-registry-system`.
 
-Pruning removes unused image metadata. Run registry garbage collection separately when blob storage reclamation is required.
+The generated CronJob runs `ac adm prune images --confirm`. When the Registry management state is
+`Managed`, the Operator adds `--prune-registry=true`, so the scheduled job also performs registry
+garbage collection after image metadata pruning. For a manually run prune, add
+`--prune-registry` only when blob reclamation is intended; otherwise run garbage collection as a
+separate reviewed operation.
 
 For manual pruning and registry garbage collection commands, see [Managing access and cleanup](./managing_access_and_cleanup.mdx).
 
