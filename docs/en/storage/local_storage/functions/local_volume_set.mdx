@@ -1,0 +1,135 @@
+---
+weight: 30
+queries:
+  - How do I create a LocalVolumeSet for Block PVs
+  - LocalVolumeSet deviceInclusionSpec maxDeviceCount volumeMode Block
+  - LocalVolumeSet models vendors from lsblk MODEL VENDOR columns
+---
+
+# Provision with LocalVolumeSet
+
+A `LocalVolumeSet` provisions PersistentVolumes from devices that match a filter. The operator creates the StorageClass named in `spec.storageClassName` if it does not exist.
+
+Use `LocalVolumeSet` when disks should be claimed by size, type, or similar properties instead of by an explicit path list. For exact paths, see [Provision with LocalVolume](./local_volume.mdx).
+
+:::warning
+Use `LocalVolumeSet` with care. When the operator provisions PersistentVolumes from local disks, it can claim every device that matches `deviceInclusionSpec`. **Alauda Build of LocalStorage** must be the only component managing those disks on the node. Do not create more than one `LocalVolumeSet` that selects the same node. Set `maxDeviceCount` when you must cap how many devices are provisioned per node.
+:::
+
+`LocalVolumeSet` does not support logical volume management (LVM) devices. Do not point it at LVM volumes. Use [LVM Storage](../../storagesystem_topolvm/index.mdx) for LVM-backed dynamic volumes.
+
+## Prerequisites
+
+- **Alauda Build of LocalStorage** is installed. See [Install](../installation.mdx).
+- Device discovery is running so you can confirm which disks are `Available`. See [Discover local disks](./device_discovery.mdx).
+- Matching devices are attached, not mounted, and have no child partitions when you select whole disks.
+
+## Provision Block volumes
+
+This example creates a Block StorageClass named `localblock` and PersistentVolumes from matching whole disks.
+
+On a control plane node:
+
+```yaml
+cat << EOF | kubectl apply -f -
+apiVersion: local.storage.openshift.io/v1alpha1
+kind: LocalVolumeSet
+metadata:
+  name: local-block-disks
+  namespace: acp-storage # [!code callout]
+spec:
+  storageClassName: localblock # [!code callout]
+  volumeMode: Block # [!code callout]
+  maxDeviceCount: 2 # [!code callout]
+  nodeSelector: # [!code callout]
+    nodeSelectorTerms:
+      - matchExpressions:
+          - key: kubernetes.io/hostname
+            operator: In
+            values:
+              - worker-01
+              - worker-02
+              - worker-03
+  deviceInclusionSpec:
+    deviceTypes: # [!code callout]
+      - disk
+    minSize: 10Gi
+    maxSize: 2Ti
+EOF
+```
+
+<Callouts>
+1. Namespace where **Alauda Build of LocalStorage** is installed. The default is `acp-storage`.
+2. StorageClass for provisioned PersistentVolumes. The operator creates it if it does not exist. Use a name that uniquely identifies this set.
+3. `Block` or `Filesystem`. For Ceph OSD consumption and other raw-device users, use `Block`.
+4. Optional. Maximum number of matching devices provisioned per node. If omitted, every matching device on the selected nodes is claimed.
+5. Optional. Nodes that run matching. Get hostnames from `kubectl get node`. If omitted, matching runs on every node.
+6. Device types to include: `disk`, `part`, `loop`, or `mpath`. If the list is empty, only `disk` is selected. LVM devices are not supported.
+</Callouts>
+
+Optional `deviceInclusionSpec` filters:
+
+| Field | Value source |
+| --- | --- |
+| `deviceTypes` | `disk`, `part`, `loop`, or `mpath`. Empty means `disk` only. |
+| `deviceMechanicalProperties` | `Rotational` or `NonRotational`. Default is both. |
+| `minSize` | Minimum device size. Default is `1Gi` when empty. |
+| `maxSize` | Maximum device size. |
+| `models` | Case-insensitive substring of the disk `MODEL` string. Copy the value from `LocalVolumeDiscoveryResult.status.discoveredDevices[].model`, or from the `MODEL` column of `lsblk -d -o NAME,TYPE,SIZE,MODEL,VENDOR,SERIAL` on the node. A value such as `SAMSUNG` matches `SAMSUNG MZVLB512`. |
+| `vendors` | Case-insensitive substring of the disk `VENDOR` string. Copy the value from `LocalVolumeDiscoveryResult.status.discoveredDevices[].vendor`, or from the `VENDOR` column of the same `lsblk` command. This column is often a bus name such as `ATA` or `NVMe`, not the disk brand. The brand is usually in `MODEL`. |
+
+If `MODEL` or `VENDOR` is empty (common on Virtio and many cloud disks), do not set `models` or `vendors`. Those filters will not match an empty string.
+
+Verify PersistentVolumes:
+
+```bash
+kubectl get pv
+```
+
+Example output:
+
+```bash
+NAME                CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS      CLAIM        STORAGECLASS   REASON   AGE
+local-pv-1cec77cf   100Gi      RWO            Delete           Available                localblock              88m
+local-pv-2ef7cd2a   100Gi      RWO            Delete           Available                localblock              82m
+```
+
+A disk that is plugged in later is provisioned automatically if it matches the filter and `maxDeviceCount` still allows it.
+
+## Bind a PersistentVolumeClaim
+
+Create the claim in the project that will use the volume. For Block volumes, set `volumeMode: Block`. The request must not exceed the device capacity.
+
+```yaml
+cat << EOF | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: local-block-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  volumeMode: Block # [!code callout]
+  resources:
+    requests:
+      storage: 100Gi # [!code callout]
+  storageClassName: localblock # [!code callout]
+EOF
+```
+
+<Callouts>
+1. Must match the `LocalVolumeSet` `volumeMode`.
+2. Must be less than or equal to the PersistentVolume capacity.
+3. Must match `spec.storageClassName`.
+</Callouts>
+
+Confirm the claim is bound:
+
+```bash
+kubectl get pvc local-block-pvc
+```
+
+## Add disks or nodes
+
+- Add a disk: attach a disk that matches `deviceInclusionSpec` on a selected node. The operator provisions a PersistentVolume when the disk is `Available` and `maxDeviceCount` is not exceeded. You do not edit a path list.
+- Add a node: add the hostname to `spec.nodeSelector` on both the `LocalVolumeSet` and the `LocalVolumeDiscovery` that inventories that node. See [Discover local disks](./device_discovery.mdx).
