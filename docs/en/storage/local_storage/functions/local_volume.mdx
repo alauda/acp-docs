@@ -1,0 +1,148 @@
+---
+weight: 20
+queries:
+  - How do I create a LocalVolume for Filesystem or Block PVs
+  - LocalVolume devicePaths by-id forceWipeDevicesAndDestroyAllData
+  - Add a disk or node to an existing LocalVolume
+---
+
+# Provision with LocalVolume
+
+A `LocalVolume` statically provisions one PersistentVolume per listed device path. The operator also creates the StorageClass named in `spec.storageClassDevices[].storageClassName` if it does not exist.
+
+Use `LocalVolume` when you know the exact disks. For filter-based provisioning, see [Provision with LocalVolumeSet](./local_volume_set.mdx).
+
+## Prerequisites
+
+- **Alauda Build of LocalStorage** is installed. See [Install](../installation.mdx).
+- Each target device is attached to a node, is not mounted, and has no partitions.
+- Prefer stable paths from [Discover local disks](./device_discovery.mdx), such as `/dev/disk/by-id/...`. Do not use a short `/dev/sdX` name.
+
+## Provision Filesystem volumes
+
+Local volumes are static. The provisioner looks for devices at the paths you list.
+
+:::note
+Do not use different StorageClass names for the same device. That creates multiple PersistentVolumes for one disk.
+:::
+
+On a control plane node:
+
+```yaml
+cat << EOF | kubectl apply -f -
+apiVersion: local.storage.openshift.io/v1
+kind: LocalVolume
+metadata:
+  name: local-disks
+  namespace: acp-storage # [!code callout]
+spec:
+  nodeSelector: # [!code callout]
+    nodeSelectorTerms:
+      - matchExpressions:
+          - key: kubernetes.io/hostname
+            operator: In
+            values:
+              - worker-01
+              - worker-02
+              - worker-03
+  storageClassDevices:
+    - storageClassName: local-sc # [!code callout]
+      forceWipeDevicesAndDestroyAllData: false # [!code callout]
+      volumeMode: Filesystem # [!code callout]
+      fsType: xfs # [!code callout]
+      devicePaths: # [!code callout]
+        - /dev/disk/by-id/<wwn-id>
+EOF
+```
+
+<Callouts>
+1. Namespace where **Alauda Build of LocalStorage** is installed. The default is `acp-storage`.
+2. Optional. Nodes that have the listed disks. Get hostnames from `kubectl get node`. If omitted, the operator looks for the paths on every node.
+3. StorageClass for the PersistentVolumes. The operator creates it if it does not exist. Use a name that uniquely identifies this set of disks.
+4. When `true`, the operator wipes partition tables, filesystem signatures, and data on the listed devices before use. The default is `false`. Set `true` only when the devices can be destroyed.
+5. `Filesystem` or `Block`.
+6. Filesystem created on first mount. Set this only when `volumeMode` is `Filesystem`.
+7. Device paths. Use `/dev/disk/by-id/...` from `LocalVolumeDiscoveryResult.status.discoveredDevices[].deviceID`.
+</Callouts>
+
+:::warning
+`forceWipeDevicesAndDestroyAllData: true` destroys existing data on the listed devices.
+:::
+
+Verify PersistentVolumes:
+
+```bash
+kubectl get pv
+```
+
+Example output:
+
+```bash
+NAME                CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS      CLAIM   STORAGECLASS   REASON   AGE
+local-pv-n8xlrd2a   100Gi      RWO            Delete           Available           local-sc                88m
+local-pv-tc78vc73   100Gi      RWO            Delete           Available           local-sc                82m
+```
+
+:::note
+Editing a `LocalVolume` does not change `fsType` or `volumeMode` on PersistentVolumes that already exist. That change would be destructive.
+:::
+
+## Provision Block volumes
+
+To provision raw block devices, set `volumeMode: Block` and omit `fsType`:
+
+```yaml
+      volumeMode: Block
+      devicePaths:
+        - /dev/disk/by-id/<wwn-id>
+```
+
+Use a StorageClass name that identifies this Block set, for example `localblock`. The PersistentVolumeClaim must also set `volumeMode: Block`.
+
+## Bind a PersistentVolumeClaim
+
+Create the claim in the project that will use the volume. The request must not exceed the device capacity.
+
+Filesystem claim:
+
+```yaml
+cat << EOF | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: local-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  volumeMode: Filesystem # [!code callout]
+  resources:
+    requests:
+      storage: 100Gi # [!code callout]
+  storageClassName: local-sc # [!code callout]
+EOF
+```
+
+<Callouts>
+1. Must match the `LocalVolume` `volumeMode`. Use `Block` for Block volumes.
+2. Must be less than or equal to the PersistentVolume capacity.
+3. Must match `spec.storageClassDevices[].storageClassName`.
+</Callouts>
+
+Confirm the claim is bound:
+
+```bash
+kubectl get pvc local-pvc
+```
+
+## Add disks or nodes
+
+Adding a disk or a node is an edit of the same `LocalVolume`. It is not a separate procedure.
+
+- Add a disk: append a `/dev/disk/by-id/...` path to `spec.storageClassDevices[].devicePaths`.
+- Add a node: add the node hostname to `spec.nodeSelector.nodeSelectorTerms`, then list that node's device paths.
+
+After you apply the edit, wait for new PersistentVolumes in `Available` state:
+
+```bash
+kubectl get pv -l storage.openshift.com/owner-name=local-disks
+```
