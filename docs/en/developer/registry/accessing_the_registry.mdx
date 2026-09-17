@@ -5,21 +5,29 @@ i18n:
     en: "Accessing the Registry"
 ---
 
-# Registry v2: Accessing the Registry
+# Accessing the Registry
 
-Use this page to access **Registry v2** from inside the cluster, from external clients, and through the <Term name="productShort" /> Image API.
+Use this page to access Alauda Container Platform Registry from inside the cluster, from external
+clients, and through the <Term name="productShort" /> Image API.
 
 ## Prerequisites
 
-- Registry v2 is installed and available in the target cluster.
+- Alauda Container Platform Registry is installed and available in the target cluster.
 - The image namespace exists.
 - The current user or service account has the required namespace permissions.
+- The `ac` CLI is installed and authenticated when you use the Registry or Image API commands.
+
+For `ac` Image API commands, select the ACP 4.4 Registry backend:
+
+```bash
+ac config set-registry-mode modern
+```
 
 ## Required Namespace Permissions
 
 Your user account or workload service account must have permissions in the namespace that owns the image repository. Ask a namespace administrator to grant the required image roles when you need cross-namespace access.
 
-Registry v2 uses ImageStream layer authorization:
+The Registry uses ImageStream layer authorization:
 
 | Operation | Typical role | Image API permission |
 | --- | --- | --- |
@@ -27,7 +35,7 @@ Registry v2 uses ImageStream layer authorization:
 | Push | `system:image-pusher` | `image.alauda.io` `imagestreams/layers` `update` |
 | Delete | `system:image-deleter` | Image API delete permissions for the target image metadata |
 
-For role binding examples, see [Managing Registry v2 access and cleanup](../../../configure/registry/registry_v2/managing_access_and_cleanup.mdx).
+For role binding examples, see [Managing access and cleanup](../../configure/registry/managing_access_and_cleanup.mdx).
 
 ## Access the Registry from Inside the Cluster
 
@@ -61,7 +69,24 @@ spec:
           image: image-registry.image-registry-system.svc:5000/team-a/my-app:v1
 ```
 
-For a custom service account, make sure it has pull permission in the image namespace. The Operator injects the managed pull secret when Registry v2 is configured to manage service account pull secrets.
+Save the manifest as `my-app.yaml` and apply it:
+
+```bash
+kubectl apply -f my-app.yaml
+kubectl -n team-a rollout status deployment/my-app --timeout=300s
+kubectl -n team-a get pods -l app=my-app
+```
+
+Expected results:
+
+- The Deployment is created in `team-a` and its Pod becomes ready using the internal Registry image.
+
+The image repository path is namespace-scoped. Use `<registry-host>/<namespace>/<repository>:<tag>`;
+do not include additional path segments after the namespace.
+
+For a custom service account, make sure it has pull permission in the image namespace. The Operator
+injects the managed pull secret when the Registry is configured to manage service account pull
+secrets.
 
 Create the service account in the workload namespace:
 
@@ -81,15 +106,27 @@ kubectl create rolebinding image-puller-app-puller \
 Verify that the managed pull secret is injected:
 
 ```bash
-kubectl -n team-b get serviceaccount app-puller \
-  -o jsonpath='{.imagePullSecrets[*].name}{"\n"}'
+PULL_SECRET="$(
+  kubectl -n team-b get serviceaccount app-puller \
+    -o jsonpath='{.imagePullSecrets[0].name}'
+)"
+test -n "$PULL_SECRET" || {
+  echo "The managed pull Secret has not been injected yet." >&2
+  exit 1
+}
+printf 'Managed pull Secret: %s\n' "$PULL_SECRET"
+kubectl -n team-b get secret "$PULL_SECRET" \
+  -o jsonpath='{.data}' | wc -c
 ```
 
 Expected result:
 
-- The command returns at least one image pull secret name.
+- The command prints a managed pull Secret name and a non-zero data size. Do not print or decode the
+  Secret data.
 
-If no pull secret is listed, ask a Registry administrator to verify that managed service account pull secrets are enabled and that the workload namespace is not ignored.
+The controller refreshes managed pull credentials asynchronously. If no pull Secret is listed, wait
+for reconciliation and ask a Registry administrator to verify that managed service account pull
+secrets are enabled and that the workload namespace is not ignored.
 
 Use the service account in the workload:
 
@@ -113,6 +150,13 @@ spec:
       containers:
         - name: app
           image: image-registry.image-registry-system.svc:5000/team-a/my-app:v1
+          imagePullPolicy: Always
+```
+
+Save the manifest as `my-app-app-puller.yaml` and apply it:
+
+```bash
+kubectl apply -f my-app-app-puller.yaml
 ```
 
 Verify the rollout:
@@ -121,6 +165,13 @@ Verify the rollout:
 kubectl -n team-b rollout status deployment/my-app --timeout=300s
 kubectl -n team-b get pods -l app=my-app
 ```
+
+Expected results:
+
+- The rollout completes successfully.
+- The Pod is ready and does not report an image pull error. If the Pod is in `ImagePullBackOff`,
+  verify the ServiceAccount permission, injected pull Secret, internal service address, and image
+  repository path.
 
 ## Authenticate an External OCI Client
 
@@ -131,15 +182,20 @@ ac registry login \
   --registry registry.example.com
 ```
 
-To write credentials to a specific Docker-compatible auth file, set `DOCKER_CONFIG` or use `--to`:
+To write credentials to a specific OCI registry auth file, use `--to`:
 
 ```bash
-export DOCKER_CONFIG=/tmp/registry-auth
+mkdir -p /tmp/registry-auth
 
 ac registry login \
   --registry registry.example.com \
-  --to "$DOCKER_CONFIG/config.json"
+  --to /tmp/registry-auth/config.json
+
+export REGISTRY_AUTH_FILE=/tmp/registry-auth/config.json
 ```
+
+The command writes credentials for `registry.example.com` to the specified auth file. Use the
+exported `REGISTRY_AUTH_FILE` with `ac image` commands that need Registry authentication.
 
 If the registry uses a private CA, configure client trust before push and pull operations. Use `--insecure` only for an HTTP endpoint or a non-production test certificate that the client does not trust.
 
@@ -191,9 +247,18 @@ Show the Image metadata for a digest:
 ac get imagestreamimages my-app@sha256:<digest> -n team-a -o yaml
 ```
 
-List Registry HTTP image repositories visible to the current user:
+List cluster-scoped Image resources through the current `modern` registry mode:
 
 ```bash
-ac get images --registry-url=https://registry.example.com
-ac get images -n team-a --registry-url=https://registry.example.com
+ac config set-registry-mode modern
+ac get images
+ac get images -o yaml
+```
+
+For namespace-scoped repository views, query ImageStream resources instead of passing a Registry URL
+override:
+
+```bash
+ac get imagestreams -n team-a
+ac get imagestreamtags my-app:v1 -n team-a -o wide
 ```
