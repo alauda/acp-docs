@@ -3,101 +3,184 @@ weight: 17
 queries:
   - Deploy Ceph Internal Mode with Local Storage Block PVs
   - CephCluster storageClassDeviceSets portable false volumeMode Block
-  - Scale PVC-backed OSDs by increasing storageClassDeviceSets count
+  - Create Cluster wizard YAML replace spec.storage
 ---
 
 # Deploying in Internal Mode with Local Storage
 
-This Internal Mode path creates a Ceph cluster in the current business cluster and backs OSDs with Block PersistentVolumes from **Local Storage**. It is the same Internal Mode as [Deploying in Internal Mode](./create_service_stand.mdx), except OSD devices come from Local Storage volumes instead of host paths selected in the wizard.
+This Internal Mode path creates a Ceph cluster in the current business cluster and backs OSDs with Block PersistentVolumes from **Local Storage**. Configure cluster type, snapshots, monitoring, and advanced options in the Distributed Storage wizard, then switch to YAML and replace `spec.storage` so Rook consumes Local Storage volumes instead of host devices.
 
-Do not mix host devices and `storageClassDeviceSets` on the same `CephCluster`.
-
-This procedure applies a `CephCluster` directly. It is not the Distributed Storage **Create Cluster** wizard.
+Do not mix host devices (`spec.storage.nodes`) and `storageClassDeviceSets` on the same `CephCluster`.
 
 ## Prerequisites
 
-- **Alauda Container Platform Storage Essentials** and **Alauda Build of Rook-Ceph** are installed. Follow the operator install steps in [Deploying in Internal Mode](./create_service_stand.mdx), then stop before **Create Cluster**.
-- **Alauda Build of LocalStorage** is installed. See [Install Local Storage](../../local_storage/installation.mdx).
-- You have provisioned Block PersistentVolumes that are `Available`. Use [Provision with LocalVolume](../../local_storage/functions/local_volume.mdx) or [Provision with LocalVolumeSet](../../local_storage/functions/local_volume_set.mdx). Do not repeat those steps here.
-- You have at least three `Available` Block PersistentVolumes, typically one per storage node. The StorageClass name is the one you set on the `LocalVolume` or `LocalVolumeSet` (for example `localblock`).
 - At least three nodes will run OSDs.
+- Each of those nodes has at least one unused disk that is not mounted and has no partitions.
+- **Download** and **Upload** the installation packages for **Alauda Container Platform Storage Essentials**, **Alauda Build of Rook-Ceph**, and **Alauda Build of LocalStorage**.
 
 ## Procedure
 
-### 1. Confirm Available Block volumes
+<Steps>
+
+### 1. Install Alauda Build of LocalStorage and provision Block volumes
+
+Install the operator as described in [Install Local Storage](../../local_storage/installation.mdx).
+
+Confirm the operator is running:
+
+```bash
+kubectl -n acp-storage get csv | grep local-storage
+```
+
+Example output:
+
+```bash
+local-storage-operator.v4.5.0   Alauda Build of LocalStorage   Succeeded
+```
+
+Provision one Block PersistentVolume per OSD. The following `LocalVolumeSet` claims at most one whole disk per selected node and creates StorageClass `localblock`. Replace the hostnames with `kubectl get node` values. For exact device paths, use [Provision with LocalVolume](../../local_storage/functions/local_volume.mdx) instead.
+
+```yaml
+cat << EOF | kubectl apply -f -
+apiVersion: local.storage.openshift.io/v1alpha1
+kind: LocalVolumeSet
+metadata:
+  name: local-block-disks
+  namespace: acp-storage
+spec:
+  storageClassName: localblock
+  volumeMode: Block
+  maxDeviceCount: 1
+  nodeSelector:
+    nodeSelectorTerms:
+      - matchExpressions:
+          - key: kubernetes.io/hostname
+            operator: In
+            values:
+              - worker-01
+              - worker-02
+              - worker-03
+  deviceInclusionSpec:
+    deviceTypes:
+      - disk
+EOF
+```
+
+Check the `LocalVolumeSet` and StorageClass:
+
+```bash
+kubectl -n acp-storage get localvolumeset local-block-disks
+kubectl get sc localblock
+```
+
+Example output:
+
+```bash
+NAME                AGE
+local-block-disks   45s
+
+NAME         PROVISIONER                    RECLAIMPOLICY   VOLUMEBINDINGMODE      ALLOWVOLUMEEXPANSION   AGE
+localblock   kubernetes.io/no-provisioner   Delete          WaitForFirstConsumer   false                  45s
+```
+
+Check that Block PersistentVolumes are `Available`. You need at least as many as the OSD `count` you will set later (three in this example):
 
 ```bash
 kubectl get pv -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,SC:.spec.storageClassName,MODE:.spec.volumeMode,CAPACITY:.spec.capacity.storage
 ```
 
-Each OSD consumes one Block PersistentVolume from that StorageClass. `count` in the next step must not exceed the number of `Available` volumes.
-
-### 2. Get the Ceph image from the Operator
-
-After **Alauda Build of Rook-Ceph** is installed, copy the unique CSV `relatedImages` entry whose `name` is `ceph`. Do not invent a tag.
+Example output:
 
 ```bash
-kubectl get csv -A -o jsonpath='{range .items[*]}{range .spec.relatedImages[*]}{.name}{"\t"}{.image}{"\n"}{end}{end}' | grep '^ceph[[:space:]]'
+NAME                STATUS      SC           MODE    CAPACITY
+local-pv-1cec77cf   Available   localblock   Block   1Ti
+local-pv-2ef7cd2a   Available   localblock   Block   1Ti
+local-pv-3fa1c73    Available   localblock   Block   1Ti
 ```
 
-### 3. Create the CephCluster
+If a volume is missing, inspect discovery results in [Discover local disks](../../local_storage/functions/device_discovery.mdx) and confirm the disk is `Available` and matches `deviceInclusionSpec`.
 
-Create the `rook-ceph` namespace if it does not exist, then apply the cluster. Replace `<ceph-image-from-csv>` and `localblock` with your values. Set `resources.requests.storage` no larger than the smallest Available PersistentVolume.
+### 2. Deploy the Rook-Ceph Operator in the wizard
 
-```yaml
-cat << EOF | kubectl apply -f -
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: rook-ceph
----
-apiVersion: ceph.rook.io/v1
-kind: CephCluster
-metadata:
-  name: ceph-cluster
-  namespace: rook-ceph
-spec:
-  dataDirHostPath: /var/lib/rook
-  cephVersion:
-    image: <ceph-image-from-csv> # [!code callout]
-  mon:
-    count: 3
-    allowMultiplePerNode: false
-  storage:
-    storageClassDeviceSets:
-      - name: local-osds
-        count: 3 # [!code callout]
-        portable: false # [!code callout]
-        volumeClaimTemplates:
-          - metadata:
-              name: data
-            spec:
-              storageClassName: localblock # [!code callout]
-              volumeMode: Block
-              accessModes:
-                - ReadWriteOnce
-              resources:
-                requests:
-                  storage: 100Gi # [!code callout]
-EOF
-```
+1. Login, go to the **Administrator** page.
 
-<Callouts>
-1. Ceph image from the installed Operator CSV `relatedImages` entry named `ceph`.
-2. Number of OSDs Rook creates from this set. Each OSD binds one Block PersistentVolume. Increase `count` only after more `Available` volumes exist.
-3. Must be `false` for Local Storage. Local volumes cannot move to another node.
-4. StorageClass created by your `LocalVolume` or `LocalVolumeSet`. The PVC `volumeMode` must be `Block`.
-5. PVC request used only to bind an `Available` Block PersistentVolume. Kubernetes requires this field; do not omit it. For Local Storage the PV is the whole disk, so the OSD uses the disk capacity (for example `1Ti`), not this request. Set it less than or equal to the smallest matching PersistentVolume. A value such as `1Gi` still binds a `1Ti` disk.
-</Callouts>
+2. In the left sidebar, click **Storage Management** > **Distributed Storage**.
 
-### 4. Verify OSDs
+3. Click **Configure Now**.
 
-```bash
-kubectl -n rook-ceph get pod -l app=rook-ceph-osd
-kubectl -n rook-ceph get cephcluster ceph-cluster -o jsonpath='{.status.ceph.health}{"\n"}'
-```
+4. If **Alauda Container Platform Storage Essentials** is not installed, the wizard installs it first. Use the same OperatorHub values as [Deploying in Internal Mode](./create_service_stand.mdx): channel `stable`, installation mode `Cluster`, namespace **acp-storage**, upgrade strategy `Manual`.
 
-Wait until three OSD pods are running and health is `HEALTH_OK` or `HEALTH_WARN` only for expected start-up notes.
+5. On the **Install Operator** wizard page, click **Start Deployment** (or **Deploy Operator**) for **Alauda Build of Rook-Ceph**.
+
+   - When the page proceeds to **Create Cluster**, the Operator is installed.
+   - If deployment fails, follow the on-screen prompts, click **Clean Up**, and deploy the Operator again.
+
+### 3. Create the cluster: fill the wizard, then edit YAML storage
+
+1. On the **Create Cluster** wizard page, set **Cluster Type** to **Standard** (Internal Mode).
+
+2. Configure everything **except host storage devices**:
+
+   - **Snapshot** and **Monitoring Alarm**, as required.
+   - **Advanced Configuration**: network, optimization parameters, and component placement. Place MON/MGR/MDS/RGW on at least three nodes when you use fixed-point deployment.
+
+   Do not add **Device Class** host devices (**Selection Device** or **Input Device**). Those fields write `spec.storage.nodes` and conflict with PVC-backed OSDs.
+
+3. Switch the page from **Form** to **YAML**. The editor shows the `CephCluster` the wizard would create. Leave `cephVersion`, `network`, `mon`, `monitoring`, and other non-storage fields as generated.
+
+4. Replace the entire `spec.storage` section. Remove `spec.storage.nodes` if it is present. Use the StorageClass from step 1 (`localblock` in the example). Set `count` to the number of `Available` Block PersistentVolumes you will consume.
+
+   ```yaml
+   spec:
+     storage:
+       storageClassDeviceSets:
+         - name: local-osds
+           count: 3 # [!code callout]
+           portable: false # [!code callout]
+           volumeClaimTemplates:
+             - metadata:
+                 name: data
+               spec:
+                 storageClassName: localblock # [!code callout]
+                 volumeMode: Block
+                 accessModes:
+                   - ReadWriteOnce
+                 resources:
+                   requests:
+                     storage: 1Gi # [!code callout]
+   ```
+
+   <Callouts>
+   1. Number of OSDs. Each OSD binds one Block PersistentVolume. Do not set this higher than the number of `Available` volumes.
+   2. Must be `false` for Local Storage. Local volumes cannot move to another node.
+   3. StorageClass created by the `LocalVolume` or `LocalVolumeSet`. Must be Block.
+   4. PVC request used only to bind an `Available` Block PersistentVolume. Kubernetes requires this field; do not omit it. The OSD uses the whole disk (for example `1Ti`), not this request. Set it less than or equal to the smallest matching PersistentVolume.
+   </Callouts>
+
+5. Click **Create Cluster** and wait for the wizard to finish.
+
+6. Verify OSDs and the PVCs Rook created:
+
+   ```bash
+   kubectl -n rook-ceph get pod -l app=rook-ceph-osd
+   kubectl -n rook-ceph get pvc
+   kubectl -n rook-ceph get cephcluster ceph-cluster -o jsonpath='{.status.ceph.health}{"\n"}'
+   ```
+
+   Example PVC output after binding 1Ti local volumes with a `1Gi` request:
+
+   ```bash
+   NAME                    STATUS   VOLUME             CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+   local-osds-data-0-0-0   Bound    local-pv-1cec77cf  1Ti        RWO            localblock     2m
+   local-osds-data-1-0-0   Bound    local-pv-2ef7cd2a  1Ti        RWO            localblock     2m
+   local-osds-data-2-0-0   Bound    local-pv-3fa1c73   1Ti        RWO            localblock     2m
+   ```
+
+   `CAPACITY` is the PersistentVolume size (the disk). `.spec.resources.requests.storage` on the PVC remains the request from the template (`1Gi` in this example).
+
+   Wait until three OSD pods are running and health is `HEALTH_OK`, or `HEALTH_WARN` only for expected start-up notes.
+
+</Steps>
 
 ## Scale OSDs
 
@@ -113,5 +196,5 @@ Do not lower `count` to remove OSDs. That is not a supported scale-in path on th
 
 ## Related information
 
-- [Deploying in Internal Mode](./create_service_stand.mdx) uses host devices in the web console.
+- [Deploying in Internal Mode](./create_service_stand.mdx) uses host devices in the web console without replacing `spec.storage`.
 - [Cleanup Distributed Storage](../how_to/clean_ceph.mdx) if you need to remove the cluster.
