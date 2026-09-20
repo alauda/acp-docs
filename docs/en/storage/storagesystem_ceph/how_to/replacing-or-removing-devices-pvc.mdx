@@ -1,0 +1,154 @@
+---
+weight: 11
+---
+
+# Replacing or Removing PVC-backed OSD Devices
+
+This document describes how to remove or replace an Object Storage Daemon (OSD) when the Ceph cluster uses **PVC-backed OSDs** (`StorageCluster.spec.ceph.storageDeviceSets`). The OSDs consume Block PersistentVolumeClaims (PVCs) from a Local Storage StorageClass such as `localblock`.
+
+For host-based OSDs (`hostStorage` / `CephCluster.spec.storage.nodes`), use [Replacing or Removing Devices](./replacing-or-removing-devices.mdx) instead.
+
+Decreasing `storageDeviceSets[].count` does **not** delete OSDs. It only lowers the desired number of OSDs so Rook does not recreate a device after you purge it. Removing data from Ceph always requires an explicit purge of a specific OSD ID.
+
+## Prerequisites
+
+- All cluster components are functioning properly, except the failed disk if you are replacing a device.
+- The cluster was created with PVC-backed OSDs. Confirm `StorageCluster` has `spec.ceph.storageDeviceSets` and that `spec.ceph.hostStorage` is not set.
+
+  ```bash
+  kubectl -n rook-ceph get storagecluster ceph-cluster -o jsonpath='{.spec.ceph.storageDeviceSets}' ; echo
+  ```
+
+- You have `cluster-admin` access and can exec into `rook-ceph-tools`.
+
+## Constraints and Limitations
+
+- During data rebalancing, cluster performance may be temporarily degraded. Do not purge more than one OSD at a time unless you have confirmed remaining capacity and failure domains.
+- Do not proceed if the cluster is in `HEALTH_ERR` due to reasons **other than** the OSD being removed.
+- If the OSD is the last device of a device class, pools that use only that class will be affected.
+- Do not scale the Rook operator to zero for PVC-backed removal. Rook must remain running so it does not recreate OSDs after you lower `count`.
+- After a purge, if `count` is still higher than the number of remaining OSDs, Rook creates a new PVC/OSD to fill the gap. That is the replace path. For shrink, lower `count` before or immediately after purge.
+
+## Identify the OSD and PVC
+
+1. List OSD pods and note the OSD ID and node.
+
+   ```bash
+   kubectl -n rook-ceph get pod -l app=rook-ceph-osd -o wide
+   ```
+
+2. Find the PVC that backs the OSD.
+
+   ```bash
+   kubectl -n rook-ceph get pvc -l ceph.rook.io/DeviceSet=<deviceSet-name>
+   kubectl -n rook-ceph get deploy rook-ceph-osd-<id> -o yaml | grep ceph.rook.io/pvc
+   ```
+
+3. Confirm cluster health and remaining capacity.
+
+   ```bash
+   kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- ceph -s
+   kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- ceph osd df
+   ```
+
+   The sum of **AVAIL** on remaining OSDs must be greater than **USE** of the OSD you are removing.
+
+## Remove an OSD (shrink)
+
+Use this procedure when you want fewer OSDs and do not want Rook to provision a replacement.
+
+<Steps>
+### Lower the desired count
+
+Patch the matching `storageDeviceSets` entry on `StorageCluster` so `count` equals the number of OSDs you will keep. Example: a set with `count: 3` becoming `2`.
+
+```bash
+kubectl -n rook-ceph patch storagecluster ceph-cluster --type=json \
+  -p '[{"op":"replace","path":"/spec/ceph/storageDeviceSets/0/count","value":2}]'
+```
+
+If you have more than one device set, change the array index so you patch the set that owns the OSD. Rook does not delete the extra OSD when `count` decreases.
+
+### Mark the OSD out and wait for data migration
+
+1. If the OSD is still running, scale it down.
+
+   ```bash
+   kubectl -n rook-ceph scale deploy rook-ceph-osd-<id> --replicas=0
+   ```
+
+2. From the tools pod, mark the OSD `down` and `out`.
+
+   ```bash
+   kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- bash
+   ceph osd down osd.<id>
+   ceph osd out osd.<id>
+   ceph -s
+   ```
+
+   Wait until PGs are `active+clean` and the cluster is `HEALTH_OK` (or only warnings related to this removal). **Do not purge before backfill finishes**, unless the OSD has already failed and you must proceed.
+
+### Purge the OSD
+
+Prefer the Rook purge command if the `rook-ceph` kubectl plugin is installed:
+
+```bash
+kubectl rook-ceph rook purge-osd <id> --force
+```
+
+If the plugin is not installed, purge from the tools pod and then delete leftover Kubernetes objects:
+
+```bash
+kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- ceph osd purge osd.<id> --yes-i-really-mean-it
+kubectl -n rook-ceph delete deploy rook-ceph-osd-<id>
+kubectl -n rook-ceph delete pvc <osd-pvc-name>
+```
+
+### Verify
+
+```bash
+kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- ceph osd tree
+kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- ceph -s
+kubectl -n rook-ceph get pvc -l ceph.rook.io/DeviceSet=<deviceSet-name>
+```
+
+The removed OSD ID must not appear in `ceph osd tree`. `storageDeviceSets[].count` must match the remaining OSD count for that set, or Rook will create another OSD.
+</Steps>
+
+## Replace a failed OSD (keep capacity)
+
+Use this procedure when a disk or PVC has failed and you want the same number of OSDs.
+
+<Steps>
+### Prepare a replacement Block PV
+
+For Local Storage, create a new Block PV in the same StorageClass (`localblock` or the class used by the device set) before or immediately after purge. The PV must be Available on a suitable node.
+
+Do not decrease `storageDeviceSets[].count`.
+
+### Purge the failed OSD
+
+Follow [Mark the OSD out and wait for data migration](#mark-the-osd-out-and-wait-for-data-migration) and [Purge the OSD](#purge-the-osd). You can skip `ceph osd down` if the OSD pod is already in `CrashLoopBackOff` or `Error`.
+
+### Wait for Rook to create a replacement
+
+Because `count` is unchanged, Rook creates a new PVC using the highest unused index and starts a new OSD. The new OSD ID may differ from the old one.
+
+```bash
+kubectl -n rook-ceph get pvc -l ceph.rook.io/DeviceSet=<deviceSet-name>
+kubectl -n rook-ceph get pod -l app=rook-ceph-osd
+kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- ceph osd tree
+kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- ceph -s
+```
+
+Wait until the new OSD is `up`/`in` and PGs are `active+clean`.
+</Steps>
+
+## Clean up Local Storage
+
+After the OSD PVC is deleted, remove or reuse the local disk according to the Local Storage guides. Do not run `sgdisk`/`dd` against a device that is still bound to a PV.
+
+## References
+
+- [Rook Ceph OSD Management](https://rook.io/docs/rook/latest-release/Storage-Configuration/Advanced/ceph-osd-mgmt/)
+- [Replacing or Removing Devices](./replacing-or-removing-devices.mdx) (host-based OSDs)
