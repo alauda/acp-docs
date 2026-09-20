@@ -27,8 +27,8 @@ Decreasing `storageClassDeviceSets[].count` or removing a `storageClassDeviceSet
 - During data rebalancing, cluster performance may be temporarily degraded. Do not purge more than one OSD at a time unless you have confirmed remaining capacity and failure domains.
 - Do not proceed if the cluster is in `HEALTH_ERR` due to reasons **other than** the OSD being removed.
 - If the OSD is the last device of a device class, pools that use only that class will be affected.
-- Do not scale the Rook operator to zero for PVC-backed removal. Rook must remain running so it does not recreate OSDs after you lower `count`.
-- After a purge, if `count` is still higher than the number of remaining OSDs, Rook creates a new PVC/OSD to fill the gap. That is the replace path. For shrink, lower `count` before or immediately after purge.
+- Do not scale the Rook operator to zero while you lower `count`, remove a set, or purge. Rook must remain running so it does not recreate OSDs after you change desired capacity. You may scale it to zero only while wiping a released disk, as described in [Clear leftover BlueStore labels](#clear-leftover-bluestore-labels).
+- After a purge, if `count` is still higher than the number of remaining OSDs, or if the device set is still in the spec, Rook creates a new PVC/OSD to fill the gap. That is the replace path. For shrink, lower `count` or remove the set before or immediately after purge.
 
 ## Identify the OSD and PVC
 
@@ -42,7 +42,7 @@ Decreasing `storageClassDeviceSets[].count` or removing a `storageClassDeviceSet
 
    ```bash
    kubectl -n rook-ceph get pvc -l ceph.rook.io/DeviceSet=<deviceSet-name>
-   kubectl -n rook-ceph get deploy rook-ceph-osd-<id> -o yaml | grep ceph.rook.io/pvc
+   kubectl -n rook-ceph get deploy rook-ceph-osd-<id> -o jsonpath='{.metadata.labels.ceph\.rook\.io/pvc}{"\n"}'
    ```
 
 3. Confirm cluster health and remaining capacity.
@@ -98,29 +98,27 @@ Rook does not delete OSDs when `count` decreases or when you remove the set.
 
 ### Purge the OSD \{#purge-the-osd}
 
-Prefer the Rook purge command if the `rook-ceph` kubectl plugin is installed:
-
-```bash
-kubectl rook-ceph rook purge-osd <id> --force
-```
-
-If the plugin is not installed, purge from the tools pod and then delete leftover Kubernetes objects:
+Purge from the tools pod, then delete leftover Kubernetes objects. Delete the completed OSD prepare Job first. That Job still mounts the PVC, so the PVC stays `Terminating` until the Job is gone.
 
 ```bash
 kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- ceph osd purge osd.<id> --yes-i-really-mean-it
 kubectl -n rook-ceph delete deploy rook-ceph-osd-<id>
+kubectl -n rook-ceph delete job rook-ceph-osd-prepare-<osd-pvc-name>
 kubectl -n rook-ceph delete pvc <osd-pvc-name>
 ```
 
-### Verify
+Wait until the PVC is gone. If you will reuse the disk, wait until the backing PV is `Available`.
+
+### Verify \{#verify-shrink}
 
 ```bash
 kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- ceph osd tree
 kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- ceph -s
 kubectl -n rook-ceph get pvc -l ceph.rook.io/DeviceSet=<deviceSet-name>
+kubectl -n rook-ceph get cephcluster ceph-cluster -o jsonpath='{.spec.storage.storageClassDeviceSets}' ; echo
 ```
 
-The removed OSD ID must not appear in `ceph osd tree`. `storageClassDeviceSets[].count` must match the remaining OSD count for that set, or Rook will create another OSD.
+The removed OSD ID must not appear in `ceph osd tree`. If you lowered `count`, it must match the remaining OSD count for that set. If you removed the set, that name must not appear in `storageClassDeviceSets`. Otherwise Rook creates another OSD.
 </Steps>
 
 ## Replace a failed OSD (keep capacity)
@@ -128,17 +126,19 @@ The removed OSD ID must not appear in `ceph osd tree`. `storageClassDeviceSets[]
 Use this procedure when a disk or PVC has failed and you want the same number of OSDs.
 
 <Steps>
-### Prepare a replacement Block PV
+### Keep the desired count
 
-For Local Storage, create a new Block PV in the same StorageClass (`localblock` or the class used by the device set) before or immediately after purge. The PV must be Available on a suitable node.
+Do not decrease `storageClassDeviceSets[].count` and do not remove the device set.
 
-Do not decrease `storageClassDeviceSets[].count`.
+If you are installing a **new** disk, create a new Block PV in the same StorageClass (`localblock` or the class used by the device set). The PV must be `Available` on a suitable node.
+
+If you are **reusing the same local disk**, do not create a new PV. After you purge the OSD, Local Storage typically returns the existing PV to `Available`. You must [clear leftover BlueStore labels](#clear-leftover-bluestore-labels) before Rook prepares the disk again. If you skip that wipe, Rook reuses the old OSD metadata and the replacement OSD stays in `CrashLoopBackOff` during `expand-bluefs`.
 
 ### Purge the failed OSD
 
 Follow [Mark the OSD out and wait for data migration](#mark-the-osd-out-and-wait-for-data-migration) and [Purge the OSD](#purge-the-osd). You can skip `ceph osd down` if the OSD pod is already in `CrashLoopBackOff` or `Error`.
 
-### Wait for Rook to create a replacement
+### Wait for Rook to create a replacement \{#wait-for-rook-to-create-a-replacement}
 
 Because `count` is unchanged, Rook creates a new PVC using the highest unused index and starts a new OSD. The new OSD ID may differ from the old one.
 
@@ -152,9 +152,42 @@ kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- ceph -s
 Wait until the new OSD is `up`/`in` and PGs are `active+clean`.
 </Steps>
 
-## Clean up Local Storage
+## Clear leftover BlueStore labels \{#clear-leftover-bluestore-labels}
 
-After the OSD PVC is deleted, remove or reuse the local disk according to the Local Storage guides. Do not run `sgdisk`/`dd` against a device that is still bound to a PV.
+Use this procedure only after the OSD PVC is gone and the backing PV is `Available`. Do not wipe a device that is still bound to a PVC.
+
+Rook OSD prepare does not zap a previously used Block PV. `sgdisk --zap-all`, wiping the first or last 100 MiB, and `blkdiscard` are not enough. BlueStore keeps labels at **1 GiB** (`0x40000000`) and **10 GiB** (`0x280000000`).
+
+1. Find the PV node and local path.
+
+   ```bash
+   kubectl get pv <pv-name> -o jsonpath='node={.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].values} path={.spec.local.path}{"\n"}'
+   ```
+
+2. Optional: scale the Rook operator to zero so it does not bind a new PVC while you wipe.
+
+   ```bash
+   kubectl -n rook-ceph scale deploy rook-ceph-operator --replicas=0
+   ```
+
+3. On that node, as root, wipe the block device that the PV path resolves to. Replace `/dev/vdc` with the real device (`readlink -f` on the PV local path, or the LocalVolume `devicePaths` entry).
+
+   ```bash
+   DEV=/dev/vdc
+   dd if=/dev/zero of=$DEV bs=1M seek=1024 count=16 oflag=direct conv=fsync
+   dd if=/dev/zero of=$DEV bs=1M seek=10240 count=16 oflag=direct conv=fsync
+   dd if=/dev/zero of=$DEV bs=1M count=16 oflag=direct conv=fsync
+   ```
+
+   Confirm the labels are gone. `ceph-bluestore-tool show-label --dev $DEV` must report that no valid bdev label was found, and `ceph-volume raw list $DEV` must be `{}`.
+
+4. If you scaled the Rook operator down, scale it back.
+
+   ```bash
+   kubectl -n rook-ceph scale deploy rook-ceph-operator --replicas=1
+   ```
+
+Then return to [Wait for Rook to create a replacement](#wait-for-rook-to-create-a-replacement) if you are replacing an OSD, or raise `count` if you are expanding.
 
 ## References
 
