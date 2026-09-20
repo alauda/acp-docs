@@ -29,6 +29,7 @@ _exposing_precheck() {
     log_info "步骤 0: 检查环境是否支持暴露测试"
     if [ "${ENABLE_REGISTRY_EXPOSING:-true}" != "true" ]; then
         skip_test_env "ENABLE_REGISTRY_EXPOSING=false，跳过暴露测试"
+        return 0
     fi
     # 文档假设 Registry 已启用
     assert_condition "${REGISTRY_CONFIG}" "${REGISTRY_CONFIG_NAME}" Available True || {
@@ -38,10 +39,63 @@ _exposing_precheck() {
     return 0
 }
 
+# 等待 Ingress 被 operator 调和出来
+#
+# 为什么需要：patch defaultRoute / routes 之后，operator 不会立刻创建 Ingress。
+# 实测首次跑时 patch 成功、紧接着 `kubectl get ingress default-route` 报 NotFound——
+# 那是**测试脚本没等**，不是文档的问题。等 1 分钟内即可。
+_wait_for_registry_ingress() {
+    local name="$1" timeout="${2:-120}"
+    local waited=0
+    while [ "${waited}" -lt "${timeout}" ]; do
+        if kubectl -n "${REGISTRY_NS}" get ingress "${name}" >/dev/null 2>&1; then
+            log_info "Ingress ${name} 已出现（等待 ${waited}s）"
+            return 0
+        fi
+        sleep 5
+        waited=$((waited + 5))
+    done
+    log_error "等待 Ingress ${name} 超时（${timeout}s）"
+    return 1
+}
+
+# 平台没有默认域名时，default-route 的 host 会是 `*`，且 operator 报
+#   Degraded=True (IngressDegraded): ingress default-route has no host and no
+#   published load balancer address
+# 这是**环境能力问题**（没有通配域名 / 没有可用的 LB 地址），不是文档错误。
+# 文档未描述这一状态，属可补充项。
+#
+# 返回 0 = 环境无法提供 host（调用方应 skip_test_env 并 return 0）
+# 返回 1 = 有可用 host
+#
+# 注意 skip_test_env 的语义：它只设 __TEST_SKIPPED=1 并返回 0，**不中断执行**。
+# 引擎在测试函数返回 0 且该标志为 1 时才记为 skipped。所以调用方必须
+# 显式 `skip_test_env ...; return 0`，不能写成 `helper || return 1`。
+_default_route_lacks_host() {
+    local degraded_reason host
+    degraded_reason="$(kubectl get "${REGISTRY_CONFIG}" "${REGISTRY_CONFIG_NAME}" \
+        -o jsonpath='{range .status.conditions[?(@.type=="Degraded")]}{.reason}{end}' 2>/dev/null)"
+    host="$(kubectl -n "${REGISTRY_NS}" get ingress default-route \
+        -o jsonpath='{.spec.rules[0].host}' 2>/dev/null)"
+
+    if [ "${degraded_reason}" = "IngressDegraded" ] || [ "${host}" = "*" ] || [ -z "${host}" ]; then
+        log_warn "default-route 没有可用 host（reason=${degraded_reason:-<none>}, host=${host:-<empty>}）"
+        log_warn "operator 报: ingress default-route has no host and no published load balancer address"
+        return 0
+    fi
+    log_info "default-route host: ${host}"
+    return 1
+}
+
 # § Expose the Registry by Using the Default Route
 _exposing_default_route() {
     log_info "步骤 1: 启用默认路由（defaultRoute=true）"
     run_block_strict exposing:enable-default-route || return 1
+
+    # patch 之后必须等 operator 调和，否则 verify 会因为 Ingress 还没建出来而误判。
+    # 实测首次跑就踩了：patch 成功、紧接着 get ingress 报 NotFound——
+    # 那是测试脚本没等，不是文档的问题。
+    _wait_for_registry_ingress default-route || return 1
 
     log_info "步骤 2: 验证默认路由"
     run_block_strict exposing:verify-default-route || return 1
@@ -51,20 +105,18 @@ _exposing_default_route() {
     assert_jsonpath_eq "${REGISTRY_CONFIG}" "${REGISTRY_CONFIG_NAME}" '{.spec.defaultRoute}' "true" || return 1
     assert_resource_exists ingress.networking.k8s.io default-route "${REGISTRY_NS}" || return 1
 
+    # 环境没有默认域名时，后续依赖 host 的步骤无法进行 —— 明确跳过而非失败
+    if _default_route_lacks_host; then
+        skip_test_env "平台未配置默认域名 / 无可用 LB 地址，default-route 拿不到 host；依赖 host 的步骤无法进行"
+        return 0
+    fi
+
     log_info "步骤 3: 解析默认路由的 host"
     run_block_strict exposing:resolve-default-host || return 1
     log_info "步骤 4: 选择可用 host"
     run_block_strict exposing:select-host || return 1
 
-    # 默认路由的 host 是平台自动分配的，不保证可从管理员工作站解析。
-    # 文档 § Prerequisites 明确说明这一点，所以后续"外部访问"部分要按 host 可达性跳过。
-    local host
-    host="$(kubectl -n "${REGISTRY_NS}" get ingress default-route \
-        -o jsonpath='{.spec.rules[0].host}' 2>/dev/null)"
-    log_info "默认路由 host: ${host}"
-
     log_info "步骤 5: 用默认 host 登录（文档给法）"
-    # 该块依赖 host 可解析；不可达时 ac registry login 会失败，属环境限制
     if ! run_block_strict exposing:login-default-host; then
         log_warn "默认 host 不可达，跳过登录验证（文档 § Prerequisites 已说明该限制）"
     fi
@@ -75,6 +127,7 @@ _exposing_default_route() {
 _exposing_custom_route() {
     if [ -z "${EXPOSING_HOST}" ]; then
         skip_test_env "未设置 REGISTRY_EXPOSING_HOST，跳过自定义安全主机测试"
+        return 0
     fi
 
     log_info "步骤 6: 创建 TLS Secret（文档示例用 registry.example.com）"
@@ -93,6 +146,9 @@ _exposing_custom_route() {
 
     log_info "步骤 7: 配置自定义路由"
     run_block_strict exposing:configure-custom-route || return 1
+
+    # 同 default-route：patch routes 之后要等 operator 把 Ingress 调和出来
+    _wait_for_registry_ingress public-registry || return 1
 
     log_info "步骤 8: 验证自定义路由"
     run_block_strict exposing:verify-custom-route || return 1
@@ -138,6 +194,7 @@ _exposing_external_access() {
     log_info "步骤 12: 外部客户端 push / pull（nerdctl）"
     if ! command -v nerdctl >/dev/null 2>&1; then
         skip_test_env "本机没有 nerdctl，跳过外部 push/pull 验证"
+        return 0
     fi
     if ! run_block_strict exposing:external-push-pull; then
         log_warn "外部 push/pull 失败——示例域名不可达或客户端未配置信任"

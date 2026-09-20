@@ -58,6 +58,7 @@ _config_development_storage() {
 _config_pvc_storage() {
     if [ "${REGISTRY_TEST_PVC:-false}" != "true" ]; then
         skip_test_env "未开启 REGISTRY_TEST_PVC，跳过 PVC 存储测试"
+        return 0
     fi
 
     log_info "步骤 2: 配置 PVC 存储"
@@ -83,6 +84,7 @@ _config_pvc_storage() {
 _config_s3_storage() {
     if [ "${REGISTRY_TEST_S3:-false}" != "true" ]; then
         skip_test_env "未开启 REGISTRY_TEST_S3，跳过 S3 存储测试"
+        return 0
     fi
 
     log_info "步骤 3: 配置 S3 存储凭据"

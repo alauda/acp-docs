@@ -394,6 +394,7 @@ _registry_step_logs_and_metrics() {
         log_success "metrics 访问已授权"
     else
         skip_test_env "prometheus-sa / vm-sa 不存在或未授权（需要监控插件），跳过 metrics 断言"
+        return 0
     fi
 
     # 固化文档改动的理由：原来的 `kubectl auth can-i` 写法对 registry/metrics 恒返回 no，
@@ -420,6 +421,7 @@ _registry_step_upgrade() {
 
     if [ -z "${REGISTRY_UPGRADE_PACKAGE_URL:-}" ]; then
         skip_test_env "未提供 REGISTRY_UPGRADE_PACKAGE_URL，目录源中无更新版本，跳过升级测试"
+        return 0
     fi
 
     # 升级前：文档要求先确认当前 Registry 健康

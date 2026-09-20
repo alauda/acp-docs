@@ -152,9 +152,11 @@ _accessing_from_outside() {
 
     if [ "${REGISTRY_TEST_EXTERNAL:-false}" != "true" ]; then
         skip_test_env "未开启 REGISTRY_TEST_EXTERNAL，跳过外部 nerdctl push/pull"
+        return 0
     fi
     if ! command -v nerdctl >/dev/null 2>&1; then
         skip_test_env "本机没有 nerdctl，跳过外部 push/pull"
+        return 0
     fi
 
     # 三个块都引用文档示例域名 registry.example.com，实际环境需替换

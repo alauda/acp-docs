@@ -104,6 +104,7 @@ _access_view_usage() {
 _access_verify_signatures() {
     if [ "${REGISTRY_TEST_SIGNATURE:-false}" != "true" ]; then
         skip_test_env "未开启 REGISTRY_TEST_SIGNATURE，跳过签名校验段落"
+        return 0
     fi
 
     log_info "步骤 5: 校验镜像签名"

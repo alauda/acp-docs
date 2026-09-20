@@ -83,6 +83,7 @@ _ac_manage_imagestreams() {
 
     if [ -z "${SRC_IMAGE}" ]; then
         skip_test_env "未提供 REGISTRY_TEST_AC_IMAGE，跳过 import-image 与后续镜像操作"
+        return 0
     fi
 
     log_info "步骤 3b: 导入镜像（文档的 ac import-image）"
@@ -103,6 +104,7 @@ _ac_manage_tags() {
 
     if [ -z "${SRC_IMAGE}" ]; then
         skip_test_env "未提供 REGISTRY_TEST_AC_IMAGE，跳过 tag 操作"
+        return 0
     fi
 
     # tag-from-external 引用外部仓库示例域名，需要显式开启
@@ -173,6 +175,7 @@ _ac_image_info() {
     log_info "步骤 8: ac image info"
     if [ -z "${SRC_IMAGE}" ]; then
         skip_test_env "未提供 REGISTRY_TEST_AC_IMAGE，跳过 image info"
+        return 0
     fi
 
     # 文档的块引用 registry.example.com 示例域名；有真实镜像时替换
@@ -194,6 +197,7 @@ _ac_copy_images() {
     log_info "步骤 9: 复制镜像（ac image mirror）"
     if [ -z "${SRC_IMAGE}" ]; then
         skip_test_env "未提供 REGISTRY_TEST_AC_IMAGE，跳过 mirror / append"
+        return 0
     fi
 
     local cmd
@@ -218,6 +222,7 @@ _ac_extract_images() {
     log_info "步骤 10: 提取镜像内容（ac image extract）"
     if [ "${REGISTRY_TEST_EXTERNAL:-false}" != "true" ]; then
         skip_test_env "未开启 REGISTRY_TEST_EXTERNAL，跳过引用外部仓库的 extract"
+        return 0
     fi
     run_block_strict ac-images:image-extract || log_warn "extract 失败"
     run_block_strict ac-images:image-extract-2 || log_warn "extract（变体 2）失败"
