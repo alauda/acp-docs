@@ -98,7 +98,104 @@ Rook does not delete OSDs when `count` decreases or when you remove the set.
 
 ### Purge the OSD \{#purge-the-osd}
 
-Purge from the tools pod, then delete leftover Kubernetes objects. Delete the completed OSD prepare Job first. That Job still mounts the PVC, so the PVC stays `Terminating` until the Job is gone.
+Use the upstream `rook-ceph-purge-osd` Job. It marks the OSD `out` if needed, runs `ceph osd purge`, and deletes the OSD Deployment, the OSD prepare Job, and the OSD PVC. The ServiceAccount is already installed with Rook.
+
+The Job only works for OSDs that are already **down** and present in `ceph osd dump`. It does **not** wait for backfill. Finish [Mark the OSD out and wait for data migration](#mark-the-osd-out-and-wait-for-data-migration) first. If the OSD never joined Ceph (`not found osd.<id> in OSDDump`), skip the Job and delete the Deployment, prepare Job, and PVC by hand.
+
+Replace `<OSD-ID>` and use the Rook operator image that is already running in the cluster:
+
+```bash
+OSD_ID=<id>
+IMG=$(kubectl -n rook-ceph get deploy rook-ceph-operator -o jsonpath='{.spec.template.spec.containers[0].image}')
+kubectl -n rook-ceph delete job rook-ceph-purge-osd --ignore-not-found
+cat <<EOF | kubectl apply -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rook-ceph-purge-osd
+  namespace: rook-ceph
+  labels:
+    app: rook-ceph-purge-osd
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: rook-ceph-purge-osd
+    spec:
+      serviceAccountName: rook-ceph-purge-osd
+      restartPolicy: Never
+      containers:
+        - name: osd-removal
+          image: ${IMG}
+          args:
+            - "ceph"
+            - "osd"
+            - "remove"
+            - "--preserve-pvc"
+            - "false"
+            - "--force-osd-removal"
+            - "false"
+            - "--osd-ids"
+            - "${OSD_ID}"
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: ROOK_MON_ENDPOINTS
+              valueFrom:
+                configMapKeyRef:
+                  key: data
+                  name: rook-ceph-mon-endpoints
+            - name: ROOK_CEPH_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  key: ceph-username
+                  name: rook-ceph-mon
+            - name: ROOK_CONFIG_DIR
+              value: /var/lib/rook
+            - name: ROOK_CEPH_CONFIG_OVERRIDE
+              value: /etc/rook/config/override.conf
+            - name: ROOK_FSID
+              valueFrom:
+                secretKeyRef:
+                  key: fsid
+                  name: rook-ceph-mon
+            - name: ROOK_LOG_LEVEL
+              value: DEBUG
+          volumeMounts:
+            - mountPath: /etc/ceph
+              name: ceph-conf-emptydir
+            - mountPath: /var/lib/rook
+              name: rook-config
+            - name: ceph-admin-secret
+              mountPath: /var/lib/rook-ceph-mon
+      volumes:
+        - name: ceph-admin-secret
+          secret:
+            secretName: rook-ceph-mon
+            items:
+              - key: ceph-secret
+                path: secret.keyring
+        - emptyDir: {}
+          name: ceph-conf-emptydir
+        - emptyDir: {}
+          name: rook-config
+EOF
+kubectl -n rook-ceph wait --for=condition=complete job/rook-ceph-purge-osd --timeout=180s
+kubectl -n rook-ceph logs -l app=rook-ceph-purge-osd --tail=50
+```
+
+Confirm the log contains `completed removal of OSD`. Then delete the Job:
+
+```bash
+kubectl -n rook-ceph delete job rook-ceph-purge-osd
+```
+
+Wait until the PVC is gone. If you will reuse the disk, wait until the backing PV is `Available`.
+
+If the Job is not available, purge from the tools pod and delete leftover objects yourself. Delete the completed OSD prepare Job first. That Job still mounts the PVC, so the PVC stays `Terminating` until the Job is gone.
 
 ```bash
 kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- ceph osd purge osd.<id> --yes-i-really-mean-it
@@ -106,8 +203,6 @@ kubectl -n rook-ceph delete deploy rook-ceph-osd-<id>
 kubectl -n rook-ceph delete job rook-ceph-osd-prepare-<osd-pvc-name>
 kubectl -n rook-ceph delete pvc <osd-pvc-name>
 ```
-
-Wait until the PVC is gone. If you will reuse the disk, wait until the backing PV is `Available`.
 
 ### Verify \{#verify-shrink}
 
