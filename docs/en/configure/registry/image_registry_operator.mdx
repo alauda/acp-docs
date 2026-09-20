@@ -30,6 +30,11 @@ Install the Image Registry Operator to deploy Alauda Container Platform Registry
 the YAML path only for controlled automation or support-guided installation when the web console is
 not available.
 
+Both paths require the `cluster-image-registry-operator` package to be present in the target
+CatalogSource. A fresh platform installation does not include it. If the package is not present,
+follow the platform's [Operator package upload procedure](../../extend/operator.mdx) before
+continuing, and see [Install by Using YAML](#install-by-using-yaml) for a worked example.
+
 ### Install from OperatorHub
 
 1. Log in to <Term name="productShort" /> and navigate to the **Administrator** page.
@@ -61,7 +66,42 @@ Expected results:
 - The installed CSV is `Succeeded`.
 - The `cluster-image-registry-operator` Deployment is available.
 
-### Install by Using YAML
+### Install by Using YAML \{#install-by-using-yaml}
+
+#### Prerequisites
+
+The `cluster-image-registry-operator` package must already be present in the target CatalogSource.
+A fresh platform installation does not include it, and the `check-subscription.cpaas.io` admission
+webhook rejects the `Subscription` when the package is missing:
+
+```
+admission webhook "check-subscription.cpaas.io" denied the request:
+packagemanifests.packages.operators.coreos.com "cluster-image-registry-operator" not found
+```
+
+Verify the package before continuing:
+
+```bash
+kubectl -n cpaas-system get packagemanifests | grep cluster-image-registry-operator
+```
+
+If it is missing, upload the Operator package first. For example:
+
+```bash
+violet push cluster-image-registry-operator.stable.amd64.<version>.tgz \
+  --platform-address="https://<platform-host>" \
+  --platform-username="<platform-admin-user>" \
+  --platform-password="<platform-admin-password>" \
+  --target-catalog-source=platform \
+  --dest-repo="<global-registry-address>" \
+  --username="<registry-user>" \
+  --password="<registry-password>" \
+  --image-pull-secret="<platform-pull-secret>"
+```
+
+The push must use a registry account with `push` permission on the target repositories. An account
+with pull-only access fails with `requested access to the resource is denied`. The
+`--image-pull-secret` value must name a Secret that exists in the namespace where the Operator runs.
 
 Create the installation namespace if it does not exist:
 
@@ -118,6 +158,25 @@ kubectl -n image-registry-system wait \
   --for=condition=Available \
   deployment/cluster-image-registry-operator \
   --timeout=300s
+```
+
+The Operator then creates the `image-registry`, `image-api-server`, and `node-ca` workloads. These
+pull their images from the platform registry, so the ServiceAccounts the Operator uses must carry a
+working registry pull Secret. If a workload stays in `ImagePullBackOff` with
+`insufficient_scope: authorization failed`, confirm that the platform registry pull Secret is
+attached to those ServiceAccounts:
+
+```bash
+kubectl -n image-registry-system get serviceaccount registry node-ca image-api-server \
+  -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.imagePullSecrets[*].name}{"\n"}{end}'
+```
+
+Attach the Secret if it is missing, then restart the workloads:
+
+```bash
+kubectl -n image-registry-system patch serviceaccount registry node-ca image-api-server \
+  --type=merge -p '{"imagePullSecrets":[{"name":"<platform-pull-secret>"}]}'
+kubectl -n image-registry-system rollout restart deployment/image-registry daemonset/node-ca
 ```
 
 ## Upgrade Alauda Container Platform Registry
@@ -189,7 +248,7 @@ Do not delete the Subscription, `Config/cluster`, storage objects, or Image API 
 an Operator upgrade. If the upgrade does not complete, inspect the Subscription, InstallPlan, CSV
 events, Operator logs, and `Config/cluster.status.conditions` before taking further action.
 
-## Change the Registry Management State
+## Change the Registry Management State \{#change-the-registry-management-state}
 
 Configure one supported storage backend before enabling the Registry. If
 `Config/cluster.spec.storage` is empty, setting `managementState` to `Managed` leaves the Operator in
@@ -258,6 +317,13 @@ The CronJob uses the Registry internal service URL by default.
 
 ## Check Operator and Registry Status
 
+This section assumes the Registry has been enabled by setting `Config/cluster.spec.managementState`
+to `Managed`, as described in
+[Change the Registry Management State](#change-the-registry-management-state).
+`spec.managementState` has no default value. While it is unset the Operator reports
+`Available=True` with reason `Removed`, and the `image-registry` and `image-api-server` Deployments
+do not exist.
+
 ```bash
 kubectl -n image-registry-system get subscription,csv,installplan
 kubectl -n image-registry-system get deploy cluster-image-registry-operator image-registry image-api-server
@@ -290,15 +356,37 @@ View Registry logs:
 kubectl -n image-registry-system logs deployment/image-registry -c registry
 ```
 
-Check metrics access from a monitoring service account:
+Check metrics access from a monitoring service account.
+
+`registry/metrics` is an RBAC-only resource. It is not exposed by the `image.alauda.io/v1` API
+discovery document, and `kubectl auth can-i` resolves resource names through discovery. As a result
+`kubectl auth can-i get registry/metrics.image.alauda.io` always reports `no`, even when the
+permission is granted. Use a `SubjectAccessReview` instead:
 
 ```bash
-kubectl auth can-i get registry/metrics.image.alauda.io \
-  --as=system:serviceaccount:cpaas-system:prometheus-sa
-
-kubectl auth can-i get registry/metrics.image.alauda.io \
-  --as=system:serviceaccount:cpaas-system:vm-sa
+for SA in prometheus-sa vm-sa; do
+  printf '%s: ' "${SA}"
+  kubectl create -f - -o jsonpath='{.status.allowed}{"\n"}' <<EOF
+apiVersion: authorization.k8s.io/v1
+kind: SubjectAccessReview
+spec:
+  user: system:serviceaccount:cpaas-system:${SA}
+  resourceAttributes:
+    verb: get
+    group: image.alauda.io
+    resource: registry
+    subresource: metrics
+EOF
+done
 ```
+
+Expected result:
+
+- Each review reports `true`.
+
+The Operator binds `system:image-registry-metrics-reader` to `prometheus-sa` and `vm-sa` through the
+`registry-monitoring` ClusterRoleBinding. Those ServiceAccounts are created by the monitoring
+plugin, so the reviews report `false` until monitoring is installed.
 
 ## Common Operator Issues
 
