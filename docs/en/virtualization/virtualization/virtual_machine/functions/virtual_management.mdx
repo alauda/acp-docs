@@ -43,19 +43,68 @@ Update the SSH keys.
 
 6. Click **Update**.
 
-## Update Specifications
+## Update Specifications \{#update-specifications}
+
+Change the size of a virtual machine, or move it between the two sizing paths: an [instance type](./instance_types_preferences.mdx) it references, or a machine model written into the virtual machine.
 
 1. Access the **Container Platform**.
 
 2. In the left navigation bar, click **Virtualization** > **Virtual Machines**.
 
-3. Locate the target virtual machine and click ⋮ > **Update Specifications**.
+3. Locate the target virtual machine and click ⋮ > **Update Specifications**. The dialog opens on the sizing path the virtual machine uses.
 
-4. Modify the relevant resources based on the platform's recommended scenarios or custom needs.
+4. Choose the size:
 
-5. Choose whether to **Restart Immediately**; the configuration will take effect after restarting.
+   | Parameter | Description |
+   | :-- | :-- |
+   | **Sizing** | **Instance Type** or **Machine Model**. Switching the path removes the fields of the previous path in the same update. |
+   | **Instance Type** | The instance type to reference, from the current namespace or the cluster. The preference of the virtual machine is kept. |
+   | **Model** | A recommended usage scenario, or custom CPU and memory. For a virtual machine that was [migrated to an instance type](#migrate-to-instance-type), the size it had before the migration is preselected and restored as it was. |
+
+5. Choose whether to **Restart now**.
 
 6. Click **Update**.
+
+When the change takes effect:
+
+- **Machine model**: the new CPU and memory apply after the virtual machine restarts.
+- **Instance type** on a running virtual machine: the platform applies what it can without a restart. Added vCPUs are hot-plugged, which moves the virtual machine to another node through a live migration; more memory is hot-plugged when the guest supports memory hotplug. What cannot be applied live — for example a smaller CPU count — takes effect at the next restart. See [CPU and Memory Hotplug](../how_to/vm_cpu_memory_hotplug.mdx) for the conditions.
+- A virtual machine that still needs a restart carries the `RestartRequired` condition:
+
+  ```bash
+  kubectl get vm web-01 -n demo -o jsonpath='{.status.conditions[?(@.type=="RestartRequired")]}'
+  ```
+
+An imported virtual machine is updated through its YAML; see [Imported Virtual Machines](#imported-virtual-machines).
+
+## Migrate to Instance Type \{#migrate-to-instance-type}
+
+Move an existing virtual machine from a machine model to an instance type, so that it is sized like the virtual machines you create with instance types. The **Resources** column of the virtual machine list shows the sizing path of each virtual machine: **Machine Model**, **Instance Type** and its name, or **Sizing undetermined**.
+
+1. Access the **Container Platform**.
+
+2. In the left navigation bar, click **Virtualization** > **Virtual Machines**.
+
+3. Locate the virtual machine and click ⋮ > **Migrate to Instance Type** (also available in the **Actions** menu of the detail page).
+
+4. Check the **Current Size** — the guest CPU count and memory the virtual machine has now — and choose an **Instance Type**:
+
+   - An instance type of exactly the same size is preselected and marked **Same size**.
+   - When none has the same size, the closest ones are listed with their difference, and nothing is chosen until you choose one; choosing one changes the size of the virtual machine.
+
+5. (Optional) Select **Also reference a preference** and choose a preference. A preference fills the device settings the virtual machine leaves unset, which can change what the guest sees — for example the model of its network interface.
+
+6. Review **What changes for the guest**, then click **Migrate**:
+
+   - When the virtual machine defines its CPUs as cores or threads and no preference is referenced, the CPU count moves to sockets; software licensed per core may notice.
+   - The settings the chosen preference fills are listed.
+   - A running virtual machine keeps its current size until it restarts.
+
+The migration removes only the size fields that conflict with an instance type and keeps every other setting. The size the virtual machine had is recorded on it (in the annotation `vm.cpaas.io/previous-size`); if you later move it back to a machine model with **Update Specifications** and keep the preselected size, that size is restored exactly.
+
+A virtual machine cannot be migrated — and the dialog says why — when its template declares no CPU or no memory, when it and the chosen instance type set the same additional setting, or when it is an imported virtual machine.
+
+**Migrate several virtual machines at once**: select them in the list and click **Batch Actions** > **Batch Migrate to Instance Type**. Choose one instance type; each virtual machine is migrated on its own, those that cannot be migrated are skipped, and each gets its own outcome (**Migrated**, **Skipped** with the reason, or **Failed** with the message).
 
 ## Live Migration
 
@@ -159,15 +208,51 @@ Assign an IP to the virtual machine using dynamic allocation (DHCP) or bind a fi
 
 6. Click **Configure**.
 
-## Using the API
+## Using the API \{#using-the-api}
 
 The console operations map to standard calls on the `VirtualMachine` resource:
 
-- **Update Specifications** — patch the inline resources (ACP uses a resource-limit model, so set `requests` and `limits` to the same values); restart the virtual machine for the change to take effect:
+- **Update Specifications**, instance type path — point the virtual machine at another instance type:
+
+  ```bash
+  kubectl patch vm web-01 -n demo --type merge -p \
+    '{"spec":{"instancetype":{"kind":"VirtualMachineClusterInstancetype","name":"u1.large"}}}'
+  # The resolved object and its recorded revision:
+  kubectl get vm web-01 -n demo -o jsonpath='{.status.instancetypeRef}'
+  ```
+
+  If the reference pins a revision (`spec.instancetype.revisionName`), clear it in the same patch — a new name with the old revision is rejected:
+
+  ```bash
+  kubectl patch vm web-01 -n demo --type merge -p \
+    '{"spec":{"instancetype":{"name":"u1.large","revisionName":null}}}'
+  ```
+
+- **Update Specifications**, machine model path — patch the inline resources (ACP uses a resource-limit model, so set `requests` and `limits` to the same values); restart the virtual machine for the change to take effect:
 
   ```bash
   kubectl patch vm web-01 -n demo --type merge -p \
     '{"spec":{"template":{"spec":{"domain":{"resources":{"requests":{"cpu":"2","memory":"4Gi"},"limits":{"cpu":"2","memory":"4Gi"}}}}}}}'
+  ```
+
+- **Switch from an instance type to a machine model** — remove the reference and write the size in one request (a virtual machine may not carry both):
+
+  ```bash
+  kubectl patch vm web-01 -n demo --type json -p '[
+    {"op":"remove","path":"/spec/instancetype"},
+    {"op":"add","path":"/spec/template/spec/domain/resources","value":
+      {"requests":{"cpu":"2","memory":"4Gi"},"limits":{"cpu":"2","memory":"4Gi"}}}
+  ]'
+  ```
+
+- **Migrate to Instance Type** — remove the size fields and add the reference in one request. Remove every size field the template carries (`resources` CPU and memory, `domain.cpu` sockets / cores / threads, `domain.memory.guest`); the console additionally records the removed fields in the annotation `vm.cpaas.io/previous-size`:
+
+  ```bash
+  kubectl patch vm web-01 -n demo --type json -p '[
+    {"op":"remove","path":"/spec/template/spec/domain/resources"},
+    {"op":"add","path":"/spec/instancetype","value":
+      {"kind":"VirtualMachineClusterInstancetype","name":"u1.medium"}}
+  ]'
   ```
 
 - **Update Tags and Annotations**:
@@ -179,13 +264,12 @@ The console operations map to standard calls on the `VirtualMachine` resource:
 
 - **Live Migration** — create a `VirtualMachineInstanceMigration`; see [Virtual Machine Live Migration](../how_to/vm_precopy.mdx).
 
-## Imported Virtual Machines Using an InstanceType Spec
+## Imported Virtual Machines \{#imported-virtual-machines}
 
-A virtual machine imported from another platform (for example via Forklift) may define its CPU and memory through a referenced `VirtualMachineClusterInstancetype` (`spec.instancetype`) instead of inline `domain.resources`. The referenced instance type is resolved so that its effective CPU and memory can be displayed.
-
-When you **edit** such a virtual machine's specification, it is converted **once** to a custom inline spec — `domain.resources` is written and `spec.instancetype` is removed — and the change takes effect after a restart. A raw imported virtual machine without an ACP label can only be edited as YAML.
+A virtual machine imported from another platform (for example via Forklift) is updated through its YAML: **Update Specifications** and **Migrate to Instance Type** are not available for it. When it references an instance type (`spec.instancetype`), its detail page shows the requested and the resolved instance type and the size it runs with, like any other virtual machine. To resize it, change the reference in its YAML — see [Using the API](#using-the-api):
 
 ```bash
-# List the cluster instance types a VM can reference:
-kubectl get virtualmachineclusterinstancetype
+# The instance types a virtual machine can reference:
+kubectl get virtualmachineclusterinstancetypes
+kubectl get virtualmachineinstancetypes -n demo
 ```
