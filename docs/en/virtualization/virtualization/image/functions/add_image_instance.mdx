@@ -1,0 +1,232 @@
+---
+weight: 45
+---
+
+# Adding Image Instances
+
+An **image instance** is an operating system image already imported into a cluster as a ready-to-boot volume. Virtual machines clone their system disk from it instead of downloading the image again, so creating many virtual machines from one image is fast and puts no load on the image server.
+
+In Kubernetes terms an image instance is a `DataSource` (`cdi.kubevirt.io/v1beta1`) that points at a PersistentVolumeClaim. CDI fills that claim through an import `DataVolume` — from an image address, or as a clone of an existing disk or volume snapshot. The same objects are described from the API side in [Bootable Volumes](../../virtual_machine/bootable_volume.mdx).
+
+Image instances added under **Administrator** live in the shared `kube-public` namespace of the cluster and can be used by virtual machines in every namespace. To add image instances that only one namespace uses — including images on S3 and images that need a credential — see [Image Instances in a Namespace](./namespace_image_instance.mdx).
+
+## Prerequisites
+
+- Virtualization is installed on the cluster.
+- A storage class for the image volume. A storage class whose StorageProfile offers **ReadWriteMany** with **Block Device** (for example Ceph RBD block storage) is recommended; see [Storage settings](#storage-settings).
+- To add from an image source, the image source has been added; see [Adding Image Sources](./add_image.mdx).
+
+## Origins \{#origins}
+
+| Source | What is imported | `DataVolume` source |
+| :-- | :-- | :-- |
+| **Image Source** | The address of an image source added by the platform administrator (registry or HTTP). Image sources that require a credential, and S3 image sources, are listed but cannot be selected here, because `kube-public` holds no Secret; add them from a namespace instead. The name is prefilled from the image source, and its default instance type and preference are carried over (see [Default specification](./manage_image_instance.mdx#default-specification)). | `registry` or `http` |
+| **Network** | An image address entered directly: **Registry** (`registry.example.com/images/centos:7`; `docker://` is added for you) or **HTTP** (`http://` or `https://` URL of a `qcow2` / `raw` file). No credential can be used on this page, and **Object storage (S3)** is not available here — S3 always needs a credential Secret, so add S3 images from a namespace. | `registry` or `http` |
+| **Disk** | A clone of an existing disk of any namespace: a `DataVolume`, or a PersistentVolumeClaim without one. Disks of a running virtual machine are listed but cannot be selected (*Used by the running virtual machine …; stop it first*). The architecture defaults to that of the virtual machine the disk belongs to. | `pvc` |
+| **Volume Snapshot** | A clone of a `VolumeSnapshot` that is ready to use. Snapshots taken by a virtual machine snapshot are marked *From virtual machine snapshot of …*. | `snapshot` |
+
+For a **Disk** or **Volume Snapshot**, the instance size defaults to the size of the origin and cannot be smaller. Deleting the origin later does not affect the image instance: it holds its own copy.
+
+## Procedure
+
+1. Access **Administrator**.
+
+2. In the left navigation bar, click **Virtualization** > **Images** > **Image Instance**, and select the cluster.
+
+3. Click **Add Image Instance**.
+
+4. Configure the parameters.
+
+   | Parameter | Description |
+   | :-- | :-- |
+   | **Source** | **Image Source**, **Network**, **Disk** or **Volume Snapshot**; see [Origins](#origins). |
+   | **Operating System** / **CPU Arch** | Used to find the image instance when creating a virtual machine. An image source tagged with both architectures can be added as either. |
+   | **Image Source** / **Source Type** and **Image URL** / **Disk** / **Volume Snapshot** | What to import, depending on the source. |
+   | **Name** | Up to 53 characters. Prefilled from the image source; empty for a disk or volume snapshot. |
+   | **Display Name** | Optional. |
+   | **Instance Size** | The size of the image volume, at least as large as the virtual size of the image. Defaults to 30 Gi (minimum 1 Gi); for a disk or volume snapshot, the size of the origin. |
+   | **StorageClass** / **Volume Mode** / **Access Mode** | See [Storage settings](#storage-settings). |
+   | **CA Certificate**, **Request Headers**, **Checksum**, **Pull Method** | Shown according to the type of the image address; see [Import settings](#import-settings). A disk or volume snapshot takes none. |
+
+5. Click **Add**.
+
+The console checks every object with a dry run first, then creates the `DataSource`, the CA certificate `ConfigMap` (if any) and the import `DataVolume`. If any of them is refused, the objects already created are removed again, so a failed add leaves nothing behind. The new image instance shows **Importing** until CDI has filled the volume, then **Available**; see [Status](./manage_image_instance.mdx#status).
+
+## Storage settings \{#storage-settings}
+
+The storage fields come in this order, because each one narrows the next: **Instance Size**, **StorageClass**, **Volume Mode**, **Access Mode**.
+
+The volume and access modes offered are those CDI reports for the storage class in its `StorageProfile`. When you choose a storage class, the console selects the recommended combination:
+
+1. **Block Device** with **ReadWriteMany**, if offered — the volume can be attached on several nodes at once, which [live migration](../../virtual_machine/how_to/vm_precopy.mdx) needs;
+2. otherwise any combination with **ReadWriteMany** (for example **File System** on CephFS);
+3. otherwise the first combination of the profile.
+
+The access modes offered follow the volume mode you choose. If you choose an access mode other than **ReadWriteMany** while the storage class supports it, the form says so. If no `StorageProfile` can be read for the storage class, the modes follow the platform's storage class rules instead.
+
+Inspect what a storage class supports:
+
+```bash
+kubectl get storageprofile sc-ceph-cluster-block -o jsonpath='{.status.claimPropertySets}{"\n"}'
+# [{"accessModes":["ReadWriteMany"],"volumeMode":"Block"},
+#  {"accessModes":["ReadWriteOnce"],"volumeMode":"Block"},
+#  {"accessModes":["ReadWriteOnce"],"volumeMode":"Filesystem"}]
+```
+
+## Import settings \{#import-settings}
+
+| Address type | Settings |
+| :-- | :-- |
+| HTTP / HTTPS | **CA Certificate**, **Request Headers**, **Checksum** |
+| Registry | **CA Certificate**, **Pull Method** |
+| S3 (namespaces only) | **CA Certificate**, credential Secret — see [Image Instances in a Namespace](./namespace_image_instance.mdx) |
+
+The settings are written into the import `DataVolume` and kept with the image instance, so a [re-import](./manage_image_instance.mdx#re-import) uses them again.
+
+### CA certificate
+
+For an image server whose certificate is self-signed or issued by a private CA, paste the CA certificate as PEM text, or click **Load File** to load a PEM or DER file (a DER file is shown as PEM). Several certificates can be pasted one after another, for example an intermediate and a root CA. Only certificates are accepted — private keys and other text are refused.
+
+The certificate is stored in the `ConfigMap` `<image instance name>-img-ca` under the key `tls.crt`, owned by the image instance (deleted with it), and the `DataVolume` references it as `certConfigMap`. Without a CA certificate no `ConfigMap` is created. The host in the image address must be in the certificate's Subject Alternative Names; CDI does not skip hostname verification. For the background and for troubleshooting, see [Importing a Virtual Machine Image from an HTTPS Server with a Self-Signed Certificate](../how_to/vm_image_https_self_signed.mdx).
+
+**The certificate is inspected in your browser only.** The form lists each certificate — role (root, intermediate or leaf), subject, issuer, validity (with *expires in N days* when close), Subject Alternative Names and SHA-256 fingerprint (the same as `openssl x509 -noout -fingerprint -sha256`). The image address and any OCSP, CA issuers or CRL address in the certificate are not contacted, and the certificate is sent to the cluster only when you click **Add**.
+
+These problems block adding the image instance, because the import would fail:
+
+- the certificate text is larger than 64 KiB;
+- a certificate cannot be read;
+- a certificate has a negative serial number;
+- a certificate has an RSA key shorter than 1024 bits;
+- every certificate has expired or is not yet valid.
+
+These are warnings; you can still add the image instance:
+
+- only the server certificate is included — add the CA that issued it, or imports fail once the server certificate is renewed;
+- a certificate expires within 30 days;
+- some certificates have expired or are not yet valid;
+- a certificate is signed with SHA-1 or MD5;
+- a certificate issues another one but is not marked as a CA;
+- the image address uses `http://`, so the CA certificate is not used;
+- the leaf certificate is not valid for the host of the image address (an IP address must be an IP SAN; a wildcard covers one label only).
+
+### Request headers
+
+HTTP addresses only. Enter one header per line as `Name: value`; they are sent with the download (`extraHeaders`). Headers are stored in plain text on the `DataVolume` — **do not put secrets in them**; use a credential Secret in a namespace instead.
+
+### Checksum
+
+HTTP addresses only. Enter the expected digest as `md5:`, `sha1:`, `sha256:` or `sha512:` followed by the hexadecimal digest, for example `sha256:c199c9b6…875a`. CDI verifies the downloaded image against it; a mismatch fails the import for good, and the image instance shows **Failed** with the reason **Checksum mismatch**.
+
+### Pull method
+
+Registry addresses only.
+
+- **Pod** (default): an importer pod pulls the image and copies it into the volume through scratch space.
+- **Node**: the node pulls the image as a container image, so the image must be a container disk the nodes can pull (including through the node's registry credentials); no scratch space is used.
+
+Image sources supplied with the platform default to **Node**.
+
+## Using the API \{#using-the-api}
+
+The console creates the following objects for an image instance named `centos-7` in `kube-public` from an HTTPS address with a private CA. Apply the same objects with `kubectl` to add an image instance without the console.
+
+```yaml
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataSource
+metadata:
+  name: centos-7
+  namespace: kube-public
+  labels:
+    virtualization.cpaas.io/image-instance: "true"
+    virtualization.cpaas.io/image-os-type: centos        # the operating system
+    virtualization.cpaas.io/image-os-arch: amd64         # amd64 | arm64
+    virtualization.cpaas.io/source-type: address         # image-source | address | disk | volume-snapshot
+    virtualization.cpaas.io/size: 30Gi
+    virtualization.cpaas.io/storage-class: sc-ceph-cluster-block
+    virtualization.cpaas.io/volume-mode: Block
+    virtualization.cpaas.io/access-mode: ReadWriteMany
+  annotations:
+    cpaas.io/display-name: CentOS 7.9
+spec:
+  source:
+    pvc:
+      name: centos-7-img-a1b2c          # the import DataVolume below
+      namespace: kube-public
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: centos-7-img-ca
+  namespace: kube-public
+data:
+  tls.crt: |
+    -----BEGIN CERTIFICATE-----
+    ...
+    -----END CERTIFICATE-----
+---
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: centos-7-img-a1b2c              # <image instance>-img-<5 random characters>
+  namespace: kube-public
+  labels:
+    virtualization.cpaas.io/image-instance-name: centos-7
+  annotations:
+    cdi.kubevirt.io/storage.bind.immediate.requested: "true"
+spec:
+  source:
+    http:
+      url: https://images.example.internal/centos-7.qcow2
+      certConfigMap: centos-7-img-ca
+      extraHeaders:
+        - "X-Request-Source: platform"
+      checksum: sha256:<hex digest>
+  storage:
+    storageClassName: sc-ceph-cluster-block
+    volumeMode: Block
+    accessModes:
+      - ReadWriteMany
+    resources:
+      requests:
+        storage: 30Gi
+```
+
+The console also makes the image instance the controller owner of the `DataVolume` and of the `ConfigMap`, so deleting the `DataSource` deletes them; objects applied by hand without that `ownerReference` must be deleted one by one.
+
+For the other address types, replace `spec.source` of the `DataVolume` with one of the following.
+
+Registry, pulled by the node:
+
+```yaml
+source:
+  registry:
+    url: docker://registry.example.com/images/centos:7
+    pullMethod: node
+    # certConfigMap: centos-7-img-ca    # a registry behind a private CA
+```
+
+Disk of another namespace (a clone):
+
+```yaml
+source:
+  pvc:
+    name: web-01-rootfs
+    namespace: demo
+```
+
+Volume snapshot (a clone):
+
+```yaml
+source:
+  snapshot:
+    name: web-01-snapshot
+    namespace: demo
+```
+
+Watch the import:
+
+```bash
+kubectl get dv,datasource -n kube-public
+# NAME                                            PHASE       PROGRESS
+# datavolume.cdi.kubevirt.io/centos-7-img-a1b2c   Succeeded   100.0%
+```
