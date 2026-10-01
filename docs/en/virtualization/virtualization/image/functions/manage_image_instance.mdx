@@ -1,0 +1,111 @@
+---
+weight: 47
+---
+
+# Managing Image Instances
+
+Under **Administrator** > **Virtualization** > **Images** > **Image Instance**, the list shows the image instances of the selected cluster with their status, and each row offers **Update Display Name**, **Update Default Specification**, **Re-import** and **Delete**. Click a name to open its details: the import source, the import `DataVolume`, the claim, the phase, the progress and the reason of a failure. Image instances of a namespace are managed the same way from the namespace; see [Image Instances in a Namespace](./namespace_image_instance.mdx).
+
+## Status \{#status}
+
+| Status | Meaning |
+| :-- | :-- |
+| **Available** | The image instance can be used to create virtual machines. |
+| **Importing** | CDI is filling the volume; the progress is shown. *The storage of this image instance was deleted and is being imported again* means the claim was deleted while the import `DataVolume` remained, so CDI recreates it. |
+| **Import error** | The import keeps failing and CDI retries it; the reason below tells why. |
+| **Failed** | The import failed for good (for example a checksum mismatch); re-import or delete the image instance. |
+| **Incomplete** | Neither the import `DataVolume` nor the claim exists any more. Re-import or delete the image instance. |
+| **Waiting for the source digest** | An image instance managed by a `DataImportCron` that has not yet found the image to import. |
+| **Unavailable** | None of the above applies; check the `DataSource` conditions. |
+
+During a [re-import](#re-import), **Re-importing** (with progress) or **Re-import error** is shown next to the status.
+
+An import error or failure is shown with a reason and CDI's original message:
+
+| Reason | Typical cause |
+| :-- | :-- |
+| **Checksum mismatch** | The downloaded image does not match the **Checksum**. |
+| **Image not found** | Wrong URL or image tag. |
+| **Authentication failed** | The credential is wrong or missing. |
+| **Credential Secret incomplete** | The Secret lacks `accessKeyId` or `secretKey`. |
+| **Certificate not trusted** | The server certificate is self-signed or from a private CA and no matching **CA Certificate** was given. |
+| **Certificate does not match the address** | The host of the image address is not in the certificate's Subject Alternative Names. |
+| **Size smaller than the image** | **Instance Size** is smaller than the virtual size of the image. |
+| **Quota exceeded** | The namespace's storage quota is used up. |
+| **Storage class not usable** | The storage class does not exist or cannot provision the requested modes. |
+| **Import pod cannot start** | The importer pod cannot be scheduled or started. |
+| **Origin in use** | A clone from a disk has not started because the disk is in use (CDI reports `CloneSourceInUse`); stop the virtual machine using the disk. |
+| **Import failed** | Any other import failure. |
+
+Only image instances that are **Available** — and, for those backed by a claim, whose claim is bound and whose import succeeded — are offered when creating a virtual machine.
+
+## Re-import \{#re-import}
+
+**Re-import** imports the image again from the same address with the same import settings (CA certificate, request headers, checksum, pull method, credential), for example after the image on the server was updated. A disk or volume snapshot is cloned again.
+
+1. Click ⋮ > **Re-import** on the image instance.
+2. Confirm. The dialog shows the address that will be imported.
+
+The new import runs in a new `DataVolume` beside the current one. An **Available** image instance keeps its current image until the new import succeeds; it then switches to the new volume, and the previous `DataVolume` is deleted once no clone still reads from it. If the new import fails, the image instance stays on its current image and shows **Re-import error**.
+
+Re-import is refused when the CA certificate `ConfigMap` of the image instance has been deleted (*CA ConfigMap … is missing*); delete the image instance and add it again with its CA certificate.
+
+## Default specification \{#default-specification}
+
+An image instance can declare the [instance type and preference](../../virtual_machine/functions/instance_types_preferences.mdx) virtual machines created from it should use. They are stored as four labels on its `DataSource`:
+
+| Label | Value |
+| :-- | :-- |
+| `instancetype.kubevirt.io/default-instancetype` | The name of the instance type |
+| `instancetype.kubevirt.io/default-instancetype-kind` | `VirtualMachineClusterInstancetype` |
+| `instancetype.kubevirt.io/default-preference` | The name of the preference |
+| `instancetype.kubevirt.io/default-preference-kind` | `VirtualMachineClusterPreference` |
+
+An image instance added from an image source takes these labels from the image source (see [Adding Image Sources](./add_image.mdx#default-specification)); an image imported from a registry may also carry them in the image itself. When you create a virtual machine from the image instance, they are preselected in the **Model** area.
+
+### Update the default specification
+
+1. Click ⋮ > **Update Default Specification** on the image instance.
+2. Select a **Default Instancetype** and a **Default Preference** of the cluster, or clear a field to remove it. Preferences named after the operating system of the image instance are marked **Suggested** and listed first.
+3. Click **Update**.
+
+CDI copies these labels onto the `DataSource` from the objects behind it — the claim and the import `DataVolume`, a volume snapshot, or a `DataImportCron` — and, when the `DataVolume` carries none of them, from the volume it was cloned from. So the console writes your choice on those objects as well, and a cleared field is removed from them too. A cleared field cannot stay empty while the volume the image instance was cloned from still declares a value: the dialog then reports which value CDI keeps copying back; choose a value instead, or remove the label from that volume.
+
+The same with `kubectl` — label the claim and the import `DataVolume` first, then the `DataSource`:
+
+```bash
+CLAIM=$(kubectl get datasource centos-7 -n kube-public -o jsonpath='{.spec.source.pvc.name}')
+for obj in pvc/$CLAIM datavolume/$CLAIM datasource/centos-7; do
+  kubectl label -n kube-public "$obj" --overwrite \
+    instancetype.kubevirt.io/default-instancetype=u1.medium \
+    instancetype.kubevirt.io/default-instancetype-kind=VirtualMachineClusterInstancetype \
+    instancetype.kubevirt.io/default-preference=centos.stream9 \
+    instancetype.kubevirt.io/default-preference-kind=VirtualMachineClusterPreference
+done
+```
+
+Changing the default specification affects virtual machines created afterwards; existing virtual machines keep what they were created with.
+
+## Update the display name
+
+Click ⋮ > **Update Display Name**. The display name is stored in the `cpaas.io/display-name` annotation of the `DataSource`.
+
+## Delete \{#delete}
+
+1. Click ⋮ > **Delete** on the image instance.
+2. The dialog lists the readers of the image instance: virtual machines whose system disk would no longer be re-creatable from it, virtual machine pools that could no longer create members, and clones still reading from it, which will not complete. Disks already created from the image instance are not affected.
+3. Enter the name of the image instance and confirm.
+
+What is deleted depends on how the image instance was created:
+
+| Image instance | Deleted |
+| :-- | :-- |
+| Added in the console (with an import `DataVolume`) | The `DataSource`; the import `DataVolume`, its claim and the CA certificate `ConfigMap` follow through their owner references. |
+| Managed by a `DataImportCron` | The `DataImportCron`, which removes what it manages. |
+| Published from an existing volume | The `DataSource`; tick **Delete storage** to delete that volume as well. |
+
+With `kubectl`, delete the `DataSource` of an image instance added in the console; the rest follows:
+
+```bash
+kubectl delete datasource centos-7 -n kube-public
+```
