@@ -1,0 +1,88 @@
+---
+weight: 50
+title: Application mTLS
+---
+
+# Application mTLS
+
+SPIRE provides the identity and trust bundle. The application or proxy uses
+them to establish mTLS and must decide which peer SPIFFE ID is authorized.
+
+## Reference A/B/C flow
+
+The ACP reference flow contains three workloads:
+
+- A is the authorized client.
+- B is the mTLS server and accepts only A's SPIFFE ID.
+- C has its own identity and must be rejected by B.
+
+The reference uses Envoy on both sides. Each Envoy obtains its certificate and
+trust bundle from the Agent SDS endpoint through a CSI-mounted Workload API
+socket. This is an application-level mTLS example, not a service mesh
+configuration. The SDK-based Workload API path is described separately in
+[Workload Identity](./workload_identity.mdx).
+
+## Required configuration
+
+Use a dedicated ServiceAccount and a separate `ClusterSPIFFEID` for each
+workload. The peer authorization rule on B must match A's complete SPIFFE ID,
+not only its trust domain or a path prefix.
+
+For the fixed reference example:
+
+| Workload | ServiceAccount | SPIFFE ID |
+| --- | --- | --- |
+| A | `acp-55264-a` | `spiffe://demo.org/acp/55264/a` |
+| B | `acp-55264-b` | `spiffe://demo.org/acp/55264/b` |
+| C | `acp-55264-c` | `spiffe://demo.org/acp/55264/c` |
+
+A and B mount the CSI volume at `/spiffe-workload-api`. Their Envoy SDS
+configuration must use the resulting socket `/spiffe-workload-api/spire-agent.sock`.
+C uses its own socket and identity; do not configure C as a copy of A.
+
+## Run the validation
+
+Use the fixed manifest and verification script from the same ACP release
+validation package:
+
+```shell
+export AC_CMD=ac
+export NAMESPACE=acp-55264-mtls
+ac apply -f acp-55264-manifests.yaml
+bash acp-55264-verify.sh
+```
+
+The manifest creates the namespace, ServiceAccounts, `ClusterSPIFFEID` objects,
+services and workloads. Wait for all three workload deployments to become
+Ready before running the verifier.
+
+## Expected results
+
+| Check | Expected result |
+| --- | --- |
+| A to B | A establishes mTLS and B receives the test payload. |
+| Peer identity | B records A's exact SPIFFE URI SAN. |
+| C to B | B rejects C because C's URI SAN does not match A's. |
+| Unauthorized payload | C's payload does not reach B. |
+| Credential distribution | No manually copied certificate and no Kubernetes Secret distributes a workload private key. |
+
+Check the application or proxy logs after the test:
+
+```shell
+ac logs -n acp-55264-mtls pod/<b-pod> -c envoy --tail=120
+ac logs -n acp-55264-mtls pod/<c-pod> -c envoy --tail=120
+```
+
+A successful TLS connection from C is a test failure even if C has a valid SVID
+of its own.
+
+## Certificate refresh
+
+An mTLS proxy must reload the current identity supplied by SDS. An application
+using certificate files must watch for file changes and reload its TLS context.
+An SDK consumer should use the SDK update mechanism and create new connections
+with the current SVID.
+
+An existing TLS connection does not change its peer certificate in the middle
+of a session. Test rotation by creating a new connection after the renewal
+window.
