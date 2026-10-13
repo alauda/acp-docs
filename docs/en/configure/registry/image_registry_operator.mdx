@@ -1,0 +1,411 @@
+---
+weight: 20
+i18n:
+  title:
+    en: "Alauda Container Platform Registry"
+---
+
+# Alauda Container Platform Registry
+
+The Image Registry Operator installs and manages the cluster-wide Alauda Container Platform Registry
+instance. It reconciles Registry runtime resources from `Config/cluster` and scheduled pruning
+resources from `ImagePruner/cluster`.
+
+## Main Components
+
+| Component | Purpose |
+| --- | --- |
+| `cluster-image-registry-operator` Deployment | Reconciles the singleton Registry from `Config/cluster` and `ImagePruner/cluster`. |
+| `image-registry` Deployment | Serves OCI push and pull traffic, authentication, authorization, storage access, health checks, and metrics. |
+| `image-api-server` Deployment | Serves the <Term name="productShort" /> Image API through Kubernetes API aggregation. |
+| `APIService/v1.image.alauda.io` | Registers `image.alauda.io/v1` with the Kubernetes API server. |
+| `node-ca` DaemonSet | Distributes Registry CA trust and Registry service host mappings to nodes. |
+| `image-pruner` CronJob | Runs scheduled image pruning and, while the Registry is managed, registry garbage collection. |
+| Managed imagePullSecret controller | Creates, injects, refreshes, and removes service account pull secrets for the internal registry. |
+
+## Install Alauda Container Platform Registry
+
+Install the Image Registry Operator to deploy Alauda Container Platform Registry from the
+<Term name="productShort" /> web console when the Operator package is available in OperatorHub. Use
+the YAML path only for controlled automation or support-guided installation when the web console is
+not available.
+
+Both install paths require the `cluster-image-registry-operator` package to be present in the
+target CatalogSource. See [Install by Using YAML](#install-by-using-yaml) for how to verify the
+package and upload it if it is missing.
+
+### Install from OperatorHub
+
+1. Log in to <Term name="productShort" /> and navigate to the **Administrator** page.
+2. In the left navigation bar, click **Marketplace** > **OperatorHub**.
+3. Search for **Alauda Container Platform Registry** or `cluster-image-registry-operator`.
+4. Click **Install**.
+5. On the installation page, use the following settings unless your release guidance states otherwise:
+
+| Parameter | Recommended value |
+| --- | --- |
+| Channel | `stable` |
+| Installation Mode | `All namespaces on the cluster` |
+| Namespace | `image-registry-system` |
+| Upgrade Strategy | `Manual` |
+
+6. Click **Install**.
+7. If an approval prompt appears, review and approve the generated install plan.
+8. Wait until the Operator status is **Installed**.
+
+Verify the installation:
+
+```bash
+kubectl -n image-registry-system get subscription,csv,installplan
+kubectl -n image-registry-system get deployment cluster-image-registry-operator
+```
+
+Expected results:
+
+- The installed CSV is `Succeeded`.
+- The `cluster-image-registry-operator` Deployment is available.
+
+### Install by Using YAML \{#install-by-using-yaml}
+
+#### Prerequisites
+
+The `cluster-image-registry-operator` package must already be present in the target CatalogSource.
+A fresh platform installation does not include it, and the `check-subscription.cpaas.io` admission
+webhook rejects the `Subscription` when the package is missing:
+
+```
+admission webhook "check-subscription.cpaas.io" denied the request:
+packagemanifests.packages.operators.coreos.com "cluster-image-registry-operator" not found
+```
+
+Verify the package before continuing:
+
+```bash
+kubectl -n cpaas-system get packagemanifests | grep cluster-image-registry-operator
+```
+
+If it is missing, upload the Operator package first, following the platform's
+[Operator package upload procedure](../../extend/operator.mdx). For example:
+
+```bash
+violet push cluster-image-registry-operator.stable.amd64.<version>.tgz \
+  --platform-address="https://<platform-host>" \
+  --platform-username="<platform-admin-user>" \
+  --platform-password="<platform-admin-password>" \
+  --target-catalog-source=platform \
+  --dest-repo="<global-registry-address>" \
+  --username="<registry-user>" \
+  --password="<registry-password>"
+```
+
+The push must use a registry account with `push` permission on the target repositories. An account
+with pull-only access fails with `requested access to the resource is denied`. The push does not
+configure image pull credentials for the Operator's own workloads; see the pull-secret note in the
+install steps below.
+
+Create the installation namespace if it does not exist:
+
+```bash
+kubectl get namespace image-registry-system >/dev/null 2>&1 || \
+  kubectl create namespace image-registry-system
+
+kubectl label namespace image-registry-system \
+  cpaas.io/project=cpaas-system \
+  pod-security.kubernetes.io/audit=privileged \
+  pod-security.kubernetes.io/enforce=privileged \
+  pod-security.kubernetes.io/warn=privileged \
+  --overwrite
+```
+
+Create a file named `image-registry-operator-subscription.yaml`:
+
+```yaml
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  annotations:
+    cpaas.io/target-namespaces: ""
+  name: cluster-image-registry-operator
+  namespace: image-registry-system
+spec:
+  channel: stable
+  installPlanApproval: Manual
+  name: cluster-image-registry-operator
+  source: platform
+  sourceNamespace: cpaas-system
+```
+
+Apply the `Subscription`:
+
+```bash
+kubectl apply -f image-registry-operator-subscription.yaml
+```
+
+Approve the generated `InstallPlan`:
+
+```bash
+kubectl -n image-registry-system get installplan
+
+kubectl -n image-registry-system patch installplan <installplan-name> \
+  --type=merge \
+  -p '{"spec":{"approved":true}}'
+```
+
+Wait for the Operator:
+
+```bash
+kubectl -n image-registry-system wait \
+  --for=condition=Available \
+  deployment/cluster-image-registry-operator \
+  --timeout=300s
+```
+
+The Operator then creates the `image-registry`, `image-api-server`, and `node-ca` workloads. These
+pull their images from the platform registry, so the ServiceAccounts the Operator uses must carry a
+working registry pull Secret. If a workload stays in `ImagePullBackOff` with
+`insufficient_scope: authorization failed`, confirm that the platform registry pull Secret is
+attached to those ServiceAccounts:
+
+```bash
+kubectl -n image-registry-system get serviceaccount registry node-ca image-api-server \
+  -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.imagePullSecrets[*].name}{"\n"}{end}'
+```
+
+Attach the Secret if it is missing, then restart the workloads:
+
+```bash
+kubectl -n image-registry-system patch serviceaccount registry node-ca image-api-server \
+  --type=merge -p '{"imagePullSecrets":[{"name":"<platform-pull-secret>"}]}'
+kubectl -n image-registry-system rollout restart deployment/image-registry daemonset/node-ca
+```
+
+## Upgrade Alauda Container Platform Registry
+
+Upgrade Alauda Container Platform Registry by upgrading the Image Registry Operator through
+OperatorHub. The Operator upgrade updates the `cluster-image-registry-operator` Deployment and then
+reconciles the existing `Config/cluster`, `ImagePruner/cluster`, Registry, Image API, and supporting
+resources.
+
+Before upgrading, confirm that the current Registry is healthy.
+
+> **Important:** For Alauda Container Platform Registry versions earlier than `v4.4`, including
+> ACP 4.3 and earlier, contact technical support for upgrade and migration plans.
+
+```bash
+kubectl -n image-registry-system get subscription,csv
+kubectl get configs.imageregistry.operator.alauda.io cluster -o yaml
+kubectl -n image-registry-system rollout status deployment/image-registry --timeout=300s
+kubectl -n image-registry-system rollout status deployment/image-api-server --timeout=300s
+```
+
+Set the Subscription approval strategy to `Manual` before making a new Operator package available:
+
+```bash
+kubectl -n image-registry-system get subscription
+kubectl -n image-registry-system patch subscription <subscription-name> \
+  --type=merge \
+  -p '{"spec":{"installPlanApproval":"Manual"}}'
+```
+
+| Placeholder | Description |
+| --- | --- |
+| `<subscription-name>` | Subscription for the Alauda Container Platform Registry Operator. Use the name returned by `kubectl -n image-registry-system get subscription`. |
+
+Make the target Operator package available in **Administrator** > **Marketplace** > **OperatorHub**.
+If the package is not present, follow the platform's [Operator package upload procedure](../../extend/operator.mdx)
+before continuing.
+
+In OperatorHub, open **Alauda Container Platform Registry**, select the target channel and version,
+and review the pending upgrade. Approve the generated InstallPlan only after verifying that the
+Subscription uses `Manual` approval:
+
+```bash
+PLAN_NAME="$(kubectl -n image-registry-system get subscription <subscription-name> \
+  -o jsonpath='{.status.installPlanRef.name}')"
+kubectl -n image-registry-system get installplan "$PLAN_NAME" -o yaml
+kubectl -n image-registry-system patch installplan "$PLAN_NAME" \
+  --type=merge \
+  -p '{"spec":{"approved":true}}'
+```
+
+Wait for the new CSV and Operator Deployment, then verify that the Registry data plane reconciles:
+
+```bash
+kubectl -n image-registry-system get subscription,csv,installplan
+kubectl -n image-registry-system rollout status deployment/cluster-image-registry-operator --timeout=300s
+kubectl -n image-registry-system rollout status deployment/image-registry --timeout=300s
+kubectl -n image-registry-system rollout status deployment/image-api-server --timeout=300s
+kubectl get configs.imageregistry.operator.alauda.io cluster -o yaml
+kubectl get imagepruners.imageregistry.operator.alauda.io cluster -o yaml
+```
+
+Expected results:
+
+- The new CSV is `Succeeded` and the Subscription reports the new installed CSV.
+- `cluster-image-registry-operator`, `image-registry`, and `image-api-server` are available.
+- Existing storage, routes, Image API metadata, and ImagePruner configuration remain reconciled.
+- `Config/cluster` reports `Available=True`, `Progressing=False`, and `Degraded=False`.
+
+> **Note:** A CSV upgrade reapplies the Operator's ServiceAccount. If a registry pull Secret was
+> attached to that ServiceAccount during installation, the upgrade can clear it, and the new
+> `cluster-image-registry-operator` Pod then stays in `ImagePullBackOff` with
+> `insufficient_scope: authorization failed`. Re-attach the Secret and restart the Deployment:
+>
+> ```bash
+> kubectl -n image-registry-system patch serviceaccount cluster-image-registry-operator \
+>   --type=merge -p '{"imagePullSecrets":[{"name":"<platform-pull-secret>"}]}'
+> kubectl -n image-registry-system rollout restart deployment/cluster-image-registry-operator
+> ```
+
+Do not delete the Subscription, `Config/cluster`, storage objects, or Image API metadata as part of
+an Operator upgrade. If the upgrade does not complete, inspect the Subscription, InstallPlan, CSV
+events, Operator logs, and `Config/cluster.status.conditions` before taking further action.
+
+## Change the Registry Management State \{#change-the-registry-management-state}
+
+Configure one supported storage backend before enabling the Registry. If
+`Config/cluster.spec.storage` is empty, setting `managementState` to `Managed` leaves the Operator in
+`StorageNotConfigured`, and the Registry data plane cannot be reconciled.
+
+Enable the Registry by setting `Config/cluster.spec.managementState` to `Managed`:
+
+```bash
+kubectl patch configs.imageregistry.operator.alauda.io cluster \
+  --type=merge \
+  -p '{"spec":{"managementState":"Managed"}}'
+```
+
+Verify that the Registry data plane is available:
+
+```bash
+kubectl -n image-registry-system rollout status deployment/image-registry --timeout=300s
+kubectl -n image-registry-system rollout status deployment/image-api-server --timeout=300s
+kubectl get configs.imageregistry.operator.alauda.io cluster -o yaml
+```
+
+Expected result:
+
+- `Config/cluster` reports `Available=True`, `Progressing=False`, and `Degraded=False`.
+
+> **Warning:** Setting the management state to `Removed` stops the Registry runtime components.
+> Push and pull traffic and the Image API server are unavailable while the Registry is removed.
+> The Operator can also leave the `image-pruner` CronJob present, but disables registry garbage
+> collection for the removed Registry. Do not rely on scheduled cleanup while the Registry is removed.
+> Use this state only during a maintenance window or for support-guided recovery.
+
+Before switching to `Removed`, back up required image data and inspect the storage management mode:
+
+```bash
+kubectl get configs.imageregistry.operator.alauda.io cluster \
+  -o jsonpath='{.spec.storage.managementState}{"\n"}'
+```
+
+Only assume image data is retained when `spec.storage.managementState` is `Unmanaged`, or when the
+storage administrator has confirmed that the backend storage reclaim policy preserves the data after
+the Registry instance is removed. Back up required image data before changing the management state.
+
+To stop the Registry, set the management state to `Removed`:
+
+```bash
+kubectl patch configs.imageregistry.operator.alauda.io cluster \
+  --type=merge \
+  -p '{"spec":{"managementState":"Removed"}}'
+```
+
+Verify that the data-plane deployments are removed:
+
+```bash
+kubectl -n image-registry-system get deployment image-registry image-api-server --ignore-not-found
+```
+
+Expected result:
+
+- The `image-registry` and `image-api-server` Deployments are not present while the Registry is removed.
+
+## Image Pruner Reconciliation
+
+The Operator reconciles the singleton `ImagePruner/cluster` into an `image-pruner` CronJob in `image-registry-system`. Configure the retention policy in the `ImagePruner` resource. See [Setting up and configuring the registry](./setting_up_and_configuring_the_registry.mdx#configure-scheduled-image-pruning).
+
+The CronJob uses the Registry internal service URL by default.
+
+## Check Operator and Registry Status
+
+This section assumes the Registry has been enabled by setting `Config/cluster.spec.managementState`
+to `Managed`, as described in
+[Change the Registry Management State](#change-the-registry-management-state).
+`spec.managementState` has no default value. While it is unset the Operator reports
+`Available=True` with reason `Removed`, and the `image-registry` and `image-api-server` Deployments
+do not exist.
+
+```bash
+kubectl -n image-registry-system get subscription,csv,installplan
+kubectl -n image-registry-system get deploy cluster-image-registry-operator image-registry image-api-server
+kubectl -n image-registry-system get daemonset node-ca
+kubectl -n image-registry-system get cronjob image-pruner
+kubectl get apiservice v1.image.alauda.io
+kubectl get configs.imageregistry.operator.alauda.io cluster -o yaml
+kubectl get imagepruners.imageregistry.operator.alauda.io cluster -o yaml
+```
+
+Expected results:
+
+- The Operator CSV is `Succeeded`.
+- `cluster-image-registry-operator`, `image-registry`, and `image-api-server` are available.
+- `node-ca` is ready on target nodes.
+- `APIService/v1.image.alauda.io` is `Available=True`.
+- `Config/cluster` reports `Available=True`, `Progressing=False`, and `Degraded=False`.
+
+## Check Registry Logs and Metrics Access
+
+Check Registry Pods:
+
+```bash
+kubectl -n image-registry-system get pods -l app.kubernetes.io/name=image-registry
+```
+
+View Registry logs:
+
+```bash
+kubectl -n image-registry-system logs deployment/image-registry -c registry
+```
+
+Check metrics access from a monitoring service account.
+
+`registry/metrics` is an RBAC-only resource. It is not exposed by the `image.alauda.io/v1` API
+discovery document, and `kubectl auth can-i` resolves resource names through discovery. As a result
+`kubectl auth can-i get registry/metrics.image.alauda.io` always reports `no`, even when the
+permission is granted. Use a `SubjectAccessReview` instead:
+
+```bash
+for SA in prometheus-sa vm-sa; do
+  printf '%s: ' "${SA}"
+  kubectl create -f - -o jsonpath='{.status.allowed}{"\n"}' <<EOF
+apiVersion: authorization.k8s.io/v1
+kind: SubjectAccessReview
+spec:
+  user: system:serviceaccount:cpaas-system:${SA}
+  resourceAttributes:
+    verb: get
+    group: image.alauda.io
+    resource: registry
+    subresource: metrics
+EOF
+done
+```
+
+Expected result:
+
+- Each review reports `true`.
+
+The Operator binds `system:image-registry-metrics-reader` to `prometheus-sa` and `vm-sa` through the
+`registry-monitoring` ClusterRoleBinding. Those ServiceAccounts are created by the monitoring
+plugin, so the reviews report `false` until monitoring is installed.
+
+## Common Operator Issues
+
+| Symptom | Check |
+| --- | --- |
+| CSV is not `Succeeded` | `Subscription`, `InstallPlan`, CSV events, and the `cpaas-system` catalog source. |
+| `Config/cluster` is `Degraded=True` | `Config.status.conditions`, Operator logs, Registry Pod events, storage, TLS Secret, and RBAC. |
+| Registry Pod is pending | PVC binding, node resources, node selectors, taints, tolerations, and topology constraints. |
+| `node-ca` is not ready | DaemonSet scheduling, Pod logs, node trust configuration, and host mapping updates. |
