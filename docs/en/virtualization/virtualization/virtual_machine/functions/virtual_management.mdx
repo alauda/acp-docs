@@ -43,19 +43,78 @@ Update the SSH keys.
 
 6. Click **Update**.
 
-## Update Specifications
+## Update Specifications \{#update-specifications}
+
+Change the size of a virtual machine, or move it between the two sizing paths: an [instance type](./instance_types_preferences.mdx) it references, or a machine model written into the virtual machine.
 
 1. Access the **Container Platform**.
 
 2. In the left navigation bar, click **Virtualization** > **Virtual Machines**.
 
-3. Locate the target virtual machine and click ⋮ > **Update Specifications**.
+3. Locate the target virtual machine and click ⋮ > **Update Specifications**. The dialog opens on the sizing path the virtual machine uses.
 
-4. Modify the relevant resources based on the platform's recommended scenarios or custom needs.
+4. Choose the size:
 
-5. Choose whether to **Restart Immediately**; the configuration will take effect after restarting.
+   | Parameter | Description |
+   | :-- | :-- |
+   | **Sizing** | **Instance Type** or **Machine Model**. Switching the path removes the fields of the previous path in the same update. |
+   | **Instance Type** | The instance type to reference, from the current namespace or the cluster. The preference of the virtual machine is kept. |
+   | **Model** | A recommended usage scenario, or custom CPU and memory. For a virtual machine that was [migrated to an instance type](#migrate-to-instance-type), the size it had before the migration is preselected and restored as it was. |
+
+5. Choose whether to **Restart now**.
 
 6. Click **Update**.
+
+When the change takes effect:
+
+- **Machine model**: the new CPU and memory apply after the virtual machine restarts.
+- **Instance type** on a running virtual machine: the reference changes at once, and the platform tries to apply the new size without a restart. Each hot-plug is carried out by a live migration, so the new size is applied live only when **all** of the following hold:
+
+  - The cluster rolls out virtual machine changes live (the KubeVirt `vmRolloutStrategy` is `LiveUpdate`).
+  - The virtual machine can be live-migrated (its `LiveMigratable` condition is `True`).
+  - The new CPU count and memory stay within the hotplug ceilings the running instance started with. These are the `maxSockets` and `maxGuest` of its instance type. When the instance type sets none, the platform computes them as the instance starts — by default four times the initial socket count and memory; the ratio and absolute caps are set cluster-wide in `spec.liveUpdateConfiguration` (`maxHotplugRatio`, `maxCpuSockets`, `maxGuest`) of the `HyperConverged` resource. An instance type whose ceilings equal its size leaves no room to grow. The ceilings of a running instance are on its VMI; see the commands below.
+  - The CPU count only increases; a smaller CPU count always needs a restart.
+  - For memory: the virtual machine runs on x86_64, the guest operating system supports memory hotplug (virtio-mem), and the guest memory is at least 1Gi.
+
+  Whatever cannot be applied live — all of it when one of the first three conditions fails — takes effect at the next restart, and the virtual machine carries the `RestartRequired` condition until then. See [CPU and Memory Hotplug](../how_to/vm_cpu_memory_hotplug.mdx) for the guest-side requirements.
+- Check whether a running virtual machine can be live-migrated, the hotplug ceilings of its running instance, and whether it still needs a restart:
+
+  ```bash
+  kubectl get vmi web-01 -n demo -o jsonpath='{.status.conditions[?(@.type=="LiveMigratable")]}'
+  kubectl get vmi web-01 -n demo -o jsonpath='{.spec.domain.cpu.maxSockets}{" "}{.spec.domain.memory.maxGuest}{"\n"}'
+  kubectl get vm web-01 -n demo -o jsonpath='{.status.conditions[?(@.type=="RestartRequired")]}'
+  ```
+
+A virtual machine that carries no platform label — typically one imported from another platform as is — is updated through its YAML; see [Imported Virtual Machines](#imported-virtual-machines).
+
+## Migrate to Instance Type \{#migrate-to-instance-type}
+
+Move an existing virtual machine from a machine model to an instance type, so that it is sized like the virtual machines you create with instance types. The **Resources** column of the virtual machine list shows the sizing path of each virtual machine: **Machine Model**, **Instance Type** and its name, or **Sizing undetermined**.
+
+1. Access the **Container Platform**.
+
+2. In the left navigation bar, click **Virtualization** > **Virtual Machines**.
+
+3. Locate the virtual machine and click ⋮ > **Migrate to Instance Type** (also available in the **Actions** menu of the detail page).
+
+4. Check the **Current Size** — the guest CPU count and memory the virtual machine has now — and choose an **Instance Type**:
+
+   - An instance type of exactly the same size is preselected and marked **Same size**.
+   - When none has the same size, the closest ones are listed with their difference, and nothing is chosen until you choose one; choosing one changes the size of the virtual machine.
+
+5. (Optional) Select **Also reference a preference** and choose a preference. A preference fills the device settings the virtual machine leaves unset, which can change what the guest sees — for example the model of its network interface.
+
+6. Review **What changes for the guest**, then click **Migrate**:
+
+   - When the virtual machine defines its CPUs as cores or threads and no preference is referenced, the CPU count moves to sockets; software licensed per core may notice.
+   - The settings the chosen preference fills are listed.
+   - A running virtual machine keeps its current size until it restarts.
+
+The migration removes only the size fields that conflict with an instance type and keeps every other setting. The size the virtual machine had is recorded on it (in the annotation `vm.cpaas.io/previous-size`); if you later move it back to a machine model with **Update Specifications** and keep the preselected size, that size is restored exactly.
+
+A virtual machine cannot be migrated — and the dialog says why — when its template declares no CPU or no memory, when it and the chosen instance type set the same additional setting, or when it carries no platform label (see [Imported Virtual Machines](#imported-virtual-machines)).
+
+**Migrate several virtual machines at once**: select them in the list and click **Batch Actions** > **Batch Migrate to Instance Type**. Choose one instance type; each virtual machine is migrated on its own, those that cannot be migrated are skipped, and each gets its own outcome (**Migrated**, **Skipped** with the reason, or **Failed** with the message).
 
 ## Live Migration
 
@@ -127,15 +186,17 @@ It is strongly recommended to back up data before reinstalling the operating sys
 
 2. In the left navigation bar, click **Virtualization** > **Virtual Machines**.
 
-3. Locate the virtual machine and select ⋮ > **Reinstall Operating System**.
+3. Locate the virtual machine and select ⋮ > **Reinstall Operating System**. The operation is available when the virtual machine is stopped, unknown or abnormal; stop a running virtual machine first.
 
 4. In the **Reinstall Operating System** window, configure the following parameters.
 
-   - **Provisioning Method**: Currently supports public images.
+   - **Provision Method**: **Image Source** (the system disk is imported from the image address) or **Image Instance** (the system disk is cloned from an [image instance](../../image/functions/add_image_instance.mdx)). The image instance picker lists the image instances of `kube-public` and of the virtual machine's namespace, the latter marked with the namespace name; the current image is marked **Current image**.
 
    - **Select Image**: By default, the current operating system image will be used for reinstallation. If you wish to reinstall a new operating system, first select the operating system of the virtual machine image, then choose the virtual machine image that belongs to that operating system.
 
 5. Click **Reinstall**.
+
+The new system disk is created like the one of a new virtual machine: its `sourceRef` names the image instance and the namespace it lives in, and its access mode follows the `StorageProfile` of the storage class (see [Creating Virtual Machines](./create_virtual_machine.mdx)).
 
 ## Configure IP \{#configure-ip}
 
@@ -159,16 +220,60 @@ Assign an IP to the virtual machine using dynamic allocation (DHCP) or bind a fi
 
 6. Click **Configure**.
 
-## Using the API
+## Using the API \{#using-the-api}
 
 The console operations map to standard calls on the `VirtualMachine` resource:
 
-- **Update Specifications** — patch the inline resources (ACP uses a resource-limit model, so set `requests` and `limits` to the same values); restart the virtual machine for the change to take effect:
+- **Update Specifications**, instance type path — point the virtual machine at another instance type:
+
+  ```bash
+  kubectl patch vm web-01 -n demo --type merge -p \
+    '{"spec":{"instancetype":{"kind":"VirtualMachineClusterInstancetype","name":"u1.large"}}}'
+  # The resolved object and its recorded revision:
+  kubectl get vm web-01 -n demo -o jsonpath='{.status.instancetypeRef}'
+  ```
+
+  If the reference pins a revision (`spec.instancetype.revisionName`), clear it in the same patch — a new name with the old revision is rejected:
+
+  ```bash
+  kubectl patch vm web-01 -n demo --type merge -p \
+    '{"spec":{"instancetype":{"name":"u1.large","revisionName":null}}}'
+  ```
+
+- **Update Specifications**, machine model path — patch the inline resources (ACP uses a resource-limit model, so set `requests` and `limits` to the same values); restart the virtual machine for the change to take effect:
 
   ```bash
   kubectl patch vm web-01 -n demo --type merge -p \
     '{"spec":{"template":{"spec":{"domain":{"resources":{"requests":{"cpu":"2","memory":"4Gi"},"limits":{"cpu":"2","memory":"4Gi"}}}}}}}'
   ```
+
+- **Switch from an instance type to a machine model** — remove the reference and write the size in one request (a virtual machine may not carry both):
+
+  ```bash
+  kubectl patch vm web-01 -n demo --type json -p '[
+    {"op":"remove","path":"/spec/instancetype"},
+    {"op":"add","path":"/spec/template/spec/domain/resources","value":
+      {"requests":{"cpu":"2","memory":"4Gi"},"limits":{"cpu":"2","memory":"4Gi"}}}
+  ]'
+  ```
+
+- **Migrate to Instance Type** — add the reference and remove **every** size field the template carries, in one request: `resources` requests and limits for CPU and memory, `domain.cpu` sockets / cores / threads, and `domain.memory.guest`. Any of them left in place conflicts with the instance type and the update is rejected (for example `VM field(s) spec.template.spec.domain.cpu.cores conflicts with selected instance type`). A merge patch that sets all of them to `null` works whatever shape the template has — a field that is not there is simply skipped:
+
+  ```bash
+  kubectl patch vm web-01 -n demo --type merge -p '{
+    "spec": {
+      "instancetype": {"kind": "VirtualMachineClusterInstancetype", "name": "u1.medium"},
+      "template": {"spec": {"domain": {
+        "resources": {"requests": {"cpu": null, "memory": null},
+                      "limits":   {"cpu": null, "memory": null}},
+        "cpu":    {"sockets": null, "cores": null, "threads": null},
+        "memory": {"guest": null}
+      }}}
+    }
+  }'
+  ```
+
+  Other settings (for example `domain.cpu.model`) are kept; if the instance type sets one of them too, remove it from the template as well. The patch can leave empty `resources`, `cpu` and `memory` objects in the template — for example `cpu: {}` on a virtual machine that had no `domain.cpu`. They are harmless: an instance type conflicts only with the individual size fields listed above, not with an empty object. Without a preference, the guest CPU count is placed in sockets. The console additionally records the removed fields in the annotation `vm.cpaas.io/previous-size` so that **Update Specifications** can restore them; a YAML migration does not.
 
 - **Update Tags and Annotations**:
 
@@ -179,13 +284,14 @@ The console operations map to standard calls on the `VirtualMachine` resource:
 
 - **Live Migration** — create a `VirtualMachineInstanceMigration`; see [Virtual Machine Live Migration](../how_to/vm_precopy.mdx).
 
-## Imported Virtual Machines Using an InstanceType Spec
+## Imported Virtual Machines \{#imported-virtual-machines}
 
-A virtual machine imported from another platform (for example via Forklift) may define its CPU and memory through a referenced `VirtualMachineClusterInstancetype` (`spec.instancetype`) instead of inline `domain.resources`. The referenced instance type is resolved so that its effective CPU and memory can be displayed.
+The console treats a virtual machine as imported when its labels — or, if the virtual machine has no labels at all, the labels of its template — include no key that contains the platform label domain (`cpaas.io` by default). This is typically a virtual machine imported from another platform as is, for example through Forklift. For such a virtual machine, **Update Specifications**, **Reset Password**, **Update Key**, **Reinstall Operating System** and **Configure IP** are disabled, **Migrate to Instance Type** reports that it cannot be migrated (and a batch migration skips it), and it is updated through its YAML. A virtual machine imported with platform labels is managed like any other: its specifications can be updated on its sizing path, and it can be migrated to an instance type.
 
-When you **edit** such a virtual machine's specification, it is converted **once** to a custom inline spec — `domain.resources` is written and `spec.instancetype` is removed — and the change takes effect after a restart. A raw imported virtual machine without an ACP label can only be edited as YAML.
+Viewing is not restricted: when an imported virtual machine references an instance type (`spec.instancetype`), its detail page shows the requested and the resolved instance type and the size it runs with, like any other virtual machine. To resize it, change the reference in its YAML — see [Using the API](#using-the-api):
 
 ```bash
-# List the cluster instance types a VM can reference:
-kubectl get virtualmachineclusterinstancetype
+# The instance types a virtual machine can reference:
+kubectl get virtualmachineclusterinstancetypes
+kubectl get virtualmachineinstancetypes -n demo
 ```

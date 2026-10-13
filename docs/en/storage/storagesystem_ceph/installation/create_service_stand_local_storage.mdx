@@ -1,0 +1,361 @@
+---
+weight: 17
+queries:
+  - Deploy Ceph Internal Mode with Local Storage Block PVs
+  - CephCluster storageClassDeviceSets crushDeviceClass tuneFastDeviceClass
+  - Create Cluster wizard YAML replace spec.storage LocalVolume
+  - Add a Ceph device class with a new storageClassDeviceSet
+---
+
+# Deploying in Internal Mode with Local Storage
+
+This Internal Mode path creates a Ceph cluster in the current business cluster and backs OSDs with Block PersistentVolumes from **Local Storage**. Configure cluster type, snapshots, monitoring, and advanced options in the Distributed Storage wizard, then switch to YAML and replace `spec.storage` so Rook consumes Local Storage volumes instead of host devices.
+
+Do not mix host devices (`spec.storage.nodes`) and `storageClassDeviceSets` on the same `CephCluster`.
+
+## Prerequisites
+
+- At least three nodes will run OSDs.
+- Each of those nodes has at least one unused disk that is not mounted and has no partitions.
+- **Download** and **Upload** the installation packages for **Alauda Container Platform Storage Essentials**, **Alauda Build of Rook-Ceph**, and **Alauda Build of LocalStorage**.
+
+## Procedure
+
+<Steps>
+
+### 1. Install Alauda Build of LocalStorage and provision Block volumes
+
+Install the operator as described in [Install Local Storage](../../local_storage/installation.mdx).
+
+Confirm the operator is running:
+
+```bash
+kubectl -n acp-storage get csv | grep local-storage
+```
+
+Example output:
+
+```bash
+local-storage-operator.v4.5.0   Alauda Build of LocalStorage   Succeeded
+```
+
+Provision one Block PersistentVolume per OSD with a `LocalVolume` so each disk path is explicit. Replace hostnames with `kubectl get node` values. Copy each `/dev/disk/by-id/...` path from [Discover local disks](../../local_storage/functions/device_discovery.mdx) (`status.discoveredDevices[].deviceID`). Do not use `/dev/sdX` or `/dev/disk/by-path/...`. Those names can change after a node reboot. Production clusters must use `/dev/disk/by-id/...`.
+
+```yaml
+cat << EOF | kubectl apply -f -
+apiVersion: local.storage.openshift.io/v1
+kind: LocalVolume
+metadata:
+  name: local-block-disks
+  namespace: acp-storage
+spec:
+  nodeSelector:
+    nodeSelectorTerms:
+      - matchExpressions:
+          - key: kubernetes.io/hostname
+            operator: In
+            values:
+              - worker-01
+              - worker-02
+              - worker-03
+  storageClassDevices:
+    - storageClassName: localblock
+      volumeMode: Block
+      devicePaths:
+        - /dev/disk/by-id/<wwn-worker-01>
+        - /dev/disk/by-id/<wwn-worker-02>
+        - /dev/disk/by-id/<wwn-worker-03>
+EOF
+```
+
+Check the `LocalVolume` and StorageClass:
+
+```bash
+kubectl -n acp-storage get localvolume local-block-disks
+kubectl get sc localblock
+```
+
+Example output:
+
+```bash
+NAME                AGE
+local-block-disks   45s
+
+NAME         PROVISIONER                    RECLAIMPOLICY   VOLUMEBINDINGMODE      ALLOWVOLUMEEXPANSION   AGE
+localblock   kubernetes.io/no-provisioner   Delete          WaitForFirstConsumer   false                  45s
+```
+
+Check that Block PersistentVolumes are `Available`. You need at least as many as the OSD `count` you will set later (three in this example):
+
+```bash
+kubectl get pv -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,SC:.spec.storageClassName,MODE:.spec.volumeMode,CAPACITY:.spec.capacity.storage
+```
+
+Example output:
+
+```bash
+NAME                STATUS      SC           MODE    CAPACITY
+local-pv-1cec77cf   Available   localblock   Block   1Ti
+local-pv-2ef7cd2a   Available   localblock   Block   1Ti
+local-pv-3fa1c73    Available   localblock   Block   1Ti
+```
+
+If a volume is missing, confirm the `by-id` path is on the selected node and the disk is unused. If discovery does not list a `deviceID`, the disk has no stable `/dev/disk/by-id` identity and is not suitable as a production LocalVolume path. For filter-based provisioning instead of explicit paths, see [Provision with LocalVolumeSet](../../local_storage/functions/local_volume_set.mdx).
+
+### 2. Deploy the Rook-Ceph Operator in the wizard
+
+1. Login, go to the **Administrator** page.
+
+2. In the left sidebar, click **Storage Management** > **Distributed Storage**.
+
+3. Click **Configure Now**.
+
+4. If **Alauda Container Platform Storage Essentials** is not installed, the wizard installs it first. Use the same OperatorHub values as [Deploying in Internal Mode](./create_service_stand.mdx): channel `stable`, installation mode `Cluster`, namespace **acp-storage**, upgrade strategy `Manual`.
+
+5. On the **Install Operator** wizard page, click **Start Deployment** (or **Deploy Operator**) for **Alauda Build of Rook-Ceph**.
+
+   - When the page proceeds to **Create Cluster**, the Operator is installed.
+   - If deployment fails, follow the on-screen prompts, click **Clean Up**, and deploy the Operator again.
+
+### 3. Create the cluster: fill the wizard, then edit YAML storage
+
+1. On the **Create Cluster** wizard page, set **Cluster Type** to **Standard** (Internal Mode).
+
+2. Configure everything **except host storage devices**:
+
+   - **Snapshot** and **Monitoring Alarm**, as required.
+   - **Advanced Configuration**: network, optimization parameters, and component placement. Place MON/MGR/MDS/RGW on at least three nodes when you use fixed-point deployment.
+
+   Do not add **Device Class** host devices (**Selection Device** or **Input Device**). Those fields write `spec.storage.nodes` and conflict with PVC-backed OSDs.
+
+3. Switch the page from **Form** to **YAML**. The editor shows the `CephCluster` the wizard would create. Leave `cephVersion`, `network`, `mon`, `monitoring`, and other non-storage fields as generated.
+
+4. Replace the entire `spec.storage` section. Remove `spec.storage.nodes` if it is present. Use the StorageClass from step 1 (`localblock` in the example). Set `count` to the number of `Available` Block PersistentVolumes you will consume. Set `crushDeviceClass` to the class name these OSDs must use. The name can be `ssd`, `hdd`, `nvme`, or any custom name you will select when creating pools.
+
+   ```yaml
+   spec:
+     storage:
+       storageClassDeviceSets:
+         - name: local-osds
+           count: 3 # [!code callout]
+           portable: false # [!code callout]
+           tuneFastDeviceClass: true # [!code callout]
+           resources: # [!code callout]
+             limits:
+               cpu: "2"
+               memory: 5Gi
+             requests:
+               cpu: "1"
+               memory: 5Gi
+           volumeClaimTemplates:
+             - metadata:
+                 name: data
+                 annotations:
+                   crushDeviceClass: ssd # [!code callout]
+               spec:
+                 storageClassName: localblock # [!code callout]
+                 volumeMode: Block
+                 accessModes:
+                   - ReadWriteOnce
+                 resources:
+                   requests:
+                     storage: 1Gi # [!code callout]
+   ```
+
+   <Callouts>
+   1. Number of OSDs. Each OSD binds one Block PersistentVolume. Do not set this higher than the number of `Available` volumes.
+   2. Must be `false` for Local Storage. Local volumes cannot move to another node.
+   3. Set from the physical media, not from the CRUSH class name. Set `true` when the underlying disks are SSD, NVMe, or cloud disks. Set `false` only when the underlying disks are HDD.
+   4. CPU and memory for OSD pods. Required.
+   5. Ceph CRUSH device class for these OSDs. Required. Use any class name you will select when creating pools. The name is not limited to `hdd`, `ssd`, or `nvme`. Pools select this class later. Changing the class after OSDs exist requires `spec.storage.allowDeviceClassUpdate: true`.
+   6. StorageClass created by the `LocalVolume`. Must be Block.
+   7. PVC request used only to bind an `Available` Block PersistentVolume. Kubernetes requires this field; do not omit it. The OSD uses the whole disk (for example `1Ti`), not this request. Set it less than or equal to the smallest matching PersistentVolume.
+   </Callouts>
+
+5. Click **Create Cluster** and wait for the wizard to finish.
+
+6. Verify OSDs and the PVCs Rook created:
+
+   ```bash
+   kubectl -n rook-ceph get pod -l app=rook-ceph-osd
+   kubectl -n rook-ceph get pvc
+   kubectl -n rook-ceph get cephcluster ceph-cluster -o jsonpath='{.status.ceph.health}{"\n"}'
+   ```
+
+   Example PVC output after binding 1Ti local volumes with a `1Gi` request:
+
+   ```bash
+   NAME                    STATUS   VOLUME             CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+   local-osds-data-0-0-0   Bound    local-pv-1cec77cf  1Ti        RWO            localblock     2m
+   local-osds-data-1-0-0   Bound    local-pv-2ef7cd2a  1Ti        RWO            localblock     2m
+   local-osds-data-2-0-0   Bound    local-pv-3fa1c73   1Ti        RWO            localblock     2m
+   ```
+
+   `CAPACITY` is the PersistentVolume size (the disk). `.spec.resources.requests.storage` on the PVC remains the request from the template (`1Gi` in this example).
+
+   Wait until three OSD pods are running and health is `HEALTH_OK`, or `HEALTH_WARN` only for expected start-up notes.
+
+</Steps>
+
+## Scale OSDs in a device class
+
+Use this procedure to add OSDs that keep the same CRUSH device class as an existing `storageClassDeviceSets` entry.
+
+<Steps>
+
+### 1. Provision additional Block volumes
+
+Provision additional Block PersistentVolumes with the same StorageClass. See [Guides](../../local_storage/functions/index.mdx). Use `/dev/disk/by-id/...` paths.
+
+### 2. Confirm the volumes are Available
+
+Confirm the new PersistentVolumes are `Available`.
+
+### 3. Increase count on the existing device set
+
+Edit the cluster and increase `spec.storage.storageClassDeviceSets[].count` on that device set to match the new total. Change only `count`. Do not replace the rest of the device set, and do not change `crushDeviceClass`.
+
+```bash
+kubectl -n rook-ceph edit cephcluster ceph-cluster
+```
+
+Do not lower `count` to remove OSDs. That is not a supported scale-in path on this page.
+
+</Steps>
+
+## Add a device class
+
+Use this procedure to introduce a new CRUSH device class after the cluster exists. Do not only increase `count` on an existing device set. Do not use the **Device Classes** tab in the web console; that writes `spec.storage.nodes` and conflicts with PVC-backed OSDs.
+
+<Steps>
+
+### 1. Provision Block volumes for the new disks
+
+Create another `LocalVolume` as in step 1 of the install procedure. Use `/dev/disk/by-id/...` paths. Give the `LocalVolume` a distinct StorageClass name when the disks are a different media type so the new OSDs cannot bind the wrong volumes.
+
+```yaml
+cat << EOF | kubectl apply -f -
+apiVersion: local.storage.openshift.io/v1
+kind: LocalVolume
+metadata:
+  name: local-block-disks-archive
+  namespace: acp-storage
+spec:
+  nodeSelector:
+    nodeSelectorTerms:
+      - matchExpressions:
+          - key: kubernetes.io/hostname
+            operator: In
+            values:
+              - worker-01
+              - worker-02
+              - worker-03
+  storageClassDevices:
+    - storageClassName: localblock-archive
+      volumeMode: Block
+      devicePaths:
+        - /dev/disk/by-id/<wwn-archive-worker-01>
+        - /dev/disk/by-id/<wwn-archive-worker-02>
+        - /dev/disk/by-id/<wwn-archive-worker-03>
+EOF
+```
+
+### 2. Confirm the new volumes
+
+Confirm the new Block PersistentVolumes are `Available` and use the new StorageClass:
+
+```bash
+kubectl get pv -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,SC:.spec.storageClassName,MODE:.spec.volumeMode,CAPACITY:.spec.capacity.storage
+```
+
+### 3. Append a storageClassDeviceSets item
+
+Edit the cluster and **append** a new item under `spec.storage.storageClassDeviceSets`. Leave every existing device set unchanged.
+
+```bash
+kubectl -n rook-ceph edit cephcluster ceph-cluster
+```
+
+```yaml
+spec:
+  storage:
+    storageClassDeviceSets:
+      - name: local-osds
+        count: 3
+        portable: false
+        tuneFastDeviceClass: true
+        resources:
+          limits:
+            cpu: "2"
+            memory: 5Gi
+          requests:
+            cpu: "1"
+            memory: 5Gi
+        volumeClaimTemplates:
+          - metadata:
+              name: data
+              annotations:
+                crushDeviceClass: ssd
+            spec:
+              storageClassName: localblock
+              volumeMode: Block
+              accessModes:
+                - ReadWriteOnce
+              resources:
+                requests:
+                  storage: 1Gi
+      - name: local-osds-archive # [!code callout]
+        count: 3 # [!code callout]
+        portable: false
+        tuneFastDeviceClass: false # [!code callout]
+        resources:
+          limits:
+            cpu: "2"
+            memory: 5Gi
+          requests:
+            cpu: "1"
+            memory: 5Gi
+        volumeClaimTemplates:
+          - metadata:
+              name: data
+              annotations:
+                crushDeviceClass: archive # [!code callout]
+            spec:
+              storageClassName: localblock-archive # [!code callout]
+              volumeMode: Block
+              accessModes:
+                - ReadWriteOnce
+              resources:
+                requests:
+                  storage: 1Gi
+```
+
+<Callouts>
+1. New device set. The `name` must be unique among `storageClassDeviceSets`.
+2. Number of OSDs in the new class. Do not set this higher than the number of `Available` volumes on the new StorageClass.
+3. Set from the physical media of the new disks, not from the CRUSH class name. Set `true` when those disks are SSD, NVMe, or cloud disks. Set `false` only when those disks are HDD.
+4. New CRUSH device class. Required. Use any class name you will select when creating pools. The name is not limited to `hdd`, `ssd`, or `nvme`.
+5. StorageClass created by the new `LocalVolume`. Must be Block.
+</Callouts>
+
+### 4. Verify the new OSDs
+
+Wait until the new OSD pods are running and cluster health is `HEALTH_OK`, or `HEALTH_WARN` only for expected start-up notes:
+
+```bash
+kubectl -n rook-ceph get pod -l app=rook-ceph-osd
+kubectl -n rook-ceph get pvc
+kubectl -n rook-ceph get cephcluster ceph-cluster -o jsonpath='{.status.ceph.health}{"\n"}'
+```
+
+### 5. Select the new class on a pool
+
+Create or update a pool so workloads can select the new class. See [Managing Storage Pools](../functions/pool_management.mdx).
+
+</Steps>
+
+## Related information
+
+- [Deploying in Internal Mode](./create_service_stand.mdx) uses host devices in the web console without replacing `spec.storage`.
+- [Adding Devices/Device Classes](../functions/device_class.mdx) is the host-device console path. Do not use it when OSDs use Local Storage Block PersistentVolumes.
+- [Cleanup Distributed Storage](../how_to/clean_ceph.mdx) if you need to remove the cluster.
