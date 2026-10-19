@@ -1,6 +1,6 @@
 ---
 weight: 40
-title: Creating Clusters on Bare Metal
+title: Create a Cluster
 author: gangwang@alauda.io
 category: howto
 queries:
@@ -14,7 +14,7 @@ queries:
   - bare metal host time synchronization ntp requirement
 ---
 
-# Creating Clusters on Bare Metal
+# Create a Cluster on Bare Metal
 
 This document explains how to create Kubernetes clusters on physical servers using the bare-metal provider. The workflow is YAML-only — there is no Fleet Essentials UI for bare-metal clusters at this time.
 
@@ -24,12 +24,12 @@ Before creating clusters, ensure all of the following prerequisites are met.
 
 ### 1. Required Plugin Installation
 
-Install the following plugins on the `global` cluster:
+Before you create the first workload cluster on Bare Metal, upload and install the following plugins on the `global` cluster, and prepare the `global` cluster as a management cluster. This applies regardless of the IaaS platform that the `global` cluster itself runs on:
 
 - **Alauda Container Platform Cluster Bootstrap Provider**
 - **Alauda Container Platform Infrastructure Provider for Bare Metal** (umbrella chart that installs both the bare-metal manager and `elemental-operator`)
 
-See the [Installation Guide](./install_provider.mdx) for details.
+For the procedure, see [Install the Provider](./install_provider.mdx).
 
 ### 2. OS Images Imported and Image Catalog Populated \{#os-images-and-image-catalog}
 
@@ -64,7 +64,7 @@ ctr -n bare-metal-os images rm \
   "baremetal-base-image:<os-image-tag>" "baremetal-base-image-iso:<os-image-tag>"
 ```
 
-The last command removes the local copies after both pushes succeed. For the registry of the `global` cluster, the `admin` password is stored in the `cpaas-system/registry-admin` Secret. In a disaster recovery pair, import the images into the registry of both `global` clusters; see [Prepare the global Cluster as a Management Cluster](../../../install/alauda_os/installing.mdx#prepare-global-as-management-cluster).
+The last command removes the local copies after both pushes succeed. For the registry of the `global` cluster, the `admin` password is stored in the `cpaas-system/registry-admin` Secret. In a disaster recovery pair, import the images into the registry of both `global` clusters; see [Prepare the global Cluster as a Management Cluster](./install_provider.mdx#prepare-global-as-management-cluster).
 
 After the import, `<base-image>` is `<registry-address>/tkestack/baremetal-base-image:<os-image-tag>` and `<base-image-iso>` is `<registry-address>/tkestack/baremetal-base-image-iso:<os-image-tag>`. Take both images from the same archive. Do not point cluster resources at a build registry, pair images from different archives, or substitute an independently built image.
 
@@ -132,7 +132,7 @@ nmcli connection up "Wired connection 1"
 
 ### 4. Host Time Synchronization \{#host-time-synchronization}
 
-Every host that will become a cluster node — control plane and worker alike — must already carry the correct time when it boots the `SeedImage` ISO. The platform's cross-node requirement is a unified time zone on every cluster node and a time synchronization error between nodes of no more than 10 seconds; see [Node Checks](../../../install/non_alauda_os/node_preprocessing.mdx#node_checks). That requirement describes the cluster's nodes, so it applies here, but nothing on this path verifies it for you: the quick-configuration script and node checks on that page target traditional-operating-system machines that the platform joins over SSH, and they never run against an Alauda OS host installed by `elemental-operator`.
+Every host that will become a cluster node — control plane and worker alike — must already carry the correct time when it boots the `SeedImage` ISO. The platform's cross-node requirement is a unified time zone on every cluster node and a time synchronization error between nodes of no more than 10 seconds; see [Node Checks](../../../install/non_alauda_os/node_preprocessing.mdx#node_checks). That requirement describes the cluster's nodes, so it applies here, but nothing on this path verifies it for you: the quick-configuration script and node checks on that page target non-Alauda OS machines that the platform joins over SSH, and they never run against an Alauda OS host installed by `elemental-operator`.
 
 Treat time synchronization as a gate before [Step 1](#step-1-machineregistration-seedimage):
 
@@ -466,7 +466,7 @@ The Bare Metal API supports both endpoint modes in the same workflow:
 - `Internal`: the provider deploys Alive and reconciles the VIP and control-plane backend membership.
 - `External`: the provider skips Alive; the load balancer owner maintains the listener, health check, and backend membership.
 
-There is no legacy provider-version tab because Bare Metal has no earlier provider release to preserve. Select the mode with `<control-plane-load-balancer-type>` in the manifest below.
+Select the mode with `<control-plane-load-balancer-type>` in the manifest below.
 
 :::warning
 **Use the Kubernetes images built into the OS image**
@@ -634,9 +634,150 @@ Each new control-plane `BaremetalMachine` advances `Pending → Allocated → Re
 The bare-metal provider does not support single-node control planes. Provision at least three control-plane replicas (`KubeadmControlPlane.spec.replicas: 3`) so that etcd retains quorum. In `Internal` mode, the same nodes also participate in Alive VIP arbitration.
 :::
 
-### Step 4: Deploy Worker Nodes
+### Step 4: Deploy Worker Nodes \{#worker-node-deployment}
 
-After the control plane is Ready, create the worker `BaremetalMachineTemplate`, the worker `KubeadmConfigTemplate`, and the `MachineDeployment`. The full worker YAML and parameter table are in [Managing Nodes on Bare Metal → Worker Node Deployment](../../../configure/nodes/alauda_os/bare-metal.mdx#worker-node-deployment).
+After the control plane is Ready, create the worker `BaremetalMachineTemplate`, the worker `KubeadmConfigTemplate`, and the `MachineDeployment`.
+
+#### Confirm the Worker Pool Capacity \{#worker-pool-capacity}
+
+```bash
+kubectl -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io <cluster-name>-worker-pool
+```
+
+`status.available` must be at least the target replica count. If you need additional capacity, register more hosts (boot the `SeedImage` ISO on them — see [Step 1](#step-1-machineregistration-seedimage)), prepare any managed storage while each inventory is still unallocated, and then add their names to `spec.machineInventories`.
+
+A host added this way goes through the same first boot as the original nodes, so it has to meet the same prerequisites: the network paths in [Network Connectivity](#network-connectivity) and the clock gate in [Host Time Synchronization](#host-time-synchronization). Confirm both for the new host rather than assuming the approval obtained at delivery time covers its subnet and its hardware clock.
+
+#### Configure the Worker `BaremetalMachineTemplate` \{#worker-machine-template}
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: BaremetalMachineTemplate
+metadata:
+  name: <cluster-name>-worker-template
+  namespace: cpaas-system
+spec:
+  template:
+    spec:
+      machineInventoryPoolRef:
+        name: <cluster-name>-worker-pool
+```
+
+**Key parameters:**
+
+| Parameter | Type | Description | Required |
+|---|---|---|---|
+| `.spec.template.spec.machineInventoryPoolRef.name` | string | Worker pool name (same namespace). Immutable once the template is created. | Yes |
+
+`allocationPolicy` is reserved for future expansion. The provider currently treats every pool as `Ordered` — it picks the first `Available` inventory in declaration order.
+
+#### Configure the Bootstrap Template \{#worker-bootstrap-template}
+
+`imagePullCredentialsVerificationPolicy: NeverVerify` is required only starting with Kubernetes 1.35. Omit this parameter when creating workers with Kubernetes 1.34 or earlier.
+
+```yaml
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+kind: KubeadmConfigTemplate
+metadata:
+  name: <cluster-name>-worker-bootstrap
+  namespace: cpaas-system
+spec:
+  template:
+    spec:
+      users:
+        - name: boot
+          sudo: ALL=(ALL) NOPASSWD:ALL
+          shell: /bin/bash
+          sshAuthorizedKeys:
+            - "<ssh-authorized-keys>"
+      files:
+        - path: /etc/kubernetes/patches/kubeletconfiguration0+strategic.json
+          owner: "root:root"
+          permissions: "0644"
+          content: |
+            {
+              "apiVersion": "kubelet.config.k8s.io/v1beta1",
+              "kind": "KubeletConfiguration",
+              "imagePullCredentialsVerificationPolicy": "NeverVerify",
+              "protectKernelDefaults": true,
+              "staticPodPath": null,
+              "tlsCertFile": "/etc/kubernetes/pki/kubelet.crt",
+              "tlsPrivateKeyFile": "/etc/kubernetes/pki/kubelet.key",
+              "streamingConnectionIdleTimeout": "5m",
+              "clientCAFile": "/etc/kubernetes/pki/ca.crt"
+            }
+      joinConfiguration:
+        patches:
+          directory: /etc/kubernetes/patches
+```
+
+The provider applies a minimal normalization to bootstrap user-data before writing it into the `reprovision` plan, so leave the following fields out of the template:
+
+- **Hostname / FQDN** — set automatically from `MachineInventoryPool.spec.machineInventories[].hostname` (or the inventory name when omitted).
+- **`kubeletExtraArgs.provider-id`** — set automatically to `baremetal:///<inventory-name>`.
+- **`nodeRegistration.criSocket`** — set automatically to `unix:///var/run/containerd/containerd.sock` when unset.
+
+The normalized user-data is also written back into the bootstrap secret under `data["resolved-value"]` for debugging; the original `data["value"]` is left untouched.
+
+#### Configure the `MachineDeployment` \{#worker-machine-deployment}
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineDeployment
+metadata:
+  name: <cluster-name>-workers
+  namespace: cpaas-system
+spec:
+  clusterName: <cluster-name>
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0        # Bare-metal pools cannot over-provision.
+      maxUnavailable: 1
+  selector:
+    matchLabels: {}
+  template:
+    metadata:
+      labels:
+        cluster.x-k8s.io/cluster-name: <cluster-name>
+        pool.name: <cluster-name>-workers
+    spec:
+      clusterName: <cluster-name>
+      version: <kubernetes-version>
+      nodeDrainTimeout: 5m
+      nodeVolumeDetachTimeout: 5m
+      bootstrap:
+        configRef:
+          apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+          kind: KubeadmConfigTemplate
+          name: <cluster-name>-worker-bootstrap
+          namespace: cpaas-system
+      infrastructureRef:
+        apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+        kind: BaremetalMachineTemplate
+        name: <cluster-name>-worker-template
+        namespace: cpaas-system
+```
+
+**Key parameters:**
+
+| Parameter | Type | Description | Required |
+|---|---|---|---|
+| `.spec.clusterName` | string | Target cluster name. | Yes |
+| `.spec.replicas` | int | Number of worker nodes. Must satisfy `replicas ≤ MachineInventoryPool.status.available + status.allocated` (for the worker pool). | Yes |
+| `.spec.template.spec.version` | string | Worker Kubernetes version. Must be a key in `elemental-image-catalog`. May differ from the control-plane version while respecting the standard kubelet skew policy. | Yes |
+| `.spec.strategy.rollingUpdate.maxSurge` | int | Bare-metal does not over-provision — keep `0`. The provider has no spare physical host to bring up an extra node first. | Yes |
+| `.spec.strategy.rollingUpdate.maxUnavailable` | int | Must be `> 0` when `maxSurge=0`. Workers are recycled one-by-one within this budget. | Yes |
+
+Apply and watch:
+
+```bash
+kubectl apply -f workers.yaml
+kubectl -n cpaas-system get machinedeployments.cluster.x-k8s.io
+kubectl -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io -w
+kubectl get nodes -o wide                     # workload cluster
+```
 
 ---
 
@@ -915,4 +1056,4 @@ spec:
           node-labels: "kube-ovn/role=master"
 ```
 
-Worker bootstrap is symmetric — see [Managing Nodes on Bare Metal → Bootstrap Template](../../../configure/nodes/alauda_os/bare-metal.mdx#step-3-configure-bootstrap-template) for the worker `KubeadmConfigTemplate`.
+Worker bootstrap is symmetric — see [Configure the Bootstrap Template](#worker-bootstrap-template) for the worker `KubeadmConfigTemplate`.

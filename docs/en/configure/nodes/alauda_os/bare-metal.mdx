@@ -1,6 +1,6 @@
 ---
 weight: 30
-title: Managing Nodes on Bare Metal
+title: Manage Nodes on Bare Metal
 author: gangwang@alauda.io
 category: howto
 queries:
@@ -10,9 +10,9 @@ queries:
   - baremetal machinedeployment
 ---
 
-# Managing Nodes on Bare Metal
+# Manage Nodes on Bare Metal
 
-This document explains how to deploy worker nodes, scale them up and down, replace specific machines, and recover failed nodes on the bare-metal provider. Node management uses Cluster API `Machine` resources orchestrated through `MachineDeployment`; the provider binds each `Machine` to one `MachineInventory` from a pool and drives the host through `clean` / `reprovision` plans.
+This document explains how to scale worker nodes up and down, replace specific machines, and recover failed nodes on the bare-metal provider. Node management uses Cluster API `Machine` resources orchestrated through `MachineDeployment`; the provider binds each `Machine` to one `MachineInventory` from a pool and drives the host through `clean` / `reprovision` plans.
 
 ## Prerequisites
 
@@ -48,148 +48,7 @@ Managed data disks are not part of `BaremetalMachineTemplate`. Their declaration
 
 The Cluster API contract for templates: the running `Machine` set keeps an in-memory snapshot of the previous template, so editing a template in place does **not** trigger a rollout. Worker upgrades create a new `BaremetalMachineTemplate` and patch `MachineDeployment.spec.template.spec.infrastructureRef.name` to point at it.
 
-## Worker Node Deployment \{#worker-node-deployment}
-
-### Step 1: Confirm the Worker Pool Capacity \{#step-1-pool-capacity}
-
-```bash
-kubectl -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io <cluster-name>-worker-pool
-```
-
-`status.available` must be at least the target replica count. If you need additional capacity, register more hosts (boot the `SeedImage` ISO on them — see [Create Cluster → Step 1](../../../workload_clusters/alauda_os/bare-metal/create_cluster.mdx#step-1-machineregistration-seedimage)), prepare any managed storage while each inventory is still unallocated, and then add their names to `spec.machineInventories`.
-
-A host added this way goes through the same first boot as the original nodes, so it has to meet the same prerequisites: the network paths in [Network Connectivity](../../../workload_clusters/alauda_os/bare-metal/create_cluster.mdx#network-connectivity) and the clock gate in [Host Time Synchronization](../../../workload_clusters/alauda_os/bare-metal/create_cluster.mdx#host-time-synchronization). Confirm both for the new host rather than assuming the approval obtained at delivery time covers its subnet and its hardware clock.
-
-### Step 2: Configure the Worker `BaremetalMachineTemplate`
-
-```yaml
-apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: BaremetalMachineTemplate
-metadata:
-  name: <cluster-name>-worker-template
-  namespace: cpaas-system
-spec:
-  template:
-    spec:
-      machineInventoryPoolRef:
-        name: <cluster-name>-worker-pool
-```
-
-**Key parameters:**
-
-| Parameter | Type | Description | Required |
-|---|---|---|---|
-| `.spec.template.spec.machineInventoryPoolRef.name` | string | Worker pool name (same namespace). Immutable once the template is created. | Yes |
-
-`allocationPolicy` is reserved for future expansion. The provider currently treats every pool as `Ordered` — it picks the first `Available` inventory in declaration order.
-
-### Step 3: Configure the Bootstrap Template \{#step-3-configure-bootstrap-template}
-
-`imagePullCredentialsVerificationPolicy: NeverVerify` is required only starting with Kubernetes 1.35. Omit this parameter when creating workers with Kubernetes 1.34 or earlier.
-
-```yaml
-apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
-kind: KubeadmConfigTemplate
-metadata:
-  name: <cluster-name>-worker-bootstrap
-  namespace: cpaas-system
-spec:
-  template:
-    spec:
-      users:
-        - name: boot
-          sudo: ALL=(ALL) NOPASSWD:ALL
-          shell: /bin/bash
-          sshAuthorizedKeys:
-            - "<ssh-authorized-keys>"
-      files:
-        - path: /etc/kubernetes/patches/kubeletconfiguration0+strategic.json
-          owner: "root:root"
-          permissions: "0644"
-          content: |
-            {
-              "apiVersion": "kubelet.config.k8s.io/v1beta1",
-              "kind": "KubeletConfiguration",
-              "imagePullCredentialsVerificationPolicy": "NeverVerify",
-              "protectKernelDefaults": true,
-              "staticPodPath": null,
-              "tlsCertFile": "/etc/kubernetes/pki/kubelet.crt",
-              "tlsPrivateKeyFile": "/etc/kubernetes/pki/kubelet.key",
-              "streamingConnectionIdleTimeout": "5m",
-              "clientCAFile": "/etc/kubernetes/pki/ca.crt"
-            }
-      joinConfiguration:
-        patches:
-          directory: /etc/kubernetes/patches
-```
-
-The provider applies a minimal normalization to bootstrap user-data before writing it into the `reprovision` plan, so leave the following fields out of the template:
-
-- **Hostname / FQDN** — set automatically from `MachineInventoryPool.spec.machineInventories[].hostname` (or the inventory name when omitted).
-- **`kubeletExtraArgs.provider-id`** — set automatically to `baremetal:///<inventory-name>`.
-- **`nodeRegistration.criSocket`** — set automatically to `unix:///var/run/containerd/containerd.sock` when unset.
-
-The normalized user-data is also written back into the bootstrap secret under `data["resolved-value"]` for debugging; the original `data["value"]` is left untouched.
-
-### Step 4: Configure the `MachineDeployment`
-
-```yaml
-apiVersion: cluster.x-k8s.io/v1beta1
-kind: MachineDeployment
-metadata:
-  name: <cluster-name>-workers
-  namespace: cpaas-system
-spec:
-  clusterName: <cluster-name>
-  replicas: 3
-  strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 0        # Bare-metal pools cannot over-provision.
-      maxUnavailable: 1
-  selector:
-    matchLabels: {}
-  template:
-    metadata:
-      labels:
-        cluster.x-k8s.io/cluster-name: <cluster-name>
-        pool.name: <cluster-name>-workers
-    spec:
-      clusterName: <cluster-name>
-      version: <kubernetes-version>
-      nodeDrainTimeout: 5m
-      nodeVolumeDetachTimeout: 5m
-      bootstrap:
-        configRef:
-          apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
-          kind: KubeadmConfigTemplate
-          name: <cluster-name>-worker-bootstrap
-          namespace: cpaas-system
-      infrastructureRef:
-        apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-        kind: BaremetalMachineTemplate
-        name: <cluster-name>-worker-template
-        namespace: cpaas-system
-```
-
-**Key parameters:**
-
-| Parameter | Type | Description | Required |
-|---|---|---|---|
-| `.spec.clusterName` | string | Target cluster name. | Yes |
-| `.spec.replicas` | int | Number of worker nodes. Must satisfy `replicas ≤ MachineInventoryPool.status.available + status.allocated` (for the worker pool). | Yes |
-| `.spec.template.spec.version` | string | Worker Kubernetes version. Must be a key in `elemental-image-catalog`. May differ from the control-plane version while respecting the standard kubelet skew policy. | Yes |
-| `.spec.strategy.rollingUpdate.maxSurge` | int | Bare-metal does not over-provision — keep `0`. The provider has no spare physical host to bring up an extra node first. | Yes |
-| `.spec.strategy.rollingUpdate.maxUnavailable` | int | Must be `> 0` when `maxSurge=0`. Workers are recycled one-by-one within this budget. | Yes |
-
-Apply and watch:
-
-```bash
-kubectl apply -f workers.yaml
-kubectl -n cpaas-system get machinedeployments.cluster.x-k8s.io
-kubectl -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io -w
-kubectl get nodes -o wide                     # workload cluster
-```
+To add another worker node pool with YAML, follow [Step 4: Deploy Worker Nodes](../../../workload_clusters/alauda_os/bare-metal/create_cluster.mdx#worker-node-deployment) on the cluster creation page.
 
 ---
 
@@ -366,7 +225,7 @@ To roll out a bootstrap change:
 
 ### Upgrading Kubernetes Version
 
-For Kubernetes upgrades on bare-metal, see [Upgrading Clusters on Bare Metal](../../../upgrade/workload/alauda_os/bare-metal.mdx). The upgrade path always replaces nodes — there is no in-place `kubeadm upgrade` step.
+For Kubernetes upgrades on bare-metal, see [Upgrade Kubernetes on Bare Metal](../../../upgrade/workload/alauda_os/bare-metal.mdx). The upgrade path always replaces nodes — there is no in-place `kubeadm upgrade` step.
 
 ---
 

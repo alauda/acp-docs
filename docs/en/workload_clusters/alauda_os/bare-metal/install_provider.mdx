@@ -1,6 +1,6 @@
 ---
 weight: 20
-title: Bare Metal Provider Installation
+title: Install the Provider
 author: gangwang@alauda.io
 category: howto
 queries:
@@ -10,9 +10,15 @@ queries:
   - elemental operator installation
 ---
 
-# Bare Metal Provider Installation
+# Install the Bare Metal Provider
 
-This document describes how to install the Infrastructure Provider for Bare Metal for Immutable Infrastructure.
+This document describes how to install the Infrastructure Provider for Bare Metal and the Cluster Bootstrap Provider on the `global` cluster, and how to prepare the `global` cluster as the management cluster for Bare Metal workload clusters.
+
+## When You Need This
+
+Complete this page after the `global` cluster is installed and before you create the first workload cluster on Bare Metal. It is required regardless of the IaaS platform that the `global` cluster itself runs on.
+
+This is a separate task from the provider steps in [Installing the global Cluster](../../../install/alauda_os/installing.mdx). Those steps upload provider packages to the temporary bootstrap cluster to create the `global` cluster itself.
 
 ## Prerequisites
 
@@ -21,27 +27,27 @@ Before installing the provider, ensure you have:
 - Access to the <Term name="product" textCase="capitalize" /> `global` cluster.
 - Access to Customer Portal for downloading plugins.
 
-## Downloading
+## Install the Provider Plugins \{#install-the-provider-plugins}
 
-:::info
-The bare-metal workflow requires two plugins from Customer Portal:
+<Steps>
+### Download the packages
+
+The bare-metal workflow requires two cluster plugins. Download both from the Customer Portal. For <Term name="productShort" /> 4.5, they are listed under **Common ACP Extensions**; see [Download](../../../install/prepare/download.mdx).
+
 1. **Alauda Container Platform Cluster Bootstrap Provider**
 2. **Alauda Container Platform Infrastructure Provider for Bare Metal** (umbrella chart that ships the `cluster-api-provider-baremetal-manager` and `elemental-operator` subcharts together)
-:::
 
-Download both plugins from the Customer Portal.
+### Upload the packages
 
-## Uploading
+Upload both packages to the platform with `violet push`. For the command and its parameters, refer to [Upload Packages](../../../extend/upload_package.mdx#violet_push_usage).
 
-For detailed instructions on uploading packages, refer to [Upload Packages](../../../extend/upload_package.mdx).
+### Install the cluster plugins
 
-## Installing
-
-For detailed instructions on installing cluster plugins, refer to [Cluster Plugin](../../../extend/cluster_plugin.mdx).
+Install both cluster plugins on the `global` cluster. For the procedure, refer to [Cluster Plugin](../../../extend/cluster_plugin.mdx).
 
 The umbrella chart installs both the bare-metal provider manager and `elemental-operator` in one step. It also creates the `elemental-image-catalog` ConfigMap, but with no entries, and the package contains no Alauda OS image. Before you create a cluster, import the Bare Metal OS images into the platform registry and add every Kubernetes version you deploy to the catalog; see [OS Images Imported and Image Catalog Populated](./create_cluster.mdx#os-images-and-image-catalog).
 
-## Verifying Installation
+### Verify the installation \{#verify-the-installation}
 
 After installing the plugins, verify that the controllers and CRDs are present:
 
@@ -76,6 +82,152 @@ kubectl -n cpaas-system get configmap elemental-image-catalog -o yaml
 ```
 
 Every `Machine.spec.version` used by a cluster — both at creation time and at upgrade time — must appear as a key in this ConfigMap. A missing key leaves the `BaremetalMachine` in `Failed` with `Reason=ImageCatalogMiss`.
+
+</Steps>
+
+## Prepare the global Cluster as a Management Cluster \{#prepare-global-as-management-cluster}
+
+[Installing the global Cluster](../../../install/alauda_os/installing.mdx) creates the `global` cluster
+itself. Creating Bare Metal workload clusters afterwards is a separate concern: the `global` cluster
+then acts as the Cluster API management cluster, and it needs provider components and artifacts that
+the bootstrap preparation did not put there. Complete this section on **both** `global` clusters of a
+DR pair — after a failover the standby becomes the active management cluster and must be able to
+reconcile the same workload clusters.
+
+Importing the Cluster API resources during installation only creates the CRDs. It does not install
+the Bare Metal provider or the Cluster Bootstrap Provider on the `global` cluster.
+
+Set the values this section uses. Run it once per `global` cluster, with
+`GLOBAL_KUBECONFIG` pointing at the cluster you are preparing. `OS_IMAGE_TAG` and `K8S_VERSION` are the
+values used in [Step 3](../../../install/alauda_os/installing.mdx#upload-provider-packages) and
+[Step 1](../../../install/alauda_os/installing.mdx#prepare-common-variables) of the `global` installation.
+
+```shell
+export GLOBAL_KUBECONFIG="<path-to-this-global-kubeconfig>"
+# Tag of the Bare Metal Alauda OS images imported in Step 3 of the global installation.
+export OS_IMAGE_TAG="<os-image-tag>"
+# Kubernetes version of this global cluster's own nodes (K8S_VERSION from Step 1 of the global installation).
+export K8S_VERSION="<target-kubernetes-version>"
+```
+
+Read the Registry address and password of the cluster you are preparing from its own
+`ProductBase` and `cpaas-system/registry-admin` Secret:
+
+```shell
+GLOBAL_REGISTRY_ADDRESS="$(kubectl --kubeconfig "${GLOBAL_KUBECONFIG}" \
+  get productbase.product.alauda.io base -o jsonpath='{.spec.registry.address}')"
+GLOBAL_REGISTRY_PASSWORD="$(kubectl --kubeconfig "${GLOBAL_KUBECONFIG}" -n cpaas-system \
+  get secret registry-admin -o jsonpath='{.data.password}' | base64 -d)"
+```
+
+### Install the Cluster API providers on the global cluster
+
+Install the Infrastructure Provider for Bare Metal and the Cluster Bootstrap Provider on this `global`
+cluster as described in [Install the Provider Plugins](#install-the-provider-plugins). If the `global`
+cluster itself was installed on Bare Metal, use the same packages you used for its bootstrap cluster.
+For the standby `global` cluster of a DR pair, upload
+the packages to the standby as described in [Upload Packages](../../../extend/upload_package.mdx#violet_push_usage).
+
+In a DR pair, set the DR fields on the Bare Metal provider exactly as you did on the bootstrap
+release: `elemental.systemAgent.splitAuthEnabled: true` on both sides, `sharedAuthReadOnly: false`
+on the active cluster and `true` on the standby.
+
+Verify that the manager and `elemental-operator` are running on this `global` cluster before continuing:
+
+```shell
+kubectl --kubeconfig "${GLOBAL_KUBECONFIG}" -n cpaas-system get deploy \
+  cluster-api-provider-baremetal-manager elemental-operator
+```
+
+### Point the provider at the platform certificate that actually exists
+
+The Bare Metal provider mounts a CA bundle for `platformUrl` from
+`elemental.tls.caCertSecretName` / `caCertSecretKey`, which default to `dex.tls` and `ca.crt`.
+Those defaults assume a cert-manager-issued `dex.tls`. On the `global` cluster `dex.tls` comes from
+the installer's `console.cert` flow instead, and a `thirdParty` certificate produces a Secret with
+only `tls.crt` and `tls.key`. With the default key the operator never starts:
+
+```text
+MountVolume.SetUp failed for volume "elemental-ca-cert":
+  references non-existent secret key: ca.crt
+```
+
+Check which keys the Secret actually has and set `caCertSecretKey` accordingly. For a self-signed
+platform certificate the certificate is its own CA, so `tls.crt` is the correct key:
+
+```shell
+kubectl --kubeconfig "${GLOBAL_KUBECONFIG}" -n cpaas-system \
+  get secret dex.tls -o jsonpath='{.data}' | jq -r 'keys | join(",")'
+```
+
+### Upload the base image to the global Registry \{#upload-os-images-to-global-registry}
+
+Workload `SeedImage` builds run on the `global` cluster and pull the base ISO from the Registry
+recorded in `ProductBase.spec.registry.address`. After handoff, reprovisioning a `global` node also
+pulls `baremetal-base-image` from that Registry, because the installer rewrites the `global`
+cluster's `cpaas.io/registry-address` annotation to it. The images imported in [Step 3](../../../install/alauda_os/installing.mdx#upload-provider-packages) live in the
+bootstrap Registry only, so the ISO build fails with `MANIFEST_UNKNOWN` until you push both of them
+to the `global` Registry. On the bootstrap node, push them from the `bare-metal-os` containerd
+namespace. `--skip-verify` requires `--local`:
+
+```shell
+for repo in baremetal-base-image baremetal-base-image-iso; do
+  ctr -n bare-metal-os images push --local --skip-verify \
+    -u "admin:${GLOBAL_REGISTRY_PASSWORD}" \
+    "${GLOBAL_REGISTRY_ADDRESS}/tkestack/${repo}:${OS_IMAGE_TAG}" "${repo}:${OS_IMAGE_TAG}"
+  curl -sk -u "admin:${GLOBAL_REGISTRY_PASSWORD}" \
+    "https://${GLOBAL_REGISTRY_ADDRESS}/v2/tkestack/${repo}/tags/list"
+done
+```
+
+Each response must list `${OS_IMAGE_TAG}`. After that, remove the local copies with
+`ctr -n bare-metal-os images rm "baremetal-base-image:${OS_IMAGE_TAG}" "baremetal-base-image-iso:${OS_IMAGE_TAG}"`.
+If the images are no longer on the bootstrap node, or the `global` cluster was not installed on Bare
+Metal, import them from the OS archive instead, as
+described in [OS Images Imported and Image Catalog Populated](./create_cluster.mdx#os-images-and-image-catalog).
+
+### Create the elemental image catalog
+
+The provider maps a Kubernetes version to an elemental upgrade image through a ConfigMap located by
+`--image-catalog-namespace` and `--image-catalog-name`, which default to `cpaas-system` and
+`elemental-image-catalog`. The provider chart creates this ConfigMap with no version entries, and
+the `global` cluster does not inherit the entry you set on the bootstrap release. Until you add an
+entry, the first `BaremetalMachine` of a workload cluster fails immediately:
+
+```text
+ImageResolved=False  ImageCatalogMiss:
+  no elemental upgrade image mapped for Kubernetes version "<version>"
+```
+
+Add one entry per Kubernetes version that this `global` cluster manages, including `${K8S_VERSION}`
+for its own nodes. Patch the existing ConfigMap rather than replacing it, so that entries added
+earlier are kept:
+
+```shell
+kubectl --kubeconfig "${GLOBAL_KUBECONFIG}" -n cpaas-system \
+  patch configmap elemental-image-catalog --type merge \
+  -p "{\"data\":{\"${K8S_VERSION}\":\"${GLOBAL_REGISTRY_ADDRESS}/tkestack/baremetal-base-image:${OS_IMAGE_TAG}\"}}"
+
+kubectl --kubeconfig "${GLOBAL_KUBECONFIG}" -n cpaas-system \
+  get configmap elemental-image-catalog -o jsonpath='{.data}'
+```
+
+<Directive type="warning" title="ImageCatalogMiss does not recover on its own">
+  A `BaremetalMachine` that hit `ImageCatalogMiss` stays `Failed` after you fix the catalog.
+  Re-reconciling the object and restarting the provider both leave it unchanged; the reconciler
+  deliberately treats a missing mapping as terminal rather than falling back to a default image.
+  Delete the `Machine` so that its owner, `KubeadmControlPlane` or the `MachineSet`, recreates it.
+  Populate the catalog before you apply the first workload cluster manifest to avoid this entirely.
+</Directive>
+
+### Workload registrations use the platform domain
+
+A workload `MachineRegistration` must not carry the
+`baremetal.cluster.io/system-agent-auth-scope: global` annotation. Its registration URL resolves to
+`https://<platform-domain>/...`, and the resulting `MachineInventory` is annotated with
+`system-agent-auth-scope: shared`. That shared identity, together with the shared ServiceAccount
+signing key, is what lets a workload host keep reporting through the platform domain after a
+failover.
 
 ## Next Steps
 

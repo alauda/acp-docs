@@ -1,6 +1,6 @@
 ---
 weight: 30
-title: Upgrading Clusters on Huawei Cloud Stack
+title: Huawei Cloud Stack
 author: chaozhou@alauda.io
 category: howto
 queries:
@@ -10,33 +10,27 @@ queries:
   - hcs upgrade preserve persistent disks
 ---
 
-# Upgrading Clusters on Huawei Cloud Stack
+# Upgrade Kubernetes on Huawei Cloud Stack
 
 This guide explains how to upgrade Kubernetes clusters on Huawei Cloud Stack with minimal downtime, while preserving stability and data integrity.
 
 :::info
 **Where this page fits in the full ACP upgrade flow**
 
-This page covers only the Kubernetes step of the upgrade. The full ACP upgrade flow — including upgrade artifact synchronization, ACP Core upgrade through CVO, Aligned plugin upgrades, and Agnostic plugin upgrades from Marketplace — is documented in the ACP product documentation. Complete those steps before you start the Kubernetes step on this page:
+This page covers only the Kubernetes step of the upgrade. The full ACP upgrade flow — including upgrade artifact synchronization, ACP Core upgrade through CVO, Aligned plugin upgrades, and Agnostic plugin upgrades from Marketplace — is documented in the following pages. Complete those steps before you start the Kubernetes step on this page:
 
 - [Upgrade Overview (scope and sequencing)](../../overview.mdx)
 - [Pre-Upgrade Preparation](../../pre-upgrade.mdx)
-- [Upgrade the global cluster (Core, Aligned, Agnostic)](../../global/upgrade_global_cluster.mdx)
-- [Upgrade workload clusters (Core, Aligned, Agnostic)](../upgrade_workload_cluster.mdx)
+- [Upgrade the Distribution Version of the `global` cluster (Core, Aligned, Agnostic)](../../global/upgrade_global_cluster.mdx)
+- [Upgrade the Distribution Version of workload clusters (Core, Aligned, Agnostic)](../upgrade_workload_cluster.mdx)
 
 Use this page when the same cluster runs on Alauda OS, because the Kubernetes step there replaces nodes from a new VM template rather than upgrading binaries in place.
 :::
 
 :::info
-**Version**
-
-HCS provider `v1.0.1` is the first release that supports pool-managed persistent disks.
-:::
-
-:::info
 **Existing Cluster Migration**
 
-If your cluster runs ACP `v4.3.1` or later and you are moving to HCS provider `v1.0.1` or later, complete the migration procedure in [Migrate Existing Huawei Cloud Stack Clusters to Pool-Managed Persistent Disks](./hcs_persistent_disk_upgrade.mdx) before you rely on upgrade-time disk preservation.
+If your cluster runs ACP `v4.3.1` or later and still keeps preserved data in `HCSMachineTemplate.spec.template.spec.dataVolumes[]`, complete the migration procedure in [Migrate Existing Huawei Cloud Stack Clusters to Pool-Managed Persistent Disks](./hcs_persistent_disk_upgrade.mdx) before you rely on upgrade-time disk preservation.
 :::
 
 ## Overview
@@ -52,7 +46,7 @@ Cluster upgrades on HCS encompass multiple components and follow a structured ap
 Upgrade HCS clusters in the following order:
 
 1. **(Prerequisite)** Upgrade the ACP platform on the management cluster first. This brings the `cluster-api-provider-hcs` controller and the related CAPI components to versions that understand the new schema. Trigger workload-cluster upgrades only after the management-side controllers have rolled out and become Ready.
-2. Upgrade the Distribution Version on the workload cluster. See [Upgrading Clusters](./index.mdx).
+2. Upgrade the Distribution Version on the workload cluster. See [Upgrade the Distribution Version](../upgrade_workload_cluster.mdx).
 3. Upgrade Kube-OVN to the chart version required by the target ACP release and wait for the `AppRelease` to reach `Success`.
 4. Upgrade the control plane Kubernetes version.
 5. Upgrade worker nodes to the target Kubernetes version.
@@ -254,13 +248,47 @@ Complete the shared [Upgrade Kube-OVN Before the Control Plane](./index.mdx#upgr
    kubectl get nodes
    ```
 
-## Worker Node Upgrades
+## Worker Node Upgrades \{#worker-node-upgrades}
 
 Worker node upgrades are managed via `MachineDeployment` resources.
 
-:::info
-For detailed worker node procedures, see the [Managing Nodes](../../../configure/nodes/alauda_os/huawei-cloud-stack.mdx#upgrading-kubernetes-version) section.
-:::
+### Upgrade the Worker Kubernetes Version \{#upgrade-worker-kubernetes-version}
+
+Kubernetes version upgrades require coordinated updates to both the `MachineDeployment` and the underlying VM template.
+
+**Note:** Ensure the VM template's Kubernetes version matches the version specified in the `MachineDeployment`. Mismatched versions will cause node join failures.
+
+**Procedure**:
+
+1. **Update Machine Template**
+
+   Create a new `HCSMachineTemplate` with an updated `imageName` that supports the target Kubernetes version.
+
+2. **Create a new bootstrap template for Kubernetes 1.35 or later**
+
+   If the target is Kubernetes 1.35 or later, clone the current `KubeadmConfigTemplate` under a new name and add the [required kubelet patch settings](./index.mdx#kubernetes-1-35-kubelet-patch) to `/etc/kubernetes/patches/kubeletconfiguration0+strategic.json`. `KubeadmConfigTemplate` is immutable, so do not edit the referenced template in place. Skip this step for earlier versions unless the release has another bootstrap change.
+
+3. **Update MachineDeployment**
+
+   Modify the following fields:
+   - `spec.template.spec.version` - Target Kubernetes version
+   - `spec.template.spec.infrastructureRef.name` - New machine template name
+   - `spec.template.spec.bootstrap.configRef.name` - New bootstrap template name; required for Kubernetes 1.35 or later
+
+     ```bash
+     kubectl patch machinedeployment <cluster-name>-md-0 -n cpaas-system \
+       --type='merge' -p='{"spec":{"template":{"spec":{"version":"<kubernetes-version>","infrastructureRef":{"name":"<new-template>"},"bootstrap":{"configRef":{"name":"<new-bootstrap-template>"}}}}}}'
+     ```
+
+   The command includes the bootstrap reference required for Kubernetes 1.35 or later. For an earlier target with no bootstrap change, omit the `bootstrap` object.
+
+4. **Monitor Upgrade**
+
+   Verify that new nodes join the cluster with the correct Kubernetes version:
+
+   ```bash
+   kubectl get nodes
+   ```
 
 ## Recovering From a Failed Phase 2 Upgrade
 
