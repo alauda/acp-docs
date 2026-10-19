@@ -1,0 +1,351 @@
+---
+weight: 31
+title: Manage Data Disks on Bare-Metal Hosts
+author: gangwang@alauda.io
+category: howto
+queries:
+  - manage bare metal data disks
+  - machineinventory storage
+  - initialize blank disk bare metal
+  - adopt existing filesystem bare metal
+  - persistent data disk bare metal
+---
+
+# Manage Data Disks on Bare-Metal Hosts
+
+Use `MachineInventory.spec.storage` to manage data disks that are already attached to a bare-metal host. The storage declaration belongs to the long-lived `MachineInventory`, not to a temporary Cluster API `Machine`, so the provider can retain the filesystem and data when a node is removed and later reuse the same inventory.
+
+This feature does not create, attach, detach, migrate, back up, or replicate physical disks or SAN LUNs. It manages only the devices explicitly listed in `spec.storage.volumes[]`. Every unlisted device remains observed but unmanaged.
+
+:::danger
+**`InitializeIfBlank` can format a disk**
+
+Use `InitializeIfBlank` only after you have verified the exact stable device ID on the target inventory, confirmed that the device is a disposable blank data disk, and backed up any important data independently. Never copy a device ID from another host and never use `/dev/sdX`, `/dev/vdX`, `/dev/nvmeXnY`, or `/dev/mapper/mpathX` as persistent identities.
+:::
+
+## Availability and Upgrade Boundary
+
+Managed storage requires all three components from a compatible Bare Metal Storage release:
+
+- The Bare Metal provider, including its storage controller and fail-closed `MachineInventory` admission webhooks.
+- The matching `elemental-operator` CRD and observer API.
+- A host OS image that installs and enables `elemental-storage-observer.service` and the early-boot storage integration.
+
+:::warning
+Obtain the matching `base-image` and `base-image-iso` from Alauda technical support before enabling managed storage. Use `base-image` for host reprovisioning and `base-image-iso` for `SeedImage` / live installation. These images are a supported pair for the target release; do not derive one image reference from the other or substitute an independently built image.
+:::
+
+Upgrading only the provider and `elemental-operator` on the `global` cluster does not install the observer service on hosts that were created from an older OS image.
+
+- An existing cluster can remain on unmanaged storage after the management-side upgrade when `spec.storage` stays absent or has `volumes: []`. This path does not create storage plans or modify disks.
+- To enable managed storage on an older host, first reinstall, reset, or replace that host with an approved observer-capable image. Confirm the observer service and a fresh `status.observedStorage` report before adding any non-empty storage declaration.
+- Do not add `spec.storage.volumes[]` to a running or allocated inventory. Storage declarations can change only while the inventory is unallocated and all managed volumes are inactive.
+
+## Storage Lifecycle
+
+| Stage | Trigger | Expected state | Host behavior |
+|---|---|---|---|
+| Observe | The host registers and the observer reports devices. | `Unmanaged` or `Observed` | Read-only discovery; no device is selected automatically. |
+| Prepare | An operator saves a non-empty storage declaration on an available inventory. | `Prepared`, `StoragePrepared=True` | Adopt an existing filesystem or initialize an explicitly authorized blank device. Business paths remain unmounted. |
+| Activate | Cluster API allocates the prepared inventory to a `BaremetalMachine`. | `Active`, `StorageActive=True` | The reprovision plan installs activation state; required mount units start before kubelet. |
+| Deactivate | The owning Cluster API `Machine` is deleted. | `Prepared`, `StorageActive=False` | The clean plan unmounts managed volumes. Filesystems, storage ownership, and data remain. |
+| Release | Volumes are removed from `spec.storage` while the inventory is available and inactive. | `Unmanaged`, `StoragePrepared=True/NoManagedVolumes` | Storage ownership and activation metadata are removed without wiping the filesystem or data. |
+
+Deleting a Machine performs **Deactivate**, not Release. A normal scale-down therefore preserves the inventory's storage declaration and data for later reuse.
+
+## Prerequisites
+
+1. Install a Bare Metal provider release that includes Storage support and wait for its manager deployment and admission webhooks to become Ready.
+2. Obtain the matching observer-capable `base-image` and `base-image-iso` from Alauda technical support. Use the ISO image to install the host and configure the paired base image for later reprovisioning.
+3. Keep the target `MachineInventory` outside production pools until Prepare succeeds. It must be `Ready=True`, unallocated, and have a default plan Secret.
+4. Back up existing data independently. Storage retention is not an application-consistent backup.
+5. Obtain the `storagectl` binary built from the exact same provider revision. `storagectl` reuses the provider's normalization, validation, and hash code; do not calculate the initialization approval hash by hand or use a binary from another release.
+6. The identity that submits `InitializeIfBlank` must be authorized for `update` on the virtual `machineinventories/storageinitialize` subresource. Pure `Adopt` declarations do not require this additional permission.
+
+Set operation-specific variables:
+
+```bash
+export BM_NS=cpaas-system
+export BM_INVENTORY='<machineinventory-name>'
+export BM_STORAGECTL='<path-to-matching-storagectl>'
+export BM_STORAGE_FILE=/tmp/baremetal-storage.yaml
+export BM_INVENTORY_FILE=/tmp/baremetal-machineinventory.json
+export BM_PATCH_FILE=/tmp/baremetal-storage.patch.json
+```
+
+Verify the management components and authorization:
+
+```bash
+kubectl -n "$BM_NS" rollout status \
+  deployment/cluster-api-provider-baremetal-manager --timeout=5m
+kubectl get mutatingwebhookconfiguration \
+  cluster-api-provider-baremetal-mutating-webhook-configuration
+kubectl get validatingwebhookconfiguration \
+  cluster-api-provider-baremetal-validating-webhook-configuration
+kubectl auth can-i update machineinventories.elemental.cattle.io \
+  --subresource=storageinitialize -n "$BM_NS"
+```
+
+The final command must return `yes` before the identity can submit or change an initialization approval. Grant this permission only to the specific administrative user or ServiceAccount that is authorized to format disks.
+
+## Step 1: Verify the Inventory and Observer
+
+Confirm that the inventory is available and has no current owner:
+
+```bash
+kubectl -n "$BM_NS" get machineinventory.elemental.cattle.io "$BM_INVENTORY" \
+  -o jsonpath='uid={.metadata.uid}{"\n"}allocation={.metadata.annotations.baremetal\.alauda\.io/allocation-state}{"\n"}baremetalMachine={.metadata.annotations.baremetal\.alauda\.io/owner-baremetalmachine}{"\n"}machine={.metadata.annotations.baremetal\.alauda\.io/owner-machine}{"\n"}cluster={.metadata.annotations.baremetal\.alauda\.io/owner-cluster}{"\n"}plan={.status.plan.secretRef.name}{"\n"}'
+```
+
+The allocation value must be empty or `Available`; all owner values must be empty. If the inventory is allocated, delete the owning CAPI Machine and wait for the normal clean and Deactivate flow. Do not remove owner annotations or finalizers manually.
+
+On the host, verify the observer:
+
+```bash
+sudo systemctl is-enabled elemental-storage-observer.service
+sudo systemctl is-active elemental-storage-observer.service
+sudo systemctl cat elemental-storage-observer.service
+```
+
+Both state commands must succeed. On the `global` cluster, inspect the observation watermark and device facts:
+
+```bash
+kubectl -n "$BM_NS" get machineinventory.elemental.cattle.io "$BM_INVENTORY" \
+  -o jsonpath='{.status.observedStorage.observedAt}{" epoch="}{.status.observedStorage.reportEpoch}{" sequence="}{.status.observedStorage.sequence}{" bootID="}{.status.observedStorage.bootID}{"\n"}'
+
+kubectl -n "$BM_NS" get machineinventory.elemental.cattle.io "$BM_INVENTORY" -o json \
+  | jq -r '.status.observedStorage.devices[] |
+      [.id,.kind,.systemRole,(.sizeBytes|tostring),(.filesystem.type//"-"),
+       (.filesystem.uuid//"-"),([.mounts[].path]|join(",")),
+       ((.health.activePaths//0)|tostring),((.health.totalPaths//0)|tostring)] | @tsv'
+```
+
+Use only a device whose report is fresh and whose `systemRole` is `Data`.
+
+| Device kind | Stable ID | Supported policy |
+|---|---|---|
+| Direct disk | `wwn:`, `nvme-eui:`, `nvme-nguid:`, or an observer-approved `serial:` ID | `Adopt` or `InitializeIfBlank` |
+| Existing partition | `partuuid:` | `Adopt` only |
+| Multipath aggregate map | `wwid:` | `Adopt`, or `InitializeIfBlank` when the whole map is blank |
+
+Do not select a system or `Unknown` device, a multipath member, a read-only or removable device, or a device with an unexpected partition table, filesystem, LVM, RAID, LUKS, swap, consumer, or mount. Do not select both a whole disk and one of its partitions.
+
+## Step 2: Define the Managed Volumes
+
+Create a storage declaration. The example intentionally uses placeholders; replace every device ID, UUID, capacity, and mount path with facts from the same target inventory. Remove any volume that does not apply to the host.
+
+```yaml title="baremetal-storage.yaml"
+storage:
+  retryNonce: 0
+  volumes:
+    - name: cpaas-data
+      source:
+        deviceID: <blank-direct-disk-id>
+        minimumSize: 100Gi
+      filesystem:
+        policy: InitializeIfBlank
+        type: xfs
+      mount:
+        path: /var/cpaas
+        required: true
+        options:
+          - noatime
+
+    - name: application-data
+      source:
+        deviceID: <existing-partition-id>
+        minimumSize: 100Gi
+      filesystem:
+        policy: Adopt
+        type: ext4
+        expectedUUID: <existing-filesystem-uuid>
+      mount:
+        path: /data/application
+        required: true
+
+    - name: registry-data
+      source:
+        deviceID: <multipath-map-id>
+        multipath:
+          minimumActivePaths: 2
+      filesystem:
+        policy: Adopt
+        type: xfs
+        expectedUUID: <existing-filesystem-uuid>
+      mount:
+        path: /srv/registry
+        required: true
+        options:
+          - noatime
+```
+
+Storage v2 supports at most 32 volumes per inventory. The first version supports whole-device XFS or ext4, existing XFS/ext4 partitions through `Adopt`, and whole multipath maps. It does not create partitions or manage LVM, mdraid, LUKS, swap, shared-cluster filesystems, or multi-host read/write access.
+
+`required` defaults to `true`. An optional volume is still prepared and activated; only its failure-to-Ready behavior changes. `/var/cpaas` must always be required. The provider adds `nodev,nosuid` to managed mounts and validates every extra mount option against an allowlist.
+
+Validate the declaration locally:
+
+```bash
+"$BM_STORAGECTL" hash --storage "$BM_STORAGE_FILE"
+```
+
+## Step 3: Render and Apply an Atomic Patch
+
+Always start from a current live object so the patch contains the latest UID and `resourceVersion`:
+
+```bash
+kubectl -n "$BM_NS" get machineinventory.elemental.cattle.io "$BM_INVENTORY" -o json \
+  >"$BM_INVENTORY_FILE"
+```
+
+For a declaration that contains `InitializeIfBlank`, choose a positive counter strictly greater than `status.storage.lastConsumedInitializationApprovalCounter` and render the patch:
+
+```bash
+jq '.status.storage.lastConsumedInitializationApprovalCounter // 0' \
+  "$BM_INVENTORY_FILE"
+
+"$BM_STORAGECTL" render-patch \
+  --inventory "$BM_INVENTORY_FILE" \
+  --storage "$BM_STORAGE_FILE" \
+  --counter <next-initialization-counter> \
+  >"$BM_PATCH_FILE"
+```
+
+The generated merge patch binds the approval to the current Inventory UID, normalized storage hash, counter, and `resourceVersion`. For an `Adopt`-only declaration, omit `--counter`.
+
+Run a server-side dry-run, inspect the resulting `spec.storage`, device IDs, paths, and approval one more time, and only then apply it:
+
+```bash
+kubectl -n "$BM_NS" patch machineinventory.elemental.cattle.io "$BM_INVENTORY" \
+  --type=merge --patch-file="$BM_PATCH_FILE" --dry-run=server -o yaml
+
+kubectl -n "$BM_NS" patch machineinventory.elemental.cattle.io "$BM_INVENTORY" \
+  --type=merge --patch-file="$BM_PATCH_FILE"
+```
+
+If the API reports a `resourceVersion` conflict, fetch the inventory again, regenerate the patch, repeat the server dry-run, and then apply. Never remove `resourceVersion` from the generated patch.
+
+## Step 4: Wait for Prepare
+
+Watch the storage state:
+
+```bash
+kubectl -n "$BM_NS" get machineinventory.elemental.cattle.io "$BM_INVENTORY" -w
+
+kubectl -n "$BM_NS" get machineinventory.elemental.cattle.io "$BM_INVENTORY" -o json \
+  | jq '.status.storage | {
+      phase,appliedSpecHash,pendingSpecHash,
+      lastConsumedInitializationApprovalCounter,conditions,appliedVolumes,operation}'
+```
+
+Before the inventory can be allocated, the expected result is:
+
+```text
+phase=Prepared
+StoragePrepared=True/AllRequiredVolumesPrepared
+StorageActive=False/Inactive
+operation=null
+```
+
+At this stage, initialized volumes have filesystem UUIDs and adopted volumes retain their original UUIDs, but the business mount paths are not active. Do not add the inventory to a production `MachineInventoryPool` until Prepare has completed.
+
+## Step 5: Allocate and Verify Activation
+
+Add the prepared inventory to the intended `MachineInventoryPool`, then create or scale the CAPI machine group as described in [Creating Clusters on Bare Metal](../../../workload_clusters/alauda_os/bare-metal/create_cluster.mdx) and [Managing Nodes on Bare Metal](./bare-metal.mdx).
+
+After reprovisioning completes, verify both the machine and storage state:
+
+```bash
+kubectl -n "$BM_NS" get baremetalmachines.infrastructure.cluster.x-k8s.io -o json \
+  | jq -r --arg inventory "$BM_INVENTORY" \
+      '.items[] | select(.status.machineInventoryRef.name==$inventory) |
+       [.metadata.name,.status.phase,.status.ready,
+        ([.status.conditions[]|select(.type=="StorageReady")|(.status+"/"+.reason)]|join(","))] | @tsv'
+
+kubectl -n "$BM_NS" get machineinventory.elemental.cattle.io "$BM_INVENTORY" -o json \
+  | jq '.status.storage | {phase,conditions,appliedVolumes,operation}'
+```
+
+The expected result is `BaremetalMachine.status.phase=Running`, `StorageReady=True/AllVolumesReady`, `MachineInventory.status.storage.phase=Active`, and `StorageActive=True/AllRequiredVolumesActive`.
+
+On the host, confirm each source UUID, filesystem type, mount path, and mount options. Required mount units must enter active state before kubelet:
+
+```bash
+sudo findmnt --mountpoint /var/cpaas
+sudo systemctl is-active "$(systemd-escape --path --suffix=mount /var/cpaas)"
+sudo systemctl show "$(systemd-escape --path --suffix=mount /var/cpaas)" \
+  -p ActiveEnterTimestamp
+sudo systemctl show kubelet.service -p ActiveEnterTimestamp
+```
+
+## Step 6: Scale Down and Reuse the Inventory
+
+Delete the owning CAPI `Machine` through the normal scale-down or replacement workflow. Do not delete the `MachineInventory` and do not remove its storage finalizer.
+
+After drain, clean, and Deactivate complete, expect:
+
+```text
+allocation-state=Available
+status.storage.phase=Prepared
+StoragePrepared=True
+StorageActive=False/Inactive
+business mount paths are inactive
+filesystem UUIDs and data are retained
+```
+
+When the same inventory is allocated again, Activate reuses the existing ownership record and filesystem UUID; it does not format the device again. Generic pool allocation does not guarantee that a replacement Machine receives the same inventory. If an application must return to host-local data on a specific inventory, place that inventory first in a controlled ordered pool or use a dedicated pool and verify the selected `BaremetalMachine.status.machineInventoryRef` before relying on the data.
+
+## Step 7: Release Storage Ownership
+
+Release a volume only while the inventory is unallocated and inactive. Removing a volume is non-destructive: it removes Storage v2 ownership and activation metadata but preserves the filesystem UUID and data.
+
+To release all volumes, create an explicit empty declaration:
+
+```yaml title="baremetal-storage-empty.yaml"
+storage:
+  volumes: []
+```
+
+Fetch the live inventory and render, dry-run, and apply a patch without an initialization counter:
+
+```bash
+kubectl -n "$BM_NS" get machineinventory.elemental.cattle.io "$BM_INVENTORY" -o json \
+  >"$BM_INVENTORY_FILE"
+
+"$BM_STORAGECTL" render-patch \
+  --inventory "$BM_INVENTORY_FILE" \
+  --storage /tmp/baremetal-storage-empty.yaml \
+  >"$BM_PATCH_FILE"
+
+kubectl -n "$BM_NS" patch machineinventory.elemental.cattle.io "$BM_INVENTORY" \
+  --type=merge --patch-file="$BM_PATCH_FILE" --dry-run=server -o yaml
+kubectl -n "$BM_NS" patch machineinventory.elemental.cattle.io "$BM_INVENTORY" \
+  --type=merge --patch-file="$BM_PATCH_FILE"
+```
+
+Wait for `phase=Unmanaged`, `StoragePrepared=True/NoManagedVolumes`, an empty `appliedVolumes[]`, and `operation=null`. Verify retained data with a read-only mount when required. A storage finalizer may remain on the live inventory so a later object deletion still follows the correct cleanup order; do not remove it manually.
+
+## Failed Operations and Retry
+
+Storage operations fail closed. A required device that is missing, stale, busy, too small, degraded, mounted from an unknown source, or no longer matches its declared UUID prevents allocation or Machine readiness. The controller never selects a replacement disk automatically.
+
+After correcting the external cause of an operation whose `status.storage.operation.phase` is `Failed`, increment `spec.storage.retryNonce` while keeping `volumes[]` unchanged and render a new patch with `storagectl`. `retryNonce` creates another execution attempt for the same logical operation. It does not authorize a first format, bypass preflight, or permit a different storage declaration.
+
+Do not use retry as a recovery mechanism for an unknown or partially mutated declaration. When `pendingSpecHash` is non-empty or the failed operation reports `mutationState=DurableStateChanged` or `Unknown`, keep the original declaration and allow the same operation journal to converge. Contact technical support before considering any break-glass finalizer or ownership action.
+
+## Restrictions
+
+- `volumes[]` cannot change while the inventory is allocated or any managed volume is active.
+- A prepared volume's `deviceID`, filesystem policy/type, or name cannot be changed in place. Release the old volume first, wait for completion, and then add the replacement declaration.
+- Storage v2 does not move data between inventories. Inventory-owned data stays with the physical host or LUN identified by that inventory.
+- Multipath support manages the aggregate `wwid:` map only. It does not configure multipath, SAN zoning, LUN masking, fencing, or multi-host read/write filesystems.
+- `/var/lib/kubelet`, `/var/lib/containerd`, `/var/lib/etcd`, `/etc`, `/usr`, `/boot`, and other system paths are protected. Use business paths such as `/var/cpaas`, `/data/*`, `/srv/*`, or `/mnt/*` that do not overlap protected paths.
+- Do not manage the same device or path through both `MachineInventory.spec.storage` and kubeadm/cloud-init `disk_setup`, `fs_setup`, `mounts`, custom systemd units, or host scripts.
+
+## Related Documentation
+
+- [Bare Metal Provider](../../../workload_clusters/alauda_os/bare-metal/overview.mdx)
+- [Creating Clusters on Bare Metal](../../../workload_clusters/alauda_os/bare-metal/create_cluster.mdx)
+- [Managing Nodes on Bare Metal](./bare-metal.mdx)
+- [Upgrading Clusters on Bare Metal](../../../upgrade/workload/alauda_os/bare-metal.mdx)
+- [MachineInventory API](../../../apis/kubernetes_apis/infrastructure_providers/bare-metal/machineinventory.mdx)

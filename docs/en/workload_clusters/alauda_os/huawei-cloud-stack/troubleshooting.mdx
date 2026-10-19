@@ -1,0 +1,66 @@
+---
+weight: 50
+title: Troubleshoot Huawei Cloud Stack Workload Clusters
+queries:
+  - troubleshoot hcs workload cluster
+  - hcs kubeadm init never completes
+  - hcs cluster stuck in provisioned hostname
+  - hcs hostname posix dots kubeadm
+  - hcs cluster api hostname fqdn issue
+---
+
+# Troubleshoot Huawei Cloud Stack Workload Clusters
+
+This guide covers troubleshooting patterns that are specific to Huawei Cloud Stack (HCS) workload clusters managed through Cluster API.
+
+If your cluster reaches `Cluster.status.phase = Provisioned` but the import flow does not complete and workload nodes stay `NotReady` because the CNI is missing, start with the provider-agnostic guide [Troubleshoot a Workload Cluster Stuck in Provisioned](../troubleshooting/troubleshoot-cluster-not-ready.mdx). That guide covers the shared diagnostic flow (`global` cluster import controller, `sentry` ServiceAccount, `clusters.platform.tkestack.io` invariants) for every Immutable Infrastructure provider.
+
+If you have already completed the generic flow and the symptoms below also appear, see the HCS-specific pattern on this page.
+
+## Pattern: kubeadm init Never Completes Because the Hostname Is Wrong \{#kubeadm-init-hostname}
+
+Symptoms — all true at the same time:
+
+- `Cluster.status.phase=Provisioned`, `HCSCluster.status.ready=true`, the ELB is up.
+- `HCSMachine.status.instanceState=ACTIVE` with an `InternalIP` populated, but `Machine.status.nodeRef` never becomes set.
+- `KubeadmControlPlane.status.initialized` stays empty and `status.readyReplicas=0` past the usual init window of about 5 to 10 minutes.
+- The `cluster-api-provider-hcs` controller logs (in `cpaas-system`) repeatedly print `connect: connection refused` against the control plane ELB VIP on port 6443.
+- The `HCSMachineConfigPool.spec.configs[].hostname` value chosen for the node contains a dot (FQDN style, for example `master-1.example.org`).
+
+In `cluster-api-provider-hcs` releases earlier than v1.0.1, a dotted `HCSMachineConfigPool.spec.configs[].hostname` is rendered into cloud-init as the full FQDN string in the `hostname` field, with `prefer_fqdn_over_hostname: true`. The resulting node has a POSIX hostname that contains dots, which kubeadm init does not handle, so kube-apiserver never starts.
+
+### Diagnose
+
+If you can reach the node (HCS console, jump host, or an in-cluster debug pod):
+
+```bash
+# On the affected node
+hostname
+hostname -f
+cat /etc/hosts
+sudo cat /var/lib/cloud/instance/user-data.txt | head -40
+sudo journalctl -u cloud-init -b 0 | grep -E "hostname|fqdn|update_etc_hosts"
+```
+
+Indicators that you are hitting this pattern:
+
+- `hostname` returns the full dotted string instead of just the short label.
+- `hostname -f` returns `Name or service not known` or `Temporary failure in name resolution`.
+- `/etc/hosts` does **not** contain a line of the form `<node-ip> <fqdn> <short>`.
+- The cloud-init user-data on the node shows `prefer_fqdn_over_hostname: true` and does not set `manage_etc_hosts`.
+
+### Mitigate
+
+Upgrade the `cluster-api-provider-hcs` plugin to v1.0.1 or later, then trigger a rolling replacement of the affected control plane and worker machines so the new cloud-init runs on freshly booted VMs. The step-by-step procedure is documented in [Configure FQDN Hostname on Existing HCS Clusters](../../../configure/nodes/alauda_os/migrate-hcs-node-fqdn-hostname.mdx).
+
+Manual edits to `/etc/hostname` and `/etc/hosts` on an existing immutable-OS node do not persist: cloud-init re-renders these files on every boot, including reboots triggered by `transactional-update`, OS patching, or `systemctl reboot`. Rolling replacement is the supported migration path.
+
+### Prevent
+
+Re-running the cluster create with `cluster-api-provider-hcs` v1.0.1 or later already installed avoids the pattern entirely. New manifests for HCS should follow [Hostname behavior on the node](./create_cluster.mdx#hostname-behavior-on-the-node) on the cluster create page when picking dotted versus short hostnames in `HCSMachineConfigPool`.
+
+## Related
+
+- [Troubleshoot a Workload Cluster Stuck in Provisioned](../troubleshooting/troubleshoot-cluster-not-ready.mdx) — provider-agnostic import-controller diagnostic flow that applies before any HCS-specific pattern on this page.
+- [Configure FQDN Hostname on Existing HCS Clusters](../../../configure/nodes/alauda_os/migrate-hcs-node-fqdn-hostname.mdx) — rolling-replacement migration procedure for clusters created before `cluster-api-provider-hcs` v1.0.1.
+- [Create Cluster on Huawei Cloud Stack](./create_cluster.mdx) — manifest reference for new clusters, including [Hostname behavior on the node](./create_cluster.mdx#hostname-behavior-on-the-node).

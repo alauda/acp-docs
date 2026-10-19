@@ -1,0 +1,1019 @@
+---
+weight: 40
+---
+
+# Managing Nodes on Huawei DCS
+
+This document explains how to manage worker nodes using Cluster API `Machine` resources.
+
+## Prerequisites
+
+:::warning
+**Important Prerequisites**
+- The control plane must be deployed before performing node operations. See [Create Cluster](../../../workload_clusters/alauda_os/huawei-dcs/create_cluster.mdx) for setup instructions.
+- Ensure you have proper access to the DCS platform and required permissions.
+:::
+
+:::info
+**Configuration Guidelines**
+When working with the configurations in this document:
+- Only modify values enclosed in `<>` brackets
+- Replace placeholder values with your environment-specific settings
+- Preserve all other default configurations unless explicitly required
+:::
+
+## Overview
+
+Worker nodes are managed through Cluster API `Machine` resources, providing declarative and automated node lifecycle management. The deployment process involves:
+
+1. **IP-Hostname Pool Configuration** - Network settings for worker nodes
+2. **Machine Template Setup** - VM specifications
+3. **Bootstrap Configuration** - Node initialization and join settings
+4. **Machine Deployment** - Orchestration of node creation and management
+
+## Worker Node Deployment \{#worker-node-deployment}
+
+### Step 1: Configure IP-Hostname Pool
+
+The IP-Hostname Pool defines the network configuration for worker node virtual machines. You must plan and configure the IP addresses, hostnames, DNS servers, additional NICs, and other network parameters before deployment.
+
+On Huawei DCS, the IP pool is also where you declare persistent disks that must survive VM replacement. Use `persistentDisk` for the platform-required `/var/cpaas` disk and for any other worker-node disk that must be preserved during delete-recreate operations. This workflow requires DCS provider `v1.0.16` or later.
+
+When a node template declares a dedicated data disk at `/var/lib/containerd`, the DCS provider's bootstrap configuration stores pod logs under `/var/lib/containerd/pods` and links `/var/log/pods` to that path. Keep the disk mounted at `/var/lib/containerd` when replacing the node if you need the pod-log data to remain on the containerd data disk.
+
+:::warning
+**Pool Size Requirement**
+The pool must include at least as many entries as the number of worker nodes you plan to deploy. Insufficient entries will prevent node deployment.
+:::
+
+**Example:**
+
+Create a `DCSIpHostnamePool` named `<cluster-name>-worker-pool`:
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: DCSIpHostnamePool
+metadata:
+  name: <cluster-name>-worker-pool
+  namespace: cpaas-system
+spec:
+  pool:
+  - ip: "<worker-ip-1>"
+    mask: "<worker-cidr-prefix-length>"
+    gateway: "<worker-gateway>"
+    dns: "<worker-dns>"
+    hostname: "<worker-hostname-1>"
+    machineName: "<worker-machine-name-1>"
+    additionNic:
+    - ip: "<worker-additional-ip-1>"
+      mask: "<worker-additional-cidr-prefix-length>"
+      gateway: "<worker-additional-gateway>"
+      dns: "<worker-additional-dns>"
+      dvSwitchName: "<additional-dvs>"
+      portGroupName: "<additional-port-group>"
+    persistentDisk:
+    - slot: 0
+      quantityGB: 40
+      datastoreClusterName: <datastore-cluster-name>
+      path: /var/cpaas
+      format: xfs
+  - ip: "<worker-ip-2>"
+    mask: "<worker-cidr-prefix-length>"
+    gateway: "<worker-gateway>"
+    dns: "<worker-dns>"
+    hostname: "<worker-hostname-2>"
+    machineName: "<worker-machine-name-2>"
+    persistentDisk:
+    - slot: 0
+      quantityGB: 40
+      datastoreClusterName: <datastore-cluster-name>
+      path: /var/cpaas
+      format: xfs
+  - ip: "<worker-ip-3>"
+    mask: "<worker-cidr-prefix-length>"
+    gateway: "<worker-gateway>"
+    dns: "<worker-dns>"
+    hostname: "<worker-hostname-3>"
+    machineName: "<worker-machine-name-3>"
+    persistentDisk:
+    - slot: 0
+      quantityGB: 40
+      datastoreClusterName: <datastore-cluster-name>
+      path: /var/cpaas
+      format: xfs
+```
+
+**Key parameters:**
+
+| Parameter | Type | Description | Required |
+|-----------|------|-------------|----------|
+| `.spec.pool[].ip` | string | IP address for the worker virtual machine | Yes |
+| `.spec.pool[].mask` | string | Subnet mask in CIDR prefix-length format without `/`, for example `24` | Yes |
+| `.spec.pool[].gateway` | string | Gateway IP address | Yes |
+| `.spec.pool[].dns` | string | DNS server IP addresses (semicolon-separated for multiple) | No |
+| `.spec.pool[].machineName` | string | Virtual machine name in the DCS platform | No |
+| `.spec.pool[].hostname` | string | Hostname for the virtual machine | No |
+| `.spec.pool[].additionNic[]` | []object | Additional NICs bound to this IP slot. Use this for storage, management, or isolated application networks. | No |
+| `.spec.pool[].additionNic[].ip` | string | Additional NIC IP address for the generated guest network configuration. | Recommended* |
+| `.spec.pool[].additionNic[].mask` | string | Additional NIC subnet mask in CIDR prefix-length format without `/`, for example `24`. | Recommended* |
+| `.spec.pool[].additionNic[].gateway` | string | Gateway for the additional NIC network. Confirm route behavior before setting this value. | No |
+| `.spec.pool[].additionNic[].dns` | string | DNS server IPs for the additional NIC network, separated by semicolons when multiple values are required. | No |
+| `.spec.pool[].additionNic[].dvSwitchName` | string | DCS distributed virtual switch used to resolve the Port Group for the additional NIC. | Yes* |
+| `.spec.pool[].additionNic[].portGroupName` | string | DCS Port Group used to attach the additional NIC. | Yes* |
+| `.spec.pool[].persistentDisk[]` | []object | Persistent disks bound to this IP slot. Use this for `/var/cpaas` and any disk that must survive node replacement. | No |
+
+\*Fields marked `Yes*` are required for the provider to resolve the target network and attach the additional NIC. Fields marked `Recommended*` are needed for the generated static guest network configuration. The CRD does not enforce these fields.
+
+### Step 2: Configure Machine Template
+
+The DCSMachineTemplate defines the specifications for worker node virtual machines, including VM templates, compute resources, storage configuration, and network settings.
+
+The fields in this resource reference several Huawei DCS platform concepts (DCS VM Template, DCS VM Folder, DCS Datastore, and related items). For the definitions of those concepts and how they map to Cluster API resources, see [Huawei DCS Concepts and Terminology](../../../workload_clusters/alauda_os/huawei-dcs/overview.mdx#concepts-and-terminology).
+
+:::warning
+**Required Disk Configurations**
+The following disk mount points are mandatory. Do not remove them:
+- System volume (`systemVolume: true`)
+- `/var/lib/kubelet` - Kubelet data directory
+- `/var/lib/containerd` - Container runtime data
+
+Configure `/var/cpaas` in the IP pool as a persistent disk, not in `DCSMachineTemplate`.
+
+You may add additional template disks, but these essential template disks must be preserved.
+:::
+
+**Example:**
+
+Create a `DCSMachineTemplate` named `<cluster-name>-worker-template`:
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: DCSMachineTemplate
+metadata:
+  name: <cluster-name>-worker-template
+  namespace: cpaas-system
+spec:
+  template:
+    spec:
+      vmTemplateName: <vm-template-name>
+      location:
+        type: folder
+        name: <folder-name>
+      vmConfig:
+        dvSwitchName: <dv-switch-name> # Optional
+        portGroupName: <port-group-name> # Optional
+        dcsMachineCpuSpec:
+          quantity: <worker-cpu>
+        dcsMachineMemorySpec: # MB
+          quantity: <worker-memory>
+        dcsMachineDiskSpec: # GB
+        - quantity: 0
+          datastoreClusterName: <datastore-cluster-name>
+          systemVolume: true
+        - quantity: 100
+          datastoreClusterName: <datastore-cluster-name>
+          path: /var/lib/kubelet
+          format: xfs
+        - quantity: 100
+          datastoreClusterName: <datastore-cluster-name>
+          path: /var/lib/containerd
+          format: xfs
+      ipHostPoolRef:
+        name: <cluster-name>-worker-pool
+```
+
+**Key parameters:**
+
+| Parameter | Type | Description | Required |
+|-----------|------|-------------|----------|
+| `.spec.template.spec.vmTemplateName` | string | DCS VM Template name as registered on the DCS platform. | Yes |
+| `.spec.template.spec.location` | object | Places the cloned virtual machine under a DCS VM Folder for organizational grouping. If omitted, the virtual machine is not placed in any folder. See [Huawei DCS Concepts and Terminology](../../../workload_clusters/alauda_os/huawei-dcs/overview.mdx#concepts-and-terminology) for the VM Folder definition and [Infrastructure → Advanced: Multi-Cluster Deployment](../../../workload_clusters/alauda_os/huawei-dcs/infrastructure.mdx#advanced-multi-cluster) for the multi-cluster use of this field. | No |
+| `.spec.template.spec.location.type` | string | Set to `folder` for the standard workflow. The folder must already exist on the DCS platform. | Yes* |
+| `.spec.template.spec.location.name` | string | Name of the existing DCS VM Folder. | Yes* |
+| `.spec.template.spec.vmConfig` | object | Virtual machine configuration | Yes |
+| `.spec.template.spec.vmConfig.dvSwitchName` | string | Virtual switch name (uses template default if not specified) | No |
+| `.spec.template.spec.vmConfig.portGroupName` | string | Port group name (must belong to the specified switch) | No |
+| `.spec.template.spec.vmConfig.dcsMachineCpuSpec.quantity` | int | CPU cores for worker VM | Yes |
+| `.spec.template.spec.vmConfig.dcsMachineMemorySpec.quantity` | int | Memory size in MB | Yes |
+| `.spec.template.spec.vmConfig.dcsMachineDiskSpec` | []object | Disk configuration array | Yes |
+| `.spec.template.spec.vmConfig.dcsMachineDiskSpec[].quantity` | int | Disk size in GB (0 for system disk uses template size) | Yes |
+| `.spec.template.spec.vmConfig.dcsMachineDiskSpec[].datastoreClusterName` | string | Datastore cluster name | Yes |
+| `.spec.template.spec.vmConfig.dcsMachineDiskSpec[].systemVolume` | bool | System disk flag (only one disk can be true) | No |
+| `.spec.template.spec.vmConfig.dcsMachineDiskSpec[].path` | string | Mount path (disk not mounted if omitted) | No |
+| `.spec.template.spec.vmConfig.dcsMachineDiskSpec[].format` | string | Filesystem format (e.g., xfs, ext4) | No |
+| `.spec.template.spec.ipHostPoolRef.name` | string | Referenced DCSIpHostnamePool name | Yes |
+
+*Required when parent object is specified
+
+### Persistent Disks Managed by the IP Pool
+
+Declare any upgrade-preserved disk in the matching `DCSIpHostnamePool.spec.pool[].persistentDisk` entry (DCS provider `v1.0.16` or later).
+
+- Use this for `/var/cpaas`, which is required by the platform.
+- Keep `DCSMachineTemplate` for the system disk and template-local disks that may be recreated with the VM.
+- Choose a unique `slot` per IP entry. The controller uses `(ip, slot)` as the persistent-disk identity.
+- On replacement nodes, the guest disk setup logic checks for an existing filesystem. If the disk is already formatted, it skips `mkfs` and mounts the disk directly.
+- Persistent-disk workflows require one-by-one replacement, so keep `MachineDeployment.spec.strategy.rollingUpdate.maxSurge = 0`.
+- You can append new `persistentDisk` entries, but deleting existing entries is not supported. The controller attaches the newly added disk to the running VM on the DCS side, but it does not format or mount the disk inside the guest OS. Guest formatting and mounting take effect only after the VM is replaced and the replacement VM runs the generated disk setup during bootstrap.
+- The controller creates new persistent volumes as independent persistent normal volumes. When it reuses an existing volume, it only requires the volume to be independent and persistent; it does not require a specific DCS volume type.
+- Treat `format`, `options`, and `pciType` as immutable after creation.
+- Use `isThin` only when the DCS environment requires an explicit thin-provisioning value for newly created persistent volumes. If omitted, the provider does not send `isThin` and DCS uses the platform default.
+- Treat `quantityGB` and datastore changes as rollout-sensitive changes. The webhook performs best-effort validation against the DCS platform when it has enough cluster context. `isThin` is creation-only: changing it does not validate, reconcile, or convert existing volumes, and affects only persistent volumes created later.
+
+To inspect the runtime state of persistent disks during node operations, check `status.persistentDiskStatus` on the pool:
+
+```bash
+kubectl get dcsiphostnamepool <cluster-name>-worker-pool -n cpaas-system -o yaml
+```
+
+### Additional NICs Managed by the IP Pool
+
+Declare worker additional NICs in `DCSIpHostnamePool.spec.pool[].additionNic[]`.
+
+- The provider applies `additionNic[]` only when it creates a new VM.
+- Existing worker VMs are not hot-updated when you edit the Pool.
+- New worker Machines use the `additionNic[]` values from the Pool slot they claim.
+- Each additional NIC should include both `dvSwitchName` and `portGroupName` so the provider can resolve the target DCS Port Group before VM clone.
+- If you also use `persistentDisk[]`, keep `MachineDeployment.spec.strategy.rollingUpdate.maxSurge = 0` so fixed IP slots and preserved disks move one node at a time.
+- If an additional NIC has a gateway, verify that the guest OS route table still prefers the intended primary network for the default route.
+
+To inspect the runtime state of additional NICs, check `DCSMachine.status.additionalNic`:
+
+```bash
+kubectl -n cpaas-system get dcsmachine -l cluster.x-k8s.io/cluster-name=<cluster-name> \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.networkConfig.ip}{"\t"}{.status.additionalNic}{"\n"}{end}'
+```
+
+### Step 3: Configure Bootstrap Template
+
+The KubeadmConfigTemplate defines the bootstrap configuration for worker nodes, including user accounts, SSH keys, system files, and kubeadm join settings.
+
+`imagePullCredentialsVerificationPolicy: NeverVerify` is required only starting with Kubernetes 1.35. Omit this parameter when creating workers with Kubernetes 1.34 or earlier. If `contentFrom.secret` supplies the patch, verify that the referenced `worker-kubelet-patch.json` contains this parameter for Kubernetes 1.35.
+
+:::info
+**Template Optimization**
+The template includes pre-optimized configurations for security and performance. Modify only the parameters that require customization for your environment.
+:::
+
+**Example:**
+
+```yaml
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+kind: KubeadmConfigTemplate
+metadata:
+  name: <cluster-name>-worker-kct
+  namespace: cpaas-system
+spec:
+  template:
+    spec:
+      format: ignition
+      users:
+      - name: boot
+        sshAuthorizedKeys:
+        - "<ssh-authorized-keys>"
+      files:
+      - path: /etc/kubernetes/patches/kubeletconfiguration0+strategic.json
+        owner: "root:root"
+        permissions: "0644"
+        content: |
+          {
+            "apiVersion": "kubelet.config.k8s.io/v1beta1",
+            "kind": "KubeletConfiguration",
+            "imagePullCredentialsVerificationPolicy": "NeverVerify",
+            "protectKernelDefaults": true,
+            "staticPodPath": null,
+            "tlsCertFile": "/etc/kubernetes/pki/kubelet.crt",
+            "tlsPrivateKeyFile": "/etc/kubernetes/pki/kubelet.key",
+            "streamingConnectionIdleTimeout": "5m",
+            "clientCAFile": "/etc/kubernetes/pki/ca.crt"
+          }
+      preKubeadmCommands:
+      - while ! ip route | grep -q "default via"; do sleep 1; done; echo "NetworkManager started"
+      - mkdir -p /run/cluster-api && restorecon -Rv /run/cluster-api
+      - if [ -f /etc/disk-setup.sh ]; then bash /etc/disk-setup.sh; fi
+      postKubeadmCommands:
+      - chmod 600 /var/lib/kubelet/config.yaml
+      joinConfiguration:
+        patches:
+          directory: /etc/kubernetes/patches
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-ip: NODE_IP
+            provider-id: PROVIDER_ID
+            volume-plugin-dir: "/opt/libexec/kubernetes/kubelet-plugins/volume/exec/"
+            protect-kernel-defaults: "true"
+```
+
+`PROVIDER_ID` and `NODE_IP` are literal magic tokens that DCS Provider substitutes at machine-join time — keep them exactly as written. See [Magic-Token Placeholders](../../../workload_clusters/alauda_os/huawei-dcs/create_cluster.mdx#magic-tokens) for the full list.
+
+:::tip
+**Alternative: reference a centrally managed Secret for the worker kubelet patch**
+
+The DCS Provider plugin ships a Secret named `dcs-kubernetes-<kubernetes-major-minor>-files` in the `cpaas-system` namespace (for example, `dcs-kubernetes-1.33-files` for Kubernetes 1.33). In addition to the control-plane files it serves to `KubeadmControlPlane` (see the create-cluster Appendix), this Secret also contains a `worker-kubelet-patch.json` key suitable for the worker `KubeadmConfigTemplate`. When that Secret is present, you can replace the inline `files` entry above with a `contentFrom.secret` reference — this keeps the worker kubelet patch in sync with the installed plugin version and avoids manual updates on cluster upgrades.
+
+```yaml
+files:
+- contentFrom:
+    secret:
+      key: worker-kubelet-patch.json
+      name: dcs-kubernetes-1.33-files
+  owner: "root:root"
+  path: /etc/kubernetes/patches/kubeletconfiguration0+strategic.json
+  permissions: "0644"
+```
+
+The inline and Secret-referenced forms are functionally equivalent; the Secret form is the recommended path when the plugin Secret is available in the target cluster.
+
+**Minimum plugin version**: Same as the control-plane Appendix tip — `worker-kubelet-patch.json` is part of the `dcs-kubernetes-1.33-files` Secret shipped from DCS Provider `v1.0.13`. On older plugin versions the Secret does not exist; keep the inline `content:` form in that case.
+:::
+
+### Step 4: Configure Machine Deployment
+
+The MachineDeployment orchestrates the creation and management of worker nodes by referencing the previously configured DCSMachineTemplate and KubeadmConfigTemplate resources. It manages the desired number of nodes and handles rolling updates.
+
+**Example:**
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineDeployment
+metadata:
+  name: <cluster-name>-md-0
+  namespace: cpaas-system
+spec:
+  strategy:
+    rollingUpdate:
+      maxSurge: 0 # Required when this node pool relies on persistent disks
+      maxUnavailable: 1
+    type: RollingUpdate
+  clusterName: <cluster-name>
+  replicas: 3
+  selector:
+    matchLabels: null
+  template:
+    metadata:
+      labels:
+        cluster.x-k8s.io/cluster-name: <cluster-name>
+        pool.name: <cluster-name>-md-0
+    spec:
+      nodeDrainTimeout: 1m
+      nodeDeletionTimeout: 5m
+      bootstrap:
+        configRef:
+          apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+          kind: KubeadmConfigTemplate
+          name: <cluster-name>-worker-kct
+          namespace: cpaas-system
+      clusterName: <cluster-name>
+      infrastructureRef:
+        apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+        kind: DCSMachineTemplate
+        name: <cluster-name>-worker-template
+        namespace: cpaas-system
+      version: <worker-kubernetes-version>
+```
+
+**Key parameters:**
+
+| Parameter | Type | Description | Required |
+|-----------|------|-------------|----------|
+| `.spec.clusterName` | string | Target cluster name for node deployment | Yes |
+| `.spec.replicas` | int | Number of worker nodes (must not exceed IP pool size) | Yes |
+| `.spec.template.spec.bootstrap.configRef` | object | Reference to KubeadmConfigTemplate | Yes |
+| `.spec.template.spec.infrastructureRef` | object | Reference to DCSMachineTemplate | Yes |
+| `.spec.template.spec.version` | string | Kubernetes version (must match VM template) | Yes |
+| `.spec.strategy.rollingUpdate.maxSurge` | int | Maximum nodes above desired during update. Keep this at `0` when the node pool relies on persistent disks | No |
+| `.spec.strategy.rollingUpdate.maxUnavailable` | int | Maximum unavailable nodes during update. When persistent disks are used with `maxSurge = 0`, keep this value greater than `0` and within the replica count | No |
+
+## Node Management Operations
+
+This section covers common operational tasks for managing worker nodes, including scaling, updates, upgrades, and template modifications.
+
+:::info
+**Cluster API Framework**
+Node management operations are based on the Cluster API framework. For detailed information, refer to the [official Cluster API documentation](https://cluster-api.sigs.k8s.io/tasks/updating-machine-templates#updating-machine-infrastructure-and-bootstrap-templates).
+:::
+
+### Scaling Worker Nodes
+
+Worker node scaling allows you to adjust cluster capacity based on workload demands. The Cluster API manages the node lifecycle automatically through the MachineDeployment resource.
+
+#### Adding Worker Nodes
+
+Increase the number of worker nodes to handle increased workload or add new capacity.
+
+**Use Case**: Scale up cluster to add more compute resources
+
+**Prerequisites**:
+- Verify the IP pool has sufficient available IP addresses for new nodes
+- Ensure the DCS platform has adequate resources to provision new VMs
+
+**Procedure**:
+
+1. **Check Current Node Status**
+
+   View the current machines in the cluster:
+
+   ```bash
+   # List all machines in the cluster
+   kubectl get machines -n cpaas-system
+
+   # List machines for a specific MachineDeployment
+   kubectl get machines -n cpaas-system -l cluster.x-k8s.io/deployment-name=<cluster-name>-md-0
+   ```
+
+2. **Extend IP Pool**
+
+   Before scaling up, add new IP configurations to the pool for the additional nodes.
+
+   :::info
+   **IP Pool Expansion**
+   The IP pool must contain at least as many entries as the desired replica count. Add new IP entries for each additional worker node you plan to deploy.
+   :::
+
+   **Add IP entries to the pool:**
+
+   First, export the current pool configuration to preserve existing entries:
+
+   ```bash
+   kubectl get dcsiphostnamepool <cluster-name>-worker-pool -n cpaas-system -o yaml
+   ```
+
+   Then use the following command to add new IP configurations. The `pool` array must include **all existing entries** plus the new entries:
+
+   ```bash
+   kubectl patch dcsiphostnamepool <cluster-name>-worker-pool -n cpaas-system \
+     --type='merge' -p='
+   {
+     "spec": {
+       "pool": [
+         {
+           "ip": "<existing-ip-1>",
+           "mask": "<worker-cidr-prefix-length>",
+           "gateway": "<worker-gateway>",
+           "dns": "<worker-dns>",
+           "hostname": "<existing-hostname-1>",
+           "machineName": "<existing-machine-name-1>",
+           "persistentDisk": [
+             {
+               "slot": 0,
+               "quantityGB": 40,
+               "datastoreClusterName": "<datastore-cluster-name>",
+               "path": "/var/cpaas",
+               "format": "xfs"
+             }
+           ]
+         },
+         {
+           "ip": "<existing-ip-2>",
+           "mask": "<worker-cidr-prefix-length>",
+           "gateway": "<worker-gateway>",
+           "dns": "<worker-dns>",
+           "hostname": "<existing-hostname-2>",
+           "machineName": "<existing-machine-name-2>",
+           "persistentDisk": [
+             {
+               "slot": 0,
+               "quantityGB": 40,
+               "datastoreClusterName": "<datastore-cluster-name>",
+               "path": "/var/cpaas",
+               "format": "xfs"
+             }
+           ]
+         },
+         {
+           "ip": "<new-worker-ip-1>",
+           "mask": "<worker-cidr-prefix-length>",
+           "gateway": "<worker-gateway>",
+           "dns": "<worker-dns>",
+           "hostname": "<new-worker-hostname-1>",
+           "machineName": "<new-worker-machine-name-1>",
+           "persistentDisk": [
+             {
+               "slot": 0,
+               "quantityGB": 40,
+               "datastoreClusterName": "<datastore-cluster-name>",
+               "path": "/var/cpaas",
+               "format": "xfs"
+             }
+           ]
+         },
+         {
+           "ip": "<new-worker-ip-2>",
+           "mask": "<worker-cidr-prefix-length>",
+           "gateway": "<worker-gateway>",
+           "dns": "<worker-dns>",
+           "hostname": "<new-worker-hostname-2>",
+           "machineName": "<new-worker-machine-name-2>",
+           "persistentDisk": [
+             {
+               "slot": 0,
+               "quantityGB": 40,
+               "datastoreClusterName": "<datastore-cluster-name>",
+               "path": "/var/cpaas",
+               "format": "xfs"
+             }
+           ]
+         }
+       ]
+     }'
+   ```
+
+   :::warning
+   **Important Notes**
+   - The `pool` array must include **all existing entries** plus the new entries you want to add
+   - Copy the existing entries from the exported YAML to avoid data loss
+   - `kubectl patch --type='merge'` replaces the entire `spec.pool` array, so copy every existing `persistentDisk` block unchanged, including `isThin` if it is present, unless you are intentionally adding new disks
+   - Ensure each new entry has unique `ip`, `hostname`, and `machineName` values
+   - If new worker nodes also need the platform-required `/var/cpaas` disk, declare it in each new entry's `persistentDisk`
+   - Network parameters (`mask`, `gateway`, `dns`) typically match existing entries
+   :::
+
+   **Example**: Adding 2 new nodes to an existing pool of 3 nodes
+
+   ```bash
+   # Current pool has 3 entries (10.0.1.11, 10.0.1.12, 10.0.1.13)
+   # Adding 2 more entries for nodes 4 and 5
+   kubectl patch dcsiphostnamepool worker-pool-1-ippool -n cpaas-system \
+     --type='merge' -p='
+   {
+     "spec": {
+       "pool": [
+         {
+           "ip": "10.0.1.11",
+           "mask": "24",
+           "gateway": "10.0.1.1",
+           "dns": "10.0.0.2",
+           "hostname": "worker-node-1",
+           "machineName": "worker-vm-1",
+           "persistentDisk": [
+             {
+               "slot": 0,
+               "quantityGB": 40,
+               "datastoreClusterName": "shared-datastore-cluster",
+               "path": "/var/cpaas",
+               "format": "xfs"
+             }
+           ]
+         },
+         {
+           "ip": "10.0.1.12",
+           "mask": "24",
+           "gateway": "10.0.1.1",
+           "dns": "10.0.0.2",
+           "hostname": "worker-node-2",
+           "machineName": "worker-vm-2",
+           "persistentDisk": [
+             {
+               "slot": 0,
+               "quantityGB": 40,
+               "datastoreClusterName": "shared-datastore-cluster",
+               "path": "/var/cpaas",
+               "format": "xfs"
+             }
+           ]
+         },
+         {
+           "ip": "10.0.1.13",
+           "mask": "24",
+           "gateway": "10.0.1.1",
+           "dns": "10.0.0.2",
+           "hostname": "worker-node-3",
+           "machineName": "worker-vm-3",
+           "persistentDisk": [
+             {
+               "slot": 0,
+               "quantityGB": 40,
+               "datastoreClusterName": "shared-datastore-cluster",
+               "path": "/var/cpaas",
+               "format": "xfs"
+             }
+           ]
+         },
+         {
+           "ip": "10.0.1.14",
+           "mask": "24",
+           "gateway": "10.0.1.1",
+           "dns": "10.0.0.2",
+           "hostname": "worker-node-4",
+           "machineName": "worker-vm-4",
+           "persistentDisk": [
+             {
+               "slot": 0,
+               "quantityGB": 40,
+               "datastoreClusterName": "shared-datastore-cluster",
+               "path": "/var/cpaas",
+               "format": "xfs"
+             }
+           ]
+         },
+         {
+           "ip": "10.0.1.15",
+           "mask": "24",
+           "gateway": "10.0.1.1",
+           "dns": "10.0.0.2",
+           "hostname": "worker-node-5",
+           "machineName": "worker-vm-5",
+           "persistentDisk": [
+             {
+               "slot": 0,
+               "quantityGB": 40,
+               "datastoreClusterName": "shared-datastore-cluster",
+               "path": "/var/cpaas",
+               "format": "xfs"
+             }
+           ]
+         }
+       ]
+     }'
+   ```
+
+3. **Verify IP Pool Capacity**
+
+   After extending the IP pool, verify it has sufficient entries for the desired replica count:
+
+   ```bash
+   kubectl get dcsiphostnamepool -n cpaas-system <cluster-name>-worker-pool -o yaml
+   ```
+
+   Check that the pool contains at least as many entries as the desired replica count.
+
+4. **Scale Up the MachineDeployment**
+
+   Update the `replicas` field to the desired number of nodes:
+
+   ```bash
+   kubectl patch machinedeployment <cluster-name>-md-0 -n cpaas-system \
+     --type='json' -p='[{"op": "replace", "path": "/spec/replicas", "value": <new-replica-count>}]'
+   ```
+
+   **Example**: Scale from 3 to 5 nodes
+
+   ```bash
+   kubectl patch machinedeployment worker-pool-1 -n cpaas-system \
+     --type='json' -p='[{"op": "replace", "path": "/spec/replicas", "value": 5}]'
+   ```
+
+5. **Monitor the Scaling Progress**
+
+   Watch the machine creation process:
+
+   ```bash
+   # Watch machines being created
+   kubectl get machines -n cpaas-system -w
+
+   # Check MachineDeployment status
+   kubectl get machinedeployment <cluster-name>-md-0 -n cpaas-system
+   ```
+
+   The Cluster API controller will automatically create new machines based on the MachineDeployment template.
+
+6. **Verify Nodes Joined the Cluster**
+
+   Switch to the target cluster context and verify the new nodes:
+
+   ```bash
+   # Switch to target cluster context
+   kubectl config use-context <target-cluster-context>
+
+   # Check all nodes are Ready
+   kubectl get nodes
+   ```
+
+   The new nodes should appear in the list and transition to `Ready` status.
+
+:::info
+**Rolling Update Behavior**
+When scaling up, new nodes are created immediately without affecting existing nodes. This ensures zero-downtime scaling.
+:::
+
+#### Removing Worker Nodes
+
+Decrease the number of worker nodes to reduce cluster capacity or remove underutilized resources. The Cluster API supports two removal strategies:
+
+1. **Random removal**: Reduce replicas, the platform randomly selects and deletes machines
+2. **Targeted removal**: Mark specific machines for deletion, then reduce replicas (recommended for IP recovery)
+
+:::info
+**IP Recovery Scenario**
+When you need to recycle specific machine IPs (e.g., for reassignment or IP pool management), use the targeted removal method. The deletion annotation ensures the platform deletes the marked machines, not random ones.
+:::
+
+:::warning
+**Data Loss Warning**
+Scaling down removes nodes and their associated VMs. Ensure:
+- Workloads can tolerate node loss through proper replication
+- No critical data is stored only on the nodes being removed
+- Applications are designed for horizontal scaling
+
+Declared persistent disks in `DCSIpHostnamePool.spec.pool[].persistentDisk` are not deleted just because a Machine is replaced. They remain available for reuse while the corresponding IP slot stays in the pool. Removing the IP slot from the pool, deleting the pool, or deleting the cluster can trigger persistent-volume cleanup.
+:::
+
+##### Random Removal
+
+**Use Case**: Scale down cluster where any node can be removed (no specific IP requirements)
+
+**Procedure**:
+
+1. **Identify Current Machine Status**
+
+    View the current machines in the MachineDeployment:
+
+    ```bash
+    kubectl get machines -n cpaas-system -l cluster.x-k8s.io/deployment-name=<cluster-name>-md-0
+    ```
+
+2. **Scale Down the MachineDeployment**
+
+    Update the `replicas` field to reduce the node count:
+
+    ```bash
+    kubectl patch machinedeployment <cluster-name>-md-0 -n cpaas-system \
+      --type='json' -p='[{"op": "replace", "path": "/spec/replicas", "value": <new-replica-count>}]'
+    ```
+
+    **Example**: Scale from 5 to 3 nodes
+
+    ```bash
+    kubectl patch machinedeployment worker-pool-1 -n cpaas-system \
+      --type='json' -p='[{"op": "replace", "path": "/spec/replicas", "value": 3}]'
+    ```
+
+    The Cluster API controller will randomly select and delete machines to match the desired replica count.
+
+3. **Monitor the Removal Progress**
+
+    Watch the machine deletion process:
+
+    ```bash
+    kubectl get machines -n cpaas-system -w
+    ```
+
+    The Cluster API controller will:
+    - Drain the selected nodes (evict pods if possible)
+    - Delete the underlying VMs from the DCS platform
+    - Remove the machine resources
+
+4. **Verify Nodes Removed**
+
+    Switch to the target cluster context:
+
+    ```bash
+    kubectl config use-context <target-cluster-context>
+    kubectl get nodes
+    ```
+
+    The removed nodes should no longer appear in the list.
+
+##### Targeted Removal
+
+**Use Case**: Remove specific machines (e.g., for IP recovery, replace unhealthy nodes)
+
+**Procedure**:
+
+1. **Identify Machines to Remove**
+
+    View the current machines:
+
+    ```bash
+    kubectl get machines -n cpaas-system -l cluster.x-k8s.io/deployment-name=<cluster-name>-md-0
+    ```
+
+    Note the `<machine-name>` of the machines you want to remove.
+
+2. **Annotate Machines for Deletion**
+
+    Mark the specific machines for deletion:
+
+    ```bash
+    kubectl patch machine <machine-name> -n cpaas-system \
+      --type='merge' -p='{"metadata": {"annotations": {"cluster.x-k8s.io/delete-machine": "true"}}}'
+    ```
+
+    Repeat for each machine you want to remove.
+
+    **Example**: Remove two specific machines
+
+    ```bash
+    kubectl patch machine worker-pool-1-abc123 -n cpaas-system \
+      --type='merge' -p='{"metadata": {"annotations": {"cluster.x-k8s.io/delete-machine": "true"}}}'
+
+    kubectl patch machine worker-pool-1-def456 -n cpaas-system \
+      --type='merge' -p='{"metadata": {"annotations": {"cluster.x-k8s.io/delete-machine": "true"}}}'
+    ```
+
+3. **Scale Down the MachineDeployment**
+
+    After annotating the machines, reduce the replica count:
+
+    :::info
+    **Replica Count Must Match Annotated Machines**
+    Reduce replicas by exactly the number of annotated machines.
+    - If you reduce by fewer, not all annotated machines will be removed
+    - If you reduce by more, additional machines will be randomly selected for deletion
+    :::
+
+    ```bash
+    kubectl patch machinedeployment <cluster-name>-md-0 -n cpaas-system \
+      --type='json' -p='[{"op": "replace", "path": "/spec/replicas", "value": <new-replica-count>}]'
+    ```
+
+    **Example**: If you annotated 2 machines, reduce replicas by exactly 2 (e.g., from 5 to 3)
+
+    The platform will delete the **annotated** machines, not randomly selected ones.
+
+4. **Monitor the Removal Progress**
+
+    Watch the machine deletion process:
+
+    ```bash
+    kubectl get machines -n cpaas-system -w
+    ```
+
+5. **Verify Nodes Removed**
+
+    Switch to the target cluster context:
+
+    ```bash
+    kubectl config use-context <target-cluster-context>
+    kubectl get nodes
+    ```
+
+    The removed nodes should no longer appear in the list.
+
+### Upgrading Machine Infrastructure
+
+To upgrade worker machine specifications (CPU, memory, disk, VM template), follow these steps:
+
+1. **Create New Machine Template**
+   - Copy the existing `DCSMachineTemplate` referenced by your `MachineDeployment`
+   - Modify the required values (CPU, memory, disk, VM template, etc.)
+   - Give the new template a unique name
+   - Apply the new `DCSMachineTemplate` to the cluster
+
+2. **Update Machine Deployment**
+   - Modify the `MachineDeployment` resource
+   - Update the `spec.template.spec.infrastructureRef.name` field to reference the new template
+   - Apply the changes
+
+3. **Rolling Update**
+   - The system will automatically trigger a rolling update
+   - Worker nodes will be replaced with the new specifications
+   - Any disks declared in `DCSIpHostnamePool.spec.pool[].persistentDisk` are detached from the old VM and reattached to the replacement VM
+   - Monitor the update progress through the MachineDeployment status
+
+If you are migrating an existing cluster from the old template-disk layout to pool-managed persistent disks, follow [Migrate Existing Huawei DCS Clusters to Pool-Managed Persistent Disks](../../../upgrade/workload/alauda_os/dcs_persistent_disk_upgrade.mdx) before you rely on upgrade-time data preservation.
+
+### Updating Bootstrap Templates
+
+Bootstrap templates (KubeadmConfigTemplate) are used by MachineDeployment and MachineSet resources. Changes to existing templates do not automatically trigger rollouts of existing machines; only new machines use the updated template.
+
+**Update Process:**
+
+1. **Export Existing Template**
+   ```bash
+   kubectl get KubeadmConfigTemplate <template-name> -o yaml > new-template.yaml
+   ```
+
+2. **Modify Configuration**
+   - Update the desired fields in the exported YAML
+   - For Kubernetes 1.35 or later, add the [required kubelet patch settings](../../../upgrade/workload/alauda_os/index.mdx#kubernetes-1-35-kubelet-patch) to `/etc/kubernetes/patches/kubeletconfiguration0+strategic.json`
+   - Change the `metadata.name` to a new unique name
+   - Remove extraneous metadata fields (`resourceVersion`, `uid`, `creationTimestamp`, etc.)
+
+3. **Create New Template**
+   ```bash
+   kubectl apply -f new-template.yaml
+   ```
+
+4. **Update MachineDeployment**
+   - Modify the MachineDeployment resource
+   - Update `spec.template.spec.bootstrap.configRef.name` to reference the new template
+   - Apply the changes to trigger a rolling update
+
+:::info
+**Template Rollout Behavior**
+Existing machines continue using the old bootstrap configuration. Only newly created machines (during scaling or rolling updates) will use the updated template.
+:::
+
+### Upgrading Kubernetes Version
+
+For Kubernetes and Alauda OS upgrades on Huawei DCS, see [Upgrading Kubernetes on Huawei DCS](../../../upgrade/workload/alauda_os/huawei-dcs.mdx). That guide covers the required order and the YAML workflow for control plane and worker replacement.
+
+---
+
+## Managing Node Pools Using the Web UI
+
+:::info
+**Fleet Essentials upgrade boundary**
+
+Fleet Essentials 1.0.4 and later can request the ACP 4.3-and-later Distribution Version upgrade through CVO. It does not perform the DCS Kubernetes and Alauda OS replacement. Use [Upgrading Kubernetes on Huawei DCS](../../../upgrade/workload/alauda_os/huawei-dcs.mdx) for that Phase 2 YAML procedure. Adding, deleting, and viewing node pools through Fleet Essentials are unaffected by this boundary.
+:::
+
+Node pools provide a declarative way to manage groups of nodes with identical configurations. You can view, add, and delete worker node pools through the web UI.
+
+**Version requirement**: This workflow requires Fleet Essentials and Alauda Container Platform Infrastructure Provider for Huawei DCS `1.0.13` or later. If the provider version is earlier than `1.0.13`, use the YAML-based node pool workflows in this document. If the node-pool workflow relies on pool-managed persistent disks, use DCS provider `v1.0.16` or later. In `v1.0.16`, the `persistentDisk` declaration on `DCSIpHostnamePool` remains YAML-only and is not exposed in the node-pool UI.
+
+If the node pool relies on pool-managed persistent disks, prepare or update the corresponding `DCSIpHostnamePool` entry with YAML before you use the web UI workflow here.
+
+:::info
+**Navigation**: Clusters → Clusters → Select cluster → Node Pools Tab
+:::
+
+### Viewing Node Pools
+
+The Node Pools Tab displays all node pools in the cluster:
+
+**Control Plane Node Pool**:
+- Fixed at 3 replicas for high availability
+- Displays Kubernetes version with upgrade indicator if available
+- Shows Conditions link for detailed status
+
+**Worker Node Pools**:
+- Customizable replica counts
+- Individual Kubernetes version management
+- Scale and upgrade operations
+
+**Node Pool Card Information**:
+
+| Field | Description |
+|-------|-------------|
+| Type | Control Plane / Worker Node |
+| Name | Resource name |
+| Status | Badge showing pool health |
+| Replicas | Current count (with Max Surge/Max Unavailable for workers) |
+| SSH Authorized Keys | List of SSH public keys |
+| Kubernetes Version | Current version (upgrade indicator if available) |
+| Machine Template | Associated template name |
+| Conditions | Link to conditions list (Control Plane only) |
+
+### Adding a Worker Node Pool
+
+**Navigation**: Node Pools Tab → Click **Add Worker Node Pool**
+
+**Form Fields**:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| Pool Name | text | Yes | Unique identifier for the node pool |
+| Machine Template | dropdown | Yes | Filter by Type: Worker Node and compatible Kubernetes version |
+| Replicas | number | Yes | Number of nodes in the pool |
+| Max Surge | number | No | Default: 0, must be ≥ 0. Keep this value at `0` if the node pool relies on persistent disks |
+| Max Unavailable | number | No | Default: 1, must be ≥ 0. When maxSurge = 0, must be > 0 and ≤ Replicas |
+| SSH Authorized Keys | text | No | Add multiple SSH public keys |
+
+**Validation**:
+- Pool name must be unique within the cluster
+- IP Pool must have sufficient available IP addresses (≥ Replicas)
+- maxSurge/maxUnavailable constraints must be satisfied
+- If the node pool relies on persistent disks, keep `maxSurge = 0` so Machines are replaced one by one
+
+**Tip**: Prefix the pool name with the cluster name followed by a hyphen (e.g., `mycluster-worker-1`) to avoid naming conflicts.
+
+After creation, new nodes appear in the **Nodes** Tab. The number of nodes equals the configured Replicas value.
+
+### Deleting a Worker Node Pool
+
+**Steps**:
+1. Click the delete icon on the Worker Node Pool card
+2. Confirm deletion in the dialog
+
+:::warning
+Deleting a worker node pool permanently removes all associated nodes and machines. Ensure workloads can tolerate the loss of these nodes through proper replication.
+:::
+
+### Viewing Conditions (Control Plane Only)
+
+Click the **Conditions** link on the Control Plane Node Pool card to view detailed status information.
+
+**Conditions List**:
+
+| Type | Status | Last Transition Time | Reason | Message |
+|------|--------|---------------------|--------|---------|
+| Condition Type | Status | Timestamp | Reason | Human-readable details |
+
+---
+
+## Troubleshooting \{#troubleshooting}
+
+### A new worker `Machine` stays in `Provisioning` and the DCS VM stays in `creating` \{#worker-stuck-creating}
+
+The diagnostic flow is identical for control-plane and worker `Machine` objects — when a `DCSMachine` reaches `Provisioning` with `status.cdRomFile` already set (DCS API auth and ISO upload succeeded), but the underlying DCS VM never schedules to a host, the failure is on the DCS platform side and not in the controller.
+
+See [Infrastructure → Troubleshooting: VM stuck in `creating`](../../../workload_clusters/alauda_os/huawei-dcs/infrastructure.mdx#stuck-creating) for the full diagnostic ladder, which covers:
+
+- Confirming the symptom is a placement stall (not a slow boot).
+- Checking datastore free space.
+- Checking host CPU / memory utilisation and overcommit ratios.
+- Coordinating with the DCS platform team to rebalance load when a single DCS Host is saturated.
+- Escalation path when the deploy task is genuinely deadlocked.
+
+For control-plane high availability across multiple physical hosts, see [Infrastructure → Cross-Host High Availability for Control Plane](../../../workload_clusters/alauda_os/huawei-dcs/infrastructure.mdx#cross-host-ha).
+
+The same diagnostic applies whether the stuck node is the first control-plane node of a fresh cluster, a new worker added through `MachineDeployment` scaling, or a replacement worker created during a rolling update.
+
+---
+
+## Next Steps
+
+- [Create Clusters](../../../workload_clusters/alauda_os/huawei-dcs/create_cluster.mdx)
+- [Upgrade Clusters](../../../upgrade/workload/alauda_os/huawei-dcs.mdx)

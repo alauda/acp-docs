@@ -1,0 +1,123 @@
+---
+weight: 50
+title: Setting the Node Time Zone
+queries:
+  - how to set the time zone on immutable cluster nodes
+  - change node timezone with MachineConfig without rebooting
+  - timedatectl set-timezone on Alauda OS nodes
+  - unify the time zone across all cluster nodes
+---
+
+# Setting the Node Time Zone
+
+All nodes of a cluster should run with one agreed time zone, so that platform
+logs, audit records and monitoring timelines line up with the operator's wall
+clock. On Alauda OS nodes you set the time zone with a `MachineConfig` object —
+never by logging in to nodes and changing them one by one.
+
+The time zone cannot be shipped as a file: `/etc/localtime` is a symbolic link,
+and machine configuration manages file contents, systemd units, and SSH public
+keys — not symbolic links. Instead, a oneshot systemd unit runs
+`timedatectl set-timezone` on each node.
+
+## Configure the Node Disruption Policy First \{#configure-the-node-disruption-policy-first}
+
+Without a [node disruption policy](./node_disruption.mdx), a systemd unit
+change falls back to the default action — **rebooting the node** — so applying
+the `MachineConfig` below would roll every node in the pool through a drain and
+reboot. Configure the policy first, confirm it took effect, and only then apply
+the `MachineConfig`.
+
+1. Add `set-timezone.service` to the `nodeDisruptionPolicy.units` list of the
+   cluster-scoped `MachineConfiguration` singleton named `cluster`:
+
+   ```yaml
+   apiVersion: machineconfiguration.alauda.io/v1alpha1
+   kind: MachineConfiguration
+   metadata:
+     name: cluster
+   spec:
+     nodeDisruptionPolicy:
+       units:
+         - name: set-timezone.service
+           actions:
+             - type: DaemonReload
+             - type: Restart
+               restart:
+                 serviceName: set-timezone.service
+   ```
+
+   :::warning
+   `cluster` is a singleton that may already carry policies for other units or
+   files — for example the `/etc/chrony.conf` entry from
+   [Configuring the Chrony Time Service](./managing.mdx#configuring-the-chrony-time-service).
+   **Append to the `units` list; do not replace the existing policy.** Any unit
+   not listed falls back to the default reboot action.
+   :::
+
+2. Confirm the policy is active before going on:
+
+   ```bash
+   kubectl get machineconfiguration cluster \
+     -o jsonpath='{.status.nodeDisruptionPolicyStatus}' | grep set-timezone
+   ```
+
+## Apply the Time Zone \{#apply-the-time-zone}
+
+Create one `MachineConfig` per role — the two objects differ only in
+`metadata.name` and the role label. Replace `Asia/Shanghai` with the agreed
+tz database name; do not deliver the example value unchanged.
+
+```yaml
+apiVersion: machineconfiguration.alauda.io/v1alpha1
+kind: MachineConfig
+metadata:
+  name: 99-worker-timezone # name the control plane copy 99-master-timezone
+  labels:
+    machineconfiguration.alauda.io/role: worker # and label it master
+spec:
+  config:
+    ignition:
+      version: 3.4.0
+    systemd:
+      units:
+        - name: set-timezone.service
+          enabled: true
+          contents: |
+            [Unit]
+            Description=Set node timezone
+            After=multi-user.target
+
+            [Service]
+            Type=oneshot
+            ExecStart=/usr/bin/timedatectl set-timezone Asia/Shanghai
+            RemainAfterExit=yes
+
+            [Install]
+            WantedBy=multi-user.target
+```
+
+## Verify \{#verify}
+
+```bash
+kubectl get machineconfigpool
+```
+
+Wait until each pool reports `UPDATED=True` and `DEGRADED=False`, and confirm
+no node went through an unexpected drain or reboot. Then spot-check nodes:
+
+```bash
+timedatectl                             # time zone and NTP state
+systemctl status set-timezone.service   # ran once, exited successfully
+```
+
+Platform logs, audit records and monitoring timelines should now agree with
+the configured time zone.
+
+## Related Notes \{#related-notes}
+
+- Time zone at install time is a host prerequisite — see the bare metal page's
+  [Host Clock and Time Zone](../../workload_clusters/alauda_os/bare-metal/create_cluster.mdx) requirements.
+  This page is for normalizing or changing the time zone on a running cluster.
+- Time synchronization is a separate concern, configured through
+  [Configuring the Chrony Time Service](./managing.mdx#configuring-the-chrony-time-service).

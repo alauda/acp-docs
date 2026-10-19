@@ -1,0 +1,264 @@
+---
+weight: 30
+title: Infrastructure Resources for Huawei Cloud Stack
+author: chaozhou@alauda.io
+category: howto
+queries:
+  - hcs infrastructure preparation
+  - hcs secret subnet and elb planning
+  - huawei cloud stack yaml prerequisites
+  - hcs pool managed persistent disks
+  - hcs availability zone planning
+---
+
+# Infrastructure Resources for Huawei Cloud Stack
+
+## Overview
+
+Before you write YAML for a Huawei Cloud Stack (HCS) cluster, prepare all required HCS inputs first. This page lists the values, sources, and constraints that must be ready before you fill any `Secret`, `HCSMachineConfigPool`, `HCSMachineTemplate`, `KubeadmControlPlane`, or `HCSCluster` manifest.
+
+Use this page as the preparation checklist. After you complete it, continue with [Creating Clusters on Huawei Cloud Stack](./create_cluster.mdx) and [Managing Nodes on Huawei Cloud Stack](../../../configure/nodes/alauda_os/huawei-cloud-stack.mdx) for the manifest workflow.
+
+:::info
+**Namespace Requirement**
+
+All HCS infrastructure resources must be deployed in the `cpaas-system` namespace to ensure proper integration with the platform as workload clusters.
+:::
+
+## Before Writing YAML
+
+Prepare the following inputs before you create or edit any cluster manifests:
+
+| Input | Used by | Source | Required before YAML | Notes |
+|-------|---------|--------|----------------------|-------|
+| Cluster name | `Cluster`, `KubeadmControlPlane`, `HCSCluster`, templates, pools | Your cluster naming plan | Yes | Use the same cluster name consistently across all related resources |
+| Kubernetes version and component baseline | `Cluster`, `KubeadmControlPlane` | Approved release baseline; [OS Support Matrix](../../../overview/alauda_os_support_matrix.mdx) only for the component versions it lists | Yes | Prepare the validated Kubernetes version, image repository, DNS image repository and tag, etcd image tag, Kube-OVN version, Pod CIDR, Service CIDR, and Kube-OVN join CIDR |
+| `accessKey` and `secretKey` | HCS credential `Secret` | HCS **My Settings** > **Access Keys** | Yes | Base64-encode these values before applying the Secret |
+| `projectID` | HCS credential `Secret` | HCS **My Settings** > **Resource Spaces** | Yes | Use the Resource Space ID, not the display name |
+| `externalGlobalDomain` | HCS credential `Secret` | HCS platform access domain | Yes | Use the HCS platform domain that the provider should call |
+| `schema` | HCS credential `Secret` | HCS administrator | No | Optional API scheme for the HCS IAM endpoint. If omitted, the provider uses `https` |
+| `region` | HCS credential `Secret` | HCS administrator | Yes | Tenant administrators cannot retrieve this value from the HCS UI |
+| `imageName` | `HCSMachineTemplate` | HCS image inventory | Yes | Use the validated HCS image name for the selected Alauda OS image |
+| `flavorName` | `HCSMachineTemplate` | HCS administrator | Yes | Use the provider-recognized HCS API value matched against `Flavor.Name`, not the tenant UI display name |
+| `availabilityZone` | `HCSMachineTemplate` | HCS administrator or the ACP web UI | Recommended | Select an explicit provider-recognized HCS API value for predictable placement. If omitted, the Provider selects an availability zone reported as available by HCS |
+| Root, temporary data volume, and persistent disk layout | `HCSMachineTemplate`, `HCSMachineConfigPool` | Cluster storage plan | Yes | Plan disk sizes and mount points before you write the template and pool. Put disks that can be recreated with the VM in `HCSMachineTemplate.spec.template.spec.dataVolumes[]`. Put disks that must survive VM replacement, such as `/var/cpaas`, in `HCSMachineConfigPool.spec.configs[].persistentDisks[]` |
+| VPC name and security group name | `HCSCluster` | HCS network inventory | Yes | Confirm that the referenced VPC and security group already exist and are usable |
+| Cluster subnet inventory | `HCSCluster`, `HCSMachineConfigPool`, control plane ELB | HCS network inventory | Yes | Prepare the subnet name, subnet ID, ELB-related subnet metadata, CIDR, gateway, DNS values, and planned free IP range for every subnet that the cluster will use |
+| Control plane and worker hostnames and static IPs | `HCSMachineConfigPool` | HCS subnet planning | Yes for static IP workflows | Prepare at least one entry per planned replica |
+| `vipAddress` and `vipSubnetName` | `HCSCluster.spec.controlPlaneLoadBalancer` | HCS ELB address plan | Yes | `vipAddress` must belong to `vipSubnetName` |
+| `elbVirsubnetL4Ips` and `elbVirsubnetL7Ips` | `HCSCluster.spec.controlPlaneLoadBalancer` | HCS ELB address plan | Yes | Each L4 or L7 entry must include exactly two IPs |
+| `vipDomainName` | `HCSCluster.spec.controlPlaneLoadBalancer` | HCS Cloud DNS Private Zones | Not recommended | Leave unset. The provider only uses it to backfill the derived `controlPlaneEndpoint`; cluster access by domain is not supported — the API server certificate is issued by the cluster's own CA, so it cannot carry a customer-issued certificate |
+| Control plane HA placement policy | `HCSCluster.spec.controlPlaneHA` | HCS scheduling policy plan | No | Required only when you enable provider-managed control-plane server groups. Choose `anti-affinity` or `soft-anti-affinity` |
+| `controlPlaneEndpoint` | `Cluster.status` / derived cluster endpoint | Controller-managed | No | Do not prepare or write this field in create manifests; the controller fills it after the ELB is ready |
+
+## Credential Secret Inputs
+
+Create the HCS credential `Secret` only after you collect all required values.
+
+| Secret key | Meaning | Where to get it |
+|------------|---------|-----------------|
+| `accessKey` | HCS access key ID | HCS **My Settings** > **Access Keys** |
+| `secretKey` | HCS secret access key | HCS **My Settings** > **Access Keys** |
+| `projectID` | Resource Space ID | HCS **My Settings** > **Resource Spaces** |
+| `externalGlobalDomain` | HCS platform access domain | HCS platform domain provided for API access |
+| `region` | HCS region API value used by the provider | HCS administrator |
+| `schema` | Optional API scheme for the HCS IAM endpoint. If omitted, the provider uses `https` | HCS administrator |
+
+Existing credential Secrets created without `schema` continue to work unchanged. Only set `schema` if your HCS IAM endpoint uses `http` instead of the default `https`.
+
+**Note:** Tenant administrators cannot retrieve `region` from the HCS UI. Get the exact provider-recognized value from the HCS administrator before you encode the Secret.
+
+## Compute Values
+
+Prepare the VM image, flavor, availability zone, temporary data volume layout, and persistent disk layout before you write the `HCSMachineTemplate` and `HCSMachineConfigPool`.
+
+| Input | Guidance |
+|-------|----------|
+| `imageName` | Use the validated HCS image name for the Alauda OS image you want to deploy |
+| `flavorName` | Use the provider-recognized HCS API value matched against `Flavor.Name`. Do not use the tenant UI display name |
+| `availabilityZone` | Use the provider-recognized HCS API value matched against `ZoneName`. Do not use the tenant UI display name |
+| Root and temporary data volumes | Plan system and temporary data disks in advance. Control plane templates typically use temporary data volumes for `/var/lib/etcd`, `/var/lib/kubelet`, and `/var/lib/containerd`. Worker templates typically use temporary data volumes for `/var/lib/kubelet` and `/var/lib/containerd`. |
+| Pool-managed persistent disks | Plan disks that must survive VM replacement in advance. Use this model for `/var/cpaas` and other node-local state that must be retained during rolling replacement. |
+
+**Note:** The ACP web UI loads flavors and availability zones through the selected HCS credential. When you write YAML, get the exact provider-recognized `Flavor.Name` and `ZoneName` values from the HCS administrator because the native HCS tenant console might not expose them.
+
+### Availability Zone Placement \{#availability-zone-placement}
+
+An `HCSMachineTemplate` selects one availability zone for every machine created from that template. The ACP web UI creates one template for the control plane node pool and one template for each worker node pool. As a result:
+
+- All control plane nodes use one availability zone.
+- All replicas in one worker node pool use one availability zone.
+- Different worker node pools can select different availability zones.
+- A single node pool does not automatically spread replicas across multiple availability zones.
+
+For predictable placement, select an availability zone explicitly. If `HCSMachineTemplate.spec.template.spec.availabilityZone` is omitted, the Provider queries HCS and selects the first availability zone that HCS reports as available. The ordering of that list is controlled by HCS.
+
+When you use the ACP web UI, the Availability Zone dropdown is loaded through the selected HCS credential, uses the HCS API `ZoneName`, and disables zones that HCS reports as unavailable. When you write YAML, use the provider-recognized `ZoneName`, not a display name from the native HCS tenant console. The Provider rejects a name that is not returned by HCS. For a named zone that exists but is currently unavailable, ECS provisioning can still reach HCS and fail there, so verify that the zone is available before you apply the manifest.
+
+:::warning
+Pool-managed persistent disks and control plane high availability add placement constraints:
+
+- An existing pool-managed persistent disk locks its replacement ECS instance to the disk's availability zone. If the template explicitly selects a different zone, the replacement fails with an availability zone conflict.
+- Control Plane High Availability spreads control plane ECS instances across physical hosts by using an HCS server group. It does not spread the control plane across availability zones; all control plane nodes remain in the zone selected by the control plane `HCSMachineTemplate`.
+:::
+
+## Version and Component Baseline
+
+Use the [OS Support Matrix](../../../overview/alauda_os_support_matrix.mdx) only for the component versions it explicitly lists, such as Kubernetes, coredns, etcd, and pause versions for supported Alauda OS images.
+
+The OS Support Matrix is not a complete source for all HCS manifest values. Before writing YAML, also get the approved release baseline for values such as the container image repository, DNS image repository, Kube-OVN version, Kube-OVN join CIDR, Pod CIDR, and Service CIDR. If your release does not publish a complete baseline source yet, use values validated for your environment by the platform or release owner.
+
+When you create clusters through the web UI instead of YAML, you do not enter these component versions by hand. The wizard reads them from the OS-release ConfigMap you register for the OS image. See [OS Release Registration](./create_cluster.mdx#os-release-registration) for the registration steps and field sources.
+
+## Network Inventory
+
+Prepare the complete cluster network inventory before you write `HCSCluster` or `HCSMachineConfigPool` resources.
+
+Your network plan must include:
+
+- The target VPC name
+- The target security group name
+- Every subnet name the cluster will use
+- The subnet ID and ELB-related subnet metadata for each subnet
+- The CIDR of each subnet
+- The gateway and DNS values of each subnet
+- The planned free IP ranges for control plane nodes, worker nodes, the ELB VIP, and ELB L4/L7 virtual subnet IPs
+
+If a single cluster uses multiple subnets, those subnets must belong to the same VPC and must allow cluster nodes to reach each other.
+
+**Important:** `HCSCluster.spec.network.subnets` is the cluster subnet inventory. Every `subnetName` referenced by `HCSMachineConfigPool`, `vipSubnetName`, `elbVirsubnetL4Ips[].subnetName`, and `elbVirsubnetL7Ips[].subnetName` must already exist in that list.
+
+For the initial cluster create flow, the controller can resolve existing subnets by name before the cluster becomes Ready. For an existing Ready cluster, do not append only a subnet name. Add the full subnet object, including at least `name`, `id`, and, when the subnet is used by the control plane ELB, `neutronSubnetId`. Keep `cidr`, `gatewayIp`, `primaryDNS`, and `secondaryDNS` in the inventory as well so the cluster subnet list remains complete.
+
+### Multi-NIC Constraints
+
+Multiple NICs are declared in `HCSMachineConfigPool.spec.configs[].networks[]`. Each `networks[]` entry only selects a subnet and a static IP for one NIC.
+
+The current provider does not let you declare:
+
+- The role or purpose of each NIC, such as management, service, or storage traffic
+- The default gateway for a specific NIC
+- Static routes or route metrics
+- Per-NIC DNS settings
+
+Treat the current multi-NIC capability as NIC attachment plus subnet and static IP selection.
+
+## Control Plane ELB Address Plan
+
+The HCS provider creates the control plane Elastic Load Balance (ELB) automatically. Plan the ELB inputs before you write `HCSCluster`.
+
+This documentation uses the fixed-address ELB workflow. Prepare all ELB-related addresses before you write `HCSCluster`:
+
+- `vipSubnetName`
+- `vipAddress`
+- `elbVirsubnetL4Ips` with exactly two L4 IPs
+- `elbVirsubnetL7Ips` with exactly two L7 IPs
+
+Leave `vipDomainName` unset: cluster access by domain is not supported (the API server certificate can only be issued by the cluster's own CA), and the provider only uses the field to backfill the derived `controlPlaneEndpoint`.
+
+### Operational constraints
+
+- The provider creates the ELB and enables Hybrid Load Balancing so cluster nodes can reach the API server through the ELB address.
+- Do not disable Hybrid Load Balancing on the HCS ELB after the cluster is created.
+- Do not write `spec.controlPlaneEndpoint` in the create manifest. The controller fills that field after the ELB is ready.
+
+## Control Plane HA Placement Plan \{#control-plane-ha-placement}
+
+For a multi-replica control plane, you can configure the HCS provider to create and maintain a provider-owned server group for control-plane ECS placement. Enable this through `HCSCluster.spec.controlPlaneHA` when you write the cluster manifest.
+
+Plan the placement policy before you enable the feature:
+
+| Policy | Behavior | Operational impact |
+|--------|----------|--------------------|
+| `anti-affinity` | Hard anti-affinity. HCS must place control-plane ECS instances on different hosts. | Use this when strict host separation is required. ECS creation can fail if HCS cannot find enough capacity that satisfies the rule. |
+| `soft-anti-affinity` | Best-effort anti-affinity. HCS tries to place control-plane ECS instances on different hosts. | Use this when you prefer spread but do not want the rule to block ECS creation. Final placement may still share a host. |
+
+This feature is cluster-scoped and applies only to control-plane machines. It does not configure worker node pools. The provider creates the server group, attaches control-plane ECS creation requests to that group, records the server group in `HCSCluster.status.controlPlaneHA`, and reports progress through the `ControlPlaneHAReady` condition.
+
+For an existing cluster, enabling `HCSCluster.spec.controlPlaneHA` creates and records the provider-owned server group, but it does not retroactively add already-running control-plane ECS instances to that group. Server group placement is applied when a control-plane ECS is created with `os:scheduler_hints.group`. To converge an existing cluster, enable `controlPlaneHA`, wait for `HCSCluster.status.controlPlaneHA.id`, then trigger a control-plane rolling replacement so replacement ECS instances are created with the server group. Until the current control-plane ECS members have been replaced and observed in the group, `ControlPlaneHAReady` can remain `False` with reason `ControlPlaneHAPending`.
+
+For the manifest example and verification commands, see [Configure HCSCluster](./create_cluster.mdx#configure-hcscluster) and [Verify Control Plane HA](./create_cluster.mdx#verify-control-plane-ha).
+
+## Static IP Pool Plan
+
+This page focuses on the planned static IP workflow.
+
+Prepare the following before you create `HCSMachineConfigPool` resources:
+
+- Control plane hostnames and static IPs
+- Worker hostnames and static IPs, if workers are created
+- Enough entries to cover the initial replica count
+- Any pool-managed persistent disks that must be bound to each fixed hostname
+
+For static IP control planes with at least three replicas, the recommended upgrade path uses `KubeadmControlPlane.spec.rolloutStrategy.rollingUpdate.maxSurge: 0`. This scale-down-then-scale-up approach usually does not require extra control plane IPs. If you plan a single-control-plane create-only topology (`replicas: 1`), do not copy that rollout setting into the create manifest. For pools that use persistent disks, keep `maxSurge: 0` because each disk is bound to one fixed hostname and slot.
+
+### Pool-Managed Persistent Disks
+
+Declare HCS disks that must survive VM delete-recreate replacement in `HCSMachineConfigPool.spec.configs[].persistentDisks[]`.
+
+Use this model for `/var/cpaas`, monitoring data, log data, or other node-local state that must be retained during rolling replacement. Keep `HCSMachineTemplate.spec.template.spec.dataVolumes[]` for temporary disks that may be recreated with each new ECS.
+
+```yaml title="hcs-machine-config-pool-with-persistent-disk.yaml"
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: HCSMachineConfigPool
+metadata:
+  name: <cluster-name>-cp-pool
+  namespace: cpaas-system
+  labels:
+    cluster.x-k8s.io/cluster-name: <cluster-name>
+spec:
+  configs:
+    - hostname: <node-hostname>
+      networks:
+        - subnetName: <subnet-name>
+          ipAddress: <node-ip>
+      persistentDisks:
+        - slot: 0
+          size: 100
+          type: SSD
+          mountPath: /var/cpaas
+          format: xfs
+          mountOptions:
+            - defaults
+            - noatime
+```
+
+**Persistent disk field descriptions:**
+
+| Field | Description |
+|-------|-------------|
+| `slot` | Disk position within one machine configuration. Slots must be unique and contiguous from `0` for the same hostname. |
+| `size` | EVS disk size in GB. For newly created EVS data disks, use `10` to `32768` GB. Existing claimed disks must match their current size. |
+| `type` | EVS disk type name that is available in the target availability zone. |
+| `mountPath` | Mount path inside the guest OS. Use `/var/cpaas` for platform state that must survive VM replacement. Size this disk for platform monitoring, log, and plug-in data. |
+| `format` | File system used when a new disk is initialized. If omitted, the provider uses `xfs`. Existing file systems are not reformatted during reattachment. |
+| `mountOptions` | Mount options applied when the replacement VM mounts the disk. If omitted, the provider uses `defaults,noatime`. |
+
+**Update rules:**
+
+- Do not declare the same `mountPath` in both `HCSMachineConfigPool.spec.configs[].persistentDisks[]` and `HCSMachineTemplate.spec.template.spec.dataVolumes[]`.
+- You can append new `persistentDisks[]` entries to an existing machine configuration. The provider creates or claims the EVS disk, but it does not hot-mount the disk into the running ECS. Trigger a rolling replacement with `maxSurge: 0` before you expect the new disk to be formatted and mounted inside the guest OS.
+- Do not remove or change `slot`, `size`, `type`, `format`, or `mountPath` after the provider has accepted a persistent disk entry. These fields define the disk identity and claim contract.
+- You can update `mountOptions`. The change takes effect when the node is replaced and the replacement VM renders its disk mounts.
+- Keep `KubeadmControlPlane.spec.rolloutStrategy.rollingUpdate.maxSurge: 0` and `MachineDeployment.spec.strategy.rollingUpdate.maxSurge: 0` for pools that use persistent disks.
+
+## Value-to-YAML Mapping
+
+Use the following mapping after you complete the preparation checklist:
+
+| Prepared input | YAML fields |
+|----------------|-------------|
+| `accessKey`, `secretKey`, `projectID`, `externalGlobalDomain`, `region`, optional `schema` | `Secret.data.*` |
+| `imageName`, `flavorName`, `availabilityZone`, root volume, and temporary data volume layout | `HCSMachineTemplate.spec.template.spec.*` |
+| Control plane and worker hostnames, static IPs, and pool-managed persistent disks | `HCSMachineConfigPool.spec.configs[]` |
+| VPC name, subnet inventory, security group name | `HCSCluster.spec.network.*` |
+| `vipAddress`, `vipSubnetName`, `vipDomainName`, `elbVirsubnetL4Ips`, `elbVirsubnetL7Ips` | `HCSCluster.spec.controlPlaneLoadBalancer.*` |
+| Control plane HA placement policy | `HCSCluster.spec.controlPlaneHA.*` |
+| Kubernetes version and component baseline | `KubeadmControlPlane.spec.version`, `Cluster.spec.clusterNetwork.*`, cluster annotations, and related bootstrap settings |
+
+## Next Steps
+
+After you complete the preparation checklist:
+
+- Follow [Creating Clusters on Huawei Cloud Stack](./create_cluster.mdx) to write the control plane and infrastructure manifests
+- Follow [Managing Nodes on Huawei Cloud Stack](../../../configure/nodes/alauda_os/huawei-cloud-stack.mdx) to add or modify worker nodes
