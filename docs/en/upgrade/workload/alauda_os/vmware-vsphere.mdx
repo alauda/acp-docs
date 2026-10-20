@@ -53,7 +53,7 @@ Before you begin, ensure the following conditions are met:
 - For cross-version upgrades that span more than one Kubernetes minor, the intermediate-version Core images and VM templates are pre-staged. See [Cross-Version Upgrade Preparation](./index.mdx#cross-version-preparation).
 - The target Kubernetes version is compatible with your workloads and add-ons.
 - The machine config pools have enough capacity for rolling updates.
-- The `KubeadmControlPlane` sets `spec.rolloutStrategy.rollingUpdate.maxSurge: 0` and `spec.replicas` to `3` or more, and every `MachineDeployment` sets `spec.strategy.rollingUpdate.maxSurge: 0` with `maxUnavailable` of `1` or more. These values let the replacement reuse the same slot and disk identity. Verify them with [Check the manifests against the admission rules](#preflight-admission-rules) **before** you start.
+- The `KubeadmControlPlane` sets `spec.rolloutStrategy.rollingUpdate.maxSurge: 0` and `spec.replicas` to `3` or more, and every `MachineDeployment` sets `spec.strategy.rollingUpdate.maxSurge: 0`. These values let the replacement reuse the same slot and disk identity. Verify them with [Check the manifests against the admission rules](#preflight-admission-rules) **before** you start.
 - The management cluster is not a disaster-recovery standby. Against a standby, the provider skips non-`global` objects and requeues every 30 seconds, so the rollout appears not to start rather than to fail. See [Standby Management Clusters](../../../workload_clusters/alauda_os/vmware-vsphere/install_provider.mdx#standby-management-cluster).
 - You know the `KubeadmControlPlane` name for this cluster. Read it from `Cluster.spec.controlPlaneRef.name`; the manifests in [Create a Cluster on VMware vSphere](../../../workload_clusters/alauda_os/vmware-vsphere/create_cluster.mdx) name it `<cluster_name>-kcp`.
 - If the cluster uses a Self-built VIP (`controlPlaneLoadBalancer.type: internal`), `VSphereCluster.status.conditions[SelfBuiltLoadBalancerReady]` is `True`, and the **new** VM template satisfies the Alive kernel prerequisites (the `ip_vs` module family is loadable, `net.ipv4.vs.conntrack=1` is permitted). Replacement control-plane nodes are built from that template, and the provider neither injects nor validates these settings.
@@ -69,7 +69,7 @@ The `KubeadmControlPlane` rules apply to `UPDATE` as well as `CREATE`, so an exi
 
 The rejection lands on the version bump itself, so the upgrade stops before anything is replaced. Correct these values in a separate, earlier edit. A `KubeadmControlPlane` at `replicas: 1` on a pool-backed template cannot be upgraded at all until it is scaled to `3`; a single-replica control plane is not a supported fixed-IP topology. Scaling it is a two-part change: add two more slots to the control-plane `VSphereMachineConfigPool` — hostnames, static addresses, and the required persistent disks — and then raise `replicas` and set `maxSurge` in one patch, because both rules are checked on the same update. See [Check the manifests against the admission rules](#preflight-admission-rules).
 
-A `MachineDeployment` that does not set `strategy.rollingUpdate.maxSurge: 0` and a `maxUnavailable` of `1` or more stalls the rollout. Correct it in the same earlier edit.
+A `MachineDeployment` that does not set `strategy.rollingUpdate.maxSurge: 0` is not rejected, but its rollout stalls: with the default `maxSurge` of `1`, the rollout needs an extra slot that a full pool does not have. Correct it in the same earlier edit.
 :::
 
 :::warning
@@ -143,7 +143,7 @@ kubectl -n <namespace> get kubeadmcontrolplane <cluster_name>-kcp \
 kubectl -n <namespace> get machinedeployment -o custom-columns='NAME:.metadata.name,TYPE:.spec.strategy.type,SURGE:.spec.strategy.rollingUpdate.maxSurge,UNAVAIL:.spec.strategy.rollingUpdate.maxUnavailable'
 ```
 
-An empty `maxSurge` or `UNAVAIL` value means the field is unset, and unset means the Cluster API default — `1` and `0` respectively. Neither default is valid for a pool-backed controller. Correct them before the version bump:
+An empty `maxSurge` value means the field is unset, and unset means the Cluster API default `1`, which is not valid for a pool-backed controller. The `MachineDeployment` example uses `maxUnavailable: 1`. Correct the values before the version bump:
 
 ```bash
 # replicas is already 3 or more: correct maxSurge on its own.
@@ -161,7 +161,7 @@ kubectl -n <namespace> patch machinedeployment <cluster_name>-md-0 --type='merge
 
 The webhook evaluates the `maxSurge` and `replicas` rules on every `KubeadmControlPlane` update and reports them together, so on a `replicas: 1` cluster a patch that corrects only one of them is rejected by the other. Never patch `replicas` on a control plane that already has three or more; the value above is a floor, not a target.
 
-A `MachineDeployment` that uses `strategy.type: OnDelete` is exempt from both rules, because `OnDelete` already replaces machines delete-first.
+A `MachineDeployment` that uses `strategy.type: OnDelete` needs no surge setting, because `OnDelete` already replaces machines delete-first.
 
 Verify that the pools are healthy before you start:
 
@@ -305,7 +305,7 @@ Use this procedure to move nodes onto a new Alauda OS image while the Kubernetes
 
 Do not touch `spec.version`, `clusterConfiguration.dns.imageTag`, `clusterConfiguration.etcd.local.imageTag`, or the `cpaas.io/kube-ovn-version` annotation. An OS-image rollout is not a Kubernetes hop, so it does not need the Kube-OVN-first ordering.
 
-The same rollout rules apply: `maxSurge: 0` on both controllers and `maxUnavailable` of `1` or more on each `MachineDeployment`. Pool-managed persistent disks reattach exactly as they do in a version upgrade, and pool-managed ephemeral disks are destroyed and recreated empty.
+The same rollout rules apply: `maxSurge: 0` on both controllers. Pool-managed persistent disks reattach exactly as they do in a version upgrade, and pool-managed ephemeral disks are destroyed and recreated empty.
 
 To recover, point the controlling resource back at the previous template. This is stage 2 of [Recovering From a Failed Phase 2 Upgrade](#recovering-from-a-failed-phase-2-upgrade).
 
@@ -347,7 +347,7 @@ Keep these infrastructure facts in mind during any recovery:
 - **The old `VSphereMachineTemplate` resource must still exist.** Do not delete the previous template until the new rollout is healthy. If you already deleted it, recreate it from version control or backup before attempting same-minor template recovery.
 - **Pool-managed disk identity is preserved, but data state is not.** Disks declared in `VSphereMachineConfigPool.spec.configs[].persistentDisks[]` reattach to the replacement machines at the same slot, but data written during the upgrade window remains on those disks.
 - **Ephemeral disks are gone.** Data on `VSphereMachineConfigPool.spec.configs[].ephemeralDisks[]` is destroyed with every replaced VM and cannot be recovered from the pool. Only pool-managed persistent disks reattach.
-- **Do not reverse a rollout-rule correction.** If stage 1 requires restoring earlier manifest values, leave `maxSurge` at `0` and `maxUnavailable` at `1` or more.
+- **Do not reverse a rollout-rule correction.** If stage 1 requires restoring earlier manifest values, leave `maxSurge` at `0`.
 
 For stage 1, use the vSphere rule in [Restore Kube-OVN During Stage-1 Recovery](./index.mdx#restore-kube-ovn-during-stage-1-recovery). The provider restores the chart from the annotation. Wait until the restored `AppRelease` passes the shared verification before changing control-plane manifests.
 
