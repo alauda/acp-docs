@@ -7,6 +7,10 @@ title: Manage Nodes on Huawei DCS
 
 This document explains how to manage worker nodes using Cluster API `Machine` resources.
 
+:::info
+To upgrade the Kubernetes version of the nodes, see [Upgrade Kubernetes on Huawei DCS](../../../upgrade/workload/alauda_os/huawei-dcs.mdx).
+:::
+
 ## Prerequisites
 
 :::warning
@@ -36,7 +40,7 @@ To add another worker node pool with YAML, follow [Deploy Worker Nodes](../../..
 
 ## Node Management Operations
 
-This section covers common operational tasks for managing worker nodes, including scaling, updates, upgrades, and template modifications.
+This section covers common operational tasks for managing worker nodes, including scaling, machine infrastructure changes, and bootstrap template updates.
 
 :::info
 **Cluster API Framework**
@@ -490,30 +494,58 @@ Declared persistent disks in `DCSIpHostnamePool.spec.pool[].persistentDisk` are 
 
     The removed nodes should no longer appear in the list.
 
-### Upgrading Machine Infrastructure
+### Changing Machine Infrastructure \{#changing-machine-infrastructure}
 
-To upgrade worker machine specifications (CPU, memory, disk, VM template), follow these steps:
+To change the machine specification of worker nodes (CPU, memory, disk, VM template), create a new machine template, then point the `MachineDeployment` at it. The worker nodes are replaced one by one.
 
-1. **Create New Machine Template**
-   - Copy the existing `DCSMachineTemplate` referenced by your `MachineDeployment`
-   - Modify the required values (CPU, memory, disk, VM template, etc.)
-   - Give the new template a unique name
-   - Apply the new `DCSMachineTemplate` to the cluster
+1. **Create a New Machine Template**
+
+   Export the `DCSMachineTemplate` referenced by your `MachineDeployment` to a new file:
+
+   ```bash
+   kubectl get dcsmachinetemplate <current-template-name> -n cpaas-system -o yaml > new-template.yaml
+   ```
+
+   In the new file:
+   - Set `metadata.name` to a unique name
+   - Modify the required values (`spec.template.spec.vmTemplateName`, `spec.template.spec.vmConfig.dcsMachineCpuSpec.quantity`, `spec.template.spec.vmConfig.dcsMachineMemorySpec.quantity`, `spec.template.spec.vmConfig.dcsMachineDiskSpec`)
+   - Remove the server-generated metadata (`resourceVersion`, `uid`, `generation`, `creationTimestamp`, `managedFields`, the `kubectl.kubernetes.io/last-applied-configuration` annotation) and the entire `status` field
+   - Leave `spec.template.spec.providerID` unset
+
+   Keep pool-managed persistent disks, including `/var/cpaas`, in `DCSIpHostnamePool.spec.pool[].persistentDisk` and additional NICs in `DCSIpHostnamePool.spec.pool[].additionNic[]`. Use `dcsMachineDiskSpec` only for the system disk and template-local disks.
+
+   Apply the new template:
+
+   ```bash
+   kubectl apply -f new-template.yaml -n cpaas-system
+   ```
 
 2. **Update Machine Deployment**
-   - Modify the `MachineDeployment` resource
-   - Update the `spec.template.spec.infrastructureRef.name` field to reference the new template
-   - Apply the changes
 
-3. **Rolling Update**
-   - The system will automatically trigger a rolling update
-   - Worker nodes will be replaced with the new specifications
-   - Any disks declared in `DCSIpHostnamePool.spec.pool[].persistentDisk` are detached from the old VM and reattached to the replacement VM
-   - Monitor the update progress through the MachineDeployment status
+   Point the `MachineDeployment` at the new template:
+
+   ```bash
+   kubectl patch machinedeployment <cluster-name>-md-0 -n cpaas-system \
+     --type='merge' -p='{"spec":{"template":{"spec":{"infrastructureRef":{"name":"<new-template-name>"}}}}}'
+   ```
+
+3. **Monitor the Rolling Update**
+   - Worker nodes are replaced one by one with the new specification
+   - Any disks declared in `DCSIpHostnamePool.spec.pool[].persistentDisk` are detached from the old VM and reattached to the replacement VM. If the pool uses persistent disks, keep `spec.strategy.rollingUpdate.maxSurge` at `0` on the `MachineDeployment`
+   - Monitor the progress:
+
+     ```bash
+     kubectl get machinedeployment <cluster-name>-md-0 -n cpaas-system
+     kubectl get machines -n cpaas-system -w
+     ```
+
+To change the machine specification of control plane nodes, use the same steps and patch `KubeadmControlPlane.spec.machineTemplate.infrastructureRef.name` instead.
+
+To move the nodes to the Alauda OS image of a new Kubernetes version, follow [Upgrade Kubernetes on Huawei DCS](../../../upgrade/workload/alauda_os/huawei-dcs.mdx) instead.
 
 If you are migrating an existing cluster from the old template-disk layout to pool-managed persistent disks, follow [Migrate Existing Huawei DCS Clusters to Pool-Managed Persistent Disks](../../../upgrade/workload/alauda_os/dcs_persistent_disk_upgrade.mdx) before you rely on upgrade-time data preservation.
 
-### Updating Bootstrap Templates
+### Updating Bootstrap Templates \{#updating-bootstrap-templates}
 
 Bootstrap templates (KubeadmConfigTemplate) are used by MachineDeployment and MachineSet resources. Changes to existing templates do not automatically trigger rollouts of existing machines; only new machines use the updated template.
 
@@ -545,19 +577,11 @@ Bootstrap templates (KubeadmConfigTemplate) are used by MachineDeployment and Ma
 Existing machines continue using the old bootstrap configuration. Only newly created machines (during scaling or rolling updates) will use the updated template.
 :::
 
-### Upgrading Kubernetes Version
-
-For Kubernetes and Alauda OS upgrades on Huawei DCS, see [Upgrading Kubernetes on Huawei DCS](../../../upgrade/workload/alauda_os/huawei-dcs.mdx). That guide covers the required order and the YAML workflow for control plane and worker replacement.
-
 ---
 
 ## Managing Node Pools Using the Web UI
 
-:::info
-**Fleet Essentials upgrade boundary**
-
-Fleet Essentials 1.0.4 and later can request the ACP 4.3-and-later Distribution Version upgrade through CVO. It does not perform the DCS Kubernetes and Alauda OS replacement. Use [Upgrading Kubernetes on Huawei DCS](../../../upgrade/workload/alauda_os/huawei-dcs.mdx) for that Phase 2 YAML procedure. Adding, deleting, and viewing node pools through Fleet Essentials are unaffected by this boundary.
-:::
+Adding, deleting, and viewing node pools through Fleet Essentials are not affected by the upgrade limitations described in [Fleet Essentials Boundary](../../../upgrade/workload/alauda_os/huawei-dcs.mdx#fleet-essentials-boundary).
 
 Node pools provide a declarative way to manage groups of nodes with identical configurations. You can view, add, and delete worker node pools through the web UI.
 

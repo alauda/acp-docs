@@ -19,12 +19,12 @@ This document explains how to create a VMware vSphere workload cluster by applyi
 
 Read the installed provider version from the provider `AppRelease` on the management cluster; do not infer it from the ACP release. See [Identify the Installed Provider Version](../../../upgrade/workload/alauda_os/index.mdx#identify-the-installed-provider-version).
 
-The following rules apply when the `VSphereMachineTemplate` referenced by a controller sets `machineConfigPoolRef` — the fixed-IP topology this page teaches. The provider's admission webhooks enforce them on `CREATE` and `UPDATE`; the last rule is enforced on `DELETE`.
+The following rules apply when the `VSphereMachineTemplate` referenced by a controller sets `machineConfigPoolRef` — the fixed-IP topology this page teaches. The provider's admission webhooks enforce the `KubeadmControlPlane` and pool rules on `CREATE` and `UPDATE`, and the last rule on `DELETE`.
 
 - `KubeadmControlPlane.spec.rolloutStrategy.rollingUpdate.maxSurge` is the integer `0`, and `spec.replicas` is `3` or more. An unset `maxSurge` means the Cluster API default `1`, which is not accepted.
 - `MachineDeployment.spec.strategy.rollingUpdate.maxSurge` is `0` and `maxUnavailable` is `1` or more. `strategy.type: OnDelete` is exempt from both.
 - `VSphereMachineConfigPool.spec.configs` declares at least one slot, and every slot declares `network`. Hostnames and primary IP addresses are unique across every pool bound to the same `Cluster`, and one pool serves one controller.
-- A slot that is already `InUse` or `Released` accepts additions to either disk list, and nothing else. See [Allocated slots are immutable](#create-the-machine-config-pools).
+- A slot that is already `InUse` or `Released` rejects some changes. See [Allocated slot restrictions](#create-the-machine-config-pools).
 - A pool that still owns `InUse` slots cannot be deleted.
 
 Confirm the webhooks are registered in your environment with the webhook check in [Verify the installation](./install_provider.mdx#verify-the-installation). Where a webhook is not registered, the same values are still required: the fixed-IP slot model has no free slot for a surge machine, so a non-compliant rollout stalls instead of being rejected up front.
@@ -57,7 +57,7 @@ This document is written for the current platform environment. The `kube-ovn` de
 2. Prepare the baseline manifest files in the procedure below.
 3. Before applying them, add only the required [creation-time topology variants](#creation-time-topology-variants).
 4. Apply the complete manifest set and finish the verification checks.
-5. After the cluster is running, use [Manage Nodes on VMware vSphere](../../../configure/nodes/alauda_os/vmware-vsphere.mdx) for scale-out, immutable template replacement, and runtime topology changes.
+5. After the cluster is running, use [Manage Nodes on VMware vSphere](../../../configure/nodes/alauda_os/vmware-vsphere.mdx) for scale-out, machine template changes, and runtime topology changes.
 
 The baseline is the validation reference. If the target cluster needs several optional topology features, introduce and validate one manifest change at a time before combining them.
 
@@ -77,7 +77,7 @@ Before you begin, ensure the following conditions are met:
 10. The platform can process the cluster annotations required to install the network plugin.
 11. The vCenter account referenced by `VSphereCluster.spec.identityRef` satisfies the Custom Fields privilege requirement in [Install the VMware vSphere Provider](./install_provider.mdx#prerequisites).
 12. The `global` cluster is the active management cluster, not a disaster-recovery standby. See [Standby Management Clusters](./install_provider.mdx#standby-management-cluster).
-13. Node labels, annotations, and taints for any dedicated node pools are planned. They are declared on the pool's resources, as described in [Configure Annotations, Labels, and Taints on Nodes](../../../configure/nodes/alauda_os/node-configuration.mdx); a `Machine` label reaches its `Node` only after label synchronization is enabled on `capi-controller-manager`. Worker pools that need Machine Configuration also declare the `node-role.kubernetes.io/worker` label, which worker nodes do not carry by default; see [Worker Label for Machine Configuration](../../../configure/nodes/alauda_os/node-configuration.mdx#worker-label).
+13. Role labels and taints for any dedicated node pools are planned. They are declared on the pool's resources, as described in [Infra Nodes](../../../configure/nodes/node_planning.mdx#create-infra-nodes-alauda-os).
 
 ## Control Plane Endpoint Modes \{#control-plane-endpoint-modes}
 
@@ -103,7 +103,7 @@ For `type: internal`, the prerequisites, the field reference, the manifest block
 
 ![VMware vSphere Cluster API resource dependencies](./assets/vsphere-resource-dependency.svg)
 
-The top-level `Cluster` references `VSphereCluster` and the control-plane or worker controllers. Those controllers reference immutable `VSphereMachineTemplate` objects. Each template references one `VSphereMachineConfigPool`, whose slots provide hostnames, static network configuration, and persistent disks to the runtime `Machine`, `VSphereMachine`, and `VSphereVM` objects.
+The top-level `Cluster` references `VSphereCluster` and the control-plane or worker controllers. Those controllers reference `VSphereMachineTemplate` objects. Each template references one `VSphereMachineConfigPool`, whose slots provide hostnames, static network configuration, and persistent disks to the runtime `Machine`, `VSphereMachine`, and `VSphereVM` objects.
 
 | Stage | Input | Apply | Expected result | Diagnose first |
 |---|---|---|---|---|
@@ -687,8 +687,8 @@ The provider validates the following:
 - Hostnames and primary IP addresses are unique within the pool **and** across every other pool bound to the same `Cluster` in the namespace.
 </Directive>
 
-<Directive type="warning" title="Allocated slots are immutable">
-Once a slot's `status.configStatuses[].state` is `InUse` or `Released`, you cannot remove the slot, change its `network.primary.ip` or `.ipv6`, remove a disk from `persistentDisks[]` or `ephemeralDisks[]`, or change a disk's `sizeGiB`, `mountPath`, or assigned `unitNumber`. Adding a disk to either list is accepted, but it takes effect only when the VM is next recreated.
+<Directive type="warning" title="Allocated slot restrictions">
+Once a slot's `status.configStatuses[].state` is `InUse` or `Released`, you cannot remove the slot, change its `network.primary.ip` or `.ipv6`, remove a disk from `persistentDisks[]`, or change a persistent disk's `sizeGiB` or `mountPath`.
 
 Plan hostnames, addresses, and disk sizes before the first Machine allocates the slot. For scale-out and runtime changes, see [Manage Nodes on VMware vSphere](../../../configure/nodes/alauda_os/vmware-vsphere.mdx).
 </Directive>
@@ -1511,16 +1511,15 @@ An `apply` or `edit` can be rejected before anything is created. Match a fragmen
 
 | Rejection contains | Cause and fix |
 |---|---|
-| `maxSurge must be 0 when the infrastructure template references a machineConfigPoolRef` | Set `maxSurge` to the integer `0` on the `KubeadmControlPlane` or `MachineDeployment`. Leaving it unset means the Cluster API default `1`. |
+| `maxSurge must be 0 when the infrastructure template references a machineConfigPoolRef` | Set `maxSurge` to the integer `0` on the `KubeadmControlPlane`. Leaving it unset means the Cluster API default `1`. |
 | `must have at least 3 replicas` | Set `KubeadmControlPlane.spec.replicas` to `3` or more. A fixed-IP rollout uses `maxSurge: 0`, which Cluster API permits only for control planes with three or more replicas. |
-| `maxUnavailable must be at least 1 when the infrastructure template references a machineConfigPoolRef` | Set `MachineDeployment.spec.strategy.rollingUpdate.maxUnavailable` to `1` or more. The Cluster API default `0` deadlocks against `maxSurge: 0`. |
 | `unit number 7 is reserved for the SCSI controller` | Choose another `unitNumber` between `0` and `15`. |
 | `also used by pool` | A hostname or primary IP collides with a slot in another pool bound to the same `Cluster` in this namespace. |
-| `allocated slot` | The slot is `InUse` or `Released`. The message names what is frozen — the primary IP or IPv6, or a disk's `sizeGiB`, `mountPath`, or `unitNumber` — or reports that the slot, or one of its disks in either list, cannot be removed. See [Allocated slots are immutable](#create-the-machine-config-pools). |
+| `allocated slot` | The slot is `InUse` or `Released`. The message names what is frozen — the primary IP or IPv6, or a persistent disk's `sizeGiB` or `mountPath` — or reports that the slot, or one of its persistent disks, cannot be removed. See [Allocated slot restrictions](#create-the-machine-config-pools). |
 | `cannot delete pool while` | The pool still owns `InUse` slots. Delete the Machines that hold them first. |
 | `is already referenced by` or `is bound to` | Two controllers reference one pool. Give each `KubeadmControlPlane` and `MachineDeployment` its own pool. |
 | `cannot change clusterRef while consumerRef is set` | The pool is already bound to a controller. Create a new pool instead of retargeting this one. |
-| `VSphereMachineTemplate spec.template.spec field is immutable` | Create a new template under a new name. See [Upgrade Kubernetes on VMware vSphere](../../../upgrade/workload/alauda_os/vmware-vsphere.mdx). |
+| `VSphereMachineTemplate spec.template.spec field is immutable` | Create a new template under a new name instead of editing the existing one. See [Roll out updated worker node configuration](../../../configure/nodes/alauda_os/vmware-vsphere.mdx#roll-out-updated-worker-node-configuration). |
 | `is immutable once controlPlaneLoadBalancer is set` | `spec.controlPlaneLoadBalancer` is write-once. See [`controlPlaneLoadBalancer` fields](#control-plane-load-balancer-fields). |
 | `cannot be set after the cluster is created` | The cluster was created without `spec.controlPlaneLoadBalancer`, which already means an external LoadBalancer. The endpoint is fixed at creation and cannot be filled in later. |
 
@@ -1693,7 +1692,7 @@ When you define the second NIC values, prepare the following placeholders in the
 - `<worker_01_nic2_ip>`
 - `<worker_02_nic2_ip>` when you also expand the worker pool
 
-For a running cluster, change all three network definitions together during immutable replacement. See [Runtime Topology Changes](../../../configure/nodes/alauda_os/vmware-vsphere.mdx#runtime-topology-changes).
+For a running cluster, change all three network definitions together when you replace the machines. See [Runtime Topology Changes](../../../configure/nodes/alauda_os/vmware-vsphere.mdx#runtime-topology-changes).
 
 ### Multiple datacenters and failure domains \{#multiple-datacenters-and-failure-domains}
 
@@ -1917,7 +1916,7 @@ Use `ephemeralDisks` for rebuildable node-local data that should not sit on the 
 <Directive type="warning" title="Keep the standard disks in their declared list">
 `/var/cpaas` must stay in `persistentDisks[]`: it holds platform state that has to survive VM replacement. `/var/lib/kubelet`, `/var/lib/containerd`, and `/var/lib/etcd` belong in `ephemeralDisks[]`; they are rebuilt on every new VM, and declaring them as persistent disks carries stale kubelet, runtime, and etcd member data onto the replacement node.
 
-This split is a creation-time choice. `ephemeralDisks[]` is new in provider `v1.0.17`, so a cluster created on an earlier provider cannot use the standard ephemeral set at all: it declares `/var/cpaas`, `/var/lib/containerd`, and `/var/lib/etcd` as persistent disks, with `wipeFilesystem: true` on the etcd disk. That cluster keeps its layout: a provider upgrade migrates no disk, and an allocated slot rejects the removal or the reshaping of a disk in either list. See [Upgrading the Provider](./install_provider.mdx#upgrade-the-provider).
+This split is a creation-time choice. `ephemeralDisks[]` is new in provider `v1.0.17`, so a cluster created on an earlier provider cannot use the standard ephemeral set at all: it declares `/var/cpaas`, `/var/lib/containerd`, and `/var/lib/etcd` as persistent disks, with `wipeFilesystem: true` on the etcd disk. That cluster keeps its layout: a provider upgrade migrates no disk. See [Upgrading the Provider](./install_provider.mdx#upgrade-the-provider).
 </Directive>
 
 The following example adds one ephemeral scratch disk alongside the standard worker set:
@@ -1947,7 +1946,7 @@ Disk names and mount paths must be unique across both lists within one slot.
 
 #### Pin a SCSI unit number \{#pin-a-scsi-unit-number}
 
-`unitNumber` on a persistent disk keeps guest device ordering stable across VM recreations. Valid values are `0` through `15`, excluding `7`, which is reserved for the SCSI controller, and each value must be unique within the slot. Once the slot is allocated, the assigned value is immutable.
+`unitNumber` on a persistent disk keeps guest device ordering stable across VM recreations. Valid values are `0` through `15`, excluding `7`, which is reserved for the SCSI controller, and each value must be unique within the slot.
 
 If you omit `unitNumber`, the controller assigns one at clone time, records it in `status.persistentDiskStatuses[].unitNumber`, and reuses that value when the VM is recreated.
 

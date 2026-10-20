@@ -14,7 +14,7 @@ queries:
 
 # Upgrade Kubernetes on VMware vSphere
 
-This document explains how to upgrade Kubernetes clusters on VMware vSphere after the platform-side distribution upgrade is complete. The documented workflow focuses on updating the control plane and worker nodes through Cluster API resources. The rules the admission webhooks enforce are listed in [Provider Requirements](../../../workload_clusters/alauda_os/vmware-vsphere/create_cluster.mdx#provider-requirements).
+This document explains how to upgrade Kubernetes clusters on VMware vSphere after the platform-side distribution upgrade is complete. The documented workflow focuses on updating the control plane and worker nodes through Cluster API resources. The rollout rules are listed in [Provider Requirements](../../../workload_clusters/alauda_os/vmware-vsphere/create_cluster.mdx#provider-requirements).
 
 :::info
 **Where this page fits in the full ACP upgrade flow**
@@ -35,7 +35,7 @@ Upgrade VMware vSphere clusters in the following order:
 
 1. **(Prerequisite)** Upgrade the ACP platform on the management cluster first. This brings the `cluster-api-provider-vsphere` controller and the related CAPI components to versions that understand the new schema. The provider updates its CRDs and migrates existing resources to the new field layout itself — no manual YAML change is required. See [Upgrading the Provider](../../../workload_clusters/alauda_os/vmware-vsphere/install_provider.mdx#upgrade-the-provider). Trigger workload-cluster upgrades only after the management-side controllers have rolled out and become Ready.
 2. Complete the distribution-version upgrade described in [Upgrade the Distribution Version](../upgrade_workload_cluster.mdx).
-3. Verify that the existing `KubeadmControlPlane` and `MachineDeployment` manifests satisfy the rollout rules. A manifest that does not can block the very first edit of the upgrade. See [Check the manifests against the admission rules](#preflight-admission-rules).
+3. Verify that the existing `KubeadmControlPlane` and `MachineDeployment` manifests satisfy the rollout rules. A `KubeadmControlPlane` that does not can block the very first edit of the upgrade, and a `MachineDeployment` that does not stalls the rollout. See [Check the manifests against the admission rules](#preflight-admission-rules).
 4. Verify that the control plane is healthy and the current cluster is stable.
 5. Upgrade Kube-OVN to the chart version required by the target ACP release and wait for the `AppRelease` to reach `Success`.
 6. Upgrade the control plane Kubernetes version.
@@ -53,7 +53,7 @@ Before you begin, ensure the following conditions are met:
 - For cross-version upgrades that span more than one Kubernetes minor, the intermediate-version Core images and VM templates are pre-staged. See [Cross-Version Upgrade Preparation](./index.mdx#cross-version-preparation).
 - The target Kubernetes version is compatible with your workloads and add-ons.
 - The machine config pools have enough capacity for rolling updates.
-- The `KubeadmControlPlane` sets `spec.rolloutStrategy.rollingUpdate.maxSurge: 0` and `spec.replicas` to `3` or more, and every `MachineDeployment` sets `spec.strategy.rollingUpdate.maxSurge: 0` with `maxUnavailable` of `1` or more. These values let the replacement reuse the same slot and disk identity, and the admission webhooks enforce them. Verify them with [Check the manifests against the admission rules](#preflight-admission-rules) **before** you start.
+- The `KubeadmControlPlane` sets `spec.rolloutStrategy.rollingUpdate.maxSurge: 0` and `spec.replicas` to `3` or more, and every `MachineDeployment` sets `spec.strategy.rollingUpdate.maxSurge: 0` with `maxUnavailable` of `1` or more. These values let the replacement reuse the same slot and disk identity. Verify them with [Check the manifests against the admission rules](#preflight-admission-rules) **before** you start.
 - The management cluster is not a disaster-recovery standby. Against a standby, the provider skips non-`global` objects and requeues every 30 seconds, so the rollout appears not to start rather than to fail. See [Standby Management Clusters](../../../workload_clusters/alauda_os/vmware-vsphere/install_provider.mdx#standby-management-cluster).
 - You know the `KubeadmControlPlane` name for this cluster. Read it from `Cluster.spec.controlPlaneRef.name`; the manifests in [Create a Cluster on VMware vSphere](../../../workload_clusters/alauda_os/vmware-vsphere/create_cluster.mdx) name it `<cluster_name>-kcp`.
 - If the cluster uses a Self-built VIP (`controlPlaneLoadBalancer.type: internal`), `VSphereCluster.status.conditions[SelfBuiltLoadBalancerReady]` is `True`, and the **new** VM template satisfies the Alive kernel prerequisites (the `ip_vs` module family is loadable, `net.ipv4.vs.conntrack=1` is permitted). Replacement control-plane nodes are built from that template, and the provider neither injects nor validates these settings.
@@ -62,19 +62,20 @@ Before you begin, ensure the following conditions are met:
 :::warning
 **The rollout rules can reject the first edit of an existing cluster**
 
-The rules apply to `UPDATE` as well as `CREATE`, so an existing cluster can hold values that are no longer accepted:
+The `KubeadmControlPlane` rules apply to `UPDATE` as well as `CREATE`, so an existing cluster can hold values that are no longer accepted:
 
 - a `KubeadmControlPlane` whose `rolloutStrategy.rollingUpdate.maxSurge` is unset — the Cluster API default is `1`;
-- a `KubeadmControlPlane` with `replicas: 1`;
-- a `MachineDeployment` whose `strategy.rollingUpdate.maxUnavailable` is unset — the Cluster API default is `0`.
+- a `KubeadmControlPlane` with `replicas: 1`.
 
 The rejection lands on the version bump itself, so the upgrade stops before anything is replaced. Correct these values in a separate, earlier edit. A `KubeadmControlPlane` at `replicas: 1` on a pool-backed template cannot be upgraded at all until it is scaled to `3`; a single-replica control plane is not a supported fixed-IP topology. Scaling it is a two-part change: add two more slots to the control-plane `VSphereMachineConfigPool` — hostnames, static addresses, and the required persistent disks — and then raise `replicas` and set `maxSurge` in one patch, because both rules are checked on the same update. See [Check the manifests against the admission rules](#preflight-admission-rules).
+
+A `MachineDeployment` that does not set `strategy.rollingUpdate.maxSurge: 0` and a `maxUnavailable` of `1` or more stalls the rollout. Correct it in the same earlier edit.
 :::
 
 :::warning
 **Disk Preservation Model**
 
-Upgrades rely on Cluster API's rolling replacement mechanism. Each cluster has five disk classes; only the pool-managed persistent class and external CSI volumes survive a delete-recreate.
+Each cluster has five disk classes; only the pool-managed persistent class and external CSI volumes survive a delete-recreate.
 
 | Disk class | Declared in | Survives upgrade? | Use for |
 |---|---|---|---|
@@ -86,15 +87,15 @@ Upgrades rely on Cluster API's rolling replacement mechanism. Each cluster has f
 
 Unlike pool-managed persistent disks, ephemeral disks take no part in reclaim and never hold a slot release, so they never delay a rollout. See [Choose persistent or ephemeral](../../../workload_clusters/alauda_os/vmware-vsphere/create_cluster.mdx#choose-persistent-or-ephemeral).
 
-**Which class your disks are in is fixed at cluster creation.** `ephemeralDisks[]` is new in provider `v1.0.17`. A cluster created on an earlier provider declares `/var/cpaas`, `/var/lib/containerd`, and `/var/lib/etcd` as persistent disks, with `wipeFilesystem: true` on the etcd disk, and an upgrade does not change that: the provider migrates no disk, and an allocated slot rejects the removal or the reshaping of a disk in either list, so a disk cannot be moved from one list to the other. Do not restructure the pool's disk lists as part of an upgrade — the standard persistent-plus-ephemeral split applies to newly created clusters only.
+**Which class your disks are in is fixed at cluster creation.** `ephemeralDisks[]` is new in provider `v1.0.17`. A cluster created on an earlier provider declares `/var/cpaas`, `/var/lib/containerd`, and `/var/lib/etcd` as persistent disks, with `wipeFilesystem: true` on the etcd disk, and an upgrade does not change that: the provider migrates no disk. Do not restructure the pool's disk lists as part of an upgrade — the standard persistent-plus-ephemeral split applies to newly created clusters only.
 
 **"Preserved" means the same disk identity is reattached** — it does not mean the disk's contents are time-traveled. Anything written to a pool-managed disk during the upgrade window stays after the upgrade and stays after a rollback.
 :::
 
 :::warning
-**Templates Cannot Be Modified In Place**
+**Create a New Template for Every Change**
 
-`VSphereMachineTemplate.spec.template.spec` is immutable. The vSphere admission webhook rejects any update with the message `"VSphereMachineTemplate spec.template.spec field is immutable. Please create a new resource instead."` Every upgrade step on this page therefore creates a new `VSphereMachineTemplate` with a new `metadata.name`, applies it, and then patches the controlling resource's `infrastructureRef.name` to the new template. Keep the previous template until the new rollout is healthy in case rollback is required.
+Every upgrade step on this page creates a new `VSphereMachineTemplate` with a new `metadata.name`, applies it, and then patches the controlling resource's `infrastructureRef.name` to the new template. Do not edit an existing template. Keep the previous template until the new rollout is healthy in case rollback is required.
 :::
 
 :::info
@@ -126,7 +127,7 @@ The cells you read from that row map to the upgrade manifests as follows:
 | **etcd** | `KubeadmControlPlane.spec.kubeadmConfigSpec.clusterConfiguration.etcd.local.imageTag` | Control plane only |
 | **kube-ovn (chart)** | `Cluster.metadata.annotations["cpaas.io/kube-ovn-version"]` and the provider-managed `cni-kube-ovn` `AppRelease` | Complete the shared [provider-version-specific Kube-OVN procedure](./index.mdx#upgrade-kube-ovn-before-the-control-plane) before changing `KubeadmControlPlane`. The provider version and target chart version determine the chart name and supported reconciliation flow. |
 
-The CoreDNS and etcd image tags are control-plane-only because `clusterConfiguration` is a `KubeadmControlPlane` field. Worker nodes inherit container image versions from the new VM template; the `MachineDeployment` does not carry its own `dns`/`etcd` tags. The Kube-OVN annotation lives on the `Cluster` resource, not on `KubeadmControlPlane`, because the vSphere provider watches it independently of the Kubernetes control plane rollout.
+The CoreDNS and etcd image tags are control-plane-only because `clusterConfiguration` is a `KubeadmControlPlane` field. Worker nodes inherit container image versions from the new VM template; the `MachineDeployment` does not carry its own `dns`/`etcd` tags. The Kube-OVN annotation lives on the `Cluster` resource, not on `KubeadmControlPlane`.
 
 ## Steps
 
@@ -257,7 +258,7 @@ Typical changes include:
 - `spec.template.spec.infrastructureRef.name` — the new `VSphereMachineTemplate` name
 - `spec.template.spec.bootstrap.configRef.name` — the new `KubeadmConfigTemplate` name. This is required for Kubernetes 1.35 or later so the worker receives the [required kubelet patch](./index.mdx#kubernetes-1-35-kubelet-patch); for earlier versions, change it only when other bootstrap settings must change. See [Updating Bootstrap Templates](../../../configure/nodes/alauda_os/vmware-vsphere.mdx#updating-bootstrap-templates).
 
-The patch below changes only `spec.template.spec`. If the pre-flight check showed that the `MachineDeployment` strategy needed correcting, that correction must already be applied — an update carrying a non-compliant strategy is rejected in full, including the version field.
+The patch below changes only `spec.template.spec`. If the pre-flight check showed that the `MachineDeployment` strategy needed correcting, that correction must already be applied before you patch.
 
 Apply the changes:
 
@@ -346,7 +347,7 @@ Keep these infrastructure facts in mind during any recovery:
 - **The old `VSphereMachineTemplate` resource must still exist.** Do not delete the previous template until the new rollout is healthy. If you already deleted it, recreate it from version control or backup before attempting same-minor template recovery.
 - **Pool-managed disk identity is preserved, but data state is not.** Disks declared in `VSphereMachineConfigPool.spec.configs[].persistentDisks[]` reattach to the replacement machines at the same slot, but data written during the upgrade window remains on those disks.
 - **Ephemeral disks are gone.** Data on `VSphereMachineConfigPool.spec.configs[].ephemeralDisks[]` is destroyed with every replaced VM and cannot be recovered from the pool. Only pool-managed persistent disks reattach.
-- **Do not reverse a rollout-rule correction.** If stage 1 requires restoring earlier manifest values, leave `maxSurge` at `0` and `maxUnavailable` at `1` or more. Restoring the older, non-compliant values is not accepted.
+- **Do not reverse a rollout-rule correction.** If stage 1 requires restoring earlier manifest values, leave `maxSurge` at `0` and `maxUnavailable` at `1` or more.
 
 For stage 1, use the vSphere rule in [Restore Kube-OVN During Stage-1 Recovery](./index.mdx#restore-kube-ovn-during-stage-1-recovery). The provider restores the chart from the annotation. Wait until the restored `AppRelease` passes the shared verification before changing control-plane manifests.
 
@@ -375,7 +376,7 @@ Confirm the following results:
 
 | Issue | What to check |
 |---|---|
-| The `kubectl edit` or `kubectl patch` on `KubeadmControlPlane` or `MachineDeployment` is rejected | Run [the pre-flight check](#preflight-admission-rules). For the full message-to-cause map, see [Admission rejections](../../../workload_clusters/alauda_os/vmware-vsphere/create_cluster.mdx#admission-rejections). |
+| The `kubectl edit` or `kubectl patch` on `KubeadmControlPlane` is rejected | Run [the pre-flight check](#preflight-admission-rules). For the full message-to-cause map, see [Admission rejections](../../../workload_clusters/alauda_os/vmware-vsphere/create_cluster.mdx#admission-rejections). |
 | The rollout stalls after the first machine is deleted | Usually the attachment-safety hold rather than a defect. See [Rollout Holds That Are Not Failures](#rollout-holds). |
 | The pool reports `Ready=True` but `SlotAvailable=False` | Normal on a fully allocated pool during a `maxSurge: 0` rollout. `SlotAvailable` is excluded from the `Ready` summary. |
 | A replaced node's disks are empty | Confirm which list the disk is declared in. On a cluster created on `v1.0.17` or later, `/var/lib/kubelet`, `/var/lib/containerd`, and `/var/lib/etcd` are ephemeral by design and start empty on every replacement. On an older cluster they are persistent disks, so also check `wipeFilesystem`, which is `true` on the etcd disk by design. |

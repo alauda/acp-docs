@@ -16,6 +16,10 @@ This document explains how to manage worker nodes on VMware vSphere after the ba
 
 To add another worker node pool with YAML, follow [Create the worker objects](../../../workload_clusters/alauda_os/vmware-vsphere/create_cluster.mdx#create-the-worker-objects) on the cluster creation page.
 
+:::info
+To upgrade the Kubernetes version of the nodes, see [Upgrade Kubernetes on VMware vSphere](../../../upgrade/workload/alauda_os/vmware-vsphere.mdx).
+:::
+
 ## Prerequisites \{#prerequisites}
 
 Before you begin, ensure the following conditions are met:
@@ -29,10 +33,11 @@ Before you begin, ensure the following conditions are met:
 :::warning
 **A Day-2 `apply` can be rejected**
 
-The rollout and pool rules are enforced on `UPDATE` as well as `CREATE`, so they are checked on every edit this page makes:
+The rollout and pool rules apply to every edit this page makes:
 
-- Re-applying an archived `MachineDeployment` manifest re-submits the whole object. If that file omits `strategy.rollingUpdate.maxSurge: 0` or a `maxUnavailable` of `1` or more, the apply is rejected — including an apply whose only intended change is `replicas`. Correct the file before you apply it. `strategy.type: OnDelete` is exempt from both rules.
-- A slot whose `status.configStatuses[].state` is `InUse` or `Released` cannot be removed, cannot have its `network.primary.ip` or `.ipv6` changed, and cannot lose a disk from `persistentDisks[]` or `ephemeralDisks[]` or change one's `sizeGiB`, `mountPath`, or assigned `unitNumber`. Adding a slot, or adding a disk to either list on an existing slot, is accepted.
+- Re-applying an archived `MachineDeployment` manifest re-submits the whole object, including an apply whose only intended change is `replicas`. Before you apply it, confirm the file sets `strategy.rollingUpdate.maxSurge: 0` and a `maxUnavailable` of `1` or more. `strategy.type: OnDelete` is exempt from both.
+- A `KubeadmControlPlane` must set `spec.rolloutStrategy.rollingUpdate.maxSurge: 0` and `spec.replicas` of `3` or more, or an edit to it is rejected. See [Check the manifests against the admission rules](../../../upgrade/workload/alauda_os/vmware-vsphere.mdx#preflight-admission-rules).
+- A slot whose `status.configStatuses[].state` is `InUse` or `Released` cannot be removed, cannot have its `network.primary.ip` or `.ipv6` changed, and cannot lose a disk from `persistentDisks[]` or change one's `sizeGiB` or `mountPath`. Adding a slot is accepted.
 
 Match a rejection message against [Admission rejections](../../../workload_clusters/alauda_os/vmware-vsphere/create_cluster.mdx#admission-rejections).
 :::
@@ -104,19 +109,13 @@ kubectl apply -f 17-vspheremachineconfigpool-worker.yaml
 kubectl apply -f 30-workers-md-0.yaml
 ```
 
-The second command replaces the whole `MachineDeployment` spec, not only `replicas`. Confirm the archived file carries `strategy.rollingUpdate.maxSurge: 0` and a `maxUnavailable` of `1` or more before you apply it, or the scale-out is rejected.
+The second command replaces the whole `MachineDeployment` spec, not only `replicas`. Confirm the archived file carries `strategy.rollingUpdate.maxSurge: 0` and a `maxUnavailable` of `1` or more before you apply it.
 
 **Note:** Keep the same existing `VSphereMachineConfigPool.metadata.name` when scale-out or replacement must preserve the logical pool. Slots and VMDKs are not reused across differently named pool objects. `releaseDelayHours` is the reclaim grace period for an unused `Released` slot, not a delay before same-pool reuse.
 
 ### Roll out updated worker node configuration \{#roll-out-updated-worker-node-configuration}
 
 When you need to change worker VM specifications, create a new `VSphereMachineTemplate` and update the `MachineDeployment` to reference it. This triggers a rolling update that replaces worker nodes with the new configuration.
-
-:::warning
-**Templates are immutable**
-
-`VSphereMachineTemplate` resources cannot be modified in-place. You must create a new template with a new name and update the reference in `MachineDeployment`. For more information, refer to the [Cluster API documentation](https://cluster-api.sigs.k8s.io/tasks/updating-machine-templates#updating-machine-infrastructure-and-bootstrap-templates).
-:::
 
 Typical changes include:
 
@@ -125,7 +124,9 @@ Typical changes include:
 - System disk sizing (`diskGiB`)
 - VM network devices (`network.devices`)
 
-Persistent disks are owned by `VSphereMachineConfigPool` slots rather than `VSphereMachineTemplate`, so update the pool slots before you start the replacement. That change can only be additive: the slot you are about to replace a node on is `InUse` or `Released`, which accepts a new disk but rejects removing one or changing an existing disk's `sizeGiB`, `mountPath`, or assigned `unitNumber`. A different geometry for an existing disk therefore needs a new slot, not an edit of the current one. See [Allocated slots are immutable](../../../workload_clusters/alauda_os/vmware-vsphere/create_cluster.mdx#create-the-machine-config-pools).
+To move nodes onto a new Alauda OS image while the Kubernetes version stays the same, follow [OS Image Update Without a Kubernetes Version Change](../../../upgrade/workload/alauda_os/vmware-vsphere.mdx#os-image-only-rollout) instead. If the Kubernetes version changes too, see [Upgrade Kubernetes on VMware vSphere](../../../upgrade/workload/alauda_os/vmware-vsphere.mdx).
+
+Persistent disks are declared in `VSphereMachineConfigPool` slots rather than in `VSphereMachineTemplate`, so a new template does not change them. A slot that is `InUse` or `Released` rejects changing an existing disk's `sizeGiB` or `mountPath`, so a different geometry for an existing disk needs a new slot, not an edit of the current one. See [Allocated slot restrictions](../../../workload_clusters/alauda_os/vmware-vsphere/create_cluster.mdx#create-the-machine-config-pools).
 
 1. **Export the existing template**
 
@@ -172,10 +173,12 @@ Persistent disks are owned by `VSphereMachineConfigPool` slots rather than `VSph
    kubectl -n <namespace> get machine
    ```
 
+To change the machine specification of control plane nodes, use the same steps and patch `KubeadmControlPlane.spec.machineTemplate.infrastructureRef.name` instead.
+
 :::tip
 **Rolling back a failed update**
 
-If the rolling update fails (for example, new VMs fail to boot), revert the `MachineDeployment` reference back to the previous template name. The old template still exists and Cluster API will roll back to it.
+If the rolling update fails (for example, new VMs fail to boot), revert the `MachineDeployment` reference back to the previous template name. This works only while the Kubernetes minor version is unchanged. The old template still exists and Cluster API will roll back to it.
 :::
 
 ### Verify worker node status
@@ -197,7 +200,7 @@ Confirm the following results:
 
 ## Updating Bootstrap Templates \{#updating-bootstrap-templates}
 
-`KubeadmConfigTemplate` resources are also immutable. Changes to an existing template do not trigger rollouts of existing machines. To update bootstrap configuration, create a new template and update the `MachineDeployment` reference.
+To update bootstrap configuration, create a new `KubeadmConfigTemplate` and update the `MachineDeployment` reference.
 
 1. **Export the existing template**
 
@@ -240,16 +243,12 @@ Confirm the following results:
 
    The Cluster API controller triggers a rolling update. Existing machines continue using the old bootstrap configuration until they are replaced.
 
-:::info
-**Upgrading Kubernetes version?** See [Upgrade Kubernetes on VMware vSphere](../../../upgrade/workload/alauda_os/vmware-vsphere.mdx) for the full control plane and worker upgrade workflow.
-:::
-
 ## Runtime Topology Changes \{#runtime-topology-changes}
 
-Networking, placement, and disk topology are part of the machine templates and machine config pool. Treat a change to these fields as an immutable rollout, not as an in-place VM edit:
+Networking, placement, and disk topology are part of the machine templates and machine config pool. Treat a change to these fields as a rollout of replacement machines, not as an in-place VM edit:
 
-1. Add the required slot definitions to the existing `VSphereMachineConfigPool` before increasing replicas or starting replacement. An allocated slot accepts additions only; see the admission warning in [Prerequisites](#prerequisites).
-2. Create a new `VSphereMachineTemplate` when its immutable VM, network, placement, or system-disk fields change.
+1. Add the required slot definitions to the existing `VSphereMachineConfigPool` before increasing replicas or starting replacement. An allocated slot rejects some changes; see the warning in [Prerequisites](#prerequisites).
+2. Create a new `VSphereMachineTemplate` when its VM, network, placement, or system-disk fields change.
 3. Create a new `KubeadmConfigTemplate` when bootstrap files or node configuration change.
 4. Update the `MachineDeployment` references only after the new pool capacity and templates exist.
 5. Monitor replacement Machines and confirm that every node becomes `Ready` before removing old templates.
@@ -260,13 +259,13 @@ For the exact second-NIC, failure-domain, and persistent-disk fields, use the cr
 - Configure `VSphereCluster.spec.failureDomainSelector` and the CPI `[Labels]` block together when enabling failure domains.
 - Do not remove the required `var-cpaas` persistent disk, or the required `var-lib-kubelet` and `var-lib-containerd` ephemeral disks, or the control-plane `var-lib-etcd` ephemeral disk.
 - Keep a new slot's disk lists identical to the slots already in that pool. `ephemeralDisks[]` exists from provider `v1.0.17`, but a pool created on an earlier provider declares `/var/cpaas`, `/var/lib/containerd`, and `/var/lib/etcd` in `persistentDisks[]`; do not convert those slots, and do not mix layouts inside one pool.
-- Append, never reshape. A slot that is `InUse` or `Released` accepts new entries in `persistentDisks[]` and `ephemeralDisks[]`, which take effect on the next VM recreation, but it rejects removing a disk or changing its `sizeGiB`, `mountPath`, or `unitNumber`. Resizing means planning a new slot.
+- Do not reshape the disks of an allocated slot. A slot that is `InUse` or `Released` rejects removing a persistent disk or changing its `sizeGiB` or `mountPath`. Resizing means planning a new slot.
 - Do not treat `machineNamingStrategy`, `wipeFilesystem`, or `releaseDelayHours` as a switch that moves disks between pools or accelerates datastore cleanup.
 
 When you expand from one NIC to two NICs, update all of the following fields together:
 
 1. Append the second NIC entry to `VSphereMachineConfigPool.spec.configs[].network.additional`; keep `network.primary` unchanged.
-2. Add the second device to `VSphereMachineTemplate.spec.template.spec.network.devices` in the new immutable template.
+2. Add the second device to `VSphereMachineTemplate.spec.template.spec.network.devices` in the new template.
 3. Add the second network to `VSphereFailureDomain.spec.topology.networks` when failure domains are enabled.
 
 When you revert from two NICs to one NIC, remove the corresponding second entry from all three fields. Leave `network.additional` empty or remove the key entirely, and roll out a new `VSphereMachineTemplate`; do not edit existing VMs directly.
