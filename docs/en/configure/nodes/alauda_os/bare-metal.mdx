@@ -44,7 +44,7 @@ When working with the configurations in this document:
 The four resources that compose a worker node group:
 
 1. **`MachineInventoryPool`** (`<cluster-name>-worker-pool`) — the allowed set of `MachineInventory` names. Already created in [Create Cluster → Step 2](../../../workload_clusters/alauda_os/bare-metal/create_cluster.mdx#step-2-pools).
-2. **`BaremetalMachineTemplate`** (`<cluster-name>-worker-template`) — references the worker pool.
+2. **`BaremetalMachineTemplate`** (`<cluster-name>-worker-template`) — references the worker pool. To move the workers to a different pool, see [Moving Workers to a Different Pool](#moving-workers-to-a-different-pool).
 3. **`KubeadmConfigTemplate`** (`<cluster-name>-worker-bootstrap`) — cloud-init `user-data` for `kubeadm join`. The bare-metal provider normalizes this user-data at reprovision time (hostname, `provider-id`, `criSocket`); operators should not pre-fill those fields.
 4. **`MachineDeployment`** — controls replica count, version, rollout strategy.
 
@@ -173,6 +173,59 @@ kubectl -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io -w
 ```
 
 Investigate the original failure separately: read `BaremetalMachine.status.conditions`, `MachineInventory.status.plan.state`, and the failing plan secret's `failed-output` key on the host that ran the plan. Common root causes are documented in the [Common Failure Modes](#common-failure-modes) section below.
+
+### Moving Workers to a Different Pool \{#moving-workers-to-a-different-pool}
+
+`BaremetalMachineTemplate` carries only the pool reference — there is no CPU, memory, or disk declaration on the template.
+
+**Use Case**: New hosts have been registered and placed in a new `MachineInventoryPool`, and the nodes should move onto them. Create a new `BaremetalMachineTemplate` that points to the new pool, then point the `MachineDeployment` at it. Nodes are replaced one by one.
+
+**Before you start**:
+
+- The target pool is in the same namespace as the template.
+- The target pool has at least as many `Available` inventories as the `MachineDeployment` has replicas. Each moved node uses one host of the target pool; hosts released by the old nodes return to the old pool and do not join the target pool. Read the count from `status.available`:
+
+  ```bash
+  kubectl -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io <target-pool-name>
+  ```
+
+- The new hosts meet the same prerequisites as the current ones: registered and ready, managed data disks prepared if you use them, the target Kubernetes version and CPU architecture in the image catalog, and the CNI network device present. See [Confirm the Worker Pool Capacity](../../../workload_clusters/alauda_os/bare-metal/create_cluster.mdx#worker-pool-capacity).
+- Keep the old template and the old pool until the move is finished.
+
+**Procedure**:
+
+1. Create a new `BaremetalMachineTemplate` with a new `metadata.name` referencing the target pool. Use the format in [Configure the Worker `BaremetalMachineTemplate`](../../../workload_clusters/alauda_os/bare-metal/create_cluster.mdx#worker-machine-template).
+2. Apply the new template.
+3. Patch the `MachineDeployment`:
+
+   ```bash
+   kubectl -n cpaas-system patch machinedeployment <cluster-name>-workers \
+     --type='merge' \
+     -p='{"spec":{"template":{"spec":{"infrastructureRef":{"name":"<new-template-name>"}}}}}'
+   ```
+
+4. Watch the rolling replacement (`maxSurge: 0`, one node at a time) and the target pool's `status.available`:
+
+   ```bash
+   kubectl -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io -w
+   kubectl -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io <target-pool-name>
+   ```
+
+**What to expect**:
+
+- The old node is deleted before its replacement is created. If the target pool runs out of hosts, the node pool stays one node short until you add hosts.
+- Node names and IP addresses change.
+- Node-local data is not carried over. Data on managed data disks stays on the old host, bound to its `MachineInventory`, and does not appear on the new host. Declare storage on the new hosts separately; see [Manage Data Disks on Bare-Metal Hosts](./manage-bare-metal-storage.mdx).
+
+**If the move stalls with no free host** (`BaremetalMachine` shows `InventoryAllocated=False / Reason=PoolExhausted`), add `Available` hosts to the target pool; they are picked up automatically. Alternatively, roll back by patching `infrastructureRef.name` back to the old template. Nodes that were already moved are replaced again one by one, so the old pool must still have enough `Available` hosts.
+
+**To move control plane nodes**, use the same steps and patch `KubeadmControlPlane.spec.machineTemplate.infrastructureRef.name` instead. Nodes are replaced one at a time. In addition:
+
+- `maxSurge: 0` requires `replicas` of 3 or more.
+- During each replacement only two etcd members run. Start only when the control plane is healthy, and keep 3 `Available` hosts ready in the target pool.
+- The new hosts must be in the same layer-2 network as the control plane VIP.
+
+After the move is complete, you can delete the old template and the old pool. Hosts released by the old nodes stay in the old pool.
 
 ### Updating Bootstrap Templates \{#updating-bootstrap-templates}
 
