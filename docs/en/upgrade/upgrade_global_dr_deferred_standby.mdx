@@ -1,0 +1,474 @@
+---
+weight: 36
+---
+
+# Upgrade a Global DR Environment with a Deferred Standby Upgrade
+
+Use this procedure when a global disaster recovery (DR) environment must upgrade the **primary global cluster** and the workload clusters first, and upgrade the **standby global cluster** in place in a later maintenance window, for example several weeks later.
+
+For all other global DR upgrades, follow [Upgrade Global Clusters in a DR Environment](./upgrade_global_dr.mdx). That procedure upgrades both global clusters in the same window and is simpler to operate.
+
+## When to Use This Procedure \{#when-to-use}
+
+| Item | [Standard DR upgrade](./upgrade_global_dr.mdx) | Deferred standby upgrade (this page) |
+| --- | --- | --- |
+| Upgrade order | Standby global, then primary global, in one window; workload clusters afterwards | Primary global, then workload clusters; standby global in a later window |
+| Supported source versions | All supported upgrade paths | ACP 4.2, 4.3, or 4.4 to ACP 4.5 |
+| How synchronization stops | **<Term name="product" /> etcd Synchronizer** is uninstalled and later reinstalled | etcd Synchronizer stays installed and is **paused**, then resumed |
+| Standby as a DR target | Unavailable during one window | Unavailable for the whole period between pause and resume |
+| How the standby is upgraded | In place | In place |
+
+While etcd Synchronizer is paused, it stays installed and keeps running, but it no longer reads from the primary global cluster and no longer writes to the standby etcd. The standby keeps the synchronized data as it was at the moment of the pause. Because the plugin is not uninstalled, the DR marker ConfigMap `kube-public/etcd-sync` stays in place, so platform controllers on the standby global cluster continue to treat it as a standby and do not manage workload clusters.
+
+When synchronization resumes, etcd Synchronizer first copies all in-scope data from the primary global cluster. It then deletes in-scope keys that existed on the standby before the pause and no longer exist on the primary. Objects created locally on the standby after the pause are kept. Built-in safety checks skip or hold the deletion when the result is unexpected; see [Resume etcd synchronization](#resume).
+
+The period from the pause to the successful verification after resume is called the **mixed-version period** on this page.
+
+| Stage | Primary global | Workload clusters | Standby global | etcd Synchronizer on the standby | Standby usable for failover |
+| --- | --- | --- | --- | --- | --- |
+| Prepare | Source | Source | Source | Pause-capable release, running | Yes |
+| Pause | Source | Source | Source, frozen | Paused | **No** |
+| Upgrade primary and workload clusters | 4.5 | 4.5 | Source, frozen | Paused | **No** |
+| Upgrade standby | 4.5 | 4.5 | 4.5 | 4.5, paused | **No** |
+| Resume and verify | 4.5 | 4.5 | 4.5 | 4.5, running | Yes, after verification |
+
+<Directive type="danger" title="Restrictions during the mixed-version period">
+From the moment you pause synchronization until verification after resume succeeds:
+
+- The standby global cluster is **not** a usable DR target. Do not fail over to it. Its data is frozen at the pause and it is running an older version than the primary.
+- Do not install new components, change plugins, or change configuration on **either** global cluster, except for the steps on this page.
+- Do not uninstall or reinstall **<Term name="product" /> etcd Synchronizer**, and do not delete the ConfigMaps `kube-public/etcd-sync` or `cpaas-system/etcd-sync-control`.
+- Do not restore the standby etcd from a snapshot and do not rebuild the standby etcd.
+- Do not log in to the standby global cluster to perform management operations, such as node, cluster, or plugin operations. Only run the commands on this page.
+- Do not edit any `status.*` key of `cpaas-system/etcd-sync-control`. Those keys are written by etcd Synchronizer only.
+</Directive>
+
+## Prerequisites \{#prerequisites}
+
+Check every item before you start, and recheck the items marked for later stages at the indicated step. Run the commands on the **standby global cluster** unless stated otherwise. The [precheck script](#precheck-script) covers the items that can be read from the cluster.
+
+| # | Requirement | When | How to check |
+| --- | --- | --- | --- |
+| 1 | The source version is ACP 4.2, 4.3, or 4.4, and the target version is ACP 4.5. | Before step 1 | Current version of both global clusters. |
+| 2 | The Cluster API controller image on the standby is `v1.10.6-alauda.15` or later. | Before step 1 | Precheck script, section **Cluster API and provider images**. |
+| 3 | For ACP 4.2 and 4.3 sources, the base-chart patch that ships Cluster API `v1.10.6-alauda.15` or later is installed on the standby. For ACP 4.4 sources, base-chart `v4.4.12` or later is installed. | Before step 1 | Requirement 2 passes. See the release notes for the patch of your source version. |
+| 4 | Infrastructure providers in use meet the minimum versions: the vSphere provider reads the DR marker from `kube-public`, and the DCS provider is `v1.0.1` or later. Record the HCS and bare-metal provider versions in use. | Before step 1 | Precheck script, section **Cluster API and provider images**. Confirm the versions with technical support. |
+| 5 | etcd Synchronizer on the standby is the patch release for your source version that supports pause mode. See the release notes of etcd Synchronizer. | Step 2 | Precheck script, section **etcd Synchronizer**: the image tag is the pause-capable release, and Lease `etcd-sync-mirror` has a holder. |
+| 6 | The standby is consistent with the primary. | Steps 1 and 2 | The `/check` endpoint reports no missed keys and no surplus keys, or each reported key has been explained. See [Check synchronization status](#check-sync-status). |
+| 7 | No objects in the scope of the standby are being deleted: Cluster API objects, infrastructure provider machines, VMs and pools, `machine.alauda.io` MachinePools, BackupStorageLocationRepos, and MachineInventories. | Steps 1 and 6 | Precheck script, section **Objects being deleted**: no output. |
+| 8 | No workload cluster Kubernetes or container runtime upgrade is in progress on either global cluster, and cluster-transformer on the standby has been restarted afterwards. | Step 1 | See [Prepare both global clusters](#prepare). |
+| 9 | The token rotator of the Alauda cluster API provider is disabled on the standby. | Steps 1 and 6 | Precheck script, section **Token rotator**: the value is `false`. |
+| 10 | etcd Synchronizer start delay (`--delay`) is 30 seconds or more. The default is `3m0s`. | Steps 1 and 6 | Precheck script, section **etcd Synchronizer**. |
+| 11 | The DR marker `kube-public/etcd-sync` exists. | Steps 3 and 6 | Precheck script, section **DR marker**. |
+| 12 | etcd Synchronizer is paused. | After step 3, step 6 | Precheck script, section **etcd Synchronizer**: `mode`, `status.phase`, and `status.observedMode` are all `Paused`. |
+| 13 | The target-version artifacts, including the ACP 4.5 etcd Synchronizer package, are published to the standby. | Before step 6 | See [Upgrade the standby global cluster](#upgrade-standby). |
+| 14 | The standby can reach the primary API server at `https://<active-cluster-vip>:6443`, the active-cluster token Secret is valid, and cert-manager on the standby is healthy. | Before steps 6 and 7 | See [Check access to the primary global cluster](#check-primary-access). |
+| 15 | Before resume, etcd Synchronizer on the standby is the ACP 4.5 release and is still paused. | End of step 6 | Precheck script, section **etcd Synchronizer**. |
+
+### Precheck Script \{#precheck-script}
+
+The script is read-only. Run it on the standby global cluster in step 1, after the pause in step 3, and again at the start of step 6. Resource types that are not installed are skipped.
+
+```bash
+#!/usr/bin/env bash
+# Read-only checks for a deferred standby upgrade. Run on the standby global cluster.
+set -uo pipefail
+
+echo "== Objects being deleted (expected: no output) =="
+available=$(kubectl api-resources -o name 2>/dev/null)
+resources=(
+  clusters.cluster.x-k8s.io machinedeployments.cluster.x-k8s.io machinesets.cluster.x-k8s.io
+  machines.cluster.x-k8s.io machinepools.cluster.x-k8s.io
+  kubeadmcontrolplanes.controlplane.cluster.x-k8s.io
+  machinepools.machine.alauda.io
+  backupstoragelocationrepoes.ait.velero.io
+  machineinventories.elemental.cattle.io
+)
+# Every infrastructure provider kind that ends with Machine, VM, or Pool.
+while read -r name kind; do
+  [[ "$kind" =~ (Machine|VM|Pool)$ ]] && resources+=("${name}.infrastructure.cluster.x-k8s.io")
+done < <(kubectl api-resources --api-group=infrastructure.cluster.x-k8s.io --no-headers 2>/dev/null \
+  | awk '{print $1, $NF}')
+for r in "${resources[@]}"; do
+  grep -qx "$r" <<<"$available" || continue
+  kubectl get "$r" -A \
+    -o jsonpath='{range .items[?(@.metadata.deletionTimestamp)]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' \
+    | sed "s|^|deleting $r: |"
+done
+
+echo "== Token rotator (expected: false) =="
+kubectl -n cpaas-system get deploy cluster-api-provider-alauda-manager \
+  -o jsonpath='{.spec.template.spec.containers[?(@.name=="cluster-api-provider-alauda")].env[?(@.name=="CLUSTER_TOKEN_ROTATOR_ENABLED")].value}{"\n"}'
+
+echo "== DR marker (expected: configmap/etcd-sync) =="
+kubectl -n kube-public get cm etcd-sync -o name
+
+echo "== etcd Synchronizer =="
+echo "image:"
+kubectl -n cpaas-system get deploy etcd-sync -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}'
+echo "start delay (expected: --delay of 30s or more; no flag means the default 3m0s):"
+kubectl -n cpaas-system get deploy etcd-sync -o jsonpath='{.spec.template.spec.containers[*].args}{"\n"}' \
+  | tr ',' '\n' | grep -- '--delay' || echo "--delay not set"
+echo "leader:"
+kubectl -n cpaas-system get lease etcd-sync-mirror -o jsonpath='{.spec.holderIdentity}{"\n"}'
+echo "mode, status.phase, status.observedMode:"
+kubectl -n cpaas-system get cm etcd-sync-control \
+  -o jsonpath='{.data.mode}{" "}{.data.status\.phase}{" "}{.data.status\.observedMode}{"\n"}{.data.status\.pauseCheck}{"\n"}' \
+  2>/dev/null || echo "control ConfigMap not created yet"
+
+echo "== Cluster API and provider images =="
+kubectl -n cpaas-system get deploy \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.template.spec.containers[*].image}{"\n"}{end}' \
+  | grep -E 'cluster-api|capv|vsphere|dcs|hcs|baremetal'
+```
+
+Keep the output of each run with the change record.
+
+### Check Synchronization Status \{#check-sync-status}
+
+Run on the standby global cluster:
+
+```bash
+mirror_svc=$(kubectl get svc -n cpaas-system etcd-sync-monitor -o jsonpath='{.spec.clusterIP}')
+ipv6_regex="^[0-9a-fA-F:]+$"
+if [[ $mirror_svc =~ $ipv6_regex ]]; then
+  mirror_host="[$mirror_svc]"
+else
+  mirror_host="$mirror_svc"
+fi
+curl -g "http://${mirror_host}/check"
+```
+
+- Missed keys exist on the primary but not on the standby. Surplus keys exist on the standby but not on the primary. For details, see [Routine Checks](/install/global_dr.mdx).
+- While etcd Synchronizer is paused, the monitor of ACP 4.2, 4.3, and 4.4 releases keeps comparing both sides and reports many missed and surplus keys. This is expected and does not require action.
+- From ACP 4.5, the monitor detects the pause: `/check` returns `paused: true` and the paused revision instead of a comparison. To run the comparison anyway, request `/check?force=true`.
+
+### Check Access to the Primary Global Cluster \{#check-primary-access}
+
+Upgrading etcd Synchronizer runs the `etcd-sync-bootstrap` Job, which reads the etcd CA from the primary global cluster with the active-cluster token. Before steps 6 and 7, confirm on the standby global cluster that this access works.
+
+Set the primary VIP and the name of the Secret configured in **Active Global Cluster Token Secret** (usually `etcd-sync-active-cluster-token`). The token is passed to `curl` through standard input and is not printed or stored:
+
+```bash
+ACTIVE_VIP='<active-cluster-vip>'          # Use [<address>] for an IPv6 address.
+TOKEN_SECRET='etcd-sync-active-cluster-token'
+
+{ printf 'Authorization: Bearer '
+  kubectl -n cpaas-system get secret "$TOKEN_SECRET" -o jsonpath='{.data.token}' | base64 -d
+  printf '\n'
+} | curl -sk -H @- -o /dev/null -w '%{http_code}\n' \
+  "https://${ACTIVE_VIP}:6443/api/v1/namespaces/cpaas-system/secrets/etcd-ca"
+```
+
+The expected result is `200`. `401` means the token is no longer valid, `403` means the token lacks permission, and `000` means the API server is not reachable. Refresh the token Secret as described in [Upgrade Global Clusters in a DR Environment](./upgrade_global_dr.mdx#global-dr-procedure) if needed. Updating the Secret does not change the pause state.
+
+Confirm that cert-manager and the etcd client certificate on the standby are healthy:
+
+```bash
+kubectl get po -n cert-manager
+kubectl get certificate -n cpaas-system remote-etcd-client
+```
+
+All cert-manager Pods are `Running`, and the certificate is `READY=True`.
+
+## Upgrade Procedure \{#procedure}
+
+<Steps>
+
+### Prepare both global clusters \{#prepare}
+
+1. Confirm prerequisites 1 to 4 and record the component versions.
+2. Confirm that the standby is consistent with the primary. See [Check synchronization status](#check-sync-status). If missed or surplus keys are reported, resolve or explain each key before you continue, and contact technical support when in doubt.
+3. Run the [precheck script](#precheck-script). If objects are being deleted, resolve them on the **primary** global cluster, for example by letting the deletion finish, and wait until the change is synchronized to the standby.
+4. On **both** global clusters, confirm that no workload cluster Kubernetes or container runtime upgrade is in progress. From ACP 4.3, no workload cluster reports `Reconciling=True`:
+
+   ```bash
+   kubectl -n cpaas-system get cvsh \
+     -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.conditions[?(@.type=="Reconciling")].status}{"\n"}{end}'
+   ```
+
+   On ACP 4.2, confirm in the Web Console that no cluster is upgrading.
+
+5. Restart cluster-transformer on the **standby** global cluster and wait until the new Pods are `Running`:
+
+   ```bash
+   kubectl delete po -n cpaas-system -l service_name=cluster-transformer
+   kubectl get po -n cpaas-system -l service_name=cluster-transformer
+   ```
+
+6. Disable the token rotator of the Alauda cluster API provider on the **standby** global cluster. Otherwise, the standby can revoke workload cluster access tokens that the primary is still using.
+
+   ```bash
+   kubectl -n cpaas-system set env deploy/cluster-api-provider-alauda-manager \
+     -c cluster-api-provider-alauda CLUSTER_TOKEN_ROTATOR_ENABLED=false
+   kubectl -n cpaas-system rollout status deploy/cluster-api-provider-alauda-manager
+   ```
+
+   With the token rotator disabled, the access tokens stored on the standby expire as the primary rotates them, so the standby can lose access to workload clusters during the mixed-version period. This is expected. Access is restored when synchronization resumes.
+
+7. Confirm that the etcd Synchronizer start delay is 30 seconds or more (prerequisite 10). If it is lower, contact technical support before you continue.
+
+### Upgrade etcd Synchronizer on the standby to a pause-capable release \{#upgrade-etcd-sync-patch}
+
+Pause mode requires the etcd Synchronizer patch release for your source version that supports pause mode. See the etcd Synchronizer release notes for the release that matches your source version. Without this release, synchronization cannot be paused and this procedure cannot be used.
+
+1. Publish the etcd Synchronizer package to the standby global cluster with `violet push`. See [Upload Packages](/extend/upload_package.mdx#violet_push_usage).
+2. Access the **standby global cluster** Web Console through its VIP and switch to **Administrator** view.
+3. Navigate to **Marketplace > Cluster Plugins** and select the `global` cluster.
+4. Find **<Term name="product" /> etcd Synchronizer** and upgrade it to the pause-capable release. Do not uninstall it.
+5. Wait until the plugin upgrade completes, the etcd Synchronizer Pods are `Running`, and Lease `etcd-sync-mirror` has a holder. Then wait for the full synchronization to finish:
+
+   ```bash
+   kubectl get po -n cpaas-system -l app=etcd-sync
+   leader_pod=$(kubectl get lease -n cpaas-system etcd-sync-mirror -o jsonpath='{.spec.holderIdentity}')
+   kubectl logs -n cpaas-system "$leader_pod" | grep -E "Acquired leader lease|Start Sync update"
+   ```
+
+6. Repeat [Check synchronization status](#check-sync-status) and run the [precheck script](#precheck-script) again. Continue only when both pass.
+
+### Pause etcd synchronization \{#pause}
+
+Run on the **standby** global cluster.
+
+1. Create the control ConfigMap with `mode=Paused`. Use `reason` to record a change reference:
+
+   ```bash
+   kubectl -n cpaas-system create configmap etcd-sync-control \
+     --from-literal=mode=Paused \
+     --from-literal=reason="Deferred standby upgrade to ACP 4.5"
+   ```
+
+2. Wait until `mode`, `status.phase`, and `status.observedMode` are all `Paused`. The etcd Synchronizer container restarts once during the transition; this is expected.
+
+   ```bash
+   kubectl -n cpaas-system get cm etcd-sync-control \
+     -o jsonpath='{.data.mode}{" "}{.data.status\.phase}{" "}{.data.status\.observedMode}{"\n"}{.data.status\.message}{"\n"}'
+   ```
+
+   The expected first line is `Paused Paused Paused`. `status.phase=Pausing` means the pause is still in progress.
+
+   If `status.phase` and `status.observedMode` stay empty, the running etcd Synchronizer does not support pause mode and **synchronization is still running**. Do not upgrade the primary global cluster. Return to [the previous step](#upgrade-etcd-sync-patch).
+
+3. Record the pause result and keep it with the change record:
+
+   ```bash
+   kubectl -n cpaas-system get cm etcd-sync-control \
+     -o jsonpath='{.data.status\.pausedAt}{" "}{.data.status\.pausedRevision}{" "}{.data.status\.etcdClusterID}{"\n"}'
+   kubectl -n cpaas-system get cm etcd-sync-control -o jsonpath='{.data.status\.pauseCheck}' | jq .
+   kubectl -n cpaas-system get cm etcd-sync-control -o yaml > etcd-sync-control-paused.yaml
+   ```
+
+   `status.pausedRevision` and `status.etcdClusterID` identify the standby etcd at the pause. They are used to decide which keys can be deleted when synchronization resumes.
+
+4. Review `status.pauseCheck`. It is a read-only self-check that applies the resume deletion rules at the time of the pause:
+
+   - `unexpected` is the number of keys on the standby that would be deleted on resume because they do not exist on the primary. The expected value is `0`.
+   - If `unexpected` is greater than `0`, review the keys in `samples`. They are usually objects that exist only on the standby or leftovers from earlier synchronization. If any of them must be kept, contact technical support; the resume step can be run without deletion.
+   - If `error` is set, the self-check could not reach the primary global cluster. The pause is still in effect. Contact technical support if you need the self-check result before you continue.
+
+5. Confirm that the DR marker still exists:
+
+   ```bash
+   kubectl -n kube-public get cm etcd-sync
+   ```
+
+   While paused, the `data.status` field of this ConfigMap can still show that synchronization is in progress. Use `cpaas-system/etcd-sync-control` as the source of truth for the pause state.
+
+6. Run the [precheck script](#precheck-script) again and keep the output.
+
+### Upgrade the primary global cluster \{#upgrade-primary}
+
+Upgrade the **primary** global cluster to ACP 4.5 with the standard workflow in [Upgrade the global cluster](./upgrade_global_cluster.mdx): sync upgrade artifacts, run preflight checks, deploy the cluster version operator, request the upgrade, and observe execution until the primary reaches the target version.
+
+Do not run the steps of [Upgrade Global Clusters in a DR Environment](./upgrade_global_dr.mdx) in this window. In particular, do not uninstall or reinstall etcd Synchronizer on the standby.
+
+### Upgrade workload clusters from the primary global cluster \{#upgrade-workload}
+
+Upgrade the workload clusters from the **primary** global cluster by following [Upgrade Workload Clusters](./upgrade_workload_cluster.mdx). In this procedure, the rule that both global clusters must reach the target version first does not apply: workload clusters are upgraded after the primary global cluster and before the standby global cluster.
+
+Do not perform any workload cluster operation from the standby global cluster.
+
+### Upgrade the standby global cluster \{#upgrade-standby}
+
+Run this step in the later maintenance window, on the **standby** global cluster unless stated otherwise.
+
+1. Run the [precheck script](#precheck-script). All items must pass. If the token rotator value is no longer `false`, disable it again as described in [Prepare both global clusters](#prepare).
+2. Publish the ACP 4.5 artifacts to the standby global cluster with [Sync upgrade artifacts](./upgrade_global_cluster.mdx#sync-upgrade-artifacts). Use the same registry type and target-version payload as for the primary. In addition, publish the ACP 4.5 **<Term name="product" /> etcd Synchronizer** package to the standby with `violet push`. An inventory taken on the primary does not list etcd Synchronizer because it is installed only on the standby.
+3. [Check access to the primary global cluster](#check-primary-access). The etcd Synchronizer upgrade during the standby upgrade fails if the primary is not reachable or the token is not valid.
+4. Run the standard workflow of [Upgrade the global cluster](./upgrade_global_cluster.mdx) with the ACP 4.5 package: run `bash upgrade.sh --preflight`, deploy the cluster version operator, request the upgrade, and observe execution.
+
+   - On ACP 4.3 and 4.4 sources, do not request the upgrade on the standby before `upgrade.sh` has deployed the ACP 4.5 cluster version operator.
+   - On the standby global cluster, preflight runs the additional check `DRSplitUpgradeWindow`. It confirms that etcd Synchronizer is paused, the DR marker exists, no objects are being deleted, and the token rotator is disabled. If it fails, see [Troubleshooting](#drsplitupgradewindow).
+   - On the standby global cluster, `VersionUpgradePath` checks only the standby global cluster itself, and the pre-upgrade etcd backup covers only the standby global cluster.
+   - Administrator acknowledgements are not synchronized between global clusters. If `AdminAckRequired` fails, record the acknowledgement on the standby as described in [Handle Administrator Acknowledgement Gates](./troubleshooting.mdx#handle-administrator-acknowledgement-gates).
+
+5. After the standby reaches ACP 4.5, confirm that etcd Synchronizer is the ACP 4.5 release and is still paused:
+
+   ```bash
+   kubectl -n cpaas-system get deploy etcd-sync -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}'
+   kubectl -n cpaas-system get cm etcd-sync-control \
+     -o jsonpath='{.data.mode}{" "}{.data.status\.phase}{" "}{.data.status\.observedMode}{"\n"}'
+   ```
+
+   The upgrade normally moves etcd Synchronizer to ACP 4.5 while it stays `Paused`. If etcd Synchronizer is still the earlier release, upgrade it to ACP 4.5 from **Marketplace > Cluster Plugins** in the standby Web Console while it is paused, and check again. Do not resume synchronization with the earlier release.
+
+### Resume etcd synchronization \{#resume}
+
+Run on the **standby** global cluster after it has reached ACP 4.5.
+
+1. Confirm [access to the primary global cluster](#check-primary-access) again.
+2. Set `mode=Running`:
+
+   ```bash
+   kubectl -n cpaas-system patch cm etcd-sync-control --type merge -p '{"data":{"mode":"Running"}}'
+   ```
+
+3. Wait until `status.phase` is `Running`. The phase changes to `Resuming` first and the etcd Synchronizer container restarts once. Resume starts after the etcd Synchronizer start delay (3 minutes by default), and its duration depends on the amount of synchronized data.
+
+   ```bash
+   kubectl -n cpaas-system get cm etcd-sync-control \
+     -o jsonpath='{.data.status\.phase}{"\n"}{.data.status\.message}{"\n"}'
+   ```
+
+   If the phase stays `Resuming`, see [Resume does not complete](#resume-stuck).
+
+4. Review the resume summary and keep it with the change record:
+
+   ```bash
+   kubectl -n cpaas-system get cm etcd-sync-control -o jsonpath='{.data.status\.lastResume}' | jq .
+   kubectl -n cpaas-system get cm etcd-sync-control -o jsonpath='{.data.status\.deleteBlocked}{"\n"}'
+   ```
+
+   | Field | Meaning | Expected |
+   | --- | --- | --- |
+   | `putKeys` | Keys copied from the primary. | Greater than `0`. |
+   | `candidates` | Keys that existed on the standby before the pause and are in deletion scope. | — |
+   | `deleted` | Keys deleted because they no longer exist on the primary, such as objects removed on the primary during the mixed-version period. `samples` lists up to 20 of them. | Consistent with the deletions made on the primary. |
+   | `deleteSkipped` | `true` if no keys were deleted on purpose. | `false` |
+   | `deleteSkipReason` | Why deletion was skipped. | Empty |
+
+   If `deleteSkipped` is `true`:
+
+   - `PutOnly`: deletion was skipped because `resumePolicy=PutOnly` was set.
+   - `ClusterIDChanged`, `RevisionRewound`, or `NoPauseRecord`: the standby etcd changed during the mixed-version period, for example it was restored from a snapshot or rebuilt, or the pause record was lost. etcd Synchronizer cannot safely tell which keys to delete, so it only copied data. The same reason is kept in `status.deleteBlocked`, and every retry in this pause cycle also skips deletion.
+
+   In both cases, keys deleted on the primary during the mixed-version period can remain on the standby. Review the surplus keys in the next step and contact technical support before you remove any of them.
+
+### Verify synchronization and restore the baseline \{#verify}
+
+1. Run [Check synchronization status](#check-sync-status) on the standby global cluster.
+
+   - Missed keys must be empty. If missed keys are reported, recreate the current etcd Synchronizer leader Pod and check again:
+
+     ```bash
+     leader_pod=$(kubectl get lease -n cpaas-system etcd-sync-mirror -o jsonpath='{.spec.holderIdentity}')
+     kubectl delete po -n cpaas-system "$leader_pod"
+     ```
+
+   - Review every surplus key. Surplus keys can be leftovers from earlier synchronization or local standby objects. Do not delete them without confirming with technical support.
+
+2. Remove the token rotator override on the standby global cluster:
+
+   ```bash
+   kubectl -n cpaas-system set env deploy/cluster-api-provider-alauda-manager \
+     -c cluster-api-provider-alauda CLUSTER_TOKEN_ROTATOR_ENABLED-
+   kubectl -n cpaas-system rollout status deploy/cluster-api-provider-alauda-manager
+   ```
+
+3. Keep `cpaas-system/etcd-sync-control` with `mode=Running`. It records the last pause and resume.
+
+The mixed-version period ends here. The standby global cluster is a usable DR target again. Continue with [Upgrade Validation](./validation.mdx) and the [Routine Checks](/install/global_dr.mdx) of global DR.
+
+</Steps>
+
+## Control ConfigMap Reference \{#control-configmap-reference}
+
+`cpaas-system/etcd-sync-control` exists only on the standby global cluster. It is not managed by the plugin and is not synchronized. etcd Synchronizer reads it every 5 seconds. When the ConfigMap does not exist, etcd Synchronizer runs normally.
+
+Keys written by the operator:
+
+| Key | Values | Description |
+| --- | --- | --- |
+| `mode` | `Running` or `Paused` (case-sensitive) | Requested state. |
+| `reason` | Free text | Change reference for auditing. |
+| `maxDeleteRatio` | Decimal number greater than `0` and up to `1`; default `0.2` | Maximum share of deletion candidates that resume may delete. If exceeded, resume stops before deleting anything. |
+| `resumePolicy` | Empty or `PutOnly` | `PutOnly` resumes by copying data only, without deleting keys. |
+
+Keys written by etcd Synchronizer (read-only):
+
+| Key | Description |
+| --- | --- |
+| `status.phase` | Current state: `Running`, `Pausing`, `Paused`, or `Resuming`. |
+| `status.observedMode` | The `mode` value that the current phase responds to. |
+| `status.pausedAt` | Time the pause completed. |
+| `status.pausedRevision` | Revision of the standby etcd at the pause. |
+| `status.etcdClusterID` | Cluster ID of the standby etcd at the pause. |
+| `status.pauseCheck` | JSON result of the self-check at the pause: `candidates`, `unexpected`, `samples`, and `error`. |
+| `status.lastResume` | JSON summary of the last resume: `putKeys`, `candidates`, `deleted`, `deleteSkipped`, `deleteSkipReason`, `samples`, and timestamps. |
+| `status.deleteBlocked` | Set when deletion is disabled for the current pause cycle: `ClusterIDChanged`, `RevisionRewound`, or `NoPauseRecord`. Cleared by the next pause. |
+| `status.message` | Reason for a wait or a failure. |
+| `status.lastTransitionTime`, `status.holder` | Time of the last phase change and the Pod that wrote the status. |
+
+Changes to `mode` are ignored while the phase is `Pausing` or `Resuming`; they take effect after the transition completes. An invalid `maxDeleteRatio` or `resumePolicy` keeps etcd Synchronizer in `Paused` and is reported in `status.message`.
+
+## Troubleshooting \{#troubleshooting}
+
+### `DRSplitUpgradeWindow` Preflight Failures \{#drsplitupgradewindow}
+
+`DRSplitUpgradeWindow` runs only when the `global` cluster that is being upgraded has the DR marker, that is, on the standby global cluster. Read its result with the commands in [Inspect Upgrade State](./troubleshooting.mdx#inspect-upgrade-state).
+
+| Reason | Cause | Action |
+| --- | --- | --- |
+| `EtcdSyncNotPaused` | `cpaas-system/etcd-sync-control` does not exist, or `mode`, `status.phase`, and `status.observedMode` are not all `Paused`. | If `status.phase` is `Pausing`, wait until it is `Paused` and rerun preflight. In all other cases, synchronization may have run during the mixed-version period: stop and contact technical support. Do not pause or resume on your own. |
+| `DRMarkerMissing` | `kube-public/etcd-sync` was removed, for example because etcd Synchronizer was uninstalled. | Stop and contact technical support. Do not reinstall etcd Synchronizer on your own. |
+| `DeletingObjectsPresent` | Objects in the frozen standby data are being deleted. The message lists up to five of them. | Stop and contact technical support. These objects should have been resolved before the pause. |
+| `TokenRotatorEnabled` | The token rotator is enabled or its rollout is not finished. | Disable it as described in [Prepare both global clusters](#prepare), wait for the rollout, and rerun preflight. |
+| `DRSplitUpgradeWindowNotReady` | More than one of the above failed. The message lists each failed item with its reason. | Resolve each listed item. |
+| `DependencyReadFailed` | An object or the API discovery could not be read. | Check the API server health of the standby global cluster and rerun preflight. This result is retried automatically. |
+
+`DRSplitUpgradeWindow` blocks the upgrade by default. Setting `spec.desiredUpdate.force` on the `ClusterVersionShadow` lets the upgrade continue past a failed check and records the failure in `status.history[0].acceptedRisks`. A forced upgrade can leave the standby global cluster or workload clusters in a state the platform has not validated. Use `force` only under the guidance of technical support. `DependencyReadFailed` cannot be forced.
+
+### Resume Does Not Complete \{#resume-stuck}
+
+If `status.phase` stays `Resuming`, read `status.message`:
+
+```bash
+kubectl -n cpaas-system get cm etcd-sync-control \
+  -o jsonpath='{.data.status\.message}{"\n"}{.data.status\.lastResume}{"\n"}'
+```
+
+- **The primary is unreachable or a query failed.** No keys are deleted. etcd Synchronizer retries automatically. Fix [access to the primary global cluster](#check-primary-access) and wait.
+- **The delete ratio was exceeded.** The message reports the number of keys to delete, the number of candidates, and the ratio. No keys have been deleted. Compare the number with the deletions made on the primary during the mixed-version period, for example removed workload clusters or nodes. Then choose one option:
+
+  - If the number is expected, raise the ratio. Resume restarts and deletes the keys:
+
+    ```bash
+    kubectl -n cpaas-system patch cm etcd-sync-control --type merge -p '{"data":{"maxDeleteRatio":"0.5"}}'
+    ```
+
+  - If you are not sure, resume without deletion. Keys deleted on the primary during the mixed-version period remain on the standby and are reported as surplus keys by `/check`:
+
+    ```bash
+    kubectl -n cpaas-system patch cm etcd-sync-control --type merge -p '{"data":{"resumePolicy":"PutOnly"}}'
+    ```
+
+  Contact technical support if the number is much larger than expected or you cannot explain it.
+
+### Other Symptoms \{#other-symptoms}
+
+| Symptom | Explanation and action |
+| --- | --- |
+| `/check` reports many missed and surplus keys while paused on ACP 4.2, 4.3, or 4.4. | Expected. The monitor of these releases does not detect the pause. |
+| `/check` returns `paused: true` on ACP 4.5. | Expected while paused. Use `/check?force=true` to run the comparison. |
+| etcd Synchronizer Pods restart repeatedly while paused. | The active-cluster token or access to the primary is no longer valid. The pause state is kept and nothing is written to the standby etcd. Fix [access to the primary global cluster](#check-primary-access) before you upgrade the standby. |
+| `kube-public/etcd-sync` shows that synchronization is in progress while paused. | Expected. Use `cpaas-system/etcd-sync-control` for the pause state. |
+
+## Related Documentation
+
+- [Overview](./overview.mdx)
+- [Upgrade Global Clusters in a DR Environment](./upgrade_global_dr.mdx)
+- [Upgrade the global cluster](./upgrade_global_cluster.mdx)
+- [Upgrade Workload Clusters](./upgrade_workload_cluster.mdx)
+- [Upgrade Validation](./validation.mdx)
+- [Upgrade Troubleshooting](./troubleshooting.mdx)
+- [Global Cluster Disaster Recovery](/install/global_dr.mdx)
