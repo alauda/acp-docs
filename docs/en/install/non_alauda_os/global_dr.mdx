@@ -1,0 +1,342 @@
+---
+weight: 50
+---
+
+# Global Cluster Disaster Recovery
+
+<Directive type="info" title="Disaster Recovery Path">
+This page documents disaster recovery for `global` clusters running on a **non-Alauda OS**. If the `global` cluster uses Alauda OS, follow [Global Cluster Disaster Recovery on Alauda OS](../alauda_os/global_dr.mdx) instead.
+</Directive>
+
+## Overview
+
+This solution is designed for disaster recovery scenarios involving the `global` cluster. The `global` cluster serves as the control plane of the platform and is responsible for managing other clusters. To ensure continuous platform service availability when the `global` cluster fails, this solution deploys two `global` clusters: a Primary Cluster and a Standby Cluster.
+
+The disaster recovery mechanism is based on real-time synchronization of etcd data from the Primary Cluster to the Standby Cluster. If the Primary Cluster becomes unavailable due to a failure, services can quickly switch to the Standby Cluster.
+
+### Supported Disaster Scenarios
+
+* Irrecoverable system-level failure of the Primary Cluster rendering it inoperable;
+* Failure of physical or virtual machines hosting the Primary Cluster, making it inaccessible;
+* Network failure at the Primary Cluster location resulting in service interruption;
+
+### Unsupported Disaster Scenarios
+
+* Failures of applications deployed within the `global` cluster;
+* Data loss caused by storage system failures (outside the scope of etcd synchronization);
+
+The roles of **Primary Cluster** and **Standby Cluster** are relative: the cluster currently serving the platform is the Primary Cluster (DNS points to it), while the standby cluster is the Standby Cluster. After a failover, these roles are swapped.
+
+## Notes
+
+* This solution only synchronizes etcd data of the `global` cluster; it does not include data from registry, chartmuseum, or other components;
+
+* Monitoring and logging data is not synchronized either. Do not store workload cluster monitoring or logging data in the Primary Cluster or the Standby Cluster: install the VictoriaMetrics Center and the log storage that aggregate workload cluster data in a dedicated workload cluster, and let each `global` cluster collect, store, and query only its own metrics and logs. Observability data held in the Primary Cluster is unavailable after a failover, so a Standby Cluster that depends on it cannot observe the platform it has just taken over;
+
+* In favor of facilitating troubleshooting and management, it is recommended to name nodes in a style like `standby-global-m1`, to indicates which cluster the node belongs to (Primary or Standby).
+
+* Disaster recovery of application data within the cluster is not supported;
+
+* Stable network connectivity is required between the two clusters to ensure reliable etcd synchronization;
+
+* If the clusters are based on heterogeneous architectures (e.g., x86 and ARM), use a dual-architecture installation package;
+
+* The following namespaces are excluded from etcd synchronization. If resources are created in these namespaces, users must back them up manually:
+
+  ```
+  cpaas-system
+  cert-manager
+  default
+  global-credentials
+  cpaas-system-global-credentials
+  kube-ovn
+  kube-public
+  kube-system
+  nsx-system
+  cpaas-solution
+  kube-node-lease
+  kubevirt
+  nativestor-system
+  operators
+  ```
+
+* If both clusters are set to use built-in image registries, container images must be uploaded separately to each;
+
+* If the Primary Cluster deploys **<Term name="company" /> DevOps Eventing v3** (knative-operator) and instances thereof, the same components must be pre-deployed in the standby cluster.
+
+## Process Overview
+
+1. Prepare a unified domain name for platform access;
+2. Point the domain to the **Primary Cluster's** VIP and install the **Primary Cluster**;
+3. Temporarily switch DNS resolution to the standby VIP to install the Standby Cluster;
+4. Copy the ETCD encryption key of the **Primary Cluster** to the nodes that will later be the control plane nodes of Standby Cluster;
+5. Install and enable **<Term name="product" /> etcd Synchronizer**;
+6. Verify sync status and perform regular checks;
+7. In case of failure, switch DNS to the standby cluster to complete disaster recovery.
+
+## Required Resources
+
+* A unified domain which will be the `Platform Access Address`, and the TLS certificate plus private key for serving HTTPS on that domain;
+* A dedicated virtual IP address for each cluster — one for the **Primary Cluster** and another for the Standby Cluster;
+
+### Network Requirements \{#network-requirements}
+
+The unified domain is a prerequisite for disaster recovery. During normal operation, the domain resolves only to the **Primary Cluster** VIP. The Standby Cluster uses the domain to access platform services on the Primary Cluster.
+
+Before installing either cluster, complete both of the following network preparations:
+
+* Configure each cluster's load balancer to forward the required TCP ports on its VIP to the control plane nodes behind that VIP. Configure port `80` only when users access the platform over HTTP.
+* Allow the required TCP ports in **both directions** between the Primary Cluster and Standby Cluster networks. Apply the rules to firewalls, security groups, router ACLs, and any other inter-site network controls.
+
+| TCP port | Service | Why it is required |
+|----------|---------|--------------------|
+| `443` | <Term name="productShort" /> platform HTTPS | The Standby Cluster uses the Platform Access Address to reach the active platform. **<Term name="product" /> etcd Synchronizer** uses this address, and logging and monitoring components send alert callbacks to it. |
+| `80` | <Term name="productShort" /> platform HTTP | Required only when users access the platform over HTTP. The connectivity requirement is otherwise the same as for port `443`. |
+| `6443` | Kubernetes API server | During installation or reinstallation of **<Term name="product" /> etcd Synchronizer**, the Standby Cluster connects to the active cluster API server to obtain the etcd CA material required for synchronization. |
+| `11443` | Built-in image registry | The Standby Cluster pulls platform and plugin images from the registry configured through the Platform Access Address. |
+| `2379` | etcd | **<Term name="product" /> etcd Synchronizer** on the Standby Cluster reads etcd data from the Primary Cluster and writes it to the local standby etcd. |
+
+The network policy must be bidirectional because the cluster roles are reversed after failover. Before failover, the effective service traffic is normally from Standby to Primary. After failover, the former Primary becomes the new Standby and must reach the new Primary on the same ports. This requirement does not make etcd replication bidirectional: **<Term name="product" /> etcd Synchronizer** runs only on the current Standby Cluster and writes synchronized data to its local etcd.
+
+## Procedure
+
+### Step 1: Install the Primary Cluster
+
+<Directive type="warning" title="NOTES OF DR (Disaster Recovery Environment) INSTALLING">
+While installing the primary cluster of the DR Environment,
+
+* First of all, documenting all of the parameters set while following the guide of the installation web UI. It is necessary to keep some options the same while installing the standby cluster.
+* A **User-provisioned** Load Balancer MUST be preconfigured to route traffic sent to the virtual IP. The `Self-built VIP` option is NOT available.
+* The `Platform Access Address` field MUST be a domain, while the `Cluster Endpoint` MUST be the virtual IP address.
+* Both clusters MUST be configured to use `An Existing Certificate` (has be the same one), request a legit certificate if necessary. The `Self-signed Certificate` option is NOT available.
+* When `Image Repository` is set to `Platform Deployment`, both `Username` and `Password` fields MUST NOT be empty; The `IP/Domain` field MUST be set to the domain used as the `Platform Access Address`.
+* Both `HTTP Port` and `HTTPS Port` fields of `Platform Access Address` MUST be 80 and 443.
+* When coming to the second page the of the installation guide (Step: `Advanced`), the `Other Platform Access Addresses` field MUST include the virtual IP of current Cluster.
+</Directive>
+
+Refer to the following documentation to complete installation:
+
+* [Prepare for Installation](../prepare/index.mdx)
+* [Installing](./installing.mdx)
+
+### Step 2: Install the Standby Cluster
+
+1. Temporarily point the domain name to the standby cluster's VIP;
+2. Log into the first control plane node of the **Primary Cluster** and copy the etcd encryption config to all standby cluster control plane nodes:
+
+    ```bash
+    # Assume the primary cluster control plane nodes are 1.1.1.1, 2.2.2.2 & 3.3.3.3
+    # and the standby cluster control plane nodes are 4.4.4.4, 5.5.5.5 & 6.6.6.6
+    for i in 4.4.4.4 5.5.5.5 6.6.6.6  # Replace with standby cluster control plane node IPs
+    do
+      ssh "<user>@$i" "sudo mkdir -p /etc/kubernetes/"
+      scp /etc/kubernetes/encryption-provider.conf "<user>@$i:/tmp/encryption-provider.conf"
+      ssh "<user>@$i" "sudo install -o root -g root -m 600 /tmp/encryption-provider.conf /etc/kubernetes/encryption-provider.conf && rm -f /tmp/encryption-provider.conf"
+    done
+    ```
+
+3. Install the standby cluster in the same way as the primary cluster
+
+<Directive type="warning" title="NOTES FOR INSTALLING STANDBY CLUSTER">
+While installing the standby cluster of the DR Environment,
+the following options MUST be set to the same as the **primary cluster**:
+* The `Platform Access Address` field.
+* All fields of `Certificate`.
+* All fields of `Image Repository`
+* Important: ensure the credentials of image repository and the <Term name="productShort" /> admin user match those set on the **Primary Cluster**.
+
+and MAKE SURE you followed the `NOTES OF DR (Disaster Recovery Environment) INSTALLING` in Step 1.
+</Directive>
+
+Refer to the following documentation to complete installation:
+
+* [Prepare for Installation](../prepare/index.mdx)
+* [Installing](./installing.mdx)
+
+### Step 3: Enable etcd Synchronization \{#etcd_sync}
+
+1. Before installing the plugin, get the bearer token for accessing the active global cluster API server from the active global cluster. Copy the command output and use it when creating the `etcd-sync-active-cluster-token` Secret in the standby global cluster under the `cpaas-system` namespace. The Secret stores the token under the data key `token`.
+
+   ```bash
+   # Run this command on the active cluster.
+   kubectl -n cpaas-system get secret k8sadmin -o jsonpath='{.data.token}' | base64 -d
+   ```
+
+   Copy the output value, then run this command on the standby cluster:
+
+   ```bash
+   ACTIVE_CLUSTER_TOKEN='<paste-the-token-from-the-active-cluster>'
+   kubectl -n cpaas-system create secret generic etcd-sync-active-cluster-token \
+     --from-literal=token="${ACTIVE_CLUSTER_TOKEN}" \
+     --dry-run=client -o yaml | kubectl apply -f -
+   ```
+
+2. When applicable, configure the load balancer to forward port `2379` to control plane nodes of the corresponding cluster. ONLY TCP mode is supported; forwarding on L7 is not supported.
+
+    :::info
+    Port forwarding through a load balancer is not required.
+    If direct access from the standby cluster to the active global cluster is available, specify the etcd addresses via **Active Global Cluster ETCD Endpoints**.
+    :::
+
+3. Access the **standby global cluster** Web Console using its VIP, and switch to **Administrator** view.
+4. Navigate to **Marketplace > Cluster Plugins**, select the `global` cluster.
+5. Find **<Term name="product" /> etcd Synchronizer**, click **Install**, and configure these parameters:
+
+   * Set **Active Global Cluster VIP** to the VIP of the active global cluster.
+   * When not forwarding port `2379` through the load balancer, configure **Active Global Cluster ETCD Endpoints** correctly.
+   * Set **Standby Cluster ETCD Endpoints** to the standby cluster etcd address. Use the default value unless the local etcd service is exposed through a different endpoint.
+   * Set **Active Global Cluster Token Secret** to `etcd-sync-active-cluster-token`.
+   * Use the default value of **Data Check Interval**.
+   * Leave **Print detail logs** disabled unless troubleshooting.
+
+During installation, the system runs the `etcd-sync-bootstrap` Job before the `etcd-sync` Deployment starts. The plugin installation continues only after the Job prepares `remote-etcd-ca`, `remote-etcd-issuer`, and `remote-etcd-client`.
+
+Verify the bootstrap Job and runtime resources:
+
+```bash
+kubectl get job -n cpaas-system etcd-sync-bootstrap
+kubectl logs -n cpaas-system job/etcd-sync-bootstrap
+kubectl get secret -n cpaas-system remote-etcd-ca
+kubectl get issuer -n cpaas-system remote-etcd-issuer
+kubectl get certificate -n cpaas-system remote-etcd-client
+kubectl get secret -n cpaas-system remote-etcd-client
+```
+
+Verify the sync Pods are running on the standby cluster and identify the current leader:
+
+```bash
+kubectl get po -n cpaas-system -l app=etcd-sync
+kubectl get lease -n cpaas-system etcd-sync-mirror
+leader_pod=$(kubectl get lease -n cpaas-system etcd-sync-mirror -o jsonpath='{.spec.holderIdentity}')
+kubectl logs -n cpaas-system "$leader_pod" | grep -E "Acquired leader lease|Start Sync update"
+```
+
+If resources with `ownerReference` dependencies need to be resynchronized, recreate the current leader Pod after `Start Sync update` appears:
+
+```bash
+leader_pod=$(kubectl get lease -n cpaas-system etcd-sync-mirror -o jsonpath='{.spec.holderIdentity}')
+kubectl delete po -n cpaas-system "$leader_pod"
+```
+
+Check sync status:
+
+```bash
+mirror_svc=$(kubectl get svc -n cpaas-system etcd-sync-monitor -o jsonpath='{.spec.clusterIP}')
+ipv6_regex="^[0-9a-fA-F:]+$"
+if [[ $mirror_svc =~ $ipv6_regex ]]; then
+  mirror_host="[$mirror_svc]"
+else
+  mirror_host="$mirror_svc"
+fi
+curl -g "http://${mirror_host}/check"
+```
+
+**Output explanation:**
+
+* `LOCAL ETCD missed keys`: Keys exist in the Primary but are missing from the standby. Often caused by GC due to resource order during sync. Restart the current etcd-sync leader Pod to fix;
+* `LOCAL ETCD surplus keys`: Extra keys exist only in the standby cluster. Confirm with ops team before deleting these keys from the standby.
+
+If the following components are installed, restart their services:
+
+* <Term name="product" /> Log Storage for Elasticsearch:
+
+  ```bash
+  kubectl delete po -n cpaas-system -l service_name=cpaas-elasticsearch
+  ```
+
+* <Term name="product" /> Monitoring for VictoriaMetrics:
+
+  ```bash
+  kubectl delete po -n cpaas-system -l 'service_name in (alertmanager,vmselect,vminsert)'
+  ```
+
+## Disaster Recovery Process
+
+<Directive type="danger" title="Verify primary/standby consistency before uninstalling Alauda Container Platform etcd Synchronizer">
+This procedure uninstalls **<Term name="product" /> etcd Synchronizer**. Before you uninstall it, confirm that the standby cluster data is consistent with the primary cluster. Uninstalling the plugin while the standby is missing data that the primary holds can cause owner references to resolve incorrectly, and workload-cluster node `Machine` objects — including Alauda OS clusters, where this destroys the backing virtual machine — may be deleted. If the consistency check reports missing or surplus keys, do not uninstall the plugin; resolve the inconsistency or contact technical support first.
+</Directive>
+
+1. Restart Elasticsearch on the standby cluster in case it is necessary:
+
+    ```bash
+    # Copy installer/res/packaged-scripts/for-upgrade/ensure-asm-template.sh to /root:
+    # DO NOT skip this step
+
+    # switch to the root user if necessary
+    sudo -i
+
+    # check whether the Log Storage for Elasticsearch is installed on global cluster
+    _es_pods=$(kubectl get po -n cpaas-system | grep cpaas-elasticsearch | awk '{print $1}')
+    if [[ -n "${_es_pods}" ]]; then
+        # In case the script returned the 401 error, restart Elasticsearch
+        # then execute the script to check the cluster again
+        bash /root/ensure-asm-template.sh
+
+        # Restart Elasticsearch
+        xargs -r -t -- kubectl delete po -n cpaas-system <<< "${_es_pods}"
+    fi
+    ```
+
+2. Verify data consistency in the standby cluster (same check as in [Step 3](#etcd_sync)). If the check reports missing or surplus keys, the standby is not consistent with the primary: do not continue to the next step. Resolve the inconsistency or contact technical support first. On **both** clusters, also confirm that no `Machine` nodes are in a non-running state, and resolve any that are before continuing:
+
+    ```bash
+    kubectl get machines.platform.tkestack.io
+    ```
+
+3. Uninstall **<Term name="product" /> etcd Synchronizer**;
+4. Remove port forwarding for `2379` from both VIPs;
+5. Switch the platform domain DNS to the standby VIP, which now becomes the Primary Cluster;
+6. Verify DNS resolution:
+
+    ```bash
+    kubectl exec -it -n cpaas-system deployments/sentry -- nslookup <platform access domain>
+    # If not resolved correctly, restart coredns Pods and retry until success
+    ```
+
+7. Clear browser cache and access the platform page to confirm it reflects the former standby cluster;
+8. Restart the following services (if installed):
+
+    * <Term name="product" /> Log Storage for Elasticsearch:
+
+      ```bash
+      kubectl delete po -n cpaas-system -l service_name=cpaas-elasticsearch
+      ```
+    * <Term name="product" /> Monitoring for VictoriaMetrics:
+
+      ```bash
+      kubectl delete po -n cpaas-system -l 'service_name in (alertmanager,vmselect,vminsert)'
+      ```
+    * cluster-transformer:
+
+      ```bash
+      kubectl delete po -n cpaas-system -l service_name=cluster-transformer
+      ```
+
+9. If workload clusters send monitoring data to the Primary, restart warlock in the workload cluster:
+
+    ```bash
+    kubectl delete po -n cpaas-system -l service_name=warlock
+    ```
+
+10. On the original Primary Cluster, repeat the [Enable etcd Synchronization](#etcd_sync) steps to convert it into the new standby cluster.
+
+## Routine Checks
+
+Regularly check sync status on the standby cluster:
+
+```bash
+mirror_svc=$(kubectl get svc -n cpaas-system etcd-sync-monitor -o jsonpath='{.spec.clusterIP}')
+ipv6_regex="^[0-9a-fA-F:]+$"
+if [[ $mirror_svc =~ $ipv6_regex ]]; then
+  mirror_host="[$mirror_svc]"
+else
+  mirror_host="$mirror_svc"
+fi
+curl -g "http://${mirror_host}/check"
+```
+
+If any keys are missing or surplus, follow the instructions in the output to resolve them.
+
+## Uploading Packages \{#upload_dr_packages}
+
+For details of the `violet push` subcommand, please refer to [Upload Packages](../../extend/upload_package.mdx#violet_push_usage).
