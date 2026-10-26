@@ -137,6 +137,8 @@ kubectl -n cpaas-system patch configmap elemental-image-catalog \
   -p='[{"op":"add","path":"/data/<new-kubernetes-version>","value":"<registry-address>/tkestack/baremetal-base-image:<new-tag>"}]'
 ```
 
+Patching the ConfigMap creates a `ResourcePatch` that records the change. Do not delete it. Before the next platform upgrade, exempt it for the target version as described in [Handle Preflight Blocks](../../troubleshooting.mdx#handle-preflight-blocks-when-needed); otherwise the `ResourcePatchUpgradeable` preflight check blocks that upgrade.
+
 In either case, verify before continuing:
 
 ```bash
@@ -186,7 +188,7 @@ After you request the platform upgrade, the platform:
 1. Checks the cluster before changing anything and blocks the upgrade if a [preflight check](#preflight-checks) fails.
 2. Upgrades ACP Core and the Distribution Version.
 3. Upgrades Kubernetes one minor version at a time through every intermediate version to the target. The control plane is replaced at every version.
-   Worker node pools are replaced at the target version, and at an intermediate version only when the Kubernetes version skew policy requires it. The platform also sets the etcd image tag, adds the Kubernetes 1.35 kubelet setting when the version reaches 1.35, and updates the `capi.cpaas.io/kubernetes` annotation on the `Cluster`.
+   Worker node pools are replaced at the target version. At an intermediate version, a worker node pool is replaced only when skipping it would leave it more than three minor versions behind the next control plane version. The platform also sets the etcd image tag, adds the Kubernetes 1.35 kubelet setting when the version reaches 1.35, and updates the `capi.cpaas.io/kubernetes` annotation on the `Cluster`.
 
 The platform creates new `BaremetalMachineTemplate` resources for the replaced node groups and keeps the previous ones. It does not change the rollout strategy of the `KubeadmControlPlane` or the `MachineDeployment` resources.
 
@@ -216,7 +218,7 @@ kubectl -n cpaas-system get infraclusterversionpreflight <preflight-name> \
   -o jsonpath='{range .status.checks[*]}{.name}{"\t"}{.severity}{"\t"}{.state}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
 ```
 
-If the Bare Metal provider that supports automatic upgrade is installed by this platform upgrade, the checks run when the upgrade reaches the Kubernetes step instead of before it starts.
+Until the platform upgrade installs the new Bare Metal provider, the platform upgrade preflight reports `InfraClusterVersionPreflight` as a non-blocking warning with the reason `ProviderCapabilityNotDeclared`. This is expected, and you can start the upgrade. The checks below start as soon as the new provider is installed, not only when the upgrade reaches the Kubernetes step. If a blocking check fails, the upgrade stops at the Kubernetes step with the earlier stages already done, and it resumes by itself once you fix the cause. The preflight object is deleted after the upgrade succeeds.
 
 | Check | Effect when it fails | What it verifies | What to do |
 |---|---|---|---|
@@ -258,7 +260,16 @@ kubectl -n cpaas-system get infraclusterversion <cluster-name> \
 kubectl -n cpaas-system get events --field-selector involvedObject.kind=InfraClusterVersion,involvedObject.name=<cluster-name>
 ```
 
-The upgrade is complete when `PHASE` is `Succeeded` and the `Ready` condition is `True`. If the `Ready` message reports `kube-proxy rollout pending`, the upgrade has completed and kube-proxy on the workload cluster is still rolling out. Then run the checks in [Verify the Node Replacement](#verification).
+The upgrade is complete when `PHASE` is `Succeeded` and the `Ready` condition is `True`. If the `Ready` message reports `kube-proxy rollout pending`, the upgrade has completed and kube-proxy on the workload cluster is still rolling out. The message is not refreshed when the rollout finishes, so check the `kube-system/kube-proxy` DaemonSet instead. Then run the checks in [Verify the Node Replacement](#verification).
+
+When the platform upgrade targets a version with the same Kubernetes version as the cluster already runs, the upgrade completes as `NoOp` without replacing any node.
+
+Replacing a control-plane node takes about 15 minutes, so a control plane with three nodes takes about one hour, followed by the worker node pools. While the control-plane nodes are replaced, the following can occur and recover without action:
+
+- Requests to the Kubernetes API briefly time out.
+- The platform plans the upgrade again.
+- Some platform components, such as `platform-registry` or `alb`, show `Failed` while the cluster's platform upgrade stays `ProgressingWithRetry`.
+- The platform upgrade preflight briefly reports `WorkloadClusterUnreachable`.
 
 While the upgrade runs, do not edit the `KubeadmControlPlane`, the `MachineDeployment` resources, their templates, or the image catalog.
 
@@ -464,6 +475,14 @@ kubectl get nodes -o wide
 ```
 
 For the target cluster, every current `BaremetalMachine` should be `Running`, every CAPI `Machine` should report the new `spec.version`, and every workload `Node` should be `Ready` with the new `kubelet` version.
+
+The `OS-IMAGE` of a `Node` does not change when its OS image is upgraded, so do not use it to verify the OS. Check the OS on the host and the etcd version by the image tag of the etcd static Pod:
+
+```bash
+grep IMAGE_TAG /etc/os-release                               # on each host
+kubectl -n kube-system get pods -l component=etcd \
+  -o custom-columns='NAME:.metadata.name,IMAGE:.spec.containers[0].image'   # workload cluster
+```
 
 For each current `BaremetalMachine`, use the `INVENTORY` and `PLAN_SECRET` columns to verify the inventory and plan that back the running node:
 
