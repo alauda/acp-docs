@@ -37,9 +37,10 @@ Upgrade VMware vSphere clusters in the following order:
 2. Complete the distribution-version upgrade described in [Upgrade the Distribution Version](../upgrade_workload_cluster.mdx).
 3. Verify that the existing `KubeadmControlPlane` and `MachineDeployment` manifests satisfy the rollout rules. A `KubeadmControlPlane` that does not can block the very first edit of the upgrade, and a `MachineDeployment` that does not stalls the rollout. See [Check the manifests against the admission rules](#preflight-admission-rules).
 4. Verify that the control plane is healthy and the current cluster is stable.
-5. Upgrade Kube-OVN to the chart version required by the target ACP release and wait for the `AppRelease` to reach `Success`.
-6. Upgrade the control plane Kubernetes version.
-7. Upgrade worker nodes to the target Kubernetes version.
+5. Upgrade the control plane Kubernetes version.
+6. Upgrade worker nodes to the target Kubernetes version.
+
+The platform upgrades Kube-OVN and CoreDNS as part of the ACP upgrade, before the Kubernetes step. The procedure on this page does not change either component.
 
 ## Prerequisites
 
@@ -114,7 +115,7 @@ The endpoint itself does not move, and an upgrade is not an opportunity to chang
 
 ## Required Values From the OS Support Matrix \{#required-values}
 
-The authoritative mapping between an ACP release, the Kubernetes version, and the matching CoreDNS, etcd, and Kube-OVN versions lives in [OS Support Matrix](../../../overview/alauda_os_support_matrix.mdx). Locate the row that corresponds to the target ACP version before you start; the row supplies the component values the steps below need.
+The authoritative mapping between an ACP release, the Kubernetes version, and the matching etcd version lives in [OS Support Matrix](../../../overview/alauda_os_support_matrix.mdx). Locate the row that corresponds to the target ACP version before you start; the row supplies the component values the steps below need.
 
 The VM template name is not in the matrix. It is the name the template was created under in vSphere from the Alauda OS image published for the target ACP release — see [Downloading Alauda OS](../../../overview/alauda_os_support_matrix.mdx#downloading-alauda-os) — and it is what `VSphereMachineTemplate.spec.template.spec.template` must be set to on both the control plane and worker templates.
 
@@ -123,11 +124,9 @@ The cells you read from that row map to the upgrade manifests as follows:
 | OS Support Matrix column | Used to set | Where it lands |
 |---|---|---|
 | **Kubernetes Version** | `KubeadmControlPlane.spec.version` and `MachineDeployment.spec.template.spec.version` | Both control plane and worker |
-| **coredns** | `KubeadmControlPlane.spec.kubeadmConfigSpec.clusterConfiguration.dns.imageTag` | Control plane only. Set only the tag — the provider sets `dns.imageRepository` itself, derived from the `-v<acp>` suffix in that tag, and also adds the CoreDNS and kube-proxy skip annotations to your `KubeadmControlPlane`. See [Provider-managed fields on your manifests](../../../workload_clusters/alauda_os/vmware-vsphere/create_cluster.mdx#provider-managed-fields) |
 | **etcd** | `KubeadmControlPlane.spec.kubeadmConfigSpec.clusterConfiguration.etcd.local.imageTag` | Control plane only |
-| **kube-ovn (chart)** | `Cluster.metadata.annotations["cpaas.io/kube-ovn-version"]` and the provider-managed `cni-kube-ovn` `AppRelease` | Complete the shared [provider-version-specific Kube-OVN procedure](./index.mdx#upgrade-kube-ovn-before-the-control-plane) before changing `KubeadmControlPlane`. The provider version and target chart version determine the chart name and supported reconciliation flow. |
 
-The CoreDNS and etcd image tags are control-plane-only because `clusterConfiguration` is a `KubeadmControlPlane` field. Worker nodes inherit container image versions from the new VM template; the `MachineDeployment` does not carry its own `dns`/`etcd` tags. The Kube-OVN annotation lives on the `Cluster` resource, not on `KubeadmControlPlane`.
+The etcd image tag is control-plane-only because `clusterConfiguration` is a `KubeadmControlPlane` field. Worker nodes inherit container image versions from the new VM template; the `MachineDeployment` does not carry its own `etcd` tag. Leave `clusterConfiguration.dns` unchanged: the platform manages CoreDNS.
 
 ## Steps
 
@@ -173,10 +172,6 @@ kubectl -n <namespace> get vspheremachineconfigpool <cluster_name>-cp-pool \
 
 Expect `Ready=True`, `MembersValid=True`, `MembersUnique=True`, and `PersistentDisksReady=True`. `SlotAvailable` can legitimately be `False` on a fully allocated pool; it is not part of the `Ready` summary.
 
-### Upgrade Kube-OVN Before the Control Plane \{#upgrade-kube-ovn-before-the-control-plane}
-
-Follow [Upgrade Kube-OVN Before the Control Plane](./index.mdx#upgrade-kube-ovn-before-the-control-plane) and select the VMware vSphere tab that matches the **installed** provider version: a cluster still on `v1.0.15` or earlier follows the legacy tab, and a Kube-OVN `v4.4` or later target requires upgrading the provider to `v1.0.16` or later first. The shared procedure includes the vSphere-specific network annotation check, the chart-name migration at Kube-OVN `v4.4`, and the required `AppRelease` health checks. Do not patch the chart source by hand; the provider reconciles it from the annotation.
-
 ### Create the target machine templates \{#create-the-target-machine-templates}
 
 Before you start the rolling upgrade, create new `VSphereMachineTemplate` resources for the control plane and workers.
@@ -217,14 +212,13 @@ Before you start the rolling upgrade, create new `VSphereMachineTemplate` resour
 
 ### Upgrade the control plane
 
-Before you start, complete the shared [Upgrade Kube-OVN Before the Control Plane](./index.mdx#upgrade-kube-ovn-before-the-control-plane) procedure and verify that the `cni-kube-ovn` `AppRelease` is at the target revision with `phase=Success`. Then collect every required control-plane value from the target ACP row in the OS Support Matrix as described in [Required Values From the OS Support Matrix](#required-values).
+Before you start, collect every required control-plane value from the target ACP row in the OS Support Matrix as described in [Required Values From the OS Support Matrix](#required-values).
 
 1. **Patch the `KubeadmControlPlane` with the target Kubernetes values**
 
-   Update the `KubeadmControlPlane` resource in a single edit to keep `spec.version`, the CoreDNS image tag, the etcd image tag, and the infrastructure template reference consistent with the same VM template:
+   Update the `KubeadmControlPlane` resource in a single edit to keep `spec.version`, the etcd image tag, and the infrastructure template reference consistent with the same VM template:
 
    - `spec.version` ← **Kubernetes Version** from the OS Support Matrix row
-   - `spec.kubeadmConfigSpec.clusterConfiguration.dns.imageTag` ← **coredns** column from the same row
    - `spec.kubeadmConfigSpec.clusterConfiguration.etcd.local.imageTag` ← **etcd** column from the same row
    - `spec.machineTemplate.infrastructureRef.name` ← the new `VSphereMachineTemplate` name created above
    - When the target is Kubernetes 1.35 or later, update `/etc/kubernetes/patches/kubeletconfiguration0+strategic.json` in `spec.kubeadmConfigSpec.files` in this same edit, as described in [Required kubelet patch for Kubernetes 1.35](./index.mdx#kubernetes-1-35-kubelet-patch)
@@ -233,7 +227,7 @@ Before you start, complete the shared [Upgrade Kube-OVN Before the Control Plane
      kubectl edit kubeadmcontrolplane <cluster_name>-kcp -n <namespace>
      ```
 
-   Updating only `spec.version` is not sufficient. The CoreDNS and etcd image tags must move together with the Kubernetes version because they are built from the same release; leaving them at the previous values can result in CoreDNS and etcd pods that do not match the new Kubernetes minor version.
+   Updating only `spec.version` is not sufficient. The etcd image tag must move together with the Kubernetes version because it is built from the same release; leaving it at the previous value can result in etcd pods that do not match the new Kubernetes minor version.
 
    :::info
    After the provider reconciles, expect the CoreDNS and kube-proxy skip annotations and a controller-set `dns.imageRepository` on the object you just edited. Do not remove them, and do not re-apply a stored manifest that lacks them. The workload cluster's kube-proxy DaemonSet and CoreDNS Deployment repositories are reconciled separately and only after this rollout completes, so a lag there is expected. See [Provider-managed fields on your manifests](../../../workload_clusters/alauda_os/vmware-vsphere/create_cluster.mdx#provider-managed-fields).
@@ -303,7 +297,7 @@ Use this procedure to move nodes onto a new Alauda OS image while the Kubernetes
 2. Apply both new templates.
 3. Patch `KubeadmControlPlane.spec.machineTemplate.infrastructureRef.name`, wait for the control-plane rollout to finish, then patch `MachineDeployment.spec.template.spec.infrastructureRef.name`.
 
-Do not touch `spec.version`, `clusterConfiguration.dns.imageTag`, `clusterConfiguration.etcd.local.imageTag`, or the `cpaas.io/kube-ovn-version` annotation. An OS-image rollout is not a Kubernetes hop, so it does not need the Kube-OVN-first ordering.
+Do not touch `spec.version` or `clusterConfiguration.etcd.local.imageTag`. An OS-image rollout is not a Kubernetes hop.
 
 The same rollout rules apply: `maxSurge: 0` on both controllers. Pool-managed persistent disks reattach exactly as they do in a version upgrade, and pool-managed ephemeral disks are destroyed and recreated empty.
 
@@ -335,9 +329,9 @@ The normal handoff is `Attached`, then `Available` once the old VM is gone, then
 
 Do not treat a Kubernetes minor downgrade as an ordinary rollback. Choose the recovery path from the rollout stage:
 
-1. **No target-version control-plane `Machine` has been created**: restore the previous Kube-OVN annotation and the previous `KubeadmControlPlane` and `MachineDeployment` manifest values. This cancels the target rollout before a new control-plane data format is introduced.
+1. **No target-version control-plane `Machine` has been created**: restore the previous `KubeadmControlPlane` and `MachineDeployment` manifest values. This cancels the target rollout before a new control-plane data format is introduced.
 2. **Only the machine template or OS image changed, and the Kubernetes minor did not change**: point the controlling resource back to the previous template. Cluster API performs another replacement rollout. Keep the Kubernetes minor unchanged.
-3. **A control-plane `Machine` on the target Kubernetes minor has joined the cluster**: do not patch Kubernetes, CoreDNS, or etcd back to the previous minor. Stop further rollout, repair forward on the target minor, or restore the cluster from the verified pre-upgrade backup by using the supported ACP recovery procedure.
+3. **A control-plane `Machine` on the target Kubernetes minor has joined the cluster**: do not patch Kubernetes or etcd back to the previous minor. Stop further rollout, repair forward on the target minor, or restore the cluster from the verified pre-upgrade backup by using the supported ACP recovery procedure.
 
 If a target-minor control-plane `Machine` was created but never joined, first restore healthy etcd quorum and determine whether the failed replacement can be removed safely. Do not assume that changing the version fields alone is sufficient.
 
@@ -348,8 +342,6 @@ Keep these infrastructure facts in mind during any recovery:
 - **Pool-managed disk identity is preserved, but data state is not.** Disks declared in `VSphereMachineConfigPool.spec.configs[].persistentDisks[]` reattach to the replacement machines at the same slot, but data written during the upgrade window remains on those disks.
 - **Ephemeral disks are gone.** Data on `VSphereMachineConfigPool.spec.configs[].ephemeralDisks[]` is destroyed with every replaced VM and cannot be recovered from the pool. Only pool-managed persistent disks reattach.
 - **Do not reverse a rollout-rule correction.** If stage 1 requires restoring earlier manifest values, leave `maxSurge` at `0`.
-
-For stage 1, use the vSphere rule in [Restore Kube-OVN During Stage-1 Recovery](./index.mdx#restore-kube-ovn-during-stage-1-recovery). The provider restores the chart from the annotation. Wait until the restored `AppRelease` passes the shared verification before changing control-plane manifests.
 
 The `KubeadmControlPlane` controller can block replacement while etcd is unhealthy. Recover quorum before retrying any safe replacement action.
 
@@ -383,7 +375,6 @@ Confirm the following results:
 | Nothing reconciles, no conditions change, and no error appears | The management cluster may be a disaster-recovery standby. See [Standby Management Clusters](../../../workload_clusters/alauda_os/vmware-vsphere/install_provider.mdx#standby-management-cluster). |
 | A workload node is powered off and does not come back | Expected once `InitialPowerOnCompleted` has latched. Power it on in vCenter. See [Rollout Holds That Are Not Failures](#rollout-holds). |
 | A new control-plane machine never bootstraps | Read the `BootstrapReady` condition on `VSphereVM` and `VSphereMachine`; the reasons are `BootstrapSecretGetFailed` and `BootstrapSecretContentInvalid`. |
-| The Kube-OVN annotation changed but the chart name or revision did not converge | Follow the shared [Kube-OVN procedure](./index.mdx#upgrade-kube-ovn-before-the-control-plane). Do not patch the chart source manually. |
 | The workload `kube-proxy` or `coredns` is still on the old image repository after the control plane reaches the target version | Expected lag — those are reconciled only after the control-plane rollout completes. See [Provider-managed fields on your manifests](../../../workload_clusters/alauda_os/vmware-vsphere/create_cluster.mdx#provider-managed-fields). |
 | A `VSphereMachineTemplate` update is rejected as immutable | Create a new template under a new name. See the warning near the top of this page. |
 
