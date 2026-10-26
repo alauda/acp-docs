@@ -151,14 +151,21 @@ For each version you add, also add a `<kubernetes-version>_etcd` key whose value
 
 ```bash
 kubectl -n cpaas-system patch configmap elemental-image-catalog --type merge \
-  -p '{"data":{"<new-kubernetes-version>_etcd":"<registry-address>/tkestack/etcd:<etcd-tag>"}}'
+  -p '{"data":{"<new-kubernetes-version>_etcd":"<registry-address>/acp/k8s/etcd:<etcd-tag>"}}'
 ```
 
-With a chart override, add the key under `provider.imageCatalog.images` with `repository: tkestack/etcd` and `tag: <etcd-tag>`.
+With a chart override, add the key under `provider.imageCatalog.images` with `repository: acp/k8s/etcd` and `tag: <etcd-tag>`.
+
+The provider uses only the tag of this value. The preflight checks do not verify that the etcd image exists in the registry, so confirm that `acp/k8s/etcd:<etcd-tag>` is there. Uploading the core package of the release pushes it.
 
 ### OS Image Keys per Architecture and OS \{#catalog-key-format}
 
-The provider looks up the OS image of a host by the key `<kubernetes-version>_<arch>_<os-id>`, for example `v1.35.6-acp.9_arm64_alaudaos.k.25`, where `<arch>` and `<os-id>` come from the host's `MachineInventory`. Only hosts with the default OS identifier `alaudaos.m.55` fall back to `<kubernetes-version>_<arch>`, and only `amd64` hosts with that identifier fall back further to the bare `<kubernetes-version>` key. Options A and B above add the bare key, so they cover only `amd64` hosts with the default OS.
+The provider looks up the OS image of a host by the key `<kubernetes-version>_<arch>_<os-id>`, for example `v1.35.6-acp.9_arm64_alaudaos.k.25`. Both parts come from labels on the host's `MachineInventory`:
+
+- `<arch>` is the value of `os.baremetal.alauda.io/arch`, or `amd64` when the label is absent.
+- `<os-id>` is the value of `os.baremetal.alauda.io/id`, or `alaudaos.m.55` when the label is absent.
+
+Only hosts with the default OS identifier `alaudaos.m.55` fall back to `<kubernetes-version>_<arch>`, and only `amd64` hosts with that identifier fall back further to the bare `<kubernetes-version>` key. Options A and B above add the bare key, so they cover only `amd64` hosts with the default OS. Hosts registered on ACP v4.4 or earlier carry neither label, so they resolve to `amd64` and `alaudaos.m.55`: for `amd64` hosts of that kind, the bare `<kubernetes-version>` key is enough.
 
 If a pool contains hosts of another architecture or OS, add a key for every combination at every version. The `UpgradePathResolvable` [preflight check](#preflight-checks) names any missing key.
 
@@ -194,7 +201,7 @@ Complete these steps before you request the platform upgrade:
 3. **Check COS_STATE on every host.** Every host in the affected pools needs at least 4 GiB free on `COS_STATE` and no partial snapshot from an earlier failed upgrade. The platform cannot check this for you. See [Check COS_STATE Free Space](#check-cos-state-free-space).
 4. **Check registry access.** The platform registry is reachable from every host in the cluster.
 5. **Check managed storage.** Every inventory with a non-empty storage declaration reports `StoragePrepared=True`, and every currently allocated inventory reports `StorageActive=True`. Record each `BaremetalMachine.status.machineInventoryRef` and the managed filesystem UUIDs before the rollout so that you can detect selection of a different inventory instead of assuming data moved with the Machine.
-6. **Check the rollout settings.** Every `MachineDeployment` uses `maxSurge: 0`. A control plane with 3 or more replicas uses `maxSurge: 0`. A control plane with a single replica uses `maxSurge: 1` and needs one spare `Available` `MachineInventory` in its pool; the host it replaces returns to the pool as the spare for the next upgrade.
+6. **Check the rollout settings.** Every `MachineDeployment` uses `maxSurge: 0`. A control plane with 3 or more replicas uses `maxSurge: 0`. A control plane with a single replica uses `maxSurge: 1` and needs one spare `Available` `MachineInventory` in its pool; the host it replaces returns to the pool as the spare for the next upgrade. With `maxSurge: 0`, a node is removed before its replacement joins. A worker node pool with a single host therefore has no worker while that host is replaced, which can take about 8 minutes. Make sure its workloads can be scheduled on other nodes, or accept the interruption.
 7. **Back up etcd.** Create and verify a current etcd backup as described in [Prerequisites for Manual Upgrade](#manual-prerequisites). The platform does not check for a backup.
 
 ### Preflight Checks \{#preflight-checks}
@@ -217,7 +224,7 @@ If the Bare Metal provider that supports automatic upgrade is installed by this 
 | `TargetImagePresent` | Blocks | Every OS image that a replacement host will pull exists in the platform registry. | Import the missing image. Check that the `Cluster` carries `cpaas.io/registry-address` and that the registry is reachable. |
 | `RolloutMaxSurgeZero` | Blocks | `maxSurge` is `0` on every `MachineDeployment` and on a control plane with 3 or more replicas, and `1` on a single-replica control plane. An unset value counts as `1`. | Correct the rollout strategy. |
 | `ControlPlaneSpareInventory` | Blocks | A single-replica control plane has at least one `Available` `MachineInventory` in its pool. | Add one `MachineInventory` to the control-plane pool. |
-| `NoFailedMachines` | Blocks | Every `BaremetalMachine` of the cluster is `Running` and every `Machine` has a node. | Repair or replace the listed machines. |
+| `NoFailedMachines` | Blocks | No `BaremetalMachine` of the cluster is `Failed`, and no machine has exceeded the node-join timeout (20 minutes) or the rollout-stall timeout (90 minutes). Machines that are still being replaced within those limits are listed in the message but do not fail the check. | Repair or replace the machines that fail the check. |
 | `KubeletPatchReady` | Blocks | When the control plane or a worker node pool reaches Kubernetes 1.35, its bootstrap configuration contains a readable `/etc/kubernetes/patches/kubeletconfiguration0+strategic.json`. On every path, including one that stays below 1.35, every Secret and key referenced by `contentFrom.secret` in any file of the `KubeadmControlPlane` or a worker `KubeadmConfigTemplate` exists. | Add the file, or restore the referenced Secret or key. |
 | `ControlPlaneTopology` | Blocks | The cluster uses a `KubeadmControlPlane` and bare-metal machine templates, and no worker node pool runs a newer Kubernetes version than the control plane. | Correct the topology before the upgrade. |
 | `NoHostPathWorkloads` | Blocks; can be bypassed with `spec.desiredUpdate.force` on the cluster's `ClusterVersionShadow` | No Pod outside the system namespaces uses a `hostPath` volume, or a `PersistentVolumeClaim` bound to a local or `hostPath` `PersistentVolume`. Their data is lost when the node is replaced. Pods owned by a DaemonSet and static (mirror) Pods are exempt. | Move the data, or set `spec.desiredUpdate.force: true` to accept the loss. |
@@ -337,7 +344,7 @@ The preflight result of a manual-mode cluster is the warning `ManualMode`: the p
 - The platform registry is reachable from every host in the cluster.
 - Every host the rollout may reprovision has at least 4 GiB free on its `state` partition, and carries no partial snapshot from an earlier failed upgrade (see [Check COS_STATE Free Space](#check-cos-state-free-space)).
 - Every `MachineDeployment` uses `maxSurge: 0`, and a control plane with 3 or more replicas uses `maxSurge: 0` — bare metal does not over-provision physical hosts. A single-replica control plane uses `maxSurge: 1` and needs one spare `Available` `MachineInventory` in its pool.
-- The relevant pools have enough capacity to replace one node at a time without falling below the desired replica count.
+- The relevant pools have enough capacity to replace one node at a time. With `maxSurge: 0`, a node is removed before its replacement joins, so each pool runs one node short while that node is replaced. Make sure the remaining nodes can carry the workloads.
 - Every inventory with a non-empty storage declaration reports `StoragePrepared=True`, and every currently allocated inventory reports `StorageActive=True`. Record each `BaremetalMachine.status.machineInventoryRef` and the managed filesystem UUIDs before the rollout so that you can detect selection of a different inventory instead of assuming data moved with the Machine.
 
 :::info
