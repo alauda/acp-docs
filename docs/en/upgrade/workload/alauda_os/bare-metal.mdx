@@ -15,7 +15,7 @@ queries:
 
 # Upgrade Kubernetes on Bare Metal
 
-On bare metal, the platform upgrades Kubernetes and the host OS automatically. A single platform upgrade request moves the cluster through ACP Core, CoreDNS, Kube-OVN, Kubernetes, and the OS image, and the upgrade is reported complete only after every node runs the target version. Your part is to import the OS images, add them to the image catalog, check the hosts, and watch the progress.
+On bare metal, the platform upgrades Kubernetes and the host OS automatically. A single platform upgrade request moves the cluster through ACP Core, Kubernetes, and the OS image, and the upgrade is reported complete only after every node runs the target version. Your part is to import the OS images, add them to the image catalog, check the hosts, and watch the progress.
 
 If you prefer to upgrade a cluster by hand, use [manual mode](#manual-upgrade).
 
@@ -178,11 +178,12 @@ After you request the platform upgrade, the platform:
 
 1. Checks the cluster before changing anything and blocks the upgrade if a [preflight check](#preflight-checks) fails.
 2. Upgrades ACP Core and the Distribution Version.
-3. Upgrades CoreDNS and then Kube-OVN.
-4. Upgrades Kubernetes one minor version at a time through every intermediate version to the target. The control plane is replaced at every version.
+3. Upgrades Kubernetes one minor version at a time through every intermediate version to the target. The control plane is replaced at every version.
    Worker node pools are replaced at the target version, and at an intermediate version only when the Kubernetes version skew policy requires it. The platform also sets the etcd image tag, adds the Kubernetes 1.35 kubelet setting when the version reaches 1.35, and updates the `capi.cpaas.io/kubernetes` annotation on the `Cluster`.
 
 The platform creates new `BaremetalMachineTemplate` resources for the replaced node groups and keeps the previous ones. It does not change the rollout strategy of the `KubeadmControlPlane` or the `MachineDeployment` resources.
+
+Kube-OVN and CoreDNS are upgraded automatically as part of the platform upgrade. On an upgrade from a release earlier than v4.5, they are upgraded after the provider hands them over to the platform, which can finish after the upgrade is reported complete. See [Kube-OVN and CoreDNS](./index.mdx#kube-ovn-coredns).
 
 ### Prepare the Cluster \{#automatic-prepare}
 
@@ -298,7 +299,7 @@ An automatic upgrade only moves forward. It cannot be paused, cancelled, or roll
 
 ## Manual Upgrade \{#manual-upgrade}
 
-In manual mode, the platform upgrade still upgrades ACP Core, the Distribution Version, CoreDNS, and Kube-OVN. It then waits for you to upgrade Kubernetes and the OS image and to [confirm completion](#manual-confirm). Until you confirm, the cluster's platform upgrade reports `ManualUpgradeRequired` with the target Kubernetes version.
+In manual mode, the platform upgrade still upgrades ACP Core and the Distribution Version. It then waits for you to upgrade Kubernetes and the OS image and to [confirm completion](#manual-confirm). Until you confirm, the cluster's platform upgrade reports `ManualUpgradeRequired` with the target Kubernetes version. Kube-OVN and CoreDNS are upgraded automatically in manual mode too; do not upgrade them by hand. See [Kube-OVN and CoreDNS](./index.mdx#kube-ovn-coredns).
 
 Bare-metal clusters do not require manual mode. Use it for any cluster that you decide to upgrade by hand.
 
@@ -345,7 +346,7 @@ The default local archive under `/var/cpaas/backup` can be used for recovery; S3
 
 ### Upgrade the Control Plane \{#upgrade-control-plane}
 
-Patch `KubeadmControlPlane.spec.version` to the new Kubernetes version and update the etcd image tag in the same edit. Leave `clusterConfiguration.dns` unchanged: the platform manages CoreDNS and Kube-OVN.
+Patch `KubeadmControlPlane.spec.version` to the new Kubernetes version and update the etcd image tag in the same edit. Leave `clusterConfiguration.dns` unchanged: CoreDNS and Kube-OVN are upgraded automatically. See [Kube-OVN and CoreDNS](./index.mdx#kube-ovn-coredns).
 
 ```bash
 kubectl -n cpaas-system edit kubeadmcontrolplane <cluster-name>-control-plane
@@ -472,6 +473,16 @@ For an inventory with managed volumes, also verify `status.storage.phase=Active`
 
 `MachineInventoryPool.status` should satisfy `available + allocated + preparing + reprovisioning + unavailable = total` with `preparing = reprovisioning = 0`. `available` may remain greater than zero when the pool contains spare inventories; those inventories are outside the plan verification above.
 
+When the cluster was upgraded from a release earlier than v4.5, also check that the Bare Metal provider has handed Kube-OVN and CoreDNS over to the platform. On the `global` cluster, read the `CoreAddonsHandedOff` condition of the `BaremetalCluster` and the `cni-type` label of the CAPI `Cluster`:
+
+```bash
+kubectl -n cpaas-system get baremetalclusters.infrastructure.cluster.x-k8s.io <cluster-name> \
+  -o jsonpath='{.status.conditions[?(@.type=="CoreAddonsHandedOff")]}'
+kubectl -n cpaas-system get cluster.cluster.x-k8s.io <cluster-name> --show-labels
+```
+
+The handoff is complete when the condition is `True` and the `Cluster` carries the label `cni-type=kube-ovn`. The handoff can finish after the platform upgrade is reported complete. See [Kube-OVN and CoreDNS](./index.mdx#kube-ovn-coredns) for the condition reasons.
+
 ## Troubleshooting Node Replacement \{#troubleshooting}
 
 | Issue | What to check |
@@ -483,6 +494,7 @@ For an inventory with managed volumes, also verify `status.storage.phase=Active`
 | `elemental upgrade` fails with `no space left on device` | The `state` partition is too small — an 8 GiB `COS_STATE` cannot hold the running system and an upgrade to a different image at the same time. Each failed attempt also leaves a partial snapshot behind, so free space keeps shrinking. Recover by removing them as described in [Remove partial snapshots left by a failed upgrade](#remove-partial-snapshots), then let the plan retry. Hosts installed before [COS_STATE sizing](../../../workload_clusters/alauda_os/bare-metal/create_cluster.mdx#size-cos-state) was applied need a reinstall to grow the partition. |
 | New control-plane node fails `kubeadm join` | Confirm the VIP is still reachable; `alive` may have lost the lock. Check `kubectl -n kube-system get lease`, `ipvsadm -Ln`, `keepalived` logs from the static pod. |
 | Worker rollout stalls with `MachineDeployment.spec.strategy.rollingUpdate.maxSurge > 0` set | Bare-metal pools cannot honour over-provisioning. Set `maxSurge=0` and bump `maxUnavailable` to budget more parallel replacements within the pool. During an automatic upgrade, stop the upgrade controller before you edit the `MachineDeployment`; see [Troubleshooting the automatic upgrade](#automatic-troubleshooting). |
+| `BaremetalCluster` condition `CoreAddonsHandedOff=False` with reason `CoreAddonsHandoffBlocked` after an upgrade from a release earlier than v4.5 | The condition message names the cause that blocks the handoff of Kube-OVN and CoreDNS to the platform. Resolve it. The previous Kube-OVN version keeps running until the cause is resolved. |
 | Pool capacity exhausted mid-rollout | `MachineInventoryPool.status.available=0` and `allocated` still includes the not-yet-replaced nodes. Add another `MachineInventory` to the pool to free the queue, or wait for in-flight `Preparing` nodes to drain. |
 
 For the full operator-side state machine reference (every condition reason and recovery action), see [Provider Overview](../../../workload_clusters/alauda_os/bare-metal/overview.mdx#clean-reprovision).
