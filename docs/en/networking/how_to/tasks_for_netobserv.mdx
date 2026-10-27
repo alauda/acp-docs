@@ -200,3 +200,102 @@ Flow-only features such as `--enable_pkt_drop`, `--enable_dns`, `--enable_rtt`,
 `--enable_pkt_translation`, `--sampling`, and interface include/exclude filters
 are available on `flows` (and `metrics`), not on `packets`. Use the installed
 CLI's help output when a release adds or changes an option.
+
+## Task 2: Adjust the eBPF agent sampling interval
+
+The eBPF agent sampling interval is configured in
+`spec.agent.ebpf.sampling` on the `FlowCollector`. The value is an interval:
+`1` (or `0`) keeps every packet, while `50` keeps approximately one packet out
+of every 50. A larger value reduces the amount of flow data and the agent's
+processing and storage pressure, but also reduces metric accuracy and detail.
+
+Patch the `FlowCollector` to change the interval. Replace `cluster` and
+`netobserv-system` with the name and namespace used by your deployment:
+
+```bash
+kubectl -n netobserv-system patch flowcollector cluster --type merge \
+  -p '{"spec":{"agent":{"ebpf":{"sampling":50}}}}'
+```
+
+For full sampling, set the interval to `1`:
+
+```bash
+kubectl -n netobserv-system patch flowcollector cluster --type merge \
+  -p '{"spec":{"agent":{"ebpf":{"sampling":1}}}}'
+```
+
+The Operator rolls out the eBPF agent DaemonSet after the `FlowCollector` is
+updated. Check the applied value and wait for the agent Pods to become ready:
+
+```bash
+kubectl -n netobserv-system get flowcollector cluster \
+  -o jsonpath='{.spec.agent.ebpf.sampling}{"\n"}'
+kubectl get daemonset -A -l app=netobserv-ebpf-agent -o wide
+kubectl get pods -A -l app=netobserv-ebpf-agent -o wide
+```
+
+Sampling is applied at the agent and is independent of any later processor or
+deduplication sampling. If both are configured, their effects are cumulative.
+
+## Task 3: Schedule eBPF agents on selected nodes
+
+The eBPF agent is deployed as a DaemonSet. By default, the Operator schedules
+it on Linux nodes. To restrict it to dedicated nodes, set
+`spec.agent.ebpf.advanced.scheduling.nodeSelector` in the `FlowCollector`.
+Every label in the selector must match, so keep `kubernetes.io/os: linux` when
+the dedicated nodes are Linux nodes:
+
+```yaml
+spec:
+  agent:
+    ebpf:
+      advanced:
+        scheduling:
+          nodeSelector:
+            kubernetes.io/os: linux
+            netobserv-agent: "true"
+```
+
+Label the target nodes before applying the configuration:
+
+```bash
+kubectl label node <node-name> netobserv-agent=true
+kubectl -n netobserv-system edit flowcollector cluster
+```
+
+Alternatively, apply the scheduling fields directly with a merge patch. Use
+`kubectl edit` when you need to remove an existing selector key:
+
+```bash
+kubectl -n netobserv-system patch flowcollector cluster --type merge \
+  -p '{"spec":{"agent":{"ebpf":{"advanced":{"scheduling":{"nodeSelector":{"kubernetes.io/os":"linux","netobserv-agent":"true"}}}}}}}'
+```
+
+If the selected nodes are tainted, add a matching toleration under the same
+`scheduling` block. For example:
+
+```yaml
+spec:
+  agent:
+    ebpf:
+      advanced:
+        scheduling:
+          tolerations:
+            - key: netobserv-agent
+              operator: Equal
+              value: "true"
+              effect: NoSchedule
+```
+
+Verify that the DaemonSet has one ready Pod on each selected node:
+
+```bash
+kubectl get daemonset -A -l app=netobserv-ebpf-agent -o wide
+kubectl get pods -A -l app=netobserv-ebpf-agent \
+  -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,NODE:.spec.nodeName,STATUS:.status.phase'
+```
+
+Restricting the selector also restricts where traffic is observed. Nodes that
+do not run an eBPF agent do not contribute flow records, so use this setting
+only when partial cluster visibility is intended or the selected nodes cover
+the workloads being investigated.
