@@ -61,7 +61,7 @@ const renderCommand = (configMaps: ConfigMapValues[]) =>
   ["kubectl apply -f - <<'EOF'", configMaps.map(renderConfigMap).join('\n---\n'), 'EOF'].join('\n')
 
 // `prefix` tells the ConfigMaps of a multi-version example apart, such as
-// `current-` and `target-`.
+// `intermediate-` and `target-`.
 const placeholderValues = (prefix = ''): ConfigMapValues => ({
   configMapName: `dcs-vm-template-<os>-<${prefix}acp-version>`,
   templateName: `<${prefix}vm-template-name>`,
@@ -281,7 +281,7 @@ function UpgradePathForm() {
   const [templateNames, setTemplateNames] = useState<Partial<Record<string, string>>>({})
 
   const path = planUpgradePath(currentAcp, targetAcp)
-  const rows = [path.current, ...path.hops.map(hop => hop.release)]
+  const rows = path.hops.map(hop => hop.release)
   const nameOf = (release: Release) => (templateNames[release.acp] ?? '').trim()
 
   return (
@@ -311,10 +311,6 @@ function UpgradePathForm() {
             ))}
           </div>
           <InvalidNamesAlert names={invalidNames(rows.map(nameOf))} />
-          <p>
-            The ConfigMap for {path.current.acp} registers the VM template that the cluster runs today, which
-            is needed when the cluster has no ConfigMap for that VM template yet.
-          </p>
           <CommandBlock
             command={renderCommand(
               rows.map(release =>
@@ -335,8 +331,8 @@ function UpgradePathForm() {
 export interface DcsVmTemplateConfigMapProps {
   /**
    * `single` generates the ConfigMap of one ACP version. `path` generates the
-   * ConfigMaps of the current version and of every version on the upgrade
-   * path to a target version.
+   * ConfigMaps of every intermediate version on the upgrade path and of the
+   * target version.
    */
   mode?: 'single' | 'path'
   /**
@@ -350,7 +346,7 @@ export interface DcsVmTemplateConfigMapProps {
 export default function DcsVmTemplateConfigMap({ mode = 'single', children }: DcsVmTemplateConfigMapProps) {
   if (import.meta.env.SSG_MD) {
     const example =
-      mode === 'path' ? [placeholderValues('current-'), placeholderValues('target-')] : [placeholderValues()]
+      mode === 'path' ? [placeholderValues('intermediate-'), placeholderValues('target-')] : [placeholderValues()]
     return (
       <>
         <pre data-lang="bash">
