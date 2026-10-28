@@ -105,10 +105,17 @@ const copyButtonStyle: CSSProperties = {
 }
 
 const note = (
-  <p>
-    Run the command on the <code>global</code> cluster. In a DR environment, run it on both{' '}
-    <code>global</code> clusters: the ConfigMaps are not synchronized between them.
-  </p>
+  <>
+    <p>
+      Run the command on the <code>global</code> cluster. In a DR environment, run it on both{' '}
+      <code>global</code> clusters: the ConfigMaps are not synchronized between them.
+    </p>
+    <p>
+      For each ACP version, register VM templates of only one OS on a <code>global</code> cluster. When
+      VM templates of different OSes have the same Kubernetes version, an upgrade can move a cluster to
+      the other OS.
+    </p>
+  </>
 )
 
 export interface DcsVmTemplateConfigMapProps {
