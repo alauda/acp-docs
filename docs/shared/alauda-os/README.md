@@ -4,13 +4,17 @@
 
 - The **Version Mapping** table in `docs/en/overview/alauda_os_support_matrix.mdx`, rendered by `docs/shared/components/VersionMappingTable.tsx`.
 - The VM template ConfigMap generator on the Huawei DCS pages, rendered by `docs/shared/components/DcsVmTemplateConfigMap.tsx`.
+- The upgrade path calculator in **Preparing for Cross-Version Upgrades** in `docs/en/upgrade/workload/alauda_os/index.mdx`, rendered by `docs/shared/components/AlaudaOsUpgradePath.tsx`.
+
+The generator and the calculator read the file through `docs/shared/components/alauda-os.ts`, which also plans the upgrade path: for each Kubernetes minor version between the current and the target version, it selects the entry with the highest `kubernetes` value in that minor.
 
 ## Add a Release
 
 Append one object to `releases` for every ACP release that publishes Alauda OS images:
 
-- Keep the entries in release order, oldest first. The generator selects the last entry by default.
+- Keep the entries in release order, oldest first. The generator and the calculator select the last entry as the target by default. Entries with the same `kubernetes` value are ordered by their position, so a later entry is a newer ACP patch.
 - Copy every value exactly as published for the release, including the leading `v` where the release uses one.
+- Write `kubernetes` as `v<major>.<minor>.<patch>`, optionally followed by a build suffix such as `-3` or `-acp.9`. Numbers in the suffix are compared as numbers.
 - Fill all fields: `acp`, `kubernetes`, `containerd`, `coredns`, `etcd`, and `pause`.
 
 Each `acp` value must be unique.
