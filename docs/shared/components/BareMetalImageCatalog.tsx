@@ -3,7 +3,7 @@
 // the bare-metal provider on the global cluster. The Kubernetes version and etcd
 // tag of each ACP version come from ../alauda-os/version-mapping.json: to add a
 // release, append an entry there (see ../alauda-os/README.md), not here.
-import { useId, useState, type ReactNode } from 'react'
+import { useId, useState, type CSSProperties, type ReactNode } from 'react'
 
 import { OS_VARIANTS, planUpgradePath, upgradeReleases, type Release } from './alauda-os.js'
 import CommandBlock from './CommandBlock.js'
@@ -42,7 +42,9 @@ const BARE_METAL_OS: readonly BareMetalOs[] = OS_VARIANTS.flatMap(variant => {
 // OCI distribution tag syntax.
 const IMAGE_TAG = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/
 
-const REGISTRY_PLACEHOLDER = '<registry-address>'
+// Stands for the registry address that the command reads from the `global`
+// cluster when no address is entered.
+const REGISTRY_VARIABLE = '${REGISTRY}'
 
 // The provider looks up `<kubernetes>_<arch>_<os-id>`, then `<kubernetes>_<arch>`
 // for the default OS, then `<kubernetes>` for amd64 with the default OS. The
@@ -57,16 +59,29 @@ const normalizeRegistry = (value: string) =>
   value
     .trim()
     .replace(/^[a-z][a-z0-9+.-]*:\/\//i, '')
-    .replace(/\/+$/, '') || REGISTRY_PLACEHOLDER
+    .replace(/\/+$/, '')
 
 type CatalogEntry = [key: string, value: string]
 
-const renderCommand = (entries: CatalogEntry[]) => {
+// The same source as the image catalog command on the provider installation
+// page, which exists whether or not the `global` cluster runs Alauda OS.
+const READ_REGISTRY = [
+  'REGISTRY=$(kubectl get productbase.product.alauda.io base \\',
+  "  -o jsonpath='{.spec.registry.address}')",
+]
+
+// `registry` is empty when the command reads the address itself. Only then is
+// the heredoc unquoted, so that the shell expands ${REGISTRY}; the rest of the
+// patch is made of validated tags and fixed text and holds nothing else the
+// shell would expand.
+const renderCommand = (entries: CatalogEntry[], registry: string) => {
   const patch = JSON.stringify({ data: Object.fromEntries(entries) }, null, 2)
-  // Inside single quotes, the shell treats only a single quote specially.
-  const quoted = patch.replace(/'/g, `'\\''`)
+  const delimiter = registry === '' ? 'EOF' : "'EOF'"
   return [
-    `kubectl -n cpaas-system patch configmap elemental-image-catalog --type merge -p '${quoted}'`,
+    ...(registry === '' ? READ_REGISTRY : []),
+    `kubectl -n cpaas-system patch configmap elemental-image-catalog --type merge --patch-file /dev/stdin <<${delimiter}`,
+    patch,
+    'EOF',
     '',
     'kubectl -n cpaas-system get configmap elemental-image-catalog -o yaml',
   ].join('\n')
@@ -75,8 +90,8 @@ const renderCommand = (entries: CatalogEntry[]) => {
 // `prefix` tells the versions of a multi-version example apart, such as
 // `intermediate-` and `target-`.
 const placeholderEntries = (prefix = ''): CatalogEntry[] => [
-  [`<${prefix}os-image-key>`, `${REGISTRY_PLACEHOLDER}/<os-image-repository>:<${prefix}os-image-tag>`],
-  [`<${prefix}kubernetes-version>_etcd`, `${REGISTRY_PLACEHOLDER}/acp/k8s/etcd:<${prefix}etcd-tag>`],
+  [`<${prefix}os-image-key>`, `${REGISTRY_VARIABLE}/<os-image-repository>:<${prefix}os-image-tag>`],
+  [`<${prefix}kubernetes-version>_etcd`, `${REGISTRY_VARIABLE}/acp/k8s/etcd:<${prefix}etcd-tag>`],
 ]
 
 interface HostValues {
@@ -85,13 +100,16 @@ interface HostValues {
   registry: string
 }
 
-const releaseEntries = (release: Release, tag: string, { os, arch, registry }: HostValues): CatalogEntry[] => [
-  [
-    osImageKey(release.kubernetes, arch, os.osId),
-    `${registry}/${os.repository}:${tag || `<os-image-tag-for-${release.acp}>`}`,
-  ],
-  [`${release.kubernetes}_etcd`, `${registry}/acp/k8s/etcd:${release.etcd}`],
-]
+// An invalid tag is reported by InvalidTagsAlert and kept out of the command,
+// which may expand its patch in the shell.
+const releaseEntries = (release: Release, tag: string, { os, arch, registry }: HostValues): CatalogEntry[] => {
+  const prefix = registry || REGISTRY_VARIABLE
+  const osTag = IMAGE_TAG.test(tag) ? tag : `<os-image-tag-for-${release.acp}>`
+  return [
+    [osImageKey(release.kubernetes, arch, os.osId), `${prefix}/${os.repository}:${osTag}`],
+    [`${release.kubernetes}_etcd`, `${prefix}/acp/k8s/etcd:${release.etcd}`],
+  ]
+}
 
 // `v4.5.0` → `alaudaos-45.m55.<timestamp>-0`, the shape of an Alauda OS M55
 // image tag.
@@ -130,8 +148,8 @@ const notes = (
 const placeholderNote = (
   <>
     <p>
-      Replace <code>{REGISTRY_PLACEHOLDER}</code> with the address of the platform registry, and take the
-      Kubernetes version and the etcd tag of each ACP version from Version Mapping.
+      The command reads the registry address of the <code>global</code> cluster. Take the Kubernetes version
+      and the etcd tag of each ACP version from Version Mapping.
     </p>
     <p>
       <code>{'<os-image-key>'}</code> is the Kubernetes version itself for <code>amd64</code> hosts with
@@ -166,16 +184,23 @@ function InvalidTagsAlert({ tags }: { tags: string[] }) {
   )
 }
 
+const hintStyle: CSSProperties = {
+  color: 'var(--rp-c-text-2)',
+  fontSize: '0.75rem',
+}
+
 interface TextFieldProps {
   id: string
   label: string
   value: string
   placeholder?: string
+  hint?: string
   invalid?: boolean
   onChange: (value: string) => void
 }
 
-function TextField({ id, label, value, placeholder, invalid = false, onChange }: TextFieldProps) {
+function TextField({ id, label, value, placeholder, hint, invalid = false, onChange }: TextFieldProps) {
+  const hintId = hint === undefined ? undefined : `${id}-hint`
   return (
     <label htmlFor={id} style={fieldStyle}>
       {label}
@@ -187,14 +212,20 @@ function TextField({ id, label, value, placeholder, invalid = false, onChange }:
         spellCheck={false}
         autoComplete="off"
         aria-invalid={invalid}
+        aria-describedby={hintId}
         onChange={event => onChange(event.target.value)}
         style={controlStyle}
       />
+      {hint === undefined ? null : (
+        <span id={hintId} style={hintStyle}>
+          {hint}
+        </span>
+      )}
     </label>
   )
 }
 
-function TagField({ id, label, value, placeholder, onChange }: Omit<TextFieldProps, 'invalid'>) {
+function TagField({ id, label, value, placeholder, onChange }: Omit<TextFieldProps, 'hint' | 'invalid'>) {
   const trimmed = value.trim()
   return (
     <TextField
@@ -247,7 +278,8 @@ function useHostFields(id: string) {
         id={`${id}-registry`}
         label="Registry address (optional)"
         value={registry}
-        placeholder={REGISTRY_PLACEHOLDER}
+        placeholder="<registry-address>"
+        hint="When empty, the command reads the registry address of the global cluster."
         onChange={setRegistry}
       />
     </>
@@ -282,7 +314,7 @@ function SingleVersionForm() {
         />
       </div>
       <InvalidTagsAlert tags={[trimmedTag]} />
-      <CommandBlock command={renderCommand(releaseEntries(release, trimmedTag, host.values))} />
+      <CommandBlock command={renderCommand(releaseEntries(release, trimmedTag, host.values), host.values.registry)} />
     </>
   )
 }
@@ -327,7 +359,10 @@ function UpgradePathForm() {
           </div>
           <InvalidTagsAlert tags={rows.map(tagOf)} />
           <CommandBlock
-            command={renderCommand(rows.flatMap(release => releaseEntries(release, tagOf(release), host.values)))}
+            command={renderCommand(
+              rows.flatMap(release => releaseEntries(release, tagOf(release), host.values)),
+              host.values.registry,
+            )}
           />
         </>
       ) : (
@@ -362,7 +397,7 @@ export default function BareMetalImageCatalog({ mode = 'single', children }: Bar
     return (
       <>
         <pre data-lang="bash">
-          <code>{renderCommand(example)}</code>
+          <code>{renderCommand(example, '')}</code>
         </pre>
         {placeholderNote}
         {mode === 'path' ? (
