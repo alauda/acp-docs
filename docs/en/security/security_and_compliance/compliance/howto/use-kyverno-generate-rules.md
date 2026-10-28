@@ -62,7 +62,7 @@ The notification message API used in this example is `notificationmessages.aitex
 
 ## Prerequisites
 
-- Alauda Container Platform Compliance with Kyverno is installed.
+- Alauda Container Platform Policy Management is installed.
 - The platform notification capability is installed in the same cluster.
 - An email notification server has been configured. The platform default email server is stored as the `platform-email-server` Secret in the `cpaas-system` namespace.
 - A notification template for email messages exists in the `cpaas-system` namespace.
