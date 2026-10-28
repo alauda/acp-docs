@@ -12,6 +12,8 @@ queries:
   - infraclusterversion bare metal
 ---
 
+import BareMetalImageCatalog /* eslint-disable-line no-unused-vars */ from '../../../../shared/components/BareMetalImageCatalog'
+
 # Upgrade Kubernetes on Bare Metal
 
 On bare metal, the platform upgrades Kubernetes and the host OS automatically. A single platform upgrade request moves the cluster through ACP Core, Kubernetes, and the OS image, and the upgrade is reported complete only after every node runs the target version. Your part is to import the OS images, add them to the image catalog, check the hosts, and watch the progress.
@@ -108,69 +110,48 @@ If the host still has less than 4 GiB free after every partial snapshot is gone,
 The bare-metal provider plugin does not carry any Kubernetes version or OS image. Its chart creates `elemental-image-catalog` with no entries, and upgrading the plugin or the Distribution Version does not add one. Every new Kubernetes version must be added explicitly, after its OS images are in the platform registry.
 :::
 
-First import the target release's `baremetal-base-image` and `baremetal-base-image-iso` from the Bare Metal OS archive into the platform registry, as described in [OS Images Imported and Image Catalog Populated](../../../workload_clusters/alauda_os/bare-metal/create_cluster.mdx#os-images-and-image-catalog). Then add the version with either option below.
+First import the OS images of the target version and of every intermediate version into the platform registry, as described in [OS Images Imported and Image Catalog Populated](../../../workload_clusters/alauda_os/bare-metal/create_cluster.mdx#os-images-and-image-catalog). See [Preparing for Cross-Version Upgrades](./index.mdx#cross-version-preparation) for the intermediate versions.
 
-**Option A — Add a chart override.** Append the new version under `provider.imageCatalog.images` in `spec.valuesOverride` of the provider's `ModuleInfo` on the `global` cluster (uses `global.registry.address` as the registry), next to the values already set there. Do not replace the whole `valuesOverride`: that drops `caCertSecretKey`, and `elemental-operator` cannot start. To find and edit the `ModuleInfo`, see [Install the cluster plugins](../../../workload_clusters/alauda_os/bare-metal/install_provider.mdx#install-the-cluster-plugins):
+Then select the current and target ACP versions, the OS and the architecture of the hosts, and enter the tag of each imported OS image below. One command adds the OS image key and the etcd key of every intermediate version and of the target version.
+
+<BareMetalImageCatalog mode="path">
+  The command creates a `ResourcePatch` that records the change. Do not delete it. Before the next platform upgrade, exempt it for the target version as described in [Handle Preflight Blocks](../../troubleshooting.mdx#handle-preflight-blocks-when-needed); otherwise the `ResourcePatchUpgradeable` preflight check blocks that upgrade.
+</BareMetalImageCatalog>
+
+If the pools contain hosts of more than one architecture or OS, run the generated command for each combination.
+
+If a key is missing when CAPI creates the replacement `Machine`, the resulting `BaremetalMachine` enters `Failed` with `ImageResolved=False / Reason=ImageCatalogMiss` and no `reprovision` plan is written. Adding the key later does **not** restart it: the `BaremetalMachine` stays `Failed` until you delete that `Machine` and its owner creates a new one. With `maxSurge: 0` the node being replaced is already gone at that point, so add the keys before you change any version.
+
+**Alternative: chart override.** If the bare-metal provider plugin is installed with a chart override for the image catalog, add the keys under `provider.imageCatalog.images` instead, and reapply the plugin. The values use `global.registry.address` as the registry:
 
 ```yaml
-spec:
-  valuesOverride:
-    acp/chart-cluster-api-provider-baremetal:
-      provider:
-        imageCatalog:
-          images:
-            <new-kubernetes-version>:
-              repository: tkestack/baremetal-base-image
-              tag: <official-image-tag>
+provider:
+  imageCatalog:
+    images:
+      <kubernetes-version>:
+        repository: tkestack/baremetal-base-image
+        tag: <os-image-tag>
+      <kubernetes-version>_etcd:
+        repository: acp/k8s/etcd
+        tag: <etcd-tag>
 ```
 
-The platform re-renders the ConfigMap; the provider's in-process watch hot-reloads the cache without restarting. In a DR pair, do this on both `global` clusters.
-
-**Option B — Patch the ConfigMap directly.** Use this when the plugin was installed without a chart override, or for an approved image reference that must be pinned directly in the catalog:
-
-```bash
-kubectl -n cpaas-system patch configmap elemental-image-catalog \
-  --type='json' \
-  -p='[{"op":"add","path":"/data/<new-kubernetes-version>","value":"<registry-address>/tkestack/baremetal-base-image:<new-tag>"}]'
-```
-
-Patching the ConfigMap creates a `ResourcePatch` that records the change. Do not delete it. Before the next platform upgrade, exempt it for the target version as described in [Handle Preflight Blocks](../../troubleshooting.mdx#handle-preflight-blocks-when-needed); otherwise the `ResourcePatchUpgradeable` preflight check blocks that upgrade.
-
-In either case, verify before continuing:
-
-```bash
-kubectl -n cpaas-system get configmap elemental-image-catalog -o yaml
-```
-
-The key must include the leading `v` (for example `v1.34.5`). If the key is missing when CAPI creates the replacement `Machine`, the resulting `BaremetalMachine` enters `Failed` with `ImageResolved=False / Reason=ImageCatalogMiss` and no `reprovision` plan is written. Adding the key later does **not** restart it: the `BaremetalMachine` stays `Failed` until you delete that `Machine` and its owner creates a new one. With `maxSurge: 0` the node being replaced is already gone at that point, so add the key before you change any version.
+Write each Kubernetes version with its leading `v`, such as `v1.36.4-acp.3`, and use the key format in [OS Image Keys per Architecture and OS](#catalog-key-format) for hosts of another architecture or OS. The chart renders `elemental-image-catalog` from these values, so the values must keep every existing key.
 
 ### Add the etcd Image for Each Version \{#catalog-etcd-key}
 
-For each version you add, also add a `<kubernetes-version>_etcd` key whose value is the etcd image of the same release. Use the tag from the **etcd** column of the matching [OS Support Matrix](../../../overview/alauda_os_support_matrix.mdx) row. The upgrade reads the tag from this key when it upgrades the control plane to that version.
-
-```bash
-kubectl -n cpaas-system patch configmap elemental-image-catalog --type merge \
-  -p '{"data":{"<new-kubernetes-version>_etcd":"<registry-address>/acp/k8s/etcd:<etcd-tag>"}}'
-```
-
-With a chart override, add the key under `provider.imageCatalog.images` with `repository: acp/k8s/etcd` and `tag: <etcd-tag>`.
-
-The provider uses only the tag of this value. The preflight checks do not verify that the etcd image exists in the registry, so confirm that `acp/k8s/etcd:<etcd-tag>` is there. Uploading the core package of the release pushes it.
+For each Kubernetes version, the catalog also holds a `<kubernetes-version>_etcd` key whose value is the etcd image of the same release, with the tag from the **etcd** column of [Version Mapping](../../../overview/alauda_os_support_matrix.mdx#version-mapping). The upgrade reads the tag from this key when it upgrades the control plane to that version. The provider uses only the tag of this value.
 
 ### OS Image Keys per Architecture and OS \{#catalog-key-format}
 
 The provider looks up the OS image of a host by the key `<kubernetes-version>_<arch>_<os-id>`, for example `v1.35.6-acp.9_arm64_alaudaos.k.25`. Both parts come from labels on the host's `MachineInventory`:
 
 - `<arch>` is the value of `os.baremetal.alauda.io/arch`, or `amd64` when the label is absent.
-- `<os-id>` is the value of `os.baremetal.alauda.io/id`, or `alaudaos.m.55` when the label is absent.
+- `<os-id>` is the value of `os.baremetal.alauda.io/id`, or `alaudaos.m.55` when the label is absent. Alauda OS M55 uses `alaudaos.m.55`; Alauda OS KO and Alauda OS KU both use `alaudaos.k.25`.
 
-Only hosts with the default OS identifier `alaudaos.m.55` fall back to `<kubernetes-version>_<arch>`, and only `amd64` hosts with that identifier fall back further to the bare `<kubernetes-version>` key. Options A and B above add the bare key, so they cover only `amd64` hosts with the default OS. Hosts registered on ACP v4.4 or earlier carry neither label, so they resolve to `amd64` and `alaudaos.m.55`: for `amd64` hosts of that kind, the bare `<kubernetes-version>` key is enough.
+Only hosts with the default OS identifier `alaudaos.m.55` fall back to `<kubernetes-version>_<arch>`, and only `amd64` hosts with that identifier fall back further to the bare `<kubernetes-version>` key. The generator writes the bare key for `amd64` hosts with Alauda OS M55 and the full key for every other combination. Hosts registered on ACP v4.4 or earlier carry neither label, so they resolve to `amd64` and `alaudaos.m.55`: for `amd64` hosts of that kind, the bare `<kubernetes-version>` key is enough.
 
 If a pool contains hosts of another architecture or OS, add a key for every combination at every version. The `UpgradePathResolvable` [preflight check](#preflight-checks) names any missing key.
-
-In a DR pair, update `elemental-image-catalog` on both `global` clusters. The catalog is not synchronized between them, and each `global` cluster plans its upgrades from its own copy.
-
-Do not change the catalog while an upgrade is in progress. A host replaced after the change installs the new value, so the nodes of one pool can end up on different images.
 
 ### Refresh the Installation ISO \{#refresh-installation-iso}
 
