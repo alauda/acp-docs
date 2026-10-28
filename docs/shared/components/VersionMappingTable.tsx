@@ -12,9 +12,7 @@ export default function VersionMappingTable() {
             <th>ACP Version</th>
             <th>Kubernetes Version</th>
             <th>containerd</th>
-            <th>coredns</th>
             <th>etcd</th>
-            <th>pause</th>
           </tr>
         </thead>
         <tbody>
@@ -23,9 +21,7 @@ export default function VersionMappingTable() {
               <td>{release.acp}</td>
               <td>{release.kubernetes}</td>
               <td>{release.containerd}</td>
-              <td>{release.coredns}</td>
               <td>{release.etcd}</td>
-              <td>{release.pause}</td>
             </tr>
           ))}
         </tbody>

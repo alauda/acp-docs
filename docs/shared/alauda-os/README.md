@@ -15,6 +15,6 @@ Append one object to `releases` for every ACP release that publishes Alauda OS i
 - Keep the entries in release order, oldest first. The generator and the calculator select the last entry as the target by default. Entries with the same `kubernetes` value are ordered by their position, so a later entry is a newer ACP patch.
 - Copy every value exactly as published for the release, including the leading `v` where the release uses one.
 - Write `kubernetes` as `v<major>.<minor>.<patch>`, optionally followed by a build suffix such as `-3` or `-acp.9`. Numbers in the suffix are compared as numbers.
-- Fill all fields: `acp`, `kubernetes`, `containerd`, `coredns`, `etcd`, and `pause`.
+- Fill all fields: `acp`, `kubernetes`, `containerd`, and `etcd`.
 
 Each `acp` value must be unique.
