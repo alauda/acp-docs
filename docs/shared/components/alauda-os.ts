@@ -114,8 +114,10 @@ export interface UpgradePath {
  * Plans the Kubernetes and Alauda OS upgrade path the way the platform does on
  * Huawei DCS and Bare Metal: Kubernetes moves one minor at a time, each
  * intermediate minor uses its highest Kubernetes version, and the last hop is
- * the target release exactly. The platform does not take the OS variant into
- * account, so every hop must use the variant the cluster runs today.
+ * the target release exactly. Every hop uses the OS variant the cluster runs
+ * today: on Huawei DCS the platform selects VM templates by Kubernetes version
+ * only, and on Bare Metal the image catalog keys include the OS identifier of
+ * the hosts.
  */
 export function planUpgradePath(currentAcp: string, targetAcp: string): UpgradePath {
   const currentIndex = indexOfRelease(currentAcp)
