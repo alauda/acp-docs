@@ -4,15 +4,10 @@
 // release, append an entry there (see ../alauda-os/README.md), not here.
 import { useEffect, useId, useState, type CSSProperties, type ReactNode } from 'react'
 
-import versionMapping from '../alauda-os/version-mapping.json' with { type: 'json' }
+import { OS_VARIANTS, releases } from './alauda-os.js'
 
-const { releases } = versionMapping
 const latestRelease = releases[releases.length - 1]
 
-const OS_OPTIONS = [
-  { value: 'm55', label: 'SLE Micro 5.5 (m55)' },
-  { value: 'k25', label: 'KubeOS (k25)' },
-]
 const OTHER_OS = 'other'
 
 // Kubernetes label value syntax. The template name is used verbatim as a
@@ -131,7 +126,7 @@ export default function DcsVmTemplateConfigMap({ children }: DcsVmTemplateConfig
   const id = useId()
   const [templateName, setTemplateName] = useState('')
   const [acpVersion, setAcpVersion] = useState(latestRelease.acp)
-  const [os, setOs] = useState(OS_OPTIONS[0].value)
+  const [os, setOs] = useState(OS_VARIANTS[0].value)
   const [customOs, setCustomOs] = useState('')
   const [copied, setCopied] = useState(false)
 
@@ -227,7 +222,7 @@ export default function DcsVmTemplateConfigMap({ children }: DcsVmTemplateConfig
             onChange={event => setOs(event.target.value)}
             style={controlStyle}
           >
-            {OS_OPTIONS.map(item => (
+            {OS_VARIANTS.map(item => (
               <option key={item.value} value={item.value}>
                 {item.label}
               </option>
