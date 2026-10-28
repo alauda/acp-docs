@@ -1,0 +1,356 @@
+---
+weight: 9
+---
+
+# Migrate ALB or Ingress to Gateway API
+
+## Overview
+
+This guide describes how to migrate HTTP/HTTPS traffic from an existing ALB or Ingress configuration to [Gateway API](https://gateway-api.sigs.k8s.io/) managed by Envoy Gateway.
+
+Gateway API is a new configuration model. It does not provide runtime compatibility for ALB rules or Ingress annotations. Migration means creating equivalent `Gateway`, `HTTPRoute`, and policy resources, validating them, and then moving traffic to the new Gateway.
+
+:::warning
+ALB is deprecated. Use [Ingress NGINX Operator](../operators/ingress_nginx_operator.mdx) only when an application requires Ingress-specific behavior that cannot be represented by Gateway API. For new L7 traffic, use [Envoy Gateway](../operators/envoy_gateway_operator.mdx) and Gateway API.
+:::
+
+This guide covers L7 HTTP/HTTPS traffic. For ALB TCP/UDP traffic, evaluate a `LoadBalancer` Service or the Gateway API `TCPRoute`/`UDPRoute` support provided by the installed Envoy Gateway version separately.
+
+## Migration model
+
+The main resources have different responsibilities after migration:
+
+| Existing configuration | Gateway API resource | Migration notes |
+| --- | --- | --- |
+| ALB frontend (protocol and port) | `Gateway.spec.listeners[]` | A listener defines the protocol, port, hostname, and TLS settings. |
+| ALB rule | `HTTPRoute` rule | A route matches the hostname, path, header, or method and references a backend Service. |
+| Ingress `host` | `HTTPRoute.spec.hostnames[]` | Preserve exact or wildcard hostname semantics. |
+| Ingress path and backend | `HTTPRoute.spec.rules[].matches[]` and `backendRefs[]` | Convert `Prefix`, `Exact`, or controller-specific matching explicitly. |
+| Ingress class or ALB selection | `HTTPRoute.spec.parentRefs[]` | Attach the route to the intended Gateway listener. |
+| Ingress TLS section or ALB HTTPS frontend | HTTPS `Gateway` listener | Reference the certificate Secret from the listener. |
+| ALB address or VIP | Gateway data-plane Service, NodePort, or host network | Keep the external address and DNS cutover as a separate operational step. |
+| ALB/Ingress advanced behavior | Gateway API filter or Envoy Gateway policy | Do not copy annotations mechanically; map their behavior. |
+
+The migration does not require deleting the old ALB or Ingress immediately. Keep the old path available until the new route has passed functional and performance checks.
+
+## Prerequisites
+
+Before changing traffic, make sure that:
+
+1. The Envoy Gateway Operator is installed. See [Install Envoy Gateway Operator](../operators/envoy_gateway_operator.mdx).
+2. The required standard Gateway API CRDs and Envoy Gateway extension CRDs are installed. See [Gateway API CRD versions](./gatewayapi_crd_versions.mdx).
+3. A `GatewayClass` controlled by Envoy Gateway is available.
+4. You have a Gateway with listeners for the protocols and ports used by the application. See [Configure Gateway API Gateway](../functions/configure_gatewayapi_gateway.mdx).
+5. You have inventoried every source Ingress or ALB frontend/rule, including hostnames, paths, backend ports, TLS Secrets, annotations, rewrite rules, authentication, session persistence, timeouts, and backend protocol.
+6. You have a test hostname or an alternate DNS record for validating the new entry point.
+
+For a large installation, migrate a small, low-risk application first. Keep a record of each source object and its destination `HTTPRoute` or policy so that the change can be audited and rolled back.
+
+## Step 1: Inventory the existing configuration
+
+List the objects that contribute to the current request path. For Ingress, inspect the Ingress object, its `IngressClass`, referenced Services, TLS Secrets, and annotations:
+
+```shell
+kubectl get ingress -A -o yaml
+kubectl get ingressclass
+kubectl get svc -A
+kubectl get secret -A
+```
+
+For ALB, inspect the ALB, frontend, and rule resources used by the application. The exact resource names depend on the ACP release and ALB CRD version; use the resources shown by [Configure ALB](../functions/configure_alb.mdx).
+
+For every route, record at least:
+
+- hostname and external port;
+- path match type and path rewrite behavior;
+- backend Service, port, and whether the backend speaks HTTP or HTTPS;
+- TLS termination, passthrough, or re-encryption behavior;
+- request and response header changes;
+- authentication, authorization, rate limiting, and source-IP restrictions;
+- load-balancing and session-persistence behavior;
+- health checks, timeouts, redirects, and any cross-namespace or cross-cluster backend.
+
+## Step 2: Create or select a Gateway
+
+Create a Gateway that exposes the required listeners. The following example terminates TLS at the Gateway:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: public-gateway
+  namespace: gateway-system
+spec:
+  gatewayClassName: envoy
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: All
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: app.example.com
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: app-example-tls
+      allowedRoutes:
+        namespaces:
+          from: All
+```
+
+Use `allowedRoutes` deliberately. `from: Same` restricts routes to the Gateway namespace; `from: All` permits routes from every namespace; `from: Selector` permits only namespaces matching the selector. If a certificate Secret is in another namespace, configure a `ReferenceGrant` in that namespace.
+
+Confirm that the Gateway has been programmed before creating routes:
+
+```shell
+kubectl get gateway public-gateway -n gateway-system -o yaml
+```
+
+The Gateway should report `Programmed=True` and its status should contain an address that clients can reach.
+
+## Step 3: Convert Ingress to HTTPRoute
+
+An Ingress with a host, prefix path, and Service backend can be represented as follows:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: web
+  namespace: default
+spec:
+  parentRefs:
+    - name: public-gateway
+      namespace: gateway-system
+      sectionName: https
+  hostnames:
+    - app.example.com
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: web
+          port: 8080
+```
+
+The conversion rules are:
+
+- map `spec.rules[].host` to `hostnames`;
+- map `pathType: Prefix` to `PathPrefix` and `pathType: Exact` to `Exact`;
+- map the Ingress backend Service and port to `backendRefs`;
+- replace `ingressClassName` with the appropriate `parentRefs` and listener `sectionName`;
+- keep one source Ingress as one `HTTPRoute` where possible, with one rule for each path;
+- split a route only when a policy or compatibility behavior needs a narrower attachment scope.
+
+Read [Configure Gateway API Route](../functions/configure_gatewayapi_route.mdx) for route attachment and match behavior.
+
+## Step 4: Convert ALB frontend and rules
+
+For ALB, map the frontend to a Gateway listener and each rule to an `HTTPRoute` rule. For example, an HTTP rule for `api.example.com/v1` that forwards to `api:8080` becomes:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: api
+  namespace: application
+spec:
+  parentRefs:
+    - name: public-gateway
+      namespace: gateway-system
+      sectionName: https
+  hostnames:
+    - api.example.com
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1
+      backendRefs:
+        - name: api
+          port: 8080
+```
+
+ALB project assignment and port-project isolation do not have a direct `HTTPRoute` field. Preserve those controls through Gateway namespace and listener ownership, platform RBAC, or a product-specific policy. Confirm the required isolation behavior before removing the ALB.
+
+## Step 5: Map annotations and ALB extensions by behavior
+
+Gateway API uses typed fields, filters, and policies. The following mappings are common starting points:
+
+| Source behavior | Gateway API or Envoy Gateway mapping | Notes |
+| --- | --- | --- |
+| Fixed prefix or full-path rewrite | `URLRewrite` filter | Use `ReplacePrefixMatch` or `ReplaceFullPath`. |
+| Regex capture rewrite | Envoy Gateway `HTTPRouteFilter` with `ReplaceRegexMatch` | A standard `URLRewrite` cannot express arbitrary capture substitutions. |
+| HTTP to HTTPS redirect | `RequestRedirect` filter | Do not create a backend route pointing to a placeholder Service. |
+| Static request/response headers | `RequestHeaderModifier` or `ResponseHeaderModifier` | Use `set`, `add`, or `remove` according to the original behavior. |
+| Client-to-Gateway timeout or connection settings | `ClientTrafficPolicy` | Attach it to the Gateway or listener as appropriate. |
+| Backend timeout, retry, load balancing, or session behavior | `BackendTrafficPolicy` or HTTPRoute fields | Choose the resource based on the required scope. |
+| Backend HTTPS | `BackendTLSPolicy` | Target the actual Service port and validate the backend certificate hostname. |
+| Authentication, authorization, or IP restrictions | `SecurityPolicy` | Check the installed Envoy Gateway version for supported features. |
+| Dynamic cookie-to-header conversion | Envoy Gateway extension policy or application change | Standard `RequestHeaderModifier` only sets static values. |
+
+### Fixed path rewrite
+
+For a simple prefix rewrite, use the standard filter on the route rule:
+
+```yaml
+filters:
+  - type: URLRewrite
+    urlRewrite:
+      path:
+        type: ReplacePrefixMatch
+        replacePrefixMatch: /
+```
+
+### Regex path rewrite
+
+For an Ingress or ALB rule that depends on regex capture groups, use an Envoy Gateway extension resource and reference it from the matching rule:
+
+```yaml
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: HTTPRouteFilter
+metadata:
+  name: api-rewrite
+  namespace: application
+spec:
+  urlRewrite:
+    path:
+      type: ReplaceRegexMatch
+      replaceRegexMatch:
+        pattern: "^/api(/|$)(.*)$"
+        substitution: "/\\2"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: api
+  namespace: application
+spec:
+  parentRefs:
+    - name: public-gateway
+      namespace: gateway-system
+      sectionName: https
+  hostnames:
+    - app.example.com
+  rules:
+    - matches:
+        - path:
+            type: RegularExpression
+            value: "^/api(/|$)(.*)$"
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.envoyproxy.io
+            kind: HTTPRouteFilter
+            name: api-rewrite
+      backendRefs:
+        - name: api
+          port: 8080
+```
+
+Check regex boundaries carefully. A pattern such as `business-1(.|$)` can also match `business-10`; use `(/|$)` when the next character must be a path separator or the end of the path.
+
+### HTTPS backends
+
+`HTTPRoute` uses HTTP when it forwards to a Service unless a backend TLS policy is configured. If the source Ingress used `backend-protocol: HTTPS`, create a `BackendTLSPolicy` and match its validation hostname to the backend certificate:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: BackendTLSPolicy
+metadata:
+  name: api-backend-tls
+  namespace: application
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: api
+      sectionName: https
+  validation:
+    hostname: api.application.svc
+    wellKnownCACertificates: System
+```
+
+Use the API version and validation fields supported by the installed Gateway API CRDs. If the backend uses a private CA, reference the appropriate Secret or ConfigMap instead of `wellKnownCACertificates`.
+
+## Step 6: Handle behavior that has no direct conversion
+
+Do not mark a route migrated until these behaviors have an explicit replacement or an accepted product limitation:
+
+- ALB-specific `rewrite-request` or `rewrite-response` logic;
+- regex rewrites and `ImplementationSpecific` paths;
+- dynamic values extracted from cookies or other request data;
+- custom load-balancing algorithms such as EWMA;
+- WAF features not provided by the installed Envoy Gateway policy;
+- source-IP matching or port-project isolation;
+- cross-cluster backends and compatibility paths;
+- backend TLS and certificate validation;
+- redirects implemented by an annotation rather than a real backend.
+
+For example, a cookie-to-header annotation cannot be represented by a standard `RequestHeaderModifier`, because that filter sets a static value. Use an Envoy Gateway extension policy or change the application to send the header itself. Keep the policy attached only to the routes that need it; attaching it to the whole Gateway can change unrelated applications.
+
+## Step 7: Validate before cutover
+
+Apply the new resources without deleting the old ones:
+
+```shell
+kubectl apply -f gateway.yaml
+kubectl apply -f routes-and-policies.yaml
+```
+
+Check status at every layer:
+
+```shell
+kubectl get gateway -A
+kubectl get httproute -A -o yaml
+kubectl get backendtlspolicy,clienttrafficpolicy,backendtrafficpolicy,securitypolicy -A
+```
+
+Verify all of the following:
+
+1. The Gateway reports `Programmed=True`.
+2. Each HTTPRoute has `Accepted=True` and `ResolvedRefs=True` under `status.parents`.
+3. Each referenced Service, Secret, policy, and extension resource is resolved.
+4. HTTP and HTTPS requests return the expected status, headers, redirects, and response body.
+5. Regex paths, rewritten paths, session persistence, authentication, and backend TLS work as expected.
+6. The test hostname reaches the new Gateway address and does not accidentally reach the old ALB.
+7. Response time, error rate, and throughput are acceptable for the workload.
+
+Use `curl` with an explicit `Host` header when testing before DNS changes:
+
+```shell
+curl --resolve app.example.com:443:<gateway-address> \
+  --cacert <ca-file> https://app.example.com/api/health
+```
+
+Some applications do not support `HEAD`; use a real `GET` request for the final functional check.
+
+## Step 8: Cut over and roll back
+
+After validation, move traffic in a controlled way:
+
+1. Lower the DNS TTL before the change.
+2. Point a test or small traffic slice at the Gateway address.
+3. Monitor request errors, latency, backend health, and Gateway/HTTPRoute status.
+4. Update the production DNS record or external load-balancer target.
+5. Keep the old ALB or Ingress configuration available during the observation window.
+
+If the new path fails, restore DNS or the external load-balancer target to the old address, then inspect the route and policy status before retrying. Do not scale down or delete the old ALB until the rollback window has ended and the new path has passed the agreed monitoring period.
+
+## Related documentation
+
+- [Configure Gateway API Gateway](../functions/configure_gatewayapi_gateway.mdx)
+- [Configure Gateway API Route](../functions/configure_gatewayapi_route.mdx)
+- [Configure Gateway API Policy](../functions/configure_gatewayapi_policy.mdx)
+- [Tasks for Envoy Gateway](./tasks_for_envoy_gateway.mdx)
+- [Configure Ingresses](../functions/configure_ingress.mdx)
+- [Configure ALB](../functions/configure_alb.mdx)
+- [Migrate from OCP Route to Gateway API Route](./task_for_migrate_from_ocp_route_to_gatewayapi_route.mdx)
+- [Gateway API: Migrating from Ingress](https://gateway-api.sigs.k8s.io/guides/migrating-from-ingress)
