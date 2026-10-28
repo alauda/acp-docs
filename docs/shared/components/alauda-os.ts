@@ -8,6 +8,17 @@ export type Release = (typeof versionMapping.releases)[number]
 /** Oldest first, in the order of version-mapping.json. */
 export const releases: readonly Release[] = versionMapping.releases
 
+/** The docs cover upgrades from this ACP version on; older clusters go to technical support. */
+export const MIN_UPGRADE_SOURCE = 'v4.3.2'
+
+const minUpgradeSourceIndex = releases.findIndex(release => release.acp === MIN_UPGRADE_SOURCE)
+if (minUpgradeSourceIndex < 0) {
+  throw new Error(`version-mapping.json has no row for ${MIN_UPGRADE_SOURCE}, the oldest upgrade source.`)
+}
+
+/** The ACP versions offered by the upgrade selectors, oldest first. */
+export const upgradeReleases: readonly Release[] = releases.slice(minUpgradeSourceIndex)
+
 export interface OsVariant {
   /** Identifier used in VM template ConfigMap names. */
   value: string

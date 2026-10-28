@@ -5,11 +5,11 @@
 // there (see ../alauda-os/README.md), not here.
 import { useEffect, useId, useState, type CSSProperties, type ReactNode } from 'react'
 
-import { OS_VARIANTS, planUpgradePath, releases, type Release } from './alauda-os.js'
+import { OS_VARIANTS, planUpgradePath, upgradeReleases, type Release } from './alauda-os.js'
 import { AcpVersionField, alertStyle, controlStyle, fieldRowStyle, fieldStyle } from './fields.js'
 
-const latestRelease = releases[releases.length - 1]
-const previousRelease = releases[Math.max(releases.length - 2, 0)]
+const latestRelease = upgradeReleases[upgradeReleases.length - 1]
+const previousRelease = upgradeReleases[Math.max(upgradeReleases.length - 2, 0)]
 
 const OTHER_OS = 'other'
 
@@ -249,7 +249,7 @@ function SingleVersionForm() {
   const [templateName, setTemplateName] = useState('')
   const [acpVersion, setAcpVersion] = useState(latestRelease.acp)
 
-  const release = releases.find(item => item.acp === acpVersion) ?? latestRelease
+  const release = upgradeReleases.find(item => item.acp === acpVersion) ?? latestRelease
   const trimmedName = templateName.trim()
   const command = renderCommand([releaseValues(release, trimmedName || '<vm-template-name>', os.osPart)])
 

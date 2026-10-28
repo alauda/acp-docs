@@ -4,7 +4,7 @@
 // entry there (see ../alauda-os/README.md), not here.
 import { useId, useState, type ReactNode } from 'react'
 
-import { planUpgradePath, releases } from './alauda-os.js'
+import { planUpgradePath, upgradeReleases } from './alauda-os.js'
 import { AcpVersionField, alertStyle, fieldRowStyle } from './fields.js'
 
 const STEP_LABELS = {
@@ -24,8 +24,8 @@ export interface AlaudaOsUpgradePathProps {
 
 export default function AlaudaOsUpgradePath({ children }: AlaudaOsUpgradePathProps) {
   const id = useId()
-  const [currentAcp, setCurrentAcp] = useState(releases[Math.max(releases.length - 2, 0)].acp)
-  const [targetAcp, setTargetAcp] = useState(releases[releases.length - 1].acp)
+  const [currentAcp, setCurrentAcp] = useState(upgradeReleases[Math.max(upgradeReleases.length - 2, 0)].acp)
+  const [targetAcp, setTargetAcp] = useState(upgradeReleases[upgradeReleases.length - 1].acp)
 
   if (import.meta.env.SSG_MD) {
     return (

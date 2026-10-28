@@ -2,7 +2,7 @@
 // the theme variables so that they follow the light and dark themes.
 import type { CSSProperties } from 'react'
 
-import { releases } from './alauda-os.js'
+import { upgradeReleases } from './alauda-os.js'
 
 export const fieldRowStyle: CSSProperties = {
   display: 'flex',
@@ -45,7 +45,7 @@ export function AcpVersionField({ id, label, value, onChange }: AcpVersionFieldP
     <label htmlFor={id} style={fieldStyle}>
       {label}
       <select id={id} value={value} onChange={event => onChange(event.target.value)} style={controlStyle}>
-        {releases.map(release => (
+        {upgradeReleases.map(release => (
           <option key={release.acp} value={release.acp}>
             {release.acp}
           </option>
