@@ -8,13 +8,8 @@ This procedure upgrades the primary global cluster and the workload clusters of 
 
 ```mermaid
 flowchart LR
-    subgraph w1 ["Maintenance window"]
-        pause["Pause etcd synchronization<br/>on the standby global cluster"] --> primary["Upgrade the primary<br/>global cluster"] --> workload["Upgrade the<br/>workload clusters"]
-    end
-    subgraph w2 ["Later maintenance window"]
-        standby["Upgrade the standby<br/>global cluster"] --> resume["Resume etcd synchronization<br/>and verify"]
-    end
-    workload -.->|No DR protection| standby
+    primary[Primary global cluster] --> workload[Workload clusters]
+    workload -.->|Later maintenance window| standby[Standby global cluster]
 ```
 
 <Directive type="warning" title="Important">
@@ -140,12 +135,7 @@ Prepare both global clusters so that the standby global cluster can be safely fr
    kubectl get po -n cpaas-system -l service_name=cluster-transformer
    ```
 
-7. On **both** global clusters, disable the token rotator of the Alauda cluster API provider, first on the standby global cluster and then on the primary global cluster. The token rotator must not run on either global cluster during the mixed-version period:
-
-   - On the standby global cluster, the token rotator can revoke workload cluster access tokens that the primary global cluster still uses.
-   - On the primary global cluster, the token rotator updates the Secrets that hold the workload cluster access tokens. While synchronization is paused, these updates do not reach the standby global cluster, which then fails with outdated tokens.
-
-   Run the following commands on each global cluster:
+7. On the **standby** global cluster, disable the token rotator of the Alauda cluster API provider. Otherwise, the token rotator on the standby global cluster can revoke workload cluster access tokens that the primary global cluster still uses.
 
    ```bash
    kubectl -n cpaas-system set env deploy/cluster-api-provider-alauda-manager \
@@ -153,14 +143,24 @@ Prepare both global clusters so that the standby global cluster can be safely fr
    kubectl -n cpaas-system rollout status deploy/cluster-api-provider-alauda-manager
    ```
 
-   On each global cluster, the platform records this change as a `ResourcePatch`, and `kubectl` prints `Warning: The operation is allowed, and ResourcePatch rp-<suffix> is created`. `ResourcePatch` objects are not synchronized between the global clusters. On each global cluster, find the `ResourcePatch` as described in [Finding the token rotator ResourcePatch](#token-rotator-resourcepatch) and record its name with the change record. You exempt each `ResourcePatch` before you upgrade its global cluster and remove it when you restore the baseline.
+   The platform records this change as a `ResourcePatch`, and `kubectl` prints `Warning: The operation is allowed, and ResourcePatch rp-<suffix> is created`. Find the `ResourcePatch` as described in [Finding the token rotator ResourcePatch](#token-rotator-resourcepatch) and record its name with the change record as the `ResourcePatch` of the **standby** global cluster.
 
-   The platform keeps one `ResourcePatch` for each target resource. If the creation time of the `ResourcePatch` is earlier than this step, it also holds earlier customizations of the Deployment. Record this with the change record.
+8. On the **primary** global cluster, disable the token rotator of the Alauda cluster API provider. Otherwise, the token rotator on the primary global cluster updates the Secrets that hold the workload cluster access tokens. While synchronization is paused, these updates do not reach the standby global cluster, which then fails with outdated tokens.
+
+   ```bash
+   kubectl -n cpaas-system set env deploy/cluster-api-provider-alauda-manager \
+     -c cluster-api-provider-alauda CLUSTER_TOKEN_ROTATOR_ENABLED=false
+   kubectl -n cpaas-system rollout status deploy/cluster-api-provider-alauda-manager
+   ```
+
+   The platform records this change as a separate `ResourcePatch` on the primary global cluster. `ResourcePatch` objects are not synchronized between the global clusters. Find the `ResourcePatch` as described in [Finding the token rotator ResourcePatch](#token-rotator-resourcepatch) and record its name with the change record as the `ResourcePatch` of the **primary** global cluster.
+
+   You exempt each `ResourcePatch` before you upgrade its global cluster and remove it when you restore the baseline. The platform keeps one `ResourcePatch` for each target resource. If the creation time of a `ResourcePatch` is earlier than these steps, it also holds earlier customizations of the Deployment. Record this with the change record.
 
 **Verification**
 
-- The precheck script reports no objects being deleted, and the token rotator value is `false`.
-- On the primary global cluster, the token rotator value is `false`:
+- On the **standby** global cluster, the precheck script reports no objects being deleted, and the token rotator value is `false`.
+- On the **primary** global cluster, the token rotator value is `false`:
 
   ```bash
   kubectl -n cpaas-system get deploy cluster-api-provider-alauda-manager \
@@ -548,21 +548,41 @@ Verify that the standby global cluster is consistent with the primary global clu
 
    Each workload cluster that you upgraded from the primary global cluster reports the target patch release. The `global` entry describes the standby global cluster itself.
 
-5. Remove the token rotator override on **both** global clusters, first on the primary global cluster and then on the standby global cluster. Run the following commands on each global cluster:
+5. On the **primary** global cluster, remove the token rotator override and its `ResourcePatch`:
 
-   ```bash
-   kubectl -n cpaas-system set env deploy/cluster-api-provider-alauda-manager \
-     -c cluster-api-provider-alauda CLUSTER_TOKEN_ROTATOR_ENABLED-
-   kubectl -n cpaas-system rollout status deploy/cluster-api-provider-alauda-manager
-   ```
+   1. Remove the token rotator override:
 
-6. On each global cluster, remove the token rotator `ResourcePatch`. Find it as described in [Finding the token rotator ResourcePatch](#token-rotator-resourcepatch). If it still exists and was created by the override in [Preparing the global clusters](#prepare), delete it:
+      ```bash
+      kubectl -n cpaas-system set env deploy/cluster-api-provider-alauda-manager \
+        -c cluster-api-provider-alauda CLUSTER_TOKEN_ROTATOR_ENABLED-
+      kubectl -n cpaas-system rollout status deploy/cluster-api-provider-alauda-manager
+      ```
 
-   ```bash
-   kubectl delete resourcepatches <rp-name> --ignore-not-found
-   ```
+   2. Remove the `ResourcePatch` that you recorded for the **primary** global cluster. Check it as described in [Finding the token rotator ResourcePatch](#token-rotator-resourcepatch). If it still exists and was created by the override in [Preparing the global clusters](#prepare), delete it:
 
-   If the `ResourcePatch` also holds earlier customizations of the Deployment, do not delete it. Confirm with `kubectl get resourcepatches <rp-name> -o yaml` that it no longer contains `CLUSTER_TOKEN_ROTATOR_ENABLED`.
+      ```bash
+      kubectl delete resourcepatches <rp-name> --ignore-not-found
+      ```
+
+      If the `ResourcePatch` also holds earlier customizations of the Deployment, do not delete it. Confirm with `kubectl get resourcepatches <rp-name> -o yaml` that it no longer contains `CLUSTER_TOKEN_ROTATOR_ENABLED`.
+
+6. On the **standby** global cluster, remove the token rotator override and its `ResourcePatch`:
+
+   1. Remove the token rotator override:
+
+      ```bash
+      kubectl -n cpaas-system set env deploy/cluster-api-provider-alauda-manager \
+        -c cluster-api-provider-alauda CLUSTER_TOKEN_ROTATOR_ENABLED-
+      kubectl -n cpaas-system rollout status deploy/cluster-api-provider-alauda-manager
+      ```
+
+   2. Remove the `ResourcePatch` that you recorded for the **standby** global cluster. Check it as described in [Finding the token rotator ResourcePatch](#token-rotator-resourcepatch). If it still exists and was created by the override in [Preparing the global clusters](#prepare), delete it:
+
+      ```bash
+      kubectl delete resourcepatches <rp-name> --ignore-not-found
+      ```
+
+      If the `ResourcePatch` also holds earlier customizations of the Deployment, do not delete it. Confirm with `kubectl get resourcepatches <rp-name> -o yaml` that it no longer contains `CLUSTER_TOKEN_ROTATOR_ENABLED`.
 
 7. Keep `cpaas-system/etcd-sync-control` with `mode=Running`. It records the last pause and resume.
 
@@ -570,14 +590,23 @@ Verify that the standby global cluster is consistent with the primary global clu
 
 - The synchronization status check reports no missed keys, and each surplus key is explained.
 - The `ClusterVersionShadow` objects of the upgraded workload clusters on the standby global cluster report the target patch release.
-- The token rotator override is removed on both global clusters. On each global cluster, the following command returns an empty line:
+- On the **primary** global cluster, the token rotator override is removed. The following command returns an empty line:
 
   ```bash
   kubectl -n cpaas-system get deploy cluster-api-provider-alauda-manager \
     -o jsonpath='{.spec.template.spec.containers[?(@.name=="cluster-api-provider-alauda")].env[?(@.name=="CLUSTER_TOKEN_ROTATOR_ENABLED")].value}{"\n"}'
   ```
 
-- On each global cluster, [Finding the token rotator ResourcePatch](#token-rotator-resourcepatch) lists no `ResourcePatch` for `cluster-api-provider-alauda-manager`, except one that holds earlier customizations and no longer contains `CLUSTER_TOKEN_ROTATOR_ENABLED`.
+- On the **primary** global cluster, [Finding the token rotator ResourcePatch](#token-rotator-resourcepatch) lists no `ResourcePatch` for `cluster-api-provider-alauda-manager`, except one that holds earlier customizations and no longer contains `CLUSTER_TOKEN_ROTATOR_ENABLED`.
+
+- On the **standby** global cluster, the token rotator override is removed. The following command returns an empty line:
+
+  ```bash
+  kubectl -n cpaas-system get deploy cluster-api-provider-alauda-manager \
+    -o jsonpath='{.spec.template.spec.containers[?(@.name=="cluster-api-provider-alauda")].env[?(@.name=="CLUSTER_TOKEN_ROTATOR_ENABLED")].value}{"\n"}'
+  ```
+
+- On the **standby** global cluster, [Finding the token rotator ResourcePatch](#token-rotator-resourcepatch) lists no `ResourcePatch` for `cluster-api-provider-alauda-manager`, except one that holds earlier customizations and no longer contains `CLUSTER_TOKEN_ROTATOR_ENABLED`.
 
 The mixed-version period ends here, and the standby global cluster provides DR protection again. Continue with [Upgrade Validation](../validation.mdx) and the [Routine Checks](/install/non_alauda_os/global_dr.mdx) of global DR.
 
