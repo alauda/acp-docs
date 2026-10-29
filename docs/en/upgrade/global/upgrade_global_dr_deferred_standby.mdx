@@ -4,7 +4,18 @@ weight: 35
 
 # Upgrade a Global DR Environment with a Deferred Standby Upgrade
 
-You can upgrade the primary global cluster and the workload clusters of a global disaster recovery (DR) environment to a new patch release first, and upgrade the standby global cluster in place in a later maintenance window. Use this procedure only when the standby global cluster cannot be upgraded in the same window as the primary global cluster.
+This procedure upgrades the primary global cluster and the workload clusters of a global disaster recovery (DR) environment to a new patch release first, and upgrades the standby global cluster in place in a later maintenance window. It applies only when the standby global cluster cannot be upgraded in the same maintenance window as the primary global cluster. When both global clusters can be upgraded in one window, use [Upgrade Global Clusters in a DR Environment](./upgrade_global_dr.mdx) instead.
+
+```mermaid
+flowchart LR
+    subgraph w1 ["Maintenance window"]
+        pause["Pause etcd synchronization<br/>on the standby global cluster"] --> primary["Upgrade the primary<br/>global cluster"] --> workload["Upgrade the<br/>workload clusters"]
+    end
+    subgraph w2 ["Later maintenance window"]
+        standby["Upgrade the standby<br/>global cluster"] --> resume["Resume etcd synchronization<br/>and verify"]
+    end
+    workload -.->|No DR protection| standby
+```
 
 <Directive type="warning" title="Important">
 This procedure supports only upgrades between **patch releases of the same minor version**, for example from ACP 4.5.1 to ACP 4.5.2.
@@ -25,7 +36,7 @@ Keep this period as short as possible. Schedule the standby upgrade window befor
 
 In a standard DR upgrade, you uninstall **<Term name="product" /> etcd Synchronizer**, upgrade both global clusters in one window, and reinstall etcd Synchronizer. In a deferred standby upgrade, etcd Synchronizer stays installed on the standby global cluster and you **pause** and later **resume** it.
 
-**Pause.** While paused, etcd Synchronizer keeps running but no longer reads from the primary global cluster and no longer writes to the standby etcd. The standby global cluster keeps the synchronized data as it was at the moment of the pause. The DR marker ConfigMap `kube-public/etcd-sync` stays in place, so platform controllers on the standby global cluster continue to treat it as a standby and do not manage workload clusters.
+**Pause.** While paused, etcd Synchronizer keeps running but no longer reads from the primary global cluster and no longer writes to the standby etcd. The standby global cluster keeps the synchronized data as it was at the moment of the pause.
 
 **Resume.** When you resume, etcd Synchronizer first copies all in-scope data from the primary global cluster. It then deletes in-scope keys that existed on the standby before the pause and no longer exist on the primary. Objects created locally on the standby after the pause are kept. Built-in safety checks skip or hold the deletion when the result is unexpected.
 
@@ -75,22 +86,20 @@ From the moment you pause synchronization until verification after resume succee
 - Do not perform any workload cluster operation from the standby global cluster.
 - Do not edit any `status.*` key of `cpaas-system/etcd-sync-control`. Only etcd Synchronizer writes these keys.
 
-<Directive type="note" title="Note">
-While the token rotator is disabled on the standby global cluster, the workload cluster access tokens stored on the standby expire as the primary global cluster rotates them. The standby global cluster can lose access to workload clusters during the mixed-version period. Access is restored when synchronization resumes.
-</Directive>
-
 ## Prerequisites \{#prerequisites}
 
-The following requirements apply to the whole procedure. Each procedure section lists the additional prerequisites for its stage. Run the commands on the **standby global cluster** unless stated otherwise. The [precheck script](#precheck-script) covers the items that can be read from the cluster.
+The following requirements apply to the whole procedure. Each step of the [upgrade procedure](#procedure) lists the additional prerequisites for its stage. Run the commands on the **standby global cluster** unless stated otherwise. The [precheck script](#precheck-script) covers the items that can be read from the cluster.
 
 - The source and target releases are **patch releases of the same minor version**, for example ACP 4.5.1 and ACP 4.5.2. Check the current version of both global clusters.
 - Both the source patch release and the target patch release ship an etcd Synchronizer that supports pause mode. See the release notes.
-- The infrastructure providers in use meet the minimum versions: the vSphere provider reads the DR marker from `kube-public`, and the DCS provider is `v1.0.1` or later. Record the HCS and bare-metal provider versions in use and confirm them with technical support.
-- The etcd Synchronizer start delay (`--delay`) is 30 seconds or more. The default is `3m0s`.
 - The standby global cluster can reach the primary global cluster API server at `https://<active-cluster-vip>:6443`. See [Checking access to the primary global cluster](#check-primary-access).
 - The standby upgrade window is scheduled. See the [restrictions during the mixed-version period](#restrictions).
 
-## Preparing the Global Clusters \{#prepare}
+## Upgrade Procedure \{#procedure}
+
+<Steps>
+
+### Preparing the Global Clusters \{#prepare}
 
 Prepare both global clusters so that the standby global cluster can be safely frozen at the pause.
 
@@ -100,7 +109,7 @@ Prepare both global clusters so that the standby global cluster can be safely fr
 
 **Procedure**
 
-1. Record the versions of the global clusters, the infrastructure providers, and etcd Synchronizer with the change record.
+1. Record the versions of the global clusters and etcd Synchronizer with the change record.
 
 2. Confirm that the standby global cluster is consistent with the primary global cluster. See [Checking synchronization status](#check-sync-status).
 
@@ -131,7 +140,9 @@ Prepare both global clusters so that the standby global cluster can be safely fr
    kubectl get po -n cpaas-system -l service_name=cluster-transformer
    ```
 
-7. On the **standby** global cluster, disable the token rotator of the Alauda cluster API provider. Otherwise, the standby can revoke workload cluster access tokens that the primary global cluster still uses.
+7. On **both** global clusters, disable the token rotator of the Alauda cluster API provider, first on the standby global cluster and then on the primary global cluster. Otherwise, the workload cluster access tokens diverge while synchronization is paused: the standby global cluster can revoke tokens that the primary global cluster still uses, and the primary global cluster can rotate tokens that the frozen standby global cluster still holds.
+
+   Run the following commands on each global cluster:
 
    ```bash
    kubectl -n cpaas-system set env deploy/cluster-api-provider-alauda-manager \
@@ -139,18 +150,23 @@ Prepare both global clusters so that the standby global cluster can be safely fr
    kubectl -n cpaas-system rollout status deploy/cluster-api-provider-alauda-manager
    ```
 
-   The platform records this change as a `ResourcePatch`, and `kubectl` prints `Warning: The operation is allowed, and ResourcePatch rp-<suffix> is created`. Find the `ResourcePatch` as described in [Finding the token rotator ResourcePatch](#token-rotator-resourcepatch) and record its name with the change record. You exempt it before the standby upgrade and remove it when you restore the baseline.
+   On each global cluster, the platform records this change as a `ResourcePatch`, and `kubectl` prints `Warning: The operation is allowed, and ResourcePatch rp-<suffix> is created`. `ResourcePatch` objects are not synchronized between the global clusters. On each global cluster, find the `ResourcePatch` as described in [Finding the token rotator ResourcePatch](#token-rotator-resourcepatch) and record its name with the change record. You exempt each `ResourcePatch` before you upgrade its global cluster and remove it when you restore the baseline.
 
    The platform keeps one `ResourcePatch` for each target resource. If the creation time of the `ResourcePatch` is earlier than this step, it also holds earlier customizations of the Deployment. Record this with the change record.
-
-8. Confirm that the etcd Synchronizer start delay is 30 seconds or more. If it is lower, contact technical support before you continue.
 
 **Verification**
 
 - The precheck script reports no objects being deleted, and the token rotator value is `false`.
+- On the primary global cluster, the token rotator value is `false`:
+
+  ```bash
+  kubectl -n cpaas-system get deploy cluster-api-provider-alauda-manager \
+    -o jsonpath='{.spec.template.spec.containers[?(@.name=="cluster-api-provider-alauda")].env[?(@.name=="CLUSTER_TOKEN_ROTATOR_ENABLED")].value}{"\n"}'
+  ```
+
 - No workload cluster upgrade is in progress on either global cluster.
 
-## Upgrading etcd Synchronizer to a Pause-Capable Release \{#upgrade-etcd-sync-patch}
+### Upgrading etcd Synchronizer to a Pause-Capable Release \{#upgrade-etcd-sync-patch}
 
 Pause mode requires the etcd Synchronizer release for the source patch release that supports pause mode. If this release is already installed on the standby global cluster, skip this section. See the release notes to identify the release.
 
@@ -188,7 +204,7 @@ Pause mode requires the etcd Synchronizer release for the source patch release t
 - The synchronization status check reports no missed keys and no surplus keys, or each reported key is explained.
 - The precheck script passes.
 
-## Pausing etcd Synchronization \{#pause}
+### Pausing etcd Synchronization \{#pause}
 
 Pause etcd Synchronizer on the standby global cluster. The mixed-version period starts when the pause completes.
 
@@ -249,19 +265,13 @@ After the pause, the environment has no DR protection until verification after r
 4. Review the pause self-check:
 
    ```bash
-   kubectl -n cpaas-system get cm etcd-sync-control -o jsonpath='{.data.status\.pauseCheck}' | jq .
+   kubectl -n cpaas-system get cm etcd-sync-control -o jsonpath='{.data.status\.pauseCheck}{"\n"}'
    ```
 
    **Example output**
 
    ```json
-   {
-     "checkedAt": "2026-11-02T02:00:09Z",
-     "sourceRevision": 91234567,
-     "candidates": 81234,
-     "unexpected": 0,
-     "samples": []
-   }
+   {"checkedAt":"2026-11-02T02:00:09Z","sourceRevision":91234567,"candidates":81234,"unexpected":0,"samples":[]}
    ```
 
    The self-check is read-only. It applies the resume deletion rules at the time of the pause:
@@ -292,38 +302,59 @@ After the pause, the environment has no DR protection until verification after r
 - `status.pauseCheck` reports `unexpected` as `0`, or each sample key is explained.
 - The DR marker `kube-public/etcd-sync` exists.
 
-## Upgrading the Primary Global Cluster and Workload Clusters \{#upgrade-primary}
+### Upgrading the Primary Global Cluster and Workload Clusters \{#upgrade-primary}
 
 Upgrade the primary global cluster to the target patch release, then upgrade the workload clusters from the primary global cluster. If the global clusters run Alauda OS, upgrade Kubernetes on the primary global cluster before you upgrade the workload clusters.
 
 **Prerequisites**
 
 - etcd Synchronizer on the standby global cluster is `Paused`.
+- The token rotator is disabled on the primary global cluster.
 - If the global clusters run Alauda OS, the prerequisites of [Upgrade Kubernetes on Alauda OS](./upgrade_kubernetes_on_alauda_os.mdx) are met on the **primary** global cluster.
 
 **Procedure**
 
-1. Upgrade the **primary** global cluster to the target patch release with the standard workflow in [Upgrade the global cluster](./upgrade_global_cluster.mdx): sync upgrade artifacts, run preflight checks, deploy the cluster version operator, request the upgrade, and observe execution until the primary global cluster reaches the target patch release.
+1. On the **primary** global cluster, exempt the token rotator `ResourcePatch` for the target patch release. Otherwise, the preflight check `ResourcePatchUpgradeable` fails with `UnexemptResourcePatches` and blocks the upgrade. Use the `ResourcePatch` name that you recorded for the primary global cluster in [Preparing the global clusters](#prepare):
+
+   ```bash
+   kubectl annotate resourcepatches <rp-name> \
+     config.cpaas.io/exempt-for-ver=<target-version> \
+     --overwrite
+   ```
+
+   Alternatively, if you request the upgrade from **Web Console (Fleet Essentials)**, confirm the `ResourcePatch` on the **Custom Configuration** step. See **Request the upgrade** in [Upgrade the global cluster](./upgrade_global_cluster.mdx).
+
+2. Upgrade the **primary** global cluster to the target patch release with the standard workflow in [Upgrade the global cluster](./upgrade_global_cluster.mdx): sync upgrade artifacts, run preflight checks, deploy the cluster version operator, request the upgrade, and observe execution until the primary global cluster reaches the target patch release.
 
    Administrator acknowledgements are not synchronized between global clusters, and an upgrade between patch releases can also require them, for example `ack-4.4-kubernetes-1.35-kernel-update`. Record the acknowledgements that the target patch release requires on the **primary** global cluster as described in [Handle Administrator Acknowledgement Gates](../troubleshooting.mdx#handle-administrator-acknowledgement-gates). You record them on the standby global cluster separately when you upgrade it.
 
    Do not run the steps of [Upgrade Global Clusters in a DR Environment](./upgrade_global_dr.mdx). In particular, do not uninstall or reinstall etcd Synchronizer on the standby global cluster.
 
-2. If the global clusters run Alauda OS, run [Upgrade Kubernetes on Alauda OS](./upgrade_kubernetes_on_alauda_os.mdx) on the **primary** global cluster only, with the kubeconfig of the primary global cluster. You upgrade Kubernetes on the standby global cluster in the standby upgrade window.
+3. If the global clusters run Alauda OS, run [Upgrade Kubernetes on Alauda OS](./upgrade_kubernetes_on_alauda_os.mdx) on the **primary** global cluster only, with the kubeconfig of the primary global cluster. You upgrade Kubernetes on the standby global cluster in the standby upgrade window.
 
    <Directive type="note" title="Note">
    During the rolling replacement, control plane nodes can be `NotReady` for a short time. This is expected.
    </Directive>
 
-3. Upgrade the workload clusters from the **primary** global cluster by following [Upgrade Workload Clusters](../workload/upgrade_workload_cluster.mdx). In this procedure, only the primary global cluster must reach the target patch release, including the Kubernetes upgrade on Alauda OS, before the workload clusters are upgraded.
+4. On the **primary** global cluster, confirm that the token rotator is still disabled:
+
+   ```bash
+   kubectl -n cpaas-system get deploy cluster-api-provider-alauda-manager \
+     -o jsonpath='{.spec.template.spec.containers[?(@.name=="cluster-api-provider-alauda")].env[?(@.name=="CLUSTER_TOKEN_ROTATOR_ENABLED")].value}{"\n"}'
+   ```
+
+   If the value is not `false`, disable it again as described in [Preparing the global clusters](#prepare).
+
+5. Upgrade the workload clusters from the **primary** global cluster by following [Upgrade Workload Clusters](../workload/upgrade_workload_cluster.mdx). In this procedure, only the primary global cluster must reach the target patch release, including the Kubernetes upgrade on Alauda OS, before the workload clusters are upgraded.
 
 **Verification**
 
 - The primary global cluster and the upgraded workload clusters report the target patch release.
 - If the global clusters run Alauda OS, all nodes of the primary global cluster report the target Kubernetes version.
+- The token rotator value on the primary global cluster is `false`.
 - etcd Synchronizer on the standby global cluster is still `Paused`.
 
-## Upgrading the Standby Global Cluster \{#upgrade-standby}
+### Upgrading the Standby Global Cluster \{#upgrade-standby}
 
 In the later maintenance window, upgrade the standby global cluster in place to the target patch release. During this upgrade, etcd Synchronizer moves to the target patch release and stays paused. If the global clusters run Alauda OS, also upgrade Kubernetes on the standby global cluster in this window, before you resume synchronization. Run the commands on the **standby** global cluster unless stated otherwise.
 
@@ -340,7 +371,7 @@ In the later maintenance window, upgrade the standby global cluster in place to 
 
 2. Exempt the token rotator `ResourcePatch` for the target patch release. Otherwise, the preflight check `ResourcePatchUpgradeable` fails with `UnexemptResourcePatches` and blocks the upgrade.
 
-   Find the `ResourcePatch` as described in [Finding the token rotator ResourcePatch](#token-rotator-resourcepatch), then add the exemption:
+   Use the `ResourcePatch` name that you recorded for the standby global cluster in [Preparing the global clusters](#prepare), or find it as described in [Finding the token rotator ResourcePatch](#token-rotator-resourcepatch), then add the exemption:
 
    ```bash
    kubectl annotate resourcepatches <rp-name> \
@@ -420,7 +451,7 @@ In the later maintenance window, upgrade the standby global cluster in place to 
 - etcd Synchronizer is the target patch release, and `mode`, `status.phase`, and `status.observedMode` are all `Paused`.
 - The token rotator value is `false`.
 
-## Resuming etcd Synchronization \{#resume}
+### Resuming etcd Synchronization \{#resume}
 
 Resume etcd Synchronizer on the standby global cluster after the standby global cluster has reached the target patch release. The environment has no DR protection until [verification](#verify) succeeds.
 
@@ -453,28 +484,13 @@ Resume etcd Synchronizer on the standby global cluster after the standby global 
 4. Review the resume summary:
 
    ```bash
-   kubectl -n cpaas-system get cm etcd-sync-control -o jsonpath='{.data.status\.lastResume}' | jq .
+   kubectl -n cpaas-system get cm etcd-sync-control -o jsonpath='{.data.status\.lastResume}{"\n"}'
    ```
 
    **Example output**
 
    ```json
-   {
-     "startedAt": "2026-12-01T03:10:12Z",
-     "completedAt": "2026-12-01T03:14:47Z",
-     "sourceRevision": 97810233,
-     "putKeys": 83012,
-     "candidates": 81234,
-     "absentOnSource": 42,
-     "skippedByIgnore": 3,
-     "skippedByGuard": 0,
-     "deleted": 39,
-     "deleteSkipped": false,
-     "deleteSkipReason": "",
-     "samples": [
-       "/registry/<resource>/<namespace>/<name>"
-     ]
-   }
+   {"startedAt":"2026-12-01T03:10:12Z","completedAt":"2026-12-01T03:14:47Z","sourceRevision":97810233,"putKeys":83012,"candidates":81234,"absentOnSource":42,"skippedByIgnore":3,"skippedByGuard":0,"deleted":39,"deleteSkipped":false,"deleteSkipReason":"","samples":["/registry/<resource>/<namespace>/<name>"]}
    ```
 
    Compare `deleted` and `samples` with the deletions made on the primary global cluster during the mixed-version period. For the meaning of each field, see [Resume summary fields](#resume-summary).
@@ -495,7 +511,7 @@ Resume etcd Synchronizer on the standby global cluster after the standby global 
 
 7. Save the resume summary with the change record.
 
-## Verifying Synchronization and Restoring the Baseline \{#verify}
+### Verifying Synchronization and Restoring the Baseline \{#verify}
 
 Verify that the standby global cluster is consistent with the primary global cluster, and restore the token rotator. The mixed-version period ends when this section completes successfully.
 
@@ -529,7 +545,7 @@ Verify that the standby global cluster is consistent with the primary global clu
 
    Each workload cluster that you upgraded from the primary global cluster reports the target patch release. The `global` entry describes the standby global cluster itself.
 
-5. Remove the token rotator override on the standby global cluster:
+5. Remove the token rotator override on **both** global clusters, first on the primary global cluster and then on the standby global cluster. Run the following commands on each global cluster:
 
    ```bash
    kubectl -n cpaas-system set env deploy/cluster-api-provider-alauda-manager \
@@ -537,7 +553,7 @@ Verify that the standby global cluster is consistent with the primary global clu
    kubectl -n cpaas-system rollout status deploy/cluster-api-provider-alauda-manager
    ```
 
-6. Remove the token rotator `ResourcePatch`. Find it as described in [Finding the token rotator ResourcePatch](#token-rotator-resourcepatch). If it still exists and was created by the override in [Preparing the global clusters](#prepare), delete it:
+6. On each global cluster, remove the token rotator `ResourcePatch`. Find it as described in [Finding the token rotator ResourcePatch](#token-rotator-resourcepatch). If it still exists and was created by the override in [Preparing the global clusters](#prepare), delete it:
 
    ```bash
    kubectl delete resourcepatches <rp-name> --ignore-not-found
@@ -551,16 +567,18 @@ Verify that the standby global cluster is consistent with the primary global clu
 
 - The synchronization status check reports no missed keys, and each surplus key is explained.
 - The `ClusterVersionShadow` objects of the upgraded workload clusters on the standby global cluster report the target patch release.
-- The token rotator override is removed. The following command returns an empty line:
+- The token rotator override is removed on both global clusters. On each global cluster, the following command returns an empty line:
 
   ```bash
   kubectl -n cpaas-system get deploy cluster-api-provider-alauda-manager \
     -o jsonpath='{.spec.template.spec.containers[?(@.name=="cluster-api-provider-alauda")].env[?(@.name=="CLUSTER_TOKEN_ROTATOR_ENABLED")].value}{"\n"}'
   ```
 
-- [Finding the token rotator ResourcePatch](#token-rotator-resourcepatch) lists no `ResourcePatch` for `cluster-api-provider-alauda-manager`, except one that holds earlier customizations and no longer contains `CLUSTER_TOKEN_ROTATOR_ENABLED`.
+- On each global cluster, [Finding the token rotator ResourcePatch](#token-rotator-resourcepatch) lists no `ResourcePatch` for `cluster-api-provider-alauda-manager`, except one that holds earlier customizations and no longer contains `CLUSTER_TOKEN_ROTATOR_ENABLED`.
 
 The mixed-version period ends here, and the standby global cluster provides DR protection again. Continue with [Upgrade Validation](../validation.mdx) and the [Routine Checks](/install/non_alauda_os/global_dr.mdx) of global DR.
+
+</Steps>
 
 ## Reference \{#reference}
 
@@ -573,8 +591,7 @@ The precheck script is read-only. Run it on the standby global cluster during pr
 | **Objects being deleted** | Cluster API objects, infrastructure provider machines, VMs and pools, `machine.alauda.io` MachinePools, BackupStorageLocationRepos, and MachineInventories that have a deletion timestamp. | No output. |
 | **Token rotator** | The `CLUSTER_TOKEN_ROTATOR_ENABLED` value of the Alauda cluster API provider. | `false` after preparation. |
 | **DR marker** | The ConfigMap `kube-public/etcd-sync`. | `configmap/etcd-sync`. |
-| **etcd Synchronizer** | The image, the start delay, the Lease holder, and the pause state in `cpaas-system/etcd-sync-control`. | The expected release; `--delay` of 30 seconds or more; a Lease holder; `Paused Paused Paused` after the pause. |
-| **Infrastructure provider images** | The images of the infrastructure providers. | The minimum versions in [Prerequisites](#prerequisites). |
+| **etcd Synchronizer** | The image, the Lease holder, and the pause state in `cpaas-system/etcd-sync-control`. | The expected release; a Lease holder; `Paused Paused Paused` after the pause. |
 
 ```bash
 #!/usr/bin/env bash
@@ -613,21 +630,12 @@ kubectl -n kube-public get cm etcd-sync -o name
 echo "== etcd Synchronizer =="
 echo "image:"
 kubectl -n cpaas-system get deploy etcd-sync -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}'
-echo "start delay (expected: --delay of 30s or more; no flag means the default 3m0s):"
-kubectl -n cpaas-system get deploy etcd-sync \
-  -o jsonpath='{range .spec.template.spec.containers[*].command[*]}{@}{"\n"}{end}{range .spec.template.spec.containers[*].args[*]}{@}{"\n"}{end}' \
-  | grep -- '^--delay' || echo "--delay not set"
 echo "leader:"
 kubectl -n cpaas-system get lease etcd-sync-mirror -o jsonpath='{.spec.holderIdentity}{"\n"}'
 echo "mode, status.phase, status.observedMode:"
 kubectl -n cpaas-system get cm etcd-sync-control \
   -o jsonpath='{.data.mode}{" "}{.data.status\.phase}{" "}{.data.status\.observedMode}{"\n"}{.data.status\.pauseCheck}{"\n"}' \
   2>/dev/null || echo "control ConfigMap not created yet"
-
-echo "== Infrastructure provider images =="
-kubectl -n cpaas-system get deploy \
-  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.template.spec.containers[*].image}{"\n"}{end}' \
-  | grep -E 'cluster-api-provider|capv|vsphere|dcs|hcs|baremetal'
 ```
 
 ### Checking Synchronization Status \{#check-sync-status}
@@ -747,7 +755,7 @@ etcd Synchronizer on the standby global cluster connects to the primary etcd thr
 
 ### Finding the Token Rotator ResourcePatch \{#token-rotator-resourcepatch}
 
-The token rotator override from [Preparing the global clusters](#prepare) is recorded as a `ResourcePatch` that targets the Deployment `cpaas-system/cluster-api-provider-alauda-manager`. On the standby global cluster, list the `ResourcePatch` objects for this Deployment:
+The token rotator override from [Preparing the global clusters](#prepare) is recorded on each global cluster as a `ResourcePatch` that targets the Deployment `cpaas-system/cluster-api-provider-alauda-manager`. On the global cluster, list the `ResourcePatch` objects for this Deployment:
 
 ```bash
 kubectl get resourcepatches \
@@ -847,7 +855,7 @@ kubectl -n cpaas-system get cm etcd-sync-control \
 | etcd Synchronizer Pods restart repeatedly while paused. | The active-cluster token or access to the primary global cluster is no longer valid. The pause state is kept, and nothing is written to the standby etcd. Fix [access to the primary global cluster](#check-primary-access) before you upgrade the standby global cluster. |
 | `kube-public/etcd-sync` shows that synchronization is in progress while paused. | Expected. Use `cpaas-system/etcd-sync-control` for the pause state. |
 | `upgrade.sh --preflight` on the standby global cluster does not print the check results. | Read the results from the `ClusterVersionShadow` with the commands in [Inspect Upgrade State](../troubleshooting.mdx#inspect-upgrade-state). |
-| Preflight on the standby global cluster reports `ResourcePatchUpgradeable` with `UnexemptResourcePatches`. | Exempt the token rotator `ResourcePatch` for the target patch release as described in [Upgrading the standby global cluster](#upgrade-standby). |
+| Preflight on a global cluster reports `ResourcePatchUpgradeable` with `UnexemptResourcePatches`. | Exempt the token rotator `ResourcePatch` of that global cluster for the target patch release, as described in [Upgrading the primary global cluster and workload clusters](#upgrade-primary) or [Upgrading the standby global cluster](#upgrade-standby). |
 
 ## Additional Resources \{#additional-resources}
 
