@@ -9,7 +9,7 @@ i18n:
 
 Use this page for Alauda Container Platform Registry administrator and namespace administrator tasks,
 including namespace image access, usage reporting, image pruning, registry garbage collection, and
-image signature verification.
+recorded image signature identity checks.
 
 ## Task Index
 
@@ -17,16 +17,18 @@ image signature verification.
 | --- | --- |
 | [Grant namespace permissions](#grant-namespace-permissions) | A user or service account needs pull, push, delete, or image catalog access in an image namespace. |
 | [View usage](#view-usage) | An administrator needs image or ImageStream usage information. |
-| [Verify image signatures](#verify-image-signatures) | An administrator needs to check or save trusted image signature conditions. |
+| [Check recorded signature identity](#verify-image-signatures) | An administrator needs to compare recorded identity claims or record an independently verified trust decision. |
 | [Prune images](#prune-images) | An administrator needs to remove unused image metadata after reviewing a dry run. |
-| [Run registry garbage collection](#run-registry-garbage-collection) | An administrator needs to reclaim unreferenced blobs from Registry storage after metadata cleanup. |
+| [Run registry garbage collection](#run-registry-garbage-collection) | An administrator needs to unlink pruned manifests and reclaim unreferenced blobs, or collect blobs already unlinked from storage manifests. |
 
 ## Prerequisites
 
 - <Term name="productShort" /> Registry is installed and available.
 - You have `kubectl` and `ac` access to the target cluster.
 - You have permission to create RoleBindings in the image namespace.
-- You have administrator permissions for usage reporting, image pruning, registry garbage collection, and signature verification.
+- You can create cluster-scoped `subjectaccessreviews.authorization.k8s.io` to check another principal's permissions.
+- You have administrator permissions for usage reporting and cleanup. Garbage collection requires Registry Pod execution access and permission to update `Config/cluster` and `ImagePruner/cluster`.
+- For signature identity checks, you can `get` cluster-scoped `imagedigests.image.alauda.io`. Saving conditions or removing embedded signatures also requires `update` on that resource.
 
 Select the ACP 4.4 Registry backend before using the `ac` administrative commands:
 
@@ -70,71 +72,131 @@ kubectl create rolebinding image-puller-sa \
 
 | Placeholder | Description |
 | --- | --- |
-| `<username>` | <Term name="productShort" /> or Kubernetes username that needs access to images in the target namespace. |
+| `<username>` | <Term name="productShort" /> or Kubernetes username to check. For a ServiceAccount, use `system:serviceaccount:<workload-namespace>:<serviceaccount-name>`. |
 | `<image-namespace>` | Namespace that owns the image repository, for example `team-a`. |
+| `<repository>` | ImageStream name in the image namespace, for example `demo`. |
 | `<workload-namespace>` | Namespace where the workload service account runs. |
 | `<serviceaccount-name>` | ServiceAccount name used by the workload that pulls the image. |
 
-Verify the RoleBinding and effective access:
+Verify that the RoleBinding exists:
 
 ```bash
 kubectl -n <image-namespace> get rolebinding
-
-kubectl auth can-i get imagestreams/layers.image.alauda.io \
-  -n <image-namespace> \
-  --as=system:serviceaccount:<workload-namespace>:<serviceaccount-name>
 ```
 
-Expected results:
+The Registry uses the following permissions in the `image.alauda.io` API group:
 
-- The RoleBinding exists in the image namespace.
-- The `kubectl auth can-i` command returns `yes` for the service account that should pull images.
+| Operation | Typical role | Scope | Permission |
+| --- | --- | --- | --- |
+| Pull | `system:image-puller` | Image namespace | `imagestreams/layers` `get` |
+| Push | `system:image-pusher` | Image namespace | `imagestreams/layers` `update` |
+| Delete image references | `system:image-deleter` | Image namespace | `imagestreamtags` `delete` |
+| Upload signatures through the Registry | `system:image-signature-writer` | Image namespace and repository | `imagesignatures` `create` |
+| Manage ImageSignature API records | `system:image-signature-writer` | Cluster | `imagesignatures` `create`, `delete` |
+| Read the image catalog | `system:image-registry-catalog-reader` | Bound namespace, or cluster with a ClusterRoleBinding | `imagestreams` `list` |
+| Read Registry metrics | `system:image-registry-metrics-reader` | Cluster | `registry/metrics` `get` |
 
-The Registry uses ImageStream layer authorization:
-
-| Operation | Typical role | Image API permission |
-| --- | --- | --- |
-| Pull | `system:image-puller` | `image.alauda.io` `imagestreams/layers` `get` |
-| Push | `system:image-pusher` | `image.alauda.io` `imagestreams/layers` `update` |
-| Delete | `system:image-deleter` | Image API delete permissions for the target image metadata |
-| Write signatures | `system:image-signature-writer` | `image.alauda.io` `imagesignatures` `create`, `delete` |
-| Read the image catalog | `system:image-registry-catalog-reader` | `image.alauda.io` `imagestreams` `list` |
-| Read Registry metrics | `system:image-registry-metrics-reader` | `image.alauda.io` `registry/metrics` `get` |
+Use a RoleBinding for namespace access. Direct ImageSignature API operations and metrics require
+cluster-scoped authorization; a ClusterRoleBinding grants that role across the cluster. The
+administrative signature command uses ImageDigest `get` and `update` permissions instead.
 
 The `system:image-pruner` ClusterRole is reserved for the Operator-managed `pruner` ServiceAccount.
 It is not a namespace access role. Manual pruning and garbage collection require the corresponding
 administrator permissions.
 
-For roles other than Pull and Push, grant the corresponding platform role or ClusterRole according to
-your authorization model, then verify the effective permission. The metrics permission is
-cluster-scoped; the other checks are scoped to the image namespace where applicable:
+Check effective pull access with a `SubjectAccessReview` matching the Registry authorization check.
+Run the standard resource command in the target cluster's kubeconfig context so any API proxy path
+is preserved. `--validate=false` bypasses the client schema check when OpenAPI validation blocks
+the request; authentication and RBAC still apply:
 
 ```bash
-kubectl auth can-i delete images.image.alauda.io \
-  --as=<username>
-kubectl auth can-i create imagesignatures.image.alauda.io \
-  --as=<username>
-kubectl auth can-i list imagestreams.image.alauda.io \
-  -n <image-namespace> \
-  --as=<username>
-kubectl auth can-i get registry/metrics.image.alauda.io \
-  --as=<username>
+kubectl create --validate=false -f - -o jsonpath='{.status.allowed}{"\n"}' <<'EOF'
+{
+  "apiVersion": "authorization.k8s.io/v1",
+  "kind": "SubjectAccessReview",
+  "spec": {
+    "user": "<username>",
+    "groups": ["system:authenticated"],
+    "resourceAttributes": {
+      "namespace": "<image-namespace>",
+      "verb": "get",
+      "group": "image.alauda.io",
+      "resource": "imagestreams/layers",
+      "name": "<repository>"
+    }
+  }
+}
+EOF
 ```
 
-Expected result:
+Supply the principal's actual groups when testing group-based grants. For a ServiceAccount,
+include `system:serviceaccounts`, `system:serviceaccounts:<workload-namespace>`, and
+`system:authenticated`. For push access, repeat the request with `verb` set to `update`.
 
-- Each command returns `yes` for a principal with the corresponding effective permission. The
-  permission can also be granted by another role.
+The command prints `status.allowed`: `true` means the supplied identity and resource attributes
+are authorized. A `false` result does not establish whether the account exists. For details,
+repeat with `-o json` and inspect `status.reason` and `status.evaluationError`.
+
+For Registry signature uploads, reuse the request above with these `resourceAttributes`:
+
+```json
+{
+  "namespace": "<image-namespace>",
+  "verb": "create",
+  "group": "image.alauda.io",
+  "resource": "imagesignatures",
+  "name": "<repository>"
+}
+```
+
+For direct cluster-scoped ImageSignature API creation, omit the namespace and repository name:
+
+```json
+{
+  "verb": "create",
+  "group": "image.alauda.io",
+  "resource": "imagesignatures"
+}
+```
+
+Repeat that review with `verb` set to `delete` to check direct signature deletion. To check the
+administrative signature command, use `resource: imagedigests`, `name: sha256:<digest>`, and
+`verb: get` or `verb: update`, still without a namespace.
+
+`registry/metrics` is an RBAC-only subresource absent from Image API discovery. Check its
+cluster-scoped permission directly:
+
+```bash
+kubectl create --validate=false -f - -o jsonpath='{.status.allowed}{"\n"}' <<'EOF'
+{
+  "apiVersion": "authorization.k8s.io/v1",
+  "kind": "SubjectAccessReview",
+  "spec": {
+    "user": "<username>",
+    "groups": ["system:authenticated"],
+    "resourceAttributes": {
+      "verb": "get",
+      "group": "image.alauda.io",
+      "resource": "registry",
+      "subresource": "metrics"
+    }
+  }
+}
+EOF
+```
+
+Use the principal's actual groups as above. The command prints `true` when the supplied identity
+has the metrics reader permission in the target cluster.
 
 ## View Usage \{#view-usage}
 
-Show storage and usage statistics for Images:
+Show metadata-derived storage totals and Pod usage for ImageDigest objects:
 
 ```bash
 ac adm top images
 ```
 
-Show storage and usage statistics for ImageStreams:
+Show metadata-derived totals for ImageStreams:
 
 ```bash
 ac adm top imagestreams
@@ -142,26 +204,53 @@ ac adm top imagestreams
 
 Expected result:
 
-- The command prints usage rows for Image or ImageStream resources visible to the current administrator.
+- The command prints usage rows for ImageDigest or ImageStream resources visible to the current administrator.
 
-## Verify Image Signatures \{#verify-image-signatures}
+Interpret the columns as follows:
 
-Verify the image signature identity recorded on an Image object:
+- Image `STORAGE` sums recorded layer sizes and child-manifest sizes. ImageStream `STORAGE` sums
+  those values once per distinct referenced image digest, including tag history.
+- Shared layers are counted again across different images. These totals do not measure physical
+  backend usage or predict reclaimable bytes.
+- Image `USAGE` counts Pods with matching digest references in the queried Pod scope. It does not
+  include every workload or external consumer. `METADATA` counts recorded layer and child-manifest
+  entries; ImageStream `LAYERS` sums those counts per referenced image.
+
+## Check Recorded Signature Identity \{#verify-image-signatures}
+
+This command compares identity claims already recorded on an ImageDigest object. It does not verify
+signature cryptography, signer trust, or image integrity. Independently verify the signature under
+your signing policy before recording a trust decision.
+
+Check the recorded identity without modifying the object:
 
 ```bash
-ac adm verify-image-signature sha256:<digest> \
+ac adm verify-image-signature 'sha256:<digest>' \
   --expected-identity=registry.example.com/team-a/demo:latest
 ```
 
 | Placeholder | Description |
 | --- | --- |
-| `sha256:<digest>` | Digest of the Image object to verify. Use `ac get images` or `ac get imagestreamtags <name>:<tag> -n <namespace> -o wide` to find the digest. |
+| `sha256:<digest>` | Digest of the ImageDigest object to verify. Use `ac get imagedigests.image.alauda.io` or `ac get imagestreamtags <name>:<tag> -n <namespace> -o wide` to find the digest. |
 | `registry.example.com/team-a/demo:latest` | Expected signed image identity. Use the image reference required by your signing policy. |
 
-Save trusted conditions back to the Image object:
+Expected result: the command reports a matching recorded identity and leaves the ImageDigest unchanged.
+
+Before changing signatures, back up the ImageDigest metadata to a protected local file:
 
 ```bash
-ac adm verify-image-signature sha256:<digest> \
+umask 077
+ac get imagedigests.image.alauda.io 'sha256:<digest>' -o yaml > image-signatures-backup.yaml
+```
+
+> **Warning:** `--save` replaces the matching signatures' conditions with `Trusted=True` and
+> `ForImage=True`. An identity match alone does not justify trust. Use this option only after
+> independent verification, with cluster-scoped ImageDigest `update` permission and a metadata backup.
+
+Record the independently verified trust decision:
+
+```bash
+ac adm verify-image-signature 'sha256:<digest>' \
   --expected-identity=registry.example.com/team-a/demo:latest \
   --save
 ```
@@ -169,40 +258,51 @@ ac adm verify-image-signature sha256:<digest> \
 Verify the saved condition:
 
 ```bash
-ac get images.image.alauda.io sha256:<digest> -o yaml
+ac get imagedigests.image.alauda.io 'sha256:<digest>' -o yaml
 ```
 
 Expected result:
 
-- The Image object contains the trusted signature condition saved by the verification command.
+- Matching signature records contain `Trusted=True` and `ForImage=True` conditions.
 
-Saving trust conditions changes Image API metadata. To roll back a saved condition, edit the Image
-object and remove the saved condition, or restore the Image object from a known-good backup.
+To roll back `--save`, restore the affected signatures' previous conditions from the metadata backup.
 
-Remove all signature records from an Image object only when the records are no longer required:
+> **Warning:** `--remove-all` immediately clears all embedded signature data from the ImageDigest
+> object without a confirmation prompt. The Registry cannot undo this operation. Keep a metadata
+> backup and confirm the records are no longer required before running it.
 
-```bash
-ac adm verify-image-signature sha256:<digest> --remove-all
-```
-
-> **Warning:** `--remove-all` removes every signature record from the Image object. This operation
-> is not reversible through the Registry. Verify the Image object after the command and restore the
-> metadata from a known-good backup if the records were removed by mistake.
+Remove the embedded records and verify that `signatures` is empty:
 
 ```bash
-ac get images.image.alauda.io sha256:<digest> -o yaml
+ac adm verify-image-signature 'sha256:<digest>' --remove-all
+ac get imagedigests.image.alauda.io 'sha256:<digest>' -o yaml
 ```
 
 ## Prune Images \{#prune-images}
 
-Confirmed pruning can permanently remove unused image metadata. If you also run registry garbage
-collection, unreferenced blobs can be permanently reclaimed from storage. Run these commands during
-a maintenance window, keep required backups, and review dry-run output before adding `--confirm`.
+> **Warning:** Confirmed pruning permanently removes selected image metadata. Keep metadata and
+> storage backups, use a maintenance window, and review a dry run with the same retention and
+> exclusion flags before adding `--confirm`.
+
+The pruner scans Pod specifications in this cluster's Pods, Deployments, StatefulSets, DaemonSets,
+ReplicaSets, ReplicationControllers, Jobs, and CronJobs. Tagged images and tag history can be prune
+candidates. Consumers in other clusters or outside the platform are not scanned; exclude their
+repositories with `--whitelist` or retain the required images before proceeding.
+
+Manual retention defaults to zero revisions and zero age, independently of `ImagePruner/cluster`.
+The examples explicitly retain five revisions per tag and images younger than 72 hours. Adjust
+these values to your policy in every preview and confirmation command.
+
+This metadata-only procedure updates ImageStream references and removes eligible ImageDigest
+objects. Storage manifest links remain. If storage reclamation is intended, start with the
+[combined cleanup procedure](#prune-and-reclaim-storage) while the metadata graph is still intact.
 
 Preview image pruning:
 
 ```bash
-ac adm prune images
+ac adm prune images \
+  --keep-tag-revisions=5 \
+  --keep-younger-than=72h
 ```
 
 Expected result:
@@ -233,12 +333,18 @@ Expected result:
 Exclude repositories with an allow-list pattern by using `--whitelist`:
 
 ```bash
-# Preview the effect of the allow-list pattern
 ac adm prune images \
+  --keep-tag-revisions=5 \
+  --keep-younger-than=72h \
   --whitelist='^cpaas-system/.*'
+```
 
-# Confirm pruning only after reviewing the preview
+After reviewing the preview, confirm the same policy:
+
+```bash
 ac adm prune images \
+  --keep-tag-revisions=5 \
+  --keep-younger-than=72h \
   --whitelist='^cpaas-system/.*' \
   --confirm
 ```
@@ -250,9 +356,129 @@ metadata from a trusted image source, or re-import the image when recovery is re
 
 ## Run Registry Garbage Collection \{#run-registry-garbage-collection}
 
-Registry garbage collection reclaims unreferenced blobs from Registry storage. Blob reclamation is not reversible from the Registry after it is confirmed.
+Storage reclamation has three stages: prune Image API metadata, unlink eligible storage manifests,
+then collect blobs no longer referenced by storage manifests. Metadata-only pruning followed by
+standalone GC can leave blobs retained by their storage manifest links.
 
-Preview registry garbage collection after metadata cleanup:
+> **Warning:** Confirmed blob reclamation is irreversible through the Registry. Neither standalone
+> GC nor combined pruning automatically stops writers. Prevent concurrent pushes, imports, and other
+> Registry or Image API writes, and let in-flight writes finish before cleanup. Keep writers paused
+> until verification completes. Restore missing data from a storage backup or a trusted image source.
+
+### Prepare the Maintenance Window
+
+These GC procedures apply to the default operand namespace, `cpaas-system`. The current `ac`
+GC commands search a fixed set of namespaces rather than the Config namespace binding. For a
+customized operand namespace, contact technical support for a matching cleanup procedure.
+
+Record the current settings and suspend scheduled pruning to prevent overlapping cleanup:
+
+```bash
+REGISTRY_NAMESPACE="$(kubectl get configs.imageregistry.operator.alauda.io cluster \
+  -o jsonpath='{.metadata.annotations.imageregistry\.operator\.alauda\.io/operand-namespace}')" || exit 1
+test "$REGISTRY_NAMESPACE" = cpaas-system || {
+  echo "This cleanup procedure requires the default Registry operand namespace." >&2
+  exit 1
+}
+REGISTRY_READ_ONLY="$(kubectl get configs.imageregistry.operator.alauda.io cluster \
+  -o jsonpath='{.spec.readOnly}')" || exit 1
+REGISTRY_READ_ONLY="${REGISTRY_READ_ONLY:-false}"
+PRUNER_SUSPENDED="$(kubectl get imagepruners.imageregistry.operator.alauda.io cluster \
+  -o jsonpath='{.spec.suspend}')" || exit 1
+PRUNER_SUSPENDED="${PRUNER_SUSPENDED:-false}"
+
+kubectl patch imagepruners.imageregistry.operator.alauda.io cluster \
+  --type=merge -p '{"spec":{"suspend":true}}' || exit 1
+kubectl -n "$REGISTRY_NAMESPACE" wait cronjob/image-pruner \
+  --for=jsonpath='{.spec.suspend}'=true --timeout=300s || exit 1
+kubectl -n "$REGISTRY_NAMESPACE" get jobs -l created-by=image-pruner \
+  -o custom-columns='NAME:.metadata.name,CONDITION:.status.conditions[*].type'
+```
+
+Wait until every existing pruner Job has a terminal `Complete` or `Failed` condition. Suspending the
+schedule does not stop an existing Job. Pause image-changing workflows and prevent other clients
+from writing throughout the selected cleanup procedure.
+
+### Prune Metadata and Reclaim Storage \{#prune-and-reclaim-storage}
+
+Use this path before metadata-only pruning when you need to remove eligible manifest links and
+reclaim blobs. The recorded `REGISTRY_READ_ONLY` value must be `false`; if it is `true`, resolve the
+existing maintenance restriction before proceeding. Keep `spec.readOnly` false during this path
+because pruning must update and delete Image API resources. Enforce writer exclusion through your
+maintenance controls instead.
+
+Verify that your workstation can reach the same Registry endpoint that pruning will use. The
+following example uses HTTPS with a private CA:
+
+```bash
+REGISTRY_URL=https://registry.example.com
+REGISTRY_CA=/path/to/registry-ca.crt
+HTTP_STATUS="$(curl --silent --show-error --cacert "$REGISTRY_CA" \
+  --output /dev/null --write-out '%{http_code}' "${REGISTRY_URL%/}/v2/")"
+case "$HTTP_STATUS" in
+  200|401) ;;
+  *) echo "Registry endpoint check failed: HTTP $HTTP_STATUS" >&2; exit 1 ;;
+esac
+```
+
+Replace `REGISTRY_URL` with a verified Registry URL, including the scheme and any port, and
+`REGISTRY_CA` with the issuing CA bundle supplied by the certificate administrator. A `401`
+response is the expected unauthenticated challenge. It proves reachability, not deletion permission;
+use the administrator account authenticated to this cluster for pruning. For a publicly trusted
+certificate, omit `--cacert` above and `--certificate-authority` from both commands below.
+
+Preview the metadata candidates with explicit retention and repository exclusions:
+
+```bash
+ac adm prune images \
+  --registry-url="$REGISTRY_URL" \
+  --certificate-authority="$REGISTRY_CA" \
+  --keep-tag-revisions=5 \
+  --keep-younger-than=72h \
+  --whitelist='^cpaas-system/.*' \
+  --prune-registry
+```
+
+This dry run lists metadata candidates and skips GC. The confirmed run also unlinks eligible
+storage manifests and collects all then-unreferenced blobs, including previously unlinked content.
+After reviewing the candidates and backups, run:
+
+```bash
+ac adm prune images \
+  --registry-url="$REGISTRY_URL" \
+  --certificate-authority="$REGISTRY_CA" \
+  --keep-tag-revisions=5 \
+  --keep-younger-than=72h \
+  --whitelist='^cpaas-system/.*' \
+  --prune-registry \
+  --confirm
+```
+
+Remaining ImageStream references can retain a shared digest or manifest. Verify metadata cleanup
+with the same dry run, then continue to [verify blob availability](#verify-blob-availability).
+Review every manifest-deletion error in the output: the command can remove metadata before a
+Registry connection failure leaves storage links intact. A successful exit alone does not prove
+that all eligible manifests were unlinked. Resolve any such errors before declaring cleanup complete.
+
+### Collect Already Unlinked Blobs
+
+Use standalone GC when storage manifest links have already been removed. It does not unlink
+manifests based on Image API retention. After stopping writers, enable read-only mode and wait for
+the Registry rollout. Do not run metadata pruning in this mode; Image API writes and deletes are
+blocked.
+
+```bash
+kubectl patch configs.imageregistry.operator.alauda.io cluster \
+  --type=merge -p '{"spec":{"readOnly":true}}'
+kubectl -n "$REGISTRY_NAMESPACE" rollout status deployment/image-registry --timeout=300s
+kubectl get configs.imageregistry.operator.alauda.io cluster \
+  -o jsonpath='{.spec.readOnly}{"\n"}'
+```
+
+Expected results: the rollout completes and `spec.readOnly` is `true`. Keep other writers paused
+and allow in-flight operations to finish before previewing GC.
+
+Preview storage garbage collection:
 
 ```bash
 ac adm registry gc
@@ -272,24 +498,47 @@ Expected result:
 
 - The command removes eligible unreferenced blobs from Registry storage.
 
-You can also trigger registry garbage collection as part of pruning:
+Continue to verify blob availability before restoring the previous settings.
+
+### Verify Blob Availability \{#verify-blob-availability}
+
+Run this check from an administrator workstation with `ac`, enough local disk space, and trust
+configured for the Registry CA. Use an account with pull access to the image namespace. Write
+credentials to a new dedicated file, then extract each critical image by immutable digest into a
+fresh directory. Extraction reads the selected platform's layers without using a local runtime cache:
 
 ```bash
-ac adm prune images --confirm --prune-registry
+REGISTRY_AUTH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/registry-auth.XXXXXX")"
+REGISTRY_AUTH_FILE="$REGISTRY_AUTH_DIR/config.json"
+ac registry login --registry registry.example.com --to "$REGISTRY_AUTH_FILE"
+VERIFY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/registry-verify.XXXXXX")"
+
+ac image extract \
+  'registry.example.com/team-a/demo@sha256:<digest>' \
+  --filter-by-os=linux/amd64 \
+  --path "/:$VERIFY_DIR" \
+  --registry-config="$REGISTRY_AUTH_FILE"
 ```
 
-Both `ac adm prune images` and `ac adm registry gc` are dry-run by default. Review the preview before
-adding `--confirm`. Confirmed blob reclamation is irreversible from the Registry; restore data from a
-storage backup or copy the image again from a trusted source if a required blob was reclaimed.
+Replace `<digest>` with the hexadecimal suffix of the required SHA-256 digest. Replace
+`linux/amd64` with the platform to verify. For a multi-architecture image, identify its platforms
+with `ac image info --show-multiarch` and repeat extraction for every required platform, each time
+using a new directory. Expected result: extraction completes and writes the image filesystem to
+`$VERIFY_DIR`. An `ac image info` inspection alone does not verify layer availability. Remove the
+temporary authentication and image directories after verification and any investigation are complete.
 
-After confirmed garbage collection, verify critical images by pulling or inspecting them:
+### Restore the Previous Settings
+
+After successful verification, restore the recorded read-only and schedule settings:
 
 ```bash
-mkdir -p /tmp/registry-auth
-ac registry login \
-  --registry registry.example.com \
-  --to /tmp/registry-auth/config.json
-
-ac image info registry.example.com/team-a/demo:latest \
-  --registry-config=/tmp/registry-auth/config.json
+kubectl patch configs.imageregistry.operator.alauda.io cluster \
+  --type=merge -p "{\"spec\":{\"readOnly\":$REGISTRY_READ_ONLY}}"
+kubectl -n "$REGISTRY_NAMESPACE" rollout status deployment/image-registry --timeout=300s
+kubectl patch imagepruners.imageregistry.operator.alauda.io cluster \
+  --type=merge -p "{\"spec\":{\"suspend\":$PRUNER_SUSPENDED}}"
 ```
+
+Verify that the rollout completes and the two fields match their recorded values. Resume writers
+when the Registry is intended to be writable. If verification fails, keep the maintenance controls
+in place while investigating.

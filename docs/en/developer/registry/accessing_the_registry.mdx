@@ -13,9 +13,29 @@ clients, and through the <Term name="productShort" /> Image API.
 ## Prerequisites
 
 - Alauda Container Platform Registry is installed and available in the target cluster.
-- The image namespace exists.
-- The current user or service account has the required namespace permissions.
+- The image namespace `team-a` exists. The cross-namespace workload example also requires `team-b`.
+- A namespace administrator has [granted the required namespace permissions](../../configure/registry/managing_access_and_cleanup.mdx#grant-namespace-permissions)
+  to your account and the workload service account. For the cross-namespace example, grant pull
+  access in `team-a` to `team-b:app-puller` before deploying the workload.
+- For the workload examples, managed service account pull Secrets are enabled in the workload
+  namespaces. Ask a Registry administrator to confirm this setting.
 - The `ac` CLI is installed and authenticated when you use the Registry or Image API commands.
+- Your account can get ServiceAccounts and Secrets in the workload namespace for the metadata
+  checks below. Ask a namespace administrator to run those checks if your account lacks this access.
+- Before deploying either workload, `team-a/my-app:v1` has been published to the Registry. See
+  [Publish and inspect images](#publish-and-inspect-images) if the image is not available yet.
+
+Run CLI commands on your developer machine or in a CI environment with access to the target cluster.
+Replace the example values before running the commands:
+
+| Value | Description |
+| --- | --- |
+| `team-a` | Namespace that owns `my-app:v1` and the first example workload. |
+| `team-b` | Namespace for the workload that pulls the image from `team-a`. |
+| `registry.example.com` | Verified external Registry hostname, including a port if required, without a scheme or path. |
+| `source.example.com/source-team/my-app:v1` | Existing source image to publish to the Registry. You need read access to it. |
+| `<digest>` | The 64-character hexadecimal suffix of a SHA-256 digest. The example commands supply `sha256:`. |
+| `REGISTRY_AUTH_FILE` | Absolute path to the local auth file selected during login. |
 
 For `ac` Image API commands, select the ACP 4.4 Registry backend:
 
@@ -25,7 +45,9 @@ ac config set-registry-mode modern
 
 ## Required Namespace Permissions
 
-Your user account or workload service account must have permissions in the namespace that owns the image repository. Ask a namespace administrator to grant the required image roles when you need cross-namespace access.
+Your user account or workload service account must have permissions in the namespace that owns the
+image repository. Namespace administrators grant those permissions through the prerequisite task
+linked above.
 
 The Registry uses ImageStream layer authorization:
 
@@ -33,21 +55,20 @@ The Registry uses ImageStream layer authorization:
 | --- | --- | --- |
 | Pull | `system:image-puller` | `image.alauda.io` `imagestreams/layers` `get` |
 | Push | `system:image-pusher` | `image.alauda.io` `imagestreams/layers` `update` |
-| Delete | `system:image-deleter` | Image API delete permissions for the target image metadata |
+| Delete | `system:image-deleter` | `image.alauda.io` `imagestreamtags` `delete` |
 
-Additional Registry roles (`system:image-signature-writer`,
-`system:image-registry-catalog-reader`, and `system:image-registry-metrics-reader`) are listed in the
-full permission table in
-[Managing access and cleanup](../../configure/registry/managing_access_and_cleanup.mdx#grant-namespace-permissions).
-
-For role binding examples, see [Managing access and cleanup](../../configure/registry/managing_access_and_cleanup.mdx).
+Image API commands can require additional resource permissions. See
+[Delete image references](./managing_images_with_ac.mdx#delete-image-references) for the read and
+delete permissions required by `ac delete images`.
 
 ## Access the Registry from Inside the Cluster
 
-Use the internal service address for workloads inside the cluster:
+The default operand namespace is `cpaas-system`. Use the operand namespace recorded on
+`Config/cluster.metadata.annotations[imageregistry.operator.alauda.io/operand-namespace]` when it has
+been customized. Use the internal service address for workloads inside the cluster:
 
 ```text
-image-registry.image-registry-system.svc:5000
+image-registry.cpaas-system.svc:5000
 ```
 
 Example workload image reference:
@@ -71,7 +92,7 @@ spec:
       serviceAccountName: default
       containers:
         - name: app
-          image: image-registry.image-registry-system.svc:5000/team-a/my-app:v1
+          image: image-registry.cpaas-system.svc:5000/team-a/my-app:v1
 ```
 
 Save the manifest as `my-app.yaml` and apply it:
@@ -89,9 +110,9 @@ Expected results:
 The image repository path is namespace-scoped. Use `<registry-host>/<namespace>/<repository>:<tag>`;
 do not include additional path segments after the namespace.
 
-For a custom service account, make sure it has pull permission in the image namespace. The Operator
-injects the managed pull secret when the Registry is configured to manage service account pull
-secrets.
+For a custom service account, complete the cross-namespace permission prerequisite before deploying
+the workload. The Operator injects a managed pull Secret when the Registry is configured to manage
+service account pull Secrets in that namespace.
 
 Create the service account in the workload namespace:
 
@@ -99,39 +120,53 @@ Create the service account in the workload namespace:
 kubectl create serviceaccount app-puller -n team-b
 ```
 
-Have a namespace administrator grant the service account pull permission in the image namespace:
-
-```bash
-kubectl create rolebinding image-puller-app-puller \
-  --clusterrole=system:image-puller \
-  --serviceaccount=team-b:app-puller \
-  -n team-a
-```
-
-Verify that the managed pull secret is injected:
+Verify that the ServiceAccount references its managed pull Secret. The annotation identifies the
+managed Secret even when the ServiceAccount has other pull Secrets:
 
 ```bash
 PULL_SECRET="$(
   kubectl -n team-b get serviceaccount app-puller \
-    -o jsonpath='{.imagePullSecrets[0].name}'
+    -o jsonpath='{.metadata.annotations.imageregistry\.operator\.alauda\.io/internal-registry-pull-secret-ref}'
 )"
 test -n "$PULL_SECRET" || {
   echo "The managed pull Secret has not been injected yet." >&2
   exit 1
 }
+
+PULL_SECRET_REFERENCE="$(
+  kubectl -n team-b get serviceaccount app-puller \
+    -o jsonpath="{.imagePullSecrets[?(@.name==\"$PULL_SECRET\")].name}"
+)"
+test "$PULL_SECRET_REFERENCE" = "$PULL_SECRET" || {
+  echo "The managed pull Secret is not referenced by the ServiceAccount yet." >&2
+  exit 1
+}
 printf 'Managed pull Secret: %s\n' "$PULL_SECRET"
-kubectl -n team-b get secret "$PULL_SECRET" \
-  -o jsonpath='{.data}' | wc -c
 ```
 
-Expected result:
+Check the Secret's management label, service account annotation, and expiry annotation. These
+commands display metadata only:
 
-- The command prints a managed pull Secret name and a non-zero data size. Do not print or decode the
-  Secret data.
+```bash
+kubectl -n team-b get secret "$PULL_SECRET" \
+  -o go-template='Managed: {{index .metadata.labels "imageregistry.operator.alauda.io/managed-pull-secret"}}
+Service account: {{index .metadata.annotations "imageregistry.operator.alauda.io/internal-registry-auth-token.service-account"}}
+Expiry: {{index .metadata.annotations "imageregistry.operator.alauda.io/internal-registry-auth-token.expiry"}}
+'
+date -u '+Current UTC: %Y-%m-%dT%H:%M:%SZ'
+```
 
-The controller refreshes managed pull credentials asynchronously. If no pull Secret is listed, wait
-for reconciliation and ask a Registry administrator to verify that managed service account pull
-secrets are enabled and that the workload namespace is not ignored.
+Expected results:
+
+- The managed Secret named by the annotation is present in `ServiceAccount.imagePullSecrets`.
+- `Managed` is `true` and `Service account` is `app-puller`.
+- `Expiry` is present and later than `Current UTC`. Do not continue while expiry is missing or past.
+
+The controller creates a Secret stub before populating credentials and refreshes them
+asynchronously. If any check fails, wait for reconciliation and repeat both verification blocks.
+If the metadata remains incomplete, ask a Registry administrator to verify that managed service
+account pull Secrets are enabled and that the workload namespace is not ignored. Do not display
+or decode credential data. The workload rollout below verifies that the credentials can pull the image.
 
 Use the service account in the workload:
 
@@ -154,7 +189,7 @@ spec:
       serviceAccountName: app-puller
       containers:
         - name: app
-          image: image-registry.image-registry-system.svc:5000/team-a/my-app:v1
+          image: image-registry.cpaas-system.svc:5000/team-a/my-app:v1
           imagePullPolicy: Always
 ```
 
@@ -178,92 +213,95 @@ Expected results:
   verify the ServiceAccount permission, injected pull Secret, internal service address, and image
   repository path.
 
-## Authenticate an External OCI Client
+## Authenticate an External OCI Client \{#authenticate-an-external-oci-client}
 
-For external access, use `ac registry login` to write credentials for a <Term name="productShort" /> account that has namespace permissions:
-
-```bash
-ac registry login \
-  --registry registry.example.com
-```
-
-To write credentials to a specific OCI registry auth file, use `--to`:
+Obtain a reachable HTTPS Registry hostname from a Registry administrator. An Ingress status address
+alone does not establish a usable Registry hostname. If the registry uses a private CA,
+[configure client trust](../../configure/registry/exposing_the_registry.mdx#configure-client-trust)
+before login. Write credentials for a <Term name="productShort" /> account with namespace permissions:
 
 ```bash
-mkdir -p /tmp/registry-auth
+REGISTRY_AUTH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/registry-auth.XXXXXX")"
+export REGISTRY_AUTH_FILE="$REGISTRY_AUTH_DIR/config.json"
 
 ac registry login \
   --registry registry.example.com \
-  --to /tmp/registry-auth/config.json
-
-export REGISTRY_AUTH_FILE=/tmp/registry-auth/config.json
+  --to "$REGISTRY_AUTH_FILE"
 ```
 
-The command writes credentials for `registry.example.com` to the specified auth file. Use the
-exported `REGISTRY_AUTH_FILE` with `ac image` commands that need Registry authentication.
+Use this new, dedicated file. The CLI does not preserve unrelated client settings when rewriting
+the selected authentication file.
 
-If the registry uses a private CA, configure client trust before push and pull operations. Use `--insecure` only for an HTTP endpoint or a non-production test certificate that the client does not trust.
-
-## Push and Pull Images
-
-Tag and push an image:
+The command writes credentials for `registry.example.com` to the specified auth file. To verify
+image access, inspect an existing image that your account can pull. If `team-a/my-app:v1` has not
+been published yet, complete [Publish and inspect images](#publish-and-inspect-images) first:
 
 ```bash
-nerdctl tag my-app:latest registry.example.com/team-a/my-app:v1
-nerdctl push registry.example.com/team-a/my-app:v1
+ac image info registry.example.com/team-a/my-app:v1 \
+  --show-multiarch \
+  --registry-config="$REGISTRY_AUTH_FILE"
 ```
 
-Pull by tag:
+Expected result: the command returns the image digest and metadata. Writing the auth file alone
+does not verify image permissions. For another OCI client, configure it to read the same auth file.
+
+`--to` and `--registry-config` (or `-a`) select the login output file. Use `--skip-check` only when
+that file is needed before the endpoint is reachable. For login, `--insecure` also bypasses the
+endpoint check; it does not configure trust for later commands. For controlled HTTP or
+untrusted-certificate tests, pass `--insecure` separately to the direct image commands.
+
+## Publish and Inspect Images \{#publish-and-inspect-images}
+
+Use `ac image mirror` to publish an existing source image without a local container runtime. Both
+registries must be reachable from your machine. For a private source, the selected auth file must
+also contain credentials for the source host.
+
+If your image exists only in a local container runtime, use that runtime's OCI client to publish it
+first. That workflow requires the client to be installed, its runtime to be running, and the image
+to exist in the selected local image store. The `ac` examples below require a full source Registry
+reference; a local-only name such as `my-app:latest` is not sufficient.
+
+Preview copying the source image to the destination repository:
 
 ```bash
-nerdctl pull registry.example.com/team-a/my-app:v1
+ac image mirror \
+  source.example.com/source-team/my-app:v1 \
+  registry.example.com/team-a/my-app:v1 \
+  --keep-manifest-list \
+  --dry-run \
+  --registry-config="$REGISTRY_AUTH_FILE"
 ```
 
-Pull by digest:
+The preview lists the planned copy without validating remote images or permissions. Publish with
+the same source and options:
 
 ```bash
-nerdctl pull registry.example.com/team-a/my-app@sha256:<digest>
+ac image mirror \
+  source.example.com/source-team/my-app:v1 \
+  registry.example.com/team-a/my-app:v1 \
+  --keep-manifest-list \
+  --registry-config="$REGISTRY_AUTH_FILE"
 ```
+
+Verify the published tag with the `ac image info` command in
+[Authenticate an external OCI client](#authenticate-an-external-oci-client).
+
+Use the returned digest to inspect an immutable image reference. Replace `<digest>` with only the
+hexadecimal suffix after `sha256:`:
+
+```bash
+ac image info registry.example.com/team-a/my-app@sha256:<digest> \
+  --show-multiarch \
+  --registry-config="$REGISTRY_AUTH_FILE"
+```
+
+Expected result: the tag and digest queries identify the same published manifest or image index.
+Workloads can now pull `image-registry.cpaas-system.svc:5000/team-a/my-app:v1` with the required
+service account permissions. To copy files to your machine, see
+[Work with OCI images directly](./managing_images_with_ac.mdx#work-with-oci-images-directly).
 
 ## Query Image API Resources
 
-List ImageStreams:
-
-```bash
-kubectl get imagestreams.image.alauda.io -A
-ac get imagestreams -A
-```
-
-Show one ImageStream:
-
-```bash
-ac get imagestreams my-app -n team-a -o yaml
-```
-
-Show the current and historical digest for a tag:
-
-```bash
-ac get imagestreamtags my-app:v1 -n team-a -o wide
-```
-
-Show the Image metadata for a digest:
-
-```bash
-ac get imagestreamimages my-app@sha256:<digest> -n team-a -o yaml
-```
-
-List cluster-scoped Image resources through the current `modern` registry mode:
-
-```bash
-ac config set-registry-mode modern
-ac get images
-ac get images -o yaml
-```
-
-For namespace-scoped repository views, query ImageStream resources instead of passing a Registry URL
-override:
-
-```bash
-ac get imagestreams -n team-a
-ac get imagestreamtags my-app:v1 -n team-a -o wide
-```
+To inspect ImageStreams, tag history, or ImageDigest metadata, use
+[Query images and ImageStreams](./managing_images_with_ac.mdx#query-images-and-imagestreams).
+ImageStream queries are namespace-scoped; ImageDigest listing requires cluster-scoped read permission.

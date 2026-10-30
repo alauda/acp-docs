@@ -9,15 +9,36 @@ i18n:
 
 Use the `ac` image commands to work with Alauda Container Platform Registry and the
 <Term name="productShort" /> Image API. Alauda Container Platform Registry in ACP 4.4 uses the
-`modern` registry mode and provides Image and ImageStream workflows for <Term name="productShort" />
+`modern` registry mode and provides ImageDigest and ImageStream workflows for <Term name="productShort" />
 clusters.
 
 ## Prerequisites
 
 - The `ac` CLI is installed and authenticated to the target cluster.
 - The Registry and the `image.alauda.io/v1` Image API are available.
-- You have the required permissions for the ImageStream, Image, and workload resources used by the
-  command.
+- The example image namespace `team-a` exists. The cross-namespace copy also requires `team-b`.
+- A namespace administrator has [granted the required image permissions](../../configure/registry/managing_access_and_cleanup.mdx#grant-namespace-permissions).
+  Image API operations also require permission to read or change the resources used by each command.
+- Registry hosts used by direct `ac image` commands are reachable from your machine, and the client
+  trusts their TLS certificates.
+
+Run the commands from your developer machine or CI environment. Replace the example values before
+running them. Each task is independent unless it explicitly continues a preceding task.
+
+| Value | Description |
+| --- | --- |
+| `team-a` | Namespace that owns the example images and the `my-app` Deployment. |
+| `team-b` | Destination namespace for the cross-namespace copy. |
+| `registry.example.com` | Verified Registry hostname, including a port when required, without a scheme or path. |
+| `source.example.com/source-team/source-app:1.0` | Existing source image that you can read. Replace other source image references in the examples with images you can access. |
+| `source-registry.example.com`, `external-registry.example.com` | Source hosts for the mirror, append, and extract examples. Replace them and their repository paths with accessible source images. |
+| `<digest>` | The 64-character hexadecimal suffix of a SHA-256 image digest. Omit `sha256:` when replacing this placeholder; the commands already include it. |
+| `REGISTRY_AUTH_FILE` | Absolute path to the local auth file written by `ac registry login`. |
+| `layer.tar.gz` | Existing local tar archive of the filesystem changes to append. Archive paths must be relative to the image filesystem root. |
+
+Before setting a workload image, the `my-app` Deployment must exist in `team-a` with a container
+named `app`. Before querying, copying, or deleting a tag, that source tag must exist in the stated
+namespace.
 
 ## Registry Mode
 
@@ -25,8 +46,8 @@ clusters.
 
 | Mode | Backend | Use it for |
 | --- | --- | --- |
-| `modern` | `image.alauda.io/v1` Image and ImageStream API plus the Registry service. | Registry management in ACP 4.4. |
-| `auto` | Automatic detection. | Discovery. Set `modern` before ImageStream or Image API operations if the command requires an explicit mode. |
+| `modern` | `image.alauda.io/v1` ImageDigest and ImageStream API plus the Registry service. | Registry management in ACP 4.4. |
+| `auto` | Automatic detection. | Discovery. If detection is ambiguous, set `modern` explicitly before ImageStream or Image API operations. |
 
 Check and set the mode:
 
@@ -35,28 +56,19 @@ ac config get-registry-mode
 ac config set-registry-mode modern
 ```
 
-Use `modern` mode before managing ImageStreams, importing images, tagging images, or viewing Image
-API usage through the Image API graph.
+Use `modern` mode before managing ImageStreams, importing images, or tagging images. The mode is
+stored for the current kubeconfig context. The `AC_IMAGE_REGISTRY_MODE` environment variable can
+override it for a command invocation.
 
-| Placeholder | Description |
-| --- | --- |
-| `<digest>` | Image digest returned by `ac get images` or an ImageStream tag query. Include the `sha256:` prefix. |
-| `REGISTRY_AUTH_FILE` | Path to the local auth file written by `ac registry login`; pass it to direct image commands with `--registry-config`. |
-
-## Command Groups
-
-| Workflow | Command | Registry mode behavior |
-| --- | --- | --- |
-| Discover and log in to the integrated Registry | `ac registry info`, `ac registry login` | Uses the current registry mode to resolve the Registry host. |
-| List and delete integrated Registry images | `ac get images`, `ac delete images` | Uses the selected registry mode. |
-| Manage ImageStreams | `ac create imagestream`, `ac create imagestreamtag`, `ac import-image`, `ac tag`, `ac set image-lookup` | Requires `modern` mode. |
-| Query Image API resources | `ac get imagestreams`, `ac get imagestreamtags`, `ac get imagestreamimages` | Requires the Image API. |
-| Work with OCI images directly | `ac image info`, `ac image mirror`, `ac image append`, `ac image extract` | Talks to registries directly. Use `--insecure` only for scoped test or private-CA cases. |
-
-Administrative usage reporting, cleanup, and trust verification are documented in
-[Managing access and cleanup](../../configure/registry/managing_access_and_cleanup.mdx).
+Administrative usage reporting and cleanup are documented in
+[Managing access and cleanup](../../configure/registry/managing_access_and_cleanup.mdx). For stored
+signature claims, see [Check recorded signature identity](../../configure/registry/managing_access_and_cleanup.mdx#verify-image-signatures).
 
 ## Discover and Log In to the Registry
+
+Before using direct `ac image` commands, complete
+[Authenticate an external OCI client](./accessing_the_registry.mdx#authenticate-an-external-oci-client).
+That procedure selects a verified host, writes `REGISTRY_AUTH_FILE`, and verifies image access.
 
 Print the Registry host selected by the current registry mode:
 
@@ -64,86 +76,91 @@ Print the Registry host selected by the current registry mode:
 ac registry info
 ```
 
-Print the internal host:
+Add `--internal` or `--public` to select the internal or public host. `--public` requires a
+configured public hostname.
+
+Treat the command output as a discovery result and verify the canonical Service address from the
+operand namespace. In the default ACP 4.4 deployment, the Service address is
+`image-registry.cpaas-system.svc:5000`:
 
 ```bash
-ac registry info --internal
+kubectl -n cpaas-system get service image-registry \
+  -o jsonpath='{.metadata.name}.{.metadata.namespace}.svc:{.spec.ports[?(@.port==5000)].port}{"\n"}'
 ```
 
-Print the public host discovered from the configured external route:
+If the operand namespace was customized, replace `cpaas-system` with the value recorded on
+`Config/cluster.metadata.annotations[imageregistry.operator.alauda.io/operand-namespace]`.
 
-```bash
-ac registry info --public
-```
-
-Check that the Registry `/v2/` endpoint is reachable:
+When the discovered host matches the endpoint you intend to use, check its `/v2/` endpoint:
 
 ```bash
 ac registry info --check
 ```
 
-Write Registry credentials to the default local credential file:
+The check uses HTTPS, preferring the public host and otherwise using the internal host. It does
+not accept an endpoint override or an insecure-connection flag. A successful check confirms
+reachability, not image permissions. If discovery reports a different host from the verified
+Service or Ingress, use the verified, reachable host explicitly for login. An internal Service
+address requires network and DNS access to the cluster.
+
+For an HTTP endpoint used only in controlled testing, check it separately with `curl` installed:
 
 ```bash
-ac registry login
+curl --silent --show-error --output /dev/null --write-out '%{http_code}\n' \
+  http://<test-registry-host>/v2/
 ```
 
-Write credentials to a temporary or CI auth file:
-
-```bash
-mkdir -p /tmp/registry-auth
-
-ac registry login \
-  --registry registry.example.com \
-  --to /tmp/registry-auth/config.json
-
-export REGISTRY_AUTH_FILE=/tmp/registry-auth/config.json
-```
-
-Expected result:
-
-- The Registry credentials are written to `/tmp/registry-auth/config.json` and are available to
-  subsequent direct image commands through `REGISTRY_AUTH_FILE`.
-
-`--to` and `--registry-config` (or `-a`) select the output auth file for `ac registry login`.
-
-Use `--skip-check` when the Registry endpoint is not reachable from the current machine but the
-credential file still needs to be written. Use `--insecure` only when the endpoint is HTTP or uses a
-certificate that the client does not trust.
+Replace `<test-registry-host>` with the HTTP test hostname and port. A `200` response or a `401`
+authentication challenge confirms that the endpoint is reachable. For normal use, have a Registry
+administrator [configure a secure external host](../../configure/registry/exposing_the_registry.mdx).
 
 ## Manage ImageStreams
 
-Create an empty ImageStream:
+The examples in this section use `team-a` explicitly. Create an empty ImageStream:
 
 ```bash
-ac create imagestream demo
+ac create imagestream demo -n team-a
 ```
 
-Create an ImageStream with local image lookup enabled:
+Add `--lookup-local` when creating the stream to enable local image lookup. To change an existing
+stream, use `ac set image-lookup` as shown below.
 
-```bash
-ac create imagestream demo --lookup-local
-```
+For imports from a private source registry, a namespace administrator must provide a registry
+credential Secret for that source in the destination namespace (`team-a` here). The Image API
+server reads those namespace credentials and must be able to reach the source registry. Local
+credentials written by `ac registry login` or selected with `REGISTRY_AUTH_FILE` are used by direct
+image commands and are not supplied to server-side imports.
 
-Create an ImageStreamTag from an external image:
+Create a new ImageStreamTag from an external image:
 
 ```bash
 ac create imagestreamtag demo:latest \
-  --from-image=source.example.com/source-team/source-app:1.0
+  --from-image=source.example.com/source-team/source-app:1.0 \
+  -n team-a
 ```
 
-Import an external image into an ImageStreamTag. Without `--confirm`, the command previews the import. Add `--confirm` to persist the tag:
+To create or refresh a tag through an import, first preview the result. This contacts the source
+registry without persisting the ImageStream changes:
 
 ```bash
 ac import-image demo:latest \
   --from=source.example.com/source-team/source-app:1.0 \
+  -n team-a
+```
+
+Persist the import with the same source and namespace:
+
+```bash
+ac import-image demo:latest \
+  --from=source.example.com/source-team/source-app:1.0 \
+  -n team-a \
   --confirm
 ```
 
 Verify the persisted ImageStreamTag:
 
 ```bash
-ac get imagestreamtags demo:latest -o yaml
+ac get imagestreamtags demo:latest -n team-a -o yaml
 ```
 
 Expected result:
@@ -154,62 +171,85 @@ Common import options:
 
 | Option | Purpose |
 | --- | --- |
-| `--scheduled` | Periodically import the external image or repository. |
 | `--insecure` | Import from a registry that is not fully secured by trusted HTTPS. |
-| `--reference-policy=source\|local` | Control whether workloads use the source reference or the local Registry reference. |
-| `--import-mode=PreserveOriginal` | Preserve the original source reference when the server supports this import mode. |
+| `--reference-policy=source\|local` | Select the source or local Registry pull reference returned when resolving an imported tag. |
+| `--import-mode=PreserveOriginal` | Preserve the source multi-architecture manifest list or image index and import its child manifests. |
 | `-o json\|yaml` | Print import results in a structured format. |
+
+Importing records metadata without eagerly copying image layers. With `source` reference policy,
+clients pull from the source registry and need access to it. With `local` policy, clients use the
+integrated Registry, which can fetch uncached content from the source. The Registry still needs
+upstream connectivity and source credentials in the ImageStream namespace. To publish a local
+copy, use [image mirroring](#work-with-oci-images-directly).
+
+The default import mode, `Legacy`, selects one platform from a multi-architecture source, preferring
+the API server's platform. Use `PreserveOriginal` when consumers need the original image index.
+ACP 4.4 performs a one-time import. Although the CLI accepts `--scheduled`, the Operator does not
+run a periodic image importer. Re-run `ac import-image` with `--confirm` to refresh the tag.
 
 Tag an external image into an ImageStreamTag:
 
 ```bash
-ac tag source.example.com/source-team/source-app:1.0 demo:latest
+ac tag source.example.com/source-team/source-app:1.0 demo:latest -n team-a
 ```
 
-Copy the current image behind one ImageStreamTag to another:
+Copy the current image behind one ImageStreamTag to another. The source `team-a/demo:stable` must
+already resolve to an image:
 
 ```bash
 ac tag --source=imagestreamtag team-a/demo:stable team-b/demo:latest
 ```
 
-Use tag options to control tracking and import behavior:
+Use `--alias` to reference a source tag in the same ImageStream:
 
 ```bash
 ac tag --source=imagestreamtag --alias team-a/demo:stable team-a/demo:latest
-ac tag --source=imagestreamtag --reference team-a/demo:stable team-a/demo:latest
-ac tag source.example.com/source-team/source-app:latest demo:latest \
-  --scheduled \
-  --insecure \
-  --reference-policy=local \
-  --import-mode=PreserveOriginal
 ```
 
-`--alias` requires the source and destination to be in the same ImageStream. The `--scheduled` and
-`--insecure` options apply to external image sources.
+Registry push and mapping updates propagate to tracking tags. After importing or retagging the
+source, re-run the alias command to refresh its resolved image; a background controller does not
+refresh every alias.
 
-Delete a tag:
+Use `--reference` to retain the source reference:
 
 ```bash
-ac tag -d demo:old
+ac tag --source=imagestreamtag --reference team-a/demo:stable team-a/demo:latest
 ```
+
+To preserve a multi-architecture external source and use the local Registry pull reference:
+
+```bash
+ac tag source.example.com/source-team/source-app:latest demo:latest \
+  --reference-policy=local \
+  --import-mode=PreserveOriginal \
+  -n team-a
+```
+
+`--alias` requires the source and destination to be in the same ImageStream. The `--insecure`
+option applies to external image sources and is only needed for controlled insecure-source tests.
 
 Enable local image lookup for one ImageStream:
 
 ```bash
-ac set image-lookup demo
+ac set image-lookup demo -n team-a
 ```
 
 Disable local image lookup:
 
 ```bash
-ac set image-lookup demo --enabled=false
+ac set image-lookup demo --enabled=false -n team-a
 ```
 
 List local lookup state:
 
 ```bash
-ac set image-lookup --list
+ac set image-lookup --list -n team-a
 ```
+
+These commands change or display `ImageStream.spec.lookupPolicy.local`. Setting this field does
+not by itself rewrite workload manifests or continuously update running workloads. Use the
+following commands to resolve an ImageStream reference and update a workload explicitly; repeat
+the update when you want to deploy a newer tag revision.
 
 Set a workload image from the current ImageStreamTag pull specification:
 
@@ -236,7 +276,7 @@ Expected result:
 - The Deployment uses the pull specification resolved from the ImageStream resource, and the
   rollout completes successfully.
 
-## Query Images and ImageStreams
+## Query Images and ImageStreams \{#query-images-and-imagestreams}
 
 List ImageStreams:
 
@@ -262,36 +302,69 @@ Show ImageStreamImage metadata by digest:
 ac get imagestreamimages demo@sha256:<digest> -n team-a -o yaml
 ```
 
-List images through the integrated Registry command:
+List repository and tag references through the compatibility command:
 
 ```bash
-ac get images
+ac get images -n team-a
 ```
 
-In `modern` mode, `ac get images` lists cluster-scoped Image resources with `NAME` and `IMAGE REFERENCE` columns.
-Use structured output:
+In `modern` mode, `ac get images` keeps the repository/tag output used by existing scripts. Without
+`-n`, it uses the current namespace; `-A` requests authorized namespaces. Structured output uses
+the same repository/tag view:
 
 ```bash
-ac get images -o yaml
-ac get images -o json
+ac get images -n team-a -o yaml
+ac get images -n team-a -o json
 ```
 
-## Delete Image References
+To include digest and creation time from Registry manifest metadata, use `-o wide`. This requires
+an endpoint established through Operator configuration discovery and reachable from your machine:
+
+```bash
+ac get images -n team-a -o wide
+```
+
+With that configuration discovery, request native Image API text output by setting
+`AC_REGISTRY_COMPAT_OUTPUT=native` and omitting `-o`:
+
+```bash
+AC_REGISTRY_COMPAT_OUTPUT=native ac get images -n team-a
+```
+
+The native output uses `NAME` and `IMAGE REFERENCE` columns for namespace-scoped tag records.
+If your account cannot read `Config/cluster` and discovery relies only on the Registry Service,
+`-o wide` is unavailable and the native request retains compatibility output. Use the explicit
+ImageStream queries above for Image API access in that case. To inspect cluster-scoped image
+metadata, query `ImageDigest` objects with the required cluster-scoped read permission:
+
+```bash
+ac get imagedigests.image.alauda.io -o yaml
+```
+
+## Delete Image References \{#delete-image-references}
 
 The preferred Registry workflow is to delete ImageStream tags:
 
 ```bash
-ac tag -d demo:old
+ac tag -d demo:old -n team-a
 ```
 
-The `ac delete images` command follows the selected registry mode. It is a dry run unless `--confirm` is set:
+The `ac delete images` command follows the selected registry mode. In modern mode it removes the
+specified ImageStreamTag references with a server-side consistency check. It is a dry run unless
+`--confirm` is set. In each target namespace it requires `list` and `get` on `imagestreams`, and
+`get` and `delete` on `imagestreamtags` in the `image.alauda.io` API group. The
+`system:image-deleter` role supplies only the delete permission; ask a namespace administrator
+to grant the additional reads before using this command.
+
+Use one `--repo` flag per existing tag reference. Preview the deletion:
 
 ```bash
-ac delete images --repo team-a/demo:old
-ac delete images --repo team-a/demo:old --confirm
+ac delete images \
+  --repo team-a/demo:old \
+  --repo team-a/api:canary
 ```
 
-Use repeated `--repo` flags to delete multiple tag references:
+Delete those same references:
 
 ```bash
 ac delete images \
@@ -300,9 +373,17 @@ ac delete images \
   --confirm
 ```
 
-Deleting image references does not necessarily release blob storage immediately. Run image pruning and registry garbage collection separately when storage reclamation is required.
+Deleting image references does not necessarily release blob storage immediately. Ask a Registry
+administrator to [prune images and reclaim storage](../../configure/registry/managing_access_and_cleanup.mdx#prune-images)
+when needed.
 
-## Work with OCI Images Directly
+## Work with OCI Images Directly \{#work-with-oci-images-directly}
+
+These commands read and write registries directly. They use `REGISTRY_AUTH_FILE` or the explicit
+`--registry-config` path. For private source images, that file must also contain credentials for
+the source host; logging in to the destination does not authenticate another registry.
+
+### Inspect an Image
 
 Show image metadata from a registry:
 
@@ -319,36 +400,69 @@ ac image info external-registry.example.com/base/base-app:latest \
   --registry-config="$REGISTRY_AUTH_FILE"
 ```
 
-Show manifest list entries:
+Add `--show-multiarch` without `--filter-by-os` to list manifest list or image index entries.
 
-```bash
-ac image info registry.example.com/team-a/demo:latest \
-  --show-multiarch \
-  --registry-config="$REGISTRY_AUTH_FILE"
-```
+### Mirror Images
 
-Copy one image to another tag:
+Preview copying an existing image to another tag while preserving all platforms:
 
 ```bash
 ac image mirror \
   registry.example.com/team-a/demo:latest \
   registry.example.com/team-a/demo:stable \
+  --keep-manifest-list \
+  --dry-run \
   --registry-config="$REGISTRY_AUTH_FILE"
 ```
 
-Copy multiple images from a mapping file:
+Copy the image with the same options:
+
+```bash
+ac image mirror \
+  registry.example.com/team-a/demo:latest \
+  registry.example.com/team-a/demo:stable \
+  --keep-manifest-list \
+  --registry-config="$REGISTRY_AUTH_FILE"
+```
+
+Without `--keep-manifest-list` or an explicit `--filter-by-os`, mirror selects the CLI machine's
+OS and architecture. This can discard other platforms or fail when the source has no matching
+platform, such as a Linux-only image copied from a macOS machine.
+
+Verify the new tag:
+
+```bash
+ac image info registry.example.com/team-a/demo:stable \
+  --show-multiarch \
+  --registry-config="$REGISTRY_AUTH_FILE"
+```
+
+Prepare a mapping file to copy multiple existing source images:
 
 ```bash
 cat > mirror-map.txt <<EOF
 source-registry.example.com/team-a/demo:latest=registry.example.com/team-a/demo:latest
 source-registry.example.com/team-a/api:v1=registry.example.com/team-a/api:v1
 EOF
+```
 
+Preview the mappings and options:
+
+```bash
 ac image mirror \
   -f mirror-map.txt \
+  --continue-on-error \
+  --keep-manifest-list \
+  --max-per-registry=4 \
+  --skip-missing \
+  --filter-by-os=linux/amd64 \
   --dry-run \
-  --keep-manifest-list
+  --registry-config="$REGISTRY_AUTH_FILE"
+```
 
+Copy using the same mappings and options:
+
+```bash
 ac image mirror \
   -f mirror-map.txt \
   --continue-on-error \
@@ -359,51 +473,79 @@ ac image mirror \
   --registry-config="$REGISTRY_AUTH_FILE"
 ```
 
-`--skip-missing` continues when an input image is not found. `--filter-by-os` selects the requested
-platform; combine it with `--keep-manifest-list` when the destination must remain a
-multi-architecture manifest list containing the selected platform entries.
+The preview lists planned mappings without checking remote images or permissions. `--skip-missing`
+skips missing sources, so a successful copy command can leave some destinations absent. With
+`--continue-on-error`, other failures are reported after the remaining mappings are attempted.
+`--filter-by-os` selects the requested platform; combine it with `--keep-manifest-list` to retain
+an image index containing only the selected platform entries.
 
-Verify a copied image:
+Verify both mapped destinations:
 
 ```bash
-ac image info registry.example.com/team-a/demo:stable \
+ac image info registry.example.com/team-a/demo:latest \
+  --show-multiarch \
+  --registry-config="$REGISTRY_AUTH_FILE"
+ac image info registry.example.com/team-a/api:v1 \
+  --show-multiarch \
   --registry-config="$REGISTRY_AUTH_FILE"
 ```
 
-Add layers or metadata to an image and push the result:
+### Append Layers or Metadata
+
+Prepare `layer.tar.gz` before running an append command. For example, create it from a directory
+containing the files to add or replace:
+
+```bash
+tar -czf layer.tar.gz -C <layer-directory> .
+```
+
+Replace `<layer-directory>` with the local directory containing those filesystem changes. Keep
+the output archive outside that directory.
+
+Preview appending the layer to the `linux/amd64` image:
 
 ```bash
 ac image append \
   --from external-registry.example.com/base/base-app:latest \
   --to registry.example.com/team-a/base-app:patched \
   layer.tar.gz \
-  --registry-config="$REGISTRY_AUTH_FILE"
-```
-
-Preview the append operation:
-
-```bash
-ac image append \
-  --from external-registry.example.com/base/base-app:latest \
-  --to registry.example.com/team-a/base-app:patched \
-  layer.tar.gz \
+  --filter-by-os=linux/amd64 \
   --dry-run \
   --registry-config="$REGISTRY_AUTH_FILE"
 ```
 
+Push the result with the same source, layer, and platform:
+
+```bash
+ac image append \
+  --from external-registry.example.com/base/base-app:latest \
+  --to registry.example.com/team-a/base-app:patched \
+  layer.tar.gz \
+  --filter-by-os=linux/amd64 \
+  --registry-config="$REGISTRY_AUTH_FILE"
+```
+
+Select a platform supported by your base image and target workloads. Without an explicit platform
+or `--keep-manifest-list`, append uses the CLI machine's OS and architecture. Use
+`--keep-manifest-list` without a platform filter to apply the change to every platform in an index.
+
 The `--image` option merges a JSON object into the runtime image configuration. The `--meta` option
-merges a JSON object into the top-level image metadata. You can also use `--drop-history` or
-`--created-at` without adding a layer:
+merges a JSON object into the top-level image metadata. To change metadata without adding a layer:
 
 ```bash
 ac image append \
   --from external-registry.example.com/base/base-app:latest \
   --to registry.example.com/team-a/base-app:annotated \
-  --image='{"Entrypoint":["/app/start"]}' \
+  --image='{"Labels":{"team":"team-a"}}' \
   --meta='{"author":"team-a"}' \
   --created-at=2024-01-01T00:00:00Z \
+  --filter-by-os=linux/amd64 \
   --registry-config="$REGISTRY_AUTH_FILE"
+```
 
+To remove history from every platform while preserving the image index:
+
+```bash
 ac image append \
   --from external-registry.example.com/base/base-app:latest \
   --to registry.example.com/team-a/base-app:no-history \
@@ -418,35 +560,67 @@ Expected result:
 - `--keep-manifest-list` preserves the multi-architecture index while applying the append operation
   to matching platform images.
 
-Extract files from an image without a local container runtime:
+Verify an appended image with
+`ac image info <result-image> --show-multiarch --registry-config="$REGISTRY_AUTH_FILE"`.
+Replace `<result-image>` with the full destination reference from the append command.
+
+### Extract Files
+
+Extract files without a local container runtime. Prepare an empty output directory:
 
 ```bash
-ac image extract external-registry.example.com/base/base-app:latest \
-  --path /:/tmp/base-app \
-  --confirm \
-  --registry-config="$REGISTRY_AUTH_FILE"
+EXTRACT_DIR="$(mktemp -d)"
 ```
 
-Extract selected files to the current directory:
+Preview extraction of one platform into that directory:
 
 ```bash
 ac image extract external-registry.example.com/base/base-app:latest \
-  --file /etc/app/config.yaml \
-  --registry-config="$REGISTRY_AUTH_FILE"
-```
-
-Preview an extraction without writing files:
-
-```bash
-ac image extract external-registry.example.com/base/base-app:latest \
-  --path /:/tmp/base-app \
+  --path /:"$EXTRACT_DIR" \
+  --filter-by-os=linux/amd64 \
   --dry-run \
   --registry-config="$REGISTRY_AUTH_FILE"
 ```
 
+Extract with the same source, destination, and platform:
+
+```bash
+ac image extract external-registry.example.com/base/base-app:latest \
+  --path /:"$EXTRACT_DIR" \
+  --filter-by-os=linux/amd64 \
+  --registry-config="$REGISTRY_AUTH_FILE"
+```
+
+The destination must be empty unless `--confirm` is set. Adding `--confirm` permits overwriting
+matching files in an existing destination. The preview lists paths without writing image contents.
+
+For `--file`, the destination is the current directory. Prepare a separate empty directory:
+
+```bash
+FILE_EXTRACT_DIR="$(mktemp -d)"
+```
+
+Run this example only when `/etc/app/config.yaml` exists in the selected source image:
+
+```bash
+(
+  cd "$FILE_EXTRACT_DIR" || exit 1
+  ac image extract external-registry.example.com/base/base-app:latest \
+    --file /etc/app/config.yaml \
+    --filter-by-os=linux/amd64 \
+    --registry-config="$REGISTRY_AUTH_FILE"
+)
+```
+
+Verify the extraction:
+
+```bash
+test -f "$FILE_EXTRACT_DIR/config.yaml"
+```
+
 Expected result:
 
-- `--file` writes the requested file to the current directory.
-- `--dry-run` lists files that would be extracted and does not write image contents.
+- The full filesystem is written under `EXTRACT_DIR` for the `--path` example.
+- The selected file is written as `config.yaml` under `FILE_EXTRACT_DIR` for the `--file` example.
 
 Use `--insecure` on `ac image` commands only for test registries, HTTP endpoints, or private certificates that are not trusted by the client.

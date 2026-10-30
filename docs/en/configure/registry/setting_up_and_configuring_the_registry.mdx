@@ -12,9 +12,62 @@ limits, and scheduled image cleanup for Alauda Container Platform Registry.
 
 ## Prerequisites
 
-- <Term name="productShort" /> Registry is installed, and `Config/cluster` exists.
+- The Image Registry Operator is installed, and it has created `Config/cluster`.
+- Run commands from an administrator workstation with `kubectl` configured for the target ACP 4.4 cluster.
 - You have permission to update `configs.imageregistry.operator.alauda.io`, `imagepruners.imageregistry.operator.alauda.io`, `LimitRange`, `ResourceQuota`, and related Kubernetes resources.
 - For persistent storage, prepare the storage backend and required credentials before configuring `Config/cluster`.
+- Before configuring runtime behavior or image limits, complete [Registry activation](./image_registry_operator.mdx#activate-the-registry).
+
+The Operator is installed in `image-registry-system`, while the Registry operand resources run in
+`cpaas-system` by default. Confirm the operand namespace before running namespace-scoped commands:
+
+```bash
+kubectl get configs.imageregistry.operator.alauda.io cluster \
+  -o jsonpath='{.metadata.annotations.imageregistry\.operator\.alauda\.io/operand-namespace}{"\n"}'
+```
+
+Replace `cpaas-system` in operand commands with the returned namespace when it differs. Storage
+Secrets, CA ConfigMaps, PVCs, and generated workloads belong in that namespace. Workload namespaces
+such as `team-a` are separate; use the namespace whose image access or limits you are configuring.
+
+## Configure Registry Authentication
+
+The Registry discovers the platform OIDC configuration at runtime by default. To select an ACP
+identity provider for the Registry basic-login flow, set `spec.auth.oidc.ldapID`. Keep runtime
+discovery enabled unless platform guidance requires a static authentication configuration:
+
+```bash
+kubectl patch configs.imageregistry.operator.alauda.io cluster \
+  --type=merge \
+  -p '{"spec":{"auth":{"oidc":{"runtimeDiscovery":true,"ldapID":"<identity-provider-id>"}}}}'
+```
+
+| Placeholder | Description |
+| --- | --- |
+| `<identity-provider-id>` | ACP identity provider ID used by the Registry basic-login flow. Omit `ldapID` when the default platform identity provider is sufficient. |
+
+Verify the authentication settings and Registry rollout:
+
+```bash
+kubectl get configs.imageregistry.operator.alauda.io cluster \
+  -o jsonpath='{.spec.auth.oidc}{"\n"}'
+kubectl -n cpaas-system rollout status deployment/image-registry --timeout=300s
+```
+
+## Before Configuring Storage \{#before-configuring-storage}
+
+> **Warning:** The storage examples configure a new Registry. Changing a backend, PVC claim, or
+> bucket does not migrate existing blobs or Image API metadata. Before replacing storage, back up
+> both, [suspend scheduled pruning](#configure-scheduled-image-pruning), wait for active cleanup Jobs
+> to finish, and stop image writers. Complete a validated data migration before switching the
+> configuration or discarding the old storage. Replacing `emptyDir` can permanently lose its data.
+
+Inspect the current backend before choosing a procedure:
+
+```bash
+kubectl get configs.imageregistry.operator.alauda.io cluster \
+  -o jsonpath='{.spec.storage}{"\n"}'
+```
 
 ## Configure Development Storage
 
@@ -59,7 +112,7 @@ Verify the configuration and rollout:
 
 ```bash
 kubectl get configs.imageregistry.operator.alauda.io cluster -o yaml
-kubectl -n image-registry-system rollout status deployment/image-registry --timeout=300s
+kubectl -n cpaas-system rollout status deployment/image-registry --timeout=300s
 ```
 
 Expected results:
@@ -67,18 +120,23 @@ Expected results:
 - `Config/cluster` reports `Available=True`, `Progressing=False`, and `Degraded=False`.
 - The `image-registry` Deployment rolls out successfully.
 
-## Configure PVC Storage
+## Configure PVC Storage \{#configure-pvc-storage}
 
 Use a persistent backend for production. The example uses `ReadWriteOnce`, one Registry replica, and
-the `Recreate` rollout strategy required by the Operator for RWO storage. Create a file named
-`image-registry-pvc.yaml`:
+the `Recreate` rollout strategy required by the Operator for RWO storage.
+
+> **Warning:** For an existing Registry, complete the [storage replacement preparation](#before-configuring-storage)
+> before changing its backend or claim. The patch below does not copy existing image data.
+
+Create a file named `image-registry-pvc.yaml`. Use a dedicated user-managed claim name; the names
+`image-registry` and `image-registry-storage` are reserved by the Operator.
 
 ```yaml
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: image-registry
-  namespace: image-registry-system
+  name: registry-data
+  namespace: cpaas-system
 spec:
   accessModes:
     - ReadWriteOnce
@@ -112,7 +170,7 @@ kubectl patch configs.imageregistry.operator.alauda.io cluster \
         "managementState": "Unmanaged",
         "emptyDir": null,
         "pvc": {
-          "claim": "image-registry"
+          "claim": "registry-data"
         },
         "s3": null,
         "swift": null,
@@ -137,23 +195,27 @@ kubectl patch configs.imageregistry.operator.alauda.io cluster \
 Verify the PVC, configuration, and rollout:
 
 ```bash
-kubectl -n image-registry-system get pvc image-registry
+kubectl -n cpaas-system get pvc registry-data
 kubectl get configs.imageregistry.operator.alauda.io cluster -o yaml
-kubectl -n image-registry-system rollout status deployment/image-registry --timeout=300s
+kubectl -n cpaas-system rollout status deployment/image-registry --timeout=300s
 ```
 
 Expected results:
 
-- The `image-registry` PVC is `Bound`.
+- The `registry-data` PVC is `Bound`.
 - `Config/cluster` reports `Available=True`, `Progressing=False`, and `Degraded=False`.
 - The `image-registry` Deployment rolls out successfully.
 
-## Configure S3-Compatible Storage Credentials
+## Configure S3-Compatible Storage \{#configure-s3-compatible-storage}
+
+> **Warning:** For an existing Registry, complete the [storage replacement preparation](#before-configuring-storage)
+> before changing the backend or bucket. Updating storage credentials can also affect the active
+> backend. The following procedure configures new storage and does not migrate existing images.
 
 Create the user-managed storage Secret before configuring `Config/cluster`. The Operator merges this Secret into the Registry private configuration:
 
 ```bash
-kubectl -n image-registry-system create secret generic image-registry-private-configuration-user \
+kubectl -n cpaas-system create secret generic image-registry-private-configuration-user \
   --from-literal=REGISTRY_STORAGE_S3_ACCESSKEY=<access-key-id> \
   --from-literal=REGISTRY_STORAGE_S3_SECRETKEY=<secret-access-key> \
   --dry-run=client -o yaml | kubectl apply -f -
@@ -167,23 +229,24 @@ kubectl -n image-registry-system create secret generic image-registry-private-co
 Verify the Secret without printing its contents:
 
 ```bash
-kubectl -n image-registry-system get secret image-registry-private-configuration-user \
+kubectl -n cpaas-system get secret image-registry-private-configuration-user \
   -o jsonpath='{.type}{"\n"}'
-kubectl -n image-registry-system get secret image-registry-private-configuration-user \
-  -o jsonpath='{.data}' | wc -c
+kubectl -n cpaas-system get secret image-registry-private-configuration-user \
+  -o go-template='Access key present: {{if index .data "REGISTRY_STORAGE_S3_ACCESSKEY"}}true{{else}}false{{end}}{{"\n"}}Secret key present: {{if index .data "REGISTRY_STORAGE_S3_SECRETKEY"}}true{{else}}false{{end}}{{"\n"}}'
 ```
 
 Expected results:
 
-- The Secret exists in `image-registry-system`.
-- The second command returns a non-zero byte count. Do not print or decode the Secret data.
+- The Secret exists in the Registry operand namespace.
+- Both key-presence checks return `true`. Do not continue if either key is missing or empty. The
+  template checks the required keys without printing or decoding their values.
 
 Use `disableRedirect: true` when clients cannot reach the object storage endpoint directly and all content must be served through the Registry.
 
 If the S3 endpoint uses a private CA, create the referenced ConfigMap with the required key:
 
 ```bash
-kubectl -n image-registry-system create configmap <trusted-ca-configmap> \
+kubectl -n cpaas-system create configmap <trusted-ca-configmap> \
   --from-file=ca-bundle.crt=/path/to/ca-bundle.crt \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
@@ -191,7 +254,7 @@ kubectl -n image-registry-system create configmap <trusted-ca-configmap> \
 Verify the ConfigMap key without displaying the certificate:
 
 ```bash
-kubectl -n image-registry-system get configmap <trusted-ca-configmap> \
+kubectl -n cpaas-system get configmap <trusted-ca-configmap> \
   -o jsonpath='{.data.ca-bundle\.crt}' | wc -c
 ```
 
@@ -235,23 +298,17 @@ kubectl patch configs.imageregistry.operator.alauda.io cluster \
 | `<bucket-name>` | Existing object storage bucket or bucket-equivalent container used for Registry blobs. |
 | `<region>` | Region value required by the storage backend. Use the provider value, or the value required by the S3-compatible service. |
 | `<s3-endpoint>` | S3-compatible endpoint host and optional port reachable from the Registry Pod, without `https://` and without the bucket name. The example supplies the `https://` scheme. |
-| `<trusted-ca-configmap>` | ConfigMap in `image-registry-system` that contains the CA certificate for the object storage endpoint. Omit `trustedCA` when the endpoint uses a public CA trusted by the Registry Pod. |
+| `<trusted-ca-configmap>` | ConfigMap in the Registry operand namespace that contains the CA certificate for the object storage endpoint. Omit `trustedCA` when the endpoint uses a public CA trusted by the Registry Pod. |
 
-The current operator supports the following storage fields: `emptyDir`, `pvc`, `s3`, `swift`, `gcs`,
-`ibmcos`, and `azure`. Do not configure other storage fields.
-
-> **Note:** The `Config` CRD also exposes a `storage.oss` field, inherited from the upstream image
-> registry operator. This operator does not implement it. Setting `storage.oss` is treated as "no
-> storage backend configured": the Operator reports `Degraded=True` with reason
-> `StorageNotConfigured`, and the Registry data plane does not reconcile. Use only the seven
-> supported fields listed above.
+Use exactly one operational backend: `emptyDir`, `pvc`, `s3`, `gcs`, `ibmcos`, or `azure`. Schema
+presence alone does not establish support; the limitations below apply to `swift` and `oss`.
 
 Verify the configuration and rollout:
 
 ```bash
 kubectl get configs.imageregistry.operator.alauda.io cluster -o yaml
-kubectl -n image-registry-system rollout status deployment/image-registry --timeout=300s
-kubectl -n image-registry-system logs deployment/image-registry -c registry --tail=80
+kubectl -n cpaas-system rollout status deployment/image-registry --timeout=300s
+kubectl -n cpaas-system logs deployment/image-registry -c registry --tail=80
 ```
 
 Expected results:
@@ -261,34 +318,41 @@ Expected results:
 
 ## Configure Cloud Storage Backends
 
-The Operator can use Swift, GCS, IBM COS, or Azure storage when the corresponding platform
-integration and credentials are available. Configure exactly one storage field in
-`Config/cluster.spec.storage`; use the same merge-patch pattern shown above and set the other
-supported storage fields to `null`.
+For GCS, IBM COS, or Azure, prepare existing provider resources and supply the required configuration
+explicitly. Store the credentials below in `image-registry-private-configuration-user` in the
+Registry operand namespace. Use the same merge-patch pattern shown above and set the other backend
+fields to `null`. For an existing Registry, first complete the
+[storage replacement preparation](#before-configuring-storage).
 
 | Backend | Main `Config/cluster.spec.storage` fields | Required user-managed Secret data |
 | --- | --- | --- |
-| Swift | `swift.authURL`, `swift.authVersion`, `swift.container`, `swift.domain`, `swift.domainID`, `swift.tenant`, `swift.tenantID`, and `swift.regionName` | `REGISTRY_STORAGE_SWIFT_USERNAME` and `REGISTRY_STORAGE_SWIFT_PASSWORD`, or the application credential keys `REGISTRY_STORAGE_SWIFT_APPLICATIONCREDENTIALID`, `REGISTRY_STORAGE_SWIFT_APPLICATIONCREDENTIALNAME`, and `REGISTRY_STORAGE_SWIFT_APPLICATIONCREDENTIALSECRET`, or `REGISTRY_STORAGE_SWIFT_TOKENID`. |
 | GCS | `gcs.bucket`, `gcs.region`, `gcs.projectID`, and optional `gcs.keyID` | `REGISTRY_STORAGE_GCS_KEYFILE` containing the service-account key file. |
 | IBM COS | `ibmcos.bucket`, `ibmcos.location`, `ibmcos.resourceGroupName`, `ibmcos.resourceKeyCRN`, and `ibmcos.serviceInstanceCRN` | `REGISTRY_STORAGE_IBMCOS_IAMAPIKEY`. |
 | Azure | `azure.accountName`, `azure.container`, `azure.cloudName`, and optional `azure.networkAccess` | `REGISTRY_STORAGE_AZURE_ACCOUNTKEY`. |
 
-Provider integrations can populate platform-specific values such as region, project, account, or
-endpoint information. Confirm the required provider resources and credentials with the storage
-administrator. After configuring a backend, verify the `Config/cluster` conditions and the Registry
-rollout as shown in the storage procedures above. Do not print Secret data while troubleshooting.
+For IBM COS, the resource key must contain HMAC credentials. Confirm the provider resources,
+permissions, and values with the storage administrator; do not rely on automatic platform discovery.
+After configuration, verify `Config/cluster` conditions and the Registry rollout as shown above.
+Do not print Secret data while troubleshooting.
+
+The following fields are present in the `Config` schema but cannot configure usable storage in
+this ACP 4.4 release:
+
+| Schema field | Limitation |
+| --- | --- |
+| `storage.swift` | Swift reconciliation requires platform information that this Operator does not supply. Do not configure it. |
+| `storage.oss` | No storage driver is implemented. Using it alone produces `StorageNotConfigured`. Do not configure it. |
 
 ## Configure Request Handling
 
-Use `Config/cluster.spec.readOnly` to reject image pushes and deletes. Use the `requests` settings
-to limit concurrent reads and writes, queued requests, and queue wait time:
+Use `Config/cluster.spec.requests` to limit concurrent reads and writes, queued requests, and queue
+wait time for each Registry replica:
 
 ```bash
 kubectl patch configs.imageregistry.operator.alauda.io cluster \
   --type=merge \
   -p '{
     "spec": {
-      "readOnly": false,
       "requests": {
         "read": {
           "maxRunning": 100,
@@ -305,26 +369,90 @@ kubectl patch configs.imageregistry.operator.alauda.io cluster \
   }'
 ```
 
-The `proxy.http`, `proxy.https`, and `proxy.noProxy` fields configure Registry egress when the
-cluster proxy settings are not sufficient. `logLevel` accepts `Normal`, `Debug`, `Trace`, or
-`TraceAll`. Resource requests and limits, node selection, tolerations, affinity, and topology spread
-are also supported by `Config/cluster.spec`.
-
 Verify request handling settings and the rollout:
 
 ```bash
 kubectl get configs.imageregistry.operator.alauda.io cluster -o yaml
-kubectl -n image-registry-system rollout status deployment/image-registry --timeout=300s
+kubectl -n cpaas-system rollout status deployment/image-registry --timeout=300s
 ```
 
 Expected results:
 
-- `Config/cluster.spec.readOnly` and `Config/cluster.spec.requests` contain the requested values.
+- `Config/cluster.spec.requests` contains the requested values.
 - The Registry Deployment rolls out successfully.
+
+### Configure HTTP Timeouts \{#configure-http-timeouts}
+
+Server timeouts use non-negative Go duration strings such as `30m` or `60s`. Setting an individual
+timeout to `0s` disables its limit.
+
+| Field under `spec.http` | Default | Applies to |
+| --- | --- | --- |
+| `readTimeout` | `30m` | Reading an entire request, including its body. This is a total deadline, not an upload inactivity interval. |
+| `writeTimeout` | `30m` | Writing a response. For HTTP/1 requests, it also includes handler work such as reading an upload body. |
+| `idleTimeout` | `60s` | Idle time between requests on a keep-alive connection, not time during an upload. |
+
+For example, explicitly configure the default values:
+
+```bash
+kubectl patch configs.imageregistry.operator.alauda.io cluster \
+  --type=merge \
+  -p '{"spec":{"http":{"readTimeout":"30m","writeTimeout":"30m","idleTimeout":"60s"}}}'
+kubectl -n cpaas-system rollout status deployment/image-registry --timeout=300s
+kubectl get configs.imageregistry.operator.alauda.io cluster \
+  -o jsonpath='{.spec.http}{"\n"}'
+```
+
+Expected result: the configured durations are present and the deployment is available. A separate
+request-header timeout is fixed at 5 seconds. For external traffic, also check the
+[Ingress timeouts](./exposing_the_registry.mdx#expose-a-custom-secure-registry-host). The Ingress read
+timeout measures the interval between upstream reads; increasing it does not extend a server's
+total request deadline.
+
+### Enable Read-Only Mode \{#enable-read-only-mode}
+
+Use `spec.readOnly: true` during maintenance that must reject Registry pushes and deletes, along
+with Image API metadata mutations such as tag changes, imports, mappings, and signature writes.
+Authorized reads remain available.
+
+> **Warning:** Metadata pruning and combined prune and garbage collection require writes. Keep
+> read-only mode disabled for those operations and quiesce external image writers instead.
+
+Enable read-only mode and wait for the Registry rollout:
+
+```bash
+kubectl patch configs.imageregistry.operator.alauda.io cluster \
+  --type=merge -p '{"spec":{"readOnly":true}}'
+kubectl -n cpaas-system rollout status deployment/image-registry --timeout=300s
+kubectl get configs.imageregistry.operator.alauda.io cluster \
+  -o jsonpath='{.spec.readOnly}{"\n"}'
+```
+
+Expected result: `true`. Authorized reads succeed, while pushes and Image API mutations receive
+read-only rejections. After the maintenance operation, restore writes before resuming writers or pruning:
+
+```bash
+kubectl patch configs.imageregistry.operator.alauda.io cluster \
+  --type=merge -p '{"spec":{"readOnly":false}}'
+kubectl -n cpaas-system rollout status deployment/image-registry --timeout=300s
+```
+
+### Other Runtime Settings
+
+`proxy.http`, `proxy.https`, and `proxy.noProxy` configure Registry egress. `disableRedirect: true`
+serves object data through the Registry when clients cannot reach the storage endpoint directly.
+`logLevel` accepts `Normal`, `Debug`, `Trace`, or `TraceAll`. Resource requests and limits, node
+selection, tolerations, affinity, and topology spread are also supported by `Config/cluster.spec`.
 
 ## Configure Managed Service Account Pull Secrets
 
 The Operator includes a managed imagePullSecret controller. When `Config/cluster` is managed, the controller can create, inject, refresh, and remove service account pull secrets for the internal registry.
+
+> **Warning:** Excluding a namespace with `ignoredNamespaces`, or setting `ignoreSystemNamespaces`
+> to `true` for a namespace labeled `namespace-type=system`, removes existing managed pull Secrets,
+> their ServiceAccount references, and the managed image-puller RoleBinding there. Prepare and
+> verify replacement credentials and image permissions before changing these settings. Selecting
+> `imagePullSecret.managementState: Removed` also removes managed access.
 
 Patch `Config/cluster` with additional hosts or ignored namespaces. The array fields in this patch replace the current arrays, so include every host and namespace that must remain configured:
 
@@ -378,7 +506,12 @@ Expected results:
 
 | Placeholder | Description |
 | --- | --- |
-| `<workload-namespace>` | Namespace where managed ServiceAccount pull credentials should be injected. It must not be listed in `ignoredNamespaces` and must satisfy `ignoreSystemNamespaces`. |
+| `<workload-namespace>` | Existing namespace where workload ServiceAccounts need Registry pull access. It must not be listed in `ignoredNamespaces`; when `ignoreSystemNamespaces` is `true`, it must not carry `namespace-type=system`. |
+
+`imagePullSecret.managementState` supports `Managed` and `Force` to manage credentials, `Unmanaged`
+to pause reconciliation, and `Removed` to remove managed credentials. When it is omitted, the
+setting follows `Config/cluster.spec.managementState`. Existing user-managed pull Secrets are not
+removed by the controller.
 
 ## Configure Image Limits
 
@@ -445,9 +578,35 @@ Expected results:
 
 ## Configure Scheduled Image Pruning \{#configure-scheduled-image-pruning}
 
-Create or update the singleton `ImagePruner/cluster` to configure scheduled image pruning. Confirm the retention policy before enabling the schedule because pruning removes unused image metadata.
+The Operator creates `ImagePruner/cluster` with an enabled schedule. Its defaults are:
 
-Create a file named `image-pruner.yaml`:
+| Setting | Default |
+| --- | --- |
+| Schedule | `0 0 * * *` in the CronJob controller's time zone |
+| Suspended | `false` |
+| Tag revisions to retain | `3` |
+| Minimum age | `60m` |
+
+> **Warning:** Jobs run `ac adm prune images --confirm=true`. While the Registry is managed, they
+> also use `--prune-registry=true` to remove eligible storage manifest references and run garbage
+> collection after metadata pruning. This deletes data without an interactive confirmation. Stop
+> CI pushes and other image writers for the entire cleanup window, including scheduled runs. Keep
+> `spec.readOnly` disabled because the combined operation requires Image API and Registry writes.
+
+Suspend the schedule before reviewing or changing the policy:
+
+```bash
+kubectl patch imagepruners.imageregistry.operator.alauda.io cluster \
+  --type=merge -p '{"spec":{"suspend":true}}'
+kubectl -n cpaas-system get cronjob image-pruner \
+  -o jsonpath='{.spec.suspend}{"\n"}'
+kubectl -n cpaas-system get jobs -l created-by=image-pruner
+```
+
+Wait until the CronJob reports `true`. Suspension prevents new scheduled Jobs; it does not stop a
+Job already running. Wait for active Jobs to finish before changing the policy or backend.
+
+Review the retention values and create a file named `image-pruner.yaml`. Keep it suspended during review:
 
 ```yaml
 apiVersion: imageregistry.operator.alauda.io/v1
@@ -456,7 +615,7 @@ metadata:
   name: cluster
 spec:
   schedule: "0 0 * * *"
-  suspend: false
+  suspend: true
   keepTagRevisions: 3
   keepYoungerThanDuration: 60m
   resources:
@@ -478,31 +637,52 @@ Verify the pruner resource and rendered CronJob:
 
 ```bash
 kubectl get imagepruners.imageregistry.operator.alauda.io cluster -o yaml
-kubectl -n image-registry-system get cronjob image-pruner
+kubectl -n cpaas-system get cronjob image-pruner
 ```
 
 Expected results:
 
 - `ImagePruner/cluster` contains the configured schedule and retention policy.
-- The Operator renders the `image-pruner` CronJob in `image-registry-system`.
+- The rendered `image-pruner` CronJob remains suspended in the Registry operand namespace.
 
-The generated CronJob runs `ac adm prune images --confirm`. When the Registry management state is
-`Managed`, the Operator adds `--prune-registry=true`, so the scheduled job also performs registry
-garbage collection after image metadata pruning. For a manually run prune, add
-`--prune-registry` only when blob reclamation is intended; otherwise run garbage collection as a
-separate reviewed operation.
+Enable the schedule only after reviewing the policy and arranging writer quiescence for every run.
+If that cannot be guaranteed, keep it suspended and perform reviewed manual cleanup during a
+maintenance window. For a scheduled cleanup window, resume and inspect the rendered command:
+
+```bash
+kubectl patch imagepruners.imageregistry.operator.alauda.io cluster \
+  --type=merge -p '{"spec":{"suspend":false}}'
+kubectl -n cpaas-system get cronjob image-pruner \
+  -o jsonpath='{.spec.suspend}{"\n"}{.spec.jobTemplate.spec.template.spec.containers[0].args}{"\n"}'
+```
+
+Expected result: `false`, `--confirm=true`, and, for a managed Registry, `--prune-registry=true`.
+Inspect the resulting Job status and logs to verify completion before resuming image writers.
+
+Metadata-only pruning leaves storage manifest references in place. Standalone garbage collection
+follows those references and can retain linked manifests and blobs after their Image API metadata
+has been removed. A later standalone garbage collection is not a substitute for the required
+manifest cleanup. Use a reviewed combined prune and Registry cleanup when storage reclamation is intended.
 
 For manual pruning and registry garbage collection commands, see [Managing access and cleanup](./managing_access_and_cleanup.mdx).
+
+Optional `ImagePruner` fields include `successfulJobsHistoryLimit`, `failedJobsHistoryLimit`,
+`nodeSelector`, `tolerations`, and `affinity`. The schema also contains `ignoreInvalidImageReferences`
+and `logLevel`, but this release does not apply them to the generated Job.
 
 ## Operate Storage
 
 For PVC-backed Registry storage:
 
 ```bash
-kubectl -n image-registry-system get pvc
-kubectl -n image-registry-system describe pvc image-registry
+kubectl get configs.imageregistry.operator.alauda.io cluster \
+  -o jsonpath='{.spec.storage.pvc.claim}{"\n"}'
+kubectl -n cpaas-system get pvc
+kubectl -n cpaas-system describe pvc <claim-name>
 kubectl get pv
 ```
+
+Replace `<claim-name>` with the configured claim returned above, such as `registry-data` from the PVC example.
 
 Common actions:
 

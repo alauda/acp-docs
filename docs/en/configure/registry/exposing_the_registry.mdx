@@ -13,102 +13,37 @@ pull images.
 
 ## Prerequisites
 
-- <Term name="productShort" /> Registry is installed and available.
-- You have permission to update `Config/cluster` and create or reference TLS Secrets in `image-registry-system`.
-- The cluster has an Ingress controller that can route traffic to `image-registry-system`.
-- For a custom host, prepare a DNS record and a TLS certificate whose Subject Alternative Name matches the Registry hostname.
+- The Image Registry Operator is installed, and [Registry activation](./image_registry_operator.mdx#activate-the-registry) is complete.
+- Run commands from an administrator workstation with `kubectl` configured for the target ACP 4.4 cluster. For external checks, install `openssl` and authenticate `ac` to the same cluster.
+- You have permission to update `Config/cluster` and create or reference TLS Secrets in the Registry operand namespace.
+- The cluster has an Ingress controller that can route traffic to the Registry operand namespace.
+- Prepare a DNS record and a TLS certificate whose Subject Alternative Name matches the Registry hostname.
 
-## Expose the Default Registry
-
-Enable the default external endpoint in `Config/cluster`:
+The Operator runs in `image-registry-system`; the Ingress, backend Service, and TLS Secret belong in
+the Registry operand namespace. Read it from the Operator-created configuration:
 
 ```bash
-kubectl patch configs.imageregistry.operator.alauda.io cluster \
-  --type=merge \
-  -p '{"spec":{"defaultRoute":true}}'
+kubectl get configs.imageregistry.operator.alauda.io cluster \
+  -o jsonpath='{.metadata.annotations.imageregistry\.operator\.alauda\.io/operand-namespace}{"\n"}'
 ```
 
-The Operator renders a Kubernetes Ingress named `default-route` in `image-registry-system`.
+The examples use the default operand namespace `cpaas-system`. Replace it when the returned value
+differs. Replace `registry.example.com` with the hostname in your DNS record and certificate.
 
-Verify the generated Ingress and Registry configuration:
+## Expose a Custom Secure Registry Host \{#expose-a-custom-secure-registry-host}
 
-```bash
-kubectl get configs.imageregistry.operator.alauda.io cluster -o yaml
-kubectl -n image-registry-system get ingress default-route
-```
+Create or provide a TLS Secret in the Registry operand namespace, then configure `Config.spec.routes[]`.
 
-Get the generated host:
-
-```bash
-REGISTRY_RULE_HOST="$(
-  kubectl -n image-registry-system get ingress default-route \
-    -o jsonpath='{.spec.rules[0].host}'
-)"
-
-REGISTRY_STATUS_ADDRESS="$(
-  kubectl -n image-registry-system get ingress default-route \
-    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
-)"
-if [ -z "$REGISTRY_STATUS_ADDRESS" ]; then
-  REGISTRY_STATUS_ADDRESS="$(
-    kubectl -n image-registry-system get ingress default-route \
-      -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
-  )"
-fi
-
-printf 'Ingress rule host: %s\n' "$REGISTRY_RULE_HOST"
-printf 'Ingress status address: %s\n' "$REGISTRY_STATUS_ADDRESS"
-```
-
-Expected results:
-
-- `Config/cluster.spec.defaultRoute` is `true`.
-- The `default-route` Ingress exists in `image-registry-system`.
-- A non-empty `spec.rules[].host` is a usable Registry hostname. An empty rule host means that the
-  Ingress is a catch-all rule; a status address identifies the Ingress controller endpoint and is not
-  automatically a Registry DNS name.
-
-If the default Ingress has no usable hostname, configure a custom secure host instead. Do not use an
-empty rule host as the value of `--registry`.
-
-When a usable host is available, assign it to `REGISTRY_HOST`. If the client uses a private CA,
-configure that CA before running the TLS check. The check must succeed with the client's normal trust
-settings before logging in:
+Create the Secret from a certificate whose Subject Alternative Name matches the custom hostname.
+Replace the certificate and private key paths with the files supplied by your certificate administrator:
 
 ```bash
-REGISTRY_HOST="$REGISTRY_RULE_HOST"
-
-test -n "$REGISTRY_HOST" || {
-  echo "No usable Registry hostname was found; configure a custom secure host." >&2
-  exit 1
-}
-
-openssl s_client \
-  -connect "$REGISTRY_HOST:443" \
-  -servername "$REGISTRY_HOST" \
-  -verify_return_error </dev/null
-```
-
-Write credentials for the generated host:
-
-```bash
-ac registry login \
-  --registry "$REGISTRY_HOST"
-```
-
-## Expose a Custom Secure Registry Host
-
-Create or provide a TLS Secret in `image-registry-system`, then configure `Config.spec.routes[]`.
-
-Create the Secret from a certificate whose Subject Alternative Name matches the custom hostname:
-
-```bash
-kubectl -n image-registry-system create secret tls registry-tls \
+kubectl -n cpaas-system create secret tls registry-tls \
   --cert=/path/to/registry.example.com.crt \
   --key=/path/to/registry.example.com.key
 ```
 
-The TLS Secret must exist in `image-registry-system` when `secretName` is set. Create a DNS record
+The TLS Secret must exist in the Registry operand namespace when `secretName` is set. Create a DNS record
 for `registry.example.com` that resolves to the Ingress controller.
 
 The generated Ingress uses the registry service as the backend and sets the backend protocol to HTTPS.
@@ -120,7 +55,6 @@ kubectl patch configs.imageregistry.operator.alauda.io cluster \
   --type=merge \
   -p '{
     "spec": {
-      "managementState": "Managed",
       "defaultRoute": false,
       "routes": [
         {
@@ -137,14 +71,23 @@ kubectl patch configs.imageregistry.operator.alauda.io cluster \
 | --- | --- |
 | `public-registry` | Route name. The Operator uses it as the generated Ingress name. |
 | `registry.example.com` | Registry hostname reachable by external clients. The DNS record must resolve to the Ingress controller. |
-| `registry-tls` | TLS Secret in `image-registry-system`. The certificate Subject Alternative Name must match the Registry hostname. |
+| `registry-tls` | TLS Secret in the Registry operand namespace. The certificate Subject Alternative Name must match the Registry hostname. |
+
+If an explicit IngressClass is required, run `kubectl get ingressclass` and set `ingressClassName`
+to the selected object's name. When omitted, the generated Ingress has no explicit class.
+Use `proxyReadTimeout`, `proxySendTimeout`, and `proxyConnectTimeout` to override the generated
+Ingress upstream timeouts;
+the defaults are 600 seconds for read and send and 60 seconds for connect. Values must be positive,
+whole-second duration strings, such as `"20m"`, no greater than `2147483647s`. These fields are part
+of the same `routes[]` item. The read timeout measures intervals between upstream reads. Server
+[HTTP deadlines](./setting_up_and_configuring_the_registry.mdx#configure-http-timeouts) apply separately.
 
 Verify the configuration and generated Ingress:
 
 ```bash
 kubectl get configs.imageregistry.operator.alauda.io cluster -o yaml
-kubectl -n image-registry-system get ingress public-registry
-kubectl -n image-registry-system describe ingress public-registry
+kubectl -n cpaas-system get ingress public-registry
+kubectl -n cpaas-system describe ingress public-registry
 ```
 
 Expected results:
@@ -154,55 +97,68 @@ Expected results:
 - The Ingress references the `registry-tls` Secret.
 
 Configure client trust as described in [Configure Client Trust](#configure-client-trust), then verify
-TLS trust and login:
+the certificate chain and hostname:
 
 ```bash
 openssl s_client \
   -connect registry.example.com:443 \
   -servername registry.example.com \
+  -verify_hostname registry.example.com \
   -verify_return_error </dev/null
-
-ac registry login \
-  --registry registry.example.com
 ```
+
+Expected result: certificate verification succeeds for `registry.example.com`. For a private CA,
+add `-CAfile /path/to/registry-ca.crt` using the issuing CA bundle supplied by your certificate administrator.
+
+## Understand the Default Ingress
+
+`spec.defaultRoute: true` creates an Ingress named `default-route` with a catch-all rule. The Operator
+does not supply a hostname, TLS Secret, or explicit IngressClass for this Ingress. Its load balancer
+status identifies the controller endpoint and does not establish a Registry DNS name or certificate.
+
+For an existing default Ingress, inspect its configuration:
+
+```bash
+kubectl -n cpaas-system get ingress default-route -o yaml
+```
+
+Use the custom secure host procedure above for external HTTPS access. It disables the default Ingress
+with `defaultRoute: false`; an empty rule host cannot be used as `ac registry login --registry`.
 
 ## Configure Client Trust \{#configure-client-trust}
 
 If the Ingress certificate is signed by a private CA, add the CA to each external client's trust store before login and push or pull operations.
 
-For a test client that uses an insecure registry option, scope the insecure setting to the registry host only:
+For controlled testing, the following command skips the endpoint probe and writes credentials for
+the selected host:
 
 ```bash
+REGISTRY_AUTH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/registry-auth.XXXXXX")"
 ac registry login \
   --registry registry.example.com \
+  --to "$REGISTRY_AUTH_DIR/config.json" \
   --insecure
 ```
 
-Configure the OCI client's trust or insecure-registry setting separately if that client also connects to an HTTP endpoint or an untrusted certificate.
+`--insecure` does not verify connectivity or configure an OCI client's trust. Configure that client's
+trust separately before pushing or pulling images.
 
 ## Verify External Access
 
 Check the Ingress:
 
 ```bash
-kubectl -n image-registry-system get ingress
-kubectl -n image-registry-system describe ingress public-registry
+kubectl -n cpaas-system get ingress
+kubectl -n cpaas-system describe ingress public-registry
 ```
 
-Write credentials from an external client:
+From an external client, [authenticate with a dedicated Registry auth file](../../developer/registry/accessing_the_registry.mdx#authenticate-an-external-oci-client),
+then [publish and inspect a test image](../../developer/registry/accessing_the_registry.mdx#publish-and-inspect-images).
+Use an existing image namespace where your account has push and pull permission, and a source image
+you can read. Both registry endpoints must be reachable from that client.
 
-```bash
-ac registry login \
-  --registry registry.example.com
-```
-
-Push and pull a test image:
-
-```bash
-nerdctl tag my-app:latest registry.example.com/team-a/my-app:external-test
-nerdctl push registry.example.com/team-a/my-app:external-test
-nerdctl pull registry.example.com/team-a/my-app:external-test
-```
+Expected result: the copy completes, and querying the published tag and digest returns the same
+manifest or image index. Do not infer image permissions from a successful login alone.
 
 ## Troubleshooting
 
@@ -211,5 +167,6 @@ nerdctl pull registry.example.com/team-a/my-app:external-test
 | Ingress is missing | `Config.spec.defaultRoute`, `Config.spec.routes[]`, and Operator logs. |
 | Ingress has no address | Ingress controller status, ALB project label, and Ingress events. |
 | TLS handshake fails | TLS Secret, client trust store, certificate SANs, and private CA configuration. |
+| `ac registry info --check` reports connection refused on port 443 | Check the selected host, DNS, controller HTTPS listener, and routing. Use a custom route with a TLS Secret; `--insecure` on login does not repair endpoint connectivity. |
 | Login fails | <Term name="productShort" /> credentials, namespace RoleBinding, OIDC runtime discovery, and Registry logs. |
 | Push or pull fails after login | Image namespace permissions, repository path, storage backend, and Registry readiness. |
