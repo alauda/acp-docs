@@ -1,0 +1,308 @@
+---
+weight: 25
+---
+
+# Ingress Node Firewall Operator
+
+## Overview
+
+The Ingress Node Firewall (INFW) Operator provides node-level ingress traffic
+filtering for Kubernetes clusters. It applies Allow or Deny rules to packets
+received on selected node network interfaces. Rules can match source CIDRs,
+protocols, ports, and ICMP types.
+
+INFW is intended for node ingress protection. It is different from the
+following features:
+
+- `NetworkPolicy` controls traffic to and from Pods through the cluster network
+  plugin.
+- A Service load balancer distributes traffic to Service backends.
+- INFW filters packets at the selected node network interface before they reach
+  the workloads on that node.
+
+The Operator manages the following resources:
+
+| Resource                       | Scope            | Purpose                                                                              |
+| ------------------------------ | ---------------- | ------------------------------------------------------------------------------------ |
+| `IngressNodeFirewallConfig`    | Namespace-scoped | Selects the nodes that run the INFW daemon and enables the node dataplane.           |
+| `IngressNodeFirewall`          | Cluster-scoped   | Defines ingress firewall rules and the nodes and interfaces to which they apply.     |
+| `IngressNodeFirewallNodeState` | Namespace-scoped | Reports the rules rendered for an individual node and whether they are synchronized. |
+
+The control flow is:
+
+```text
+IngressNodeFirewall
+        |
+        v
+IngressNodeFirewallNodeState
+        |
+        v
+INFW daemon on the selected node
+        |
+        v
+XDP dataplane on the selected network interface
+```
+
+## Installation
+
+1. Navigate to **Administrator** > **Marketplace** > **OperatorHub**.
+2. Search for **Ingress Node Firewall Operator**.
+3. Click **Install** and complete the installation form.
+4. Select the target namespace for the Operator installation.
+
+After installation, verify that:
+
+- the Ingress Node Firewall Operator CSV is `Succeeded`;
+- the controller manager Pod is `Running`;
+- the following CRDs are available:
+  - `ingressnodefirewallconfigs.ingressnodefirewall.openshift.io`;
+  - `ingressnodefirewalls.ingressnodefirewall.openshift.io`;
+  - `ingressnodefirewallnodestates.ingressnodefirewall.openshift.io`.
+
+The examples in this document use `<operator-namespace>` as a placeholder for
+the namespace where the Operator is installed. Replace it with the namespace
+selected during installation.
+
+## Configure the INFW Daemon
+
+Create one `IngressNodeFirewallConfig` resource in the Operator installation
+namespace. The resource name must be `ingressnodefirewallconfig`. Only one
+`IngressNodeFirewallConfig` is supported in a cluster.
+
+The Operator creates an INFW DaemonSet on nodes matching
+`.spec.nodeSelector`. The default dataplane uses the INFW daemon to manage the
+XDP program and its maps.
+
+```yaml
+apiVersion: ingressnodefirewall.openshift.io/v1alpha1
+kind: IngressNodeFirewallConfig
+metadata:
+  name: ingressnodefirewallconfig
+  namespace: <operator-namespace>
+spec:
+  nodeSelector:
+    kubernetes.io/os: linux
+  debug: false
+```
+
+### Configuration fields
+
+| Field                | Description                                                                                             |
+| -------------------- | ------------------------------------------------------------------------------------------------------- |
+| `.spec.nodeSelector` | A key-value node selector for the INFW DaemonSet. If omitted, the daemon can run on all eligible nodes. |
+| `.spec.debug`        | Enables debug information for dataplane troubleshooting. Keep this disabled during normal operation.    |
+
+After creating or updating the Config, verify the generated DaemonSet:
+
+```shell
+kubectl -n <operator-namespace> get ingressnodefirewallconfig
+kubectl -n <operator-namespace> get daemonset ingress-node-firewall-daemon -o wide
+kubectl -n <operator-namespace> get pods -l app=ingress-node-firewall-daemon -o wide
+```
+
+The daemon must be `Ready` on every node that is expected to enforce INFW
+rules. Do not create a second Config in another namespace.
+
+## Create Firewall Rules
+
+Create an `IngressNodeFirewall` resource to apply rules to selected nodes. This
+resource is cluster-scoped, so do not set `metadata.namespace`.
+
+The following example denies TCP port `8080` on the `eth0` interface of nodes
+with the label `node-role.kubernetes.io/worker`:
+
+```yaml
+apiVersion: ingressnodefirewall.openshift.io/v1alpha1
+kind: IngressNodeFirewall
+metadata:
+  name: deny-tcp-8080
+spec:
+  interfaces:
+    - eth0
+  nodeSelector:
+    matchLabels:
+      node-role.kubernetes.io/worker: ''
+  ingress:
+    - sourceCIDRs:
+        - 0.0.0.0/0
+        - ::/0
+      rules:
+        - order: 10
+          protocolConfig:
+            protocol: TCP
+            tcp:
+              ports: 8080
+          action: Deny
+```
+
+### Rule fields
+
+| Field                                    | Description                                                                                        |
+| ---------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `.spec.interfaces`                       | Network interfaces where the rule is enforced, such as `eth0`. At least one interface is required. |
+| `.spec.nodeSelector`                     | Selects the nodes where the rule is applied. Use Kubernetes node labels.                           |
+| `.spec.ingress[].sourceCIDRs`            | Source IPv4 or IPv6 CIDRs matched by the rule group. At least one CIDR is required.                |
+| `.spec.ingress[].rules[].order`          | Rule evaluation order. Use a unique value from `1` to `99` for each rule set.                      |
+| `.spec.ingress[].rules[].protocolConfig` | Protocol-specific match criteria. Supported protocols are TCP, UDP, SCTP, ICMP, and ICMPv6.        |
+| `.spec.ingress[].rules[].action`         | `Allow` or `Deny`. If omitted, the default action is `Allow`.                                      |
+
+The `nodeSelector` and interface name must match the actual target nodes. A
+rule with a valid status can still have no dataplane effect if it selects the
+wrong node or interface.
+
+### TCP, UDP, and SCTP rules
+
+For TCP, UDP, and SCTP, specify a single port or a port range:
+
+```yaml
+rules:
+  - order: 10
+    protocolConfig:
+      protocol: UDP
+      udp:
+        ports: '5000-5010'
+    action: Allow
+```
+
+Use the protocol-specific field that matches `protocol`:
+
+- `protocol: TCP` requires `tcp`.
+- `protocol: UDP` requires `udp`.
+- `protocol: SCTP` requires `sctp`.
+
+### ICMP and ICMPv6 rules
+
+For ICMP and ICMPv6, specify the ICMP type and, when required, the ICMP code:
+
+```yaml
+rules:
+  - order: 20
+    protocolConfig:
+      protocol: ICMP
+      icmp:
+        icmpType: 8
+        icmpCode: 0
+    action: Deny
+```
+
+Use `icmp` with `protocol: ICMP` and `icmpv6` with `protocol: ICMPv6`.
+
+## Verify Rule Status
+
+Check the status of the firewall resource after creating or updating it:
+
+```shell
+kubectl get ingressnodefirewall deny-tcp-8080 -o yaml
+```
+
+The expected status is:
+
+```yaml
+status:
+  syncStatus: Synchronized
+```
+
+The Operator creates an `IngressNodeFirewallNodeState` for each selected node.
+Check the rendered node state in the Operator namespace:
+
+```shell
+kubectl -n <operator-namespace> get ingressnodefirewallnodestates \
+  -o custom-columns=NAME:.metadata.name,SYNC:.status.syncStatus
+```
+
+The selected node states should also report `Synchronized`. A `Synchronized`
+status confirms that the rule was rendered and delivered to the node daemon. It
+does not replace a real connection test; verify the expected traffic path when
+deploying a production rule.
+
+## Update and Delete Rules
+
+To update a rule, edit the `IngressNodeFirewall` resource and apply it again:
+
+```shell
+kubectl apply -f deny-tcp-8080.yaml
+```
+
+Wait for both the firewall resource and its affected NodeState resources to
+return to `Synchronized` before testing the new behavior.
+
+To remove a rule:
+
+```shell
+kubectl delete ingressnodefirewall deny-tcp-8080
+```
+
+Wait for the resource and the corresponding NodeState resources to be removed
+before creating a replacement rule with the same target and order values.
+
+## Troubleshooting
+
+### The DaemonSet is not created
+
+Check the Config namespace, name, node selector, and controller logs:
+
+```shell
+kubectl -n <operator-namespace> describe \
+  ingressnodefirewallconfig ingressnodefirewallconfig
+kubectl -n <operator-namespace> logs \
+  deploy/ingress-node-firewall-controller-manager --tail=200
+```
+
+The Config must be in the Operator installation namespace and must select at
+least one eligible node.
+
+### The daemon Pod is not Ready
+
+Check the Pod status and events:
+
+```shell
+kubectl -n <operator-namespace> get pods \
+  -l app=ingress-node-firewall-daemon -o wide
+kubectl -n <operator-namespace> describe pod \
+  -l app=ingress-node-firewall-daemon
+kubectl -n <operator-namespace> logs \
+  daemonset/ingress-node-firewall-daemon -c daemon --tail=200
+```
+
+Verify that the selected nodes provide the required BPF, XDP, bpffs, and
+privileged execution capabilities. Also check that the interface names in the
+firewall rules exist on those nodes.
+
+### The NodeState reports `Error`
+
+Check the firewall resource and NodeState events, then verify:
+
+- the node selector matches the intended nodes;
+- every interface exists on the selected nodes;
+- each source CIDR is valid;
+- the protocol-specific field matches the selected protocol;
+- rule order values are valid and unique.
+
+  ```shell
+  kubectl get ingressnodefirewall <firewall-name> -o yaml
+  kubectl -n <operator-namespace> get ingressnodefirewallnodestates -o yaml
+  kubectl -n <operator-namespace> get events --sort-by=.lastTimestamp
+  ```
+
+### The status is `Synchronized`, but traffic is still allowed
+
+Check the actual traffic path and collect the daemon logs. Confirm that the
+test traffic reaches the selected node and interface, and that another
+firewall, security group, or host firewall is not determining the result.
+
+```shell
+kubectl -n <operator-namespace> logs \
+  daemonset/ingress-node-firewall-daemon -c daemon --tail=200
+```
+
+## Constraints and Compatibility
+
+- INFW filters ingress traffic on node interfaces. It does not implement
+  namespace isolation or Service load balancing.
+- The `IngressNodeFirewallConfig` resource is a cluster singleton and must be
+  created in the Operator installation namespace.
+- The default ACP deployment uses the INFW self-managed XDP dataplane.
+- Nodes must provide the BPF, XDP, bpffs, and privileged execution capabilities
+  required by the daemon.
+- Before using a rule in production, verify the selected node labels and
+  interface names on the target cluster.
