@@ -1,0 +1,230 @@
+---
+weight: 10
+---
+
+# Uploading a Local Image and Creating a Virtual Machine
+
+Use this procedure when you already have a virtual machine disk image **on your local
+machine** (for example a `qcow2`, `raw`, or `img` file downloaded from an OS vendor) and want
+to run a virtual machine from it, rather than importing the image from a remote HTTP, registry,
+or S3 source.
+
+On Alauda Container Platform this is a **command-line workflow** built on the KubeVirt
+`virtctl` client and the CDI upload proxy — the web console does not yet offer a local-upload
+source. The uploaded image is stored as a `DataSource` (a **bootable volume**) that virtual
+machines can boot from and that can be reused by many virtual machines.
+
+> **Tip**: If instead you want to **install** an operating system from an ISO, see
+> [Creating Linux Images Based on ISO](./vm_iso_linux.mdx) and
+> [Creating Windows Images Based on ISO](./vm_iso_windows.mdx).
+
+## Prerequisites
+
+- The `virtctl` command-line client is installed and matches the cluster's KubeVirt version.
+  `virtctl` is the standard KubeVirt CLI; download the binary that matches your cluster from the
+  KubeVirt releases and place it on your `PATH`.
+- The `kubectl` command-line tool is installed and configured to access the cluster.
+- A local disk image in `qcow2`, `raw`, or `img` format. To speed up the upload, compress the
+  image first with `virt-sparsify`, `xz`, or `gzip`.
+- A `StorageClass` that supports the `ReadWriteOnce` (RWO) access mode.
+- The `cdi-uploadproxy` Service (in the `kubevirt` namespace) is reachable from where you run
+  `virtctl` — see Step 1.
+
+## Procedure
+
+<Steps>
+
+### Expose the CDI upload proxy outside the cluster
+
+`virtctl image-upload` streams the image to the `cdi-uploadproxy` Service, which is an internal
+`ClusterIP` Service in the `kubevirt` namespace. You must make it reachable from where you run
+`virtctl`.
+
+> **Note**: CDI does not expose the upload proxy or discover its external address by itself on
+> Alauda Container Platform, so you expose the Service yourself (this step) and set the upload
+> URL explicitly (Step 2).
+
+Use **TLS passthrough** so that `virtctl` negotiates TLS directly with `cdi-uploadproxy` (the
+proxy serves a self-signed certificate, so clients pass `--insecure`). For every method below the
+backend is the `cdi-uploadproxy` Service on port `443` in the `kubevirt` namespace; note the
+resulting external URL for Step 2.
+
+- **Gateway API (Envoy Gateway) — recommended.** Add a `TLS` listener in `Passthrough` mode to a
+  `Gateway`, then create a `TLSRoute` whose backend is the `cdi-uploadproxy` Service on port
+  `443`. The Gateway's external address — a `LoadBalancer` IP or a `NodePort`, set by the
+  gateway's Service Type — becomes the upload URL. See
+  [Configure GatewayAPI Gateway](/networking/functions/configure_gatewayapi_gateway.mdx) and
+  [Configure GatewayAPI Route](/networking/functions/configure_gatewayapi_route.mdx) for the full
+  procedure, and [Envoy Gateway Operator](/networking/operators/envoy_gateway_operator.mdx) to
+  install the controller.
+- **Ingress (ingress-nginx).** Expose `cdi-uploadproxy` with an SSL-passthrough `Ingress`. See
+  [Configure Ingresses](/networking/functions/configure_ingress.mdx) and
+  [Ingress Nginx Operator](/networking/operators/ingress_nginx_operator.mdx). The legacy ALB
+  ingress (`cpaas.io/alb2`) is deprecated.
+- **LoadBalancer or NodePort Service.** Without an ingress controller, expose the Service
+  directly — a `LoadBalancer` where MetalLB is configured, or a `NodePort`, which always works:
+
+  ```bash
+  kubectl expose service cdi-uploadproxy -n kubevirt \
+    --name=cdi-uploadproxy-np --type=NodePort --port=443 --target-port=8443
+  kubectl get service cdi-uploadproxy-np -n kubevirt   # note the 443:<nodePort> mapping
+  ```
+
+  Reach the proxy at `https://<node-ip>:<nodePort>`.
+
+After exposing the Service, verify it answers through the new endpoint (the certificate is
+self-signed, so use `-k`):
+
+```bash
+curl -k https://<upload-proxy-host>/healthz
+# -> OK
+```
+
+### Point `virtctl` at the upload proxy URL
+
+`virtctl image-upload` needs to know the external URL from Step 1. Choose one of the following.
+
+**Configure it once (persistent).** Set `CDIConfig.spec.uploadProxyURLOverride` so that every
+`virtctl image-upload` discovers the URL automatically. Because the CDI configuration is managed
+by the HyperConverged (HCO) operator — which reconciles direct edits away and does not expose
+this field — set it through HCO's jsonpatch annotation:
+
+```bash
+kubectl annotate hyperconverged kubevirt-hyperconverged -n kubevirt \
+  'containerizeddataimporter.kubevirt.io/jsonpatch=[{"op":"add","path":"/spec/config/uploadProxyURLOverride","value":"https://cdi-uploadproxy.example.com:8443"}]' \
+  --overwrite
+
+# Verify it propagated to the calculated URL that virtctl reads:
+kubectl get cdiconfig config -o jsonpath='{.status.uploadProxyURL}{"\n"}'
+```
+
+> **Warning**: HCO documents jsonpatch annotations as an advanced, **unsupported** mechanism —
+> an incorrect patch can destabilize the virtualization stack. Use it deliberately, and remove
+> the annotation
+> (`kubectl annotate hyperconverged kubevirt-hyperconverged -n kubevirt containerizeddataimporter.kubevirt.io/jsonpatch-`)
+> to revert.
+
+**Or pass it per command.** Skip the cluster configuration and give the URL on each upload with
+`--uploadproxy-url` (shown in Step 3).
+
+### Upload the local image
+
+Run `virtctl image-upload`. The `--datasource` flag also creates a `DataSource` that points at
+the uploaded volume, making it selectable as a bootable volume:
+
+```bash
+virtctl image-upload dv uploaded-image \
+  --datasource \
+  --size=30Gi \
+  --storage-class=rbd-1 \
+  --image-path=./my-image.qcow2 \
+  --namespace=my-namespace
+# add --uploadproxy-url=https://cdi-uploadproxy.example.com:8443 --insecure
+# if you did NOT set uploadProxyURLOverride in Step 2.
+```
+
+Notes:
+
+- `--size` must be **larger than the image's virtual disk size** (not the file size). For
+  example, if your image has a 24 GiB virtual disk, request at least a 30 GiB volume. CDI
+  rejects a volume smaller than the uncompressed disk.
+- Use `--no-create` (and omit `--size`) to upload into a `DataVolume` that already exists.
+- `--insecure` skips verification of the proxy's self-signed certificate.
+
+Wait for the upload and import to finish:
+
+```bash
+kubectl get dv uploaded-image -n my-namespace -w
+# PHASE: UploadReady -> ... -> Succeeded
+
+kubectl get datasource uploaded-image -n my-namespace
+# the DataSource becomes Ready
+```
+
+> **Note**: A `DataSource` created by `virtctl --datasource` does not carry the
+> `virtualization.cpaas.io/*` labels used to mark a bootable volume. The image is fully
+> usable through the API (by `sourceRef`, as in the next step); to also apply that label
+> contract, see [Bootable Volumes](../../virtual_machine/bootable_volume.mdx).
+
+### Create a virtual machine from the uploaded image
+
+Reference the `DataSource` from a `dataVolumeTemplates` entry via `sourceRef`. KubeVirt clones
+the uploaded volume into a fresh disk for the new virtual machine:
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: example-vm
+  namespace: my-namespace
+spec:
+  runStrategy: RerunOnFailure
+  dataVolumeTemplates:
+    - metadata:
+        name: example-vm-rootdisk
+      spec:
+        sourceRef:
+          kind: DataSource
+          name: uploaded-image
+          namespace: my-namespace
+        storage:
+          resources:
+            requests:
+              storage: 30Gi
+          storageClassName: rbd-1
+  template:
+    metadata:
+      labels:
+        kubevirt.io/vm: example-vm
+    spec:
+      domain:
+        cpu:
+          cores: 1
+        resources:
+          requests:
+            memory: 2Gi
+        devices:
+          disks:
+            - name: rootdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              masquerade: {}
+      networks:
+        - name: default
+          pod: {}
+      volumes:
+        - name: rootdisk
+          dataVolume:
+            name: example-vm-rootdisk
+```
+
+```bash
+kubectl apply -f example-vm.yaml
+kubectl get vm example-vm -n my-namespace          # STATUS: Running
+kubectl get vmi example-vm -n my-namespace         # PHASE: Running, with an IP
+```
+
+Confirm the operating system boots by opening the serial console; a login prompt indicates a
+successful boot:
+
+```bash
+virtctl console example-vm -n my-namespace
+# example-vm login:
+```
+
+> **Tip**: The uploaded image can also be referenced as a bootable volume when creating a
+> virtual machine, once it carries the required labels — see
+> [Creating Virtual Machines](../../virtual_machine/functions/create_virtual_machine.mdx) and
+> [Bootable Volumes](../../virtual_machine/bootable_volume.mdx).
+
+</Steps>
+
+## Creating a Windows virtual machine
+
+For Windows, upload the image to a volume and then clone it when you create the virtual machine,
+applying an `autounattend.xml` answer file during first boot. The upload step is identical to
+the procedure above (use a `qcow2`/`raw`/`img` Windows disk image); for the ISO-based install
+flow and the VirtIO driver requirements, see
+[Creating Windows Images Based on ISO](./vm_iso_windows.mdx).

@@ -5,7 +5,7 @@ metadata:
   annotations:
     pipelinesascode.tekton.dev/on-comment: "^(/doc-build)$"
     pipelinesascode.tekton.dev/cancel-in-progress: "true"
-    pipelinesascode.tekton.dev/max-keep-runs: "10"
+    pipelinesascode.tekton.dev/max-keep-runs: "3"
     pipelinesascode.tekton.dev/on-cel-expression: |-
       (
         event == "push" &&
@@ -15,9 +15,21 @@ metadata:
         )
       )
 spec:
+  # `tasks` is the budget for all tasks together, not per task — a run whose
+  # steps add up past it is cancelled wherever it happens to be, and everything
+  # already done is thrown away because `upload-translations` runs last.
+  #
+  # Sized from immutable-infra-docs on 2026-09-03/04, where 6h cancelled two
+  # runs during `auto-translate-ru` after Chinese had already succeeded:
+  #   auto-translate-zh   2h06m–2h25m for one attempt, 3h25m–3h34m with retries
+  #   auto-translate-ru   still running at 2h25m and 2h30m when the budget ran out
+  # so the realistic total is over 8h once either language needs a retry.
+  #
+  # This is the coarse bound. What stops a genuinely stuck step is the per-task
+  # `timeout` in the pipeline body (product-docs-pipeline in docs/engineering/gitops).
   timeouts:
-    pipeline: 6h
-    tasks: 3h
+    pipeline: 12h
+    tasks: 10h
 
   params:
     - name: doc-base
@@ -35,60 +47,76 @@ spec:
     - name: pull-request-target
       value: "{{ target_branch }}"
 
-
+  # The pipeline body is delivered to this namespace by Argo CD from docs/engineering/gitops
+  # (pipelines/product-docs-pipeline). PaC cannot assemble a bare pipelineRef.name for a
+  # pipeline that is not inlined here, so the cluster resolver is what references it. A
+  # change to the body reaches every site repository with its next run.
   pipelineRef:
-    resolver: hub
+    resolver: cluster
     params:
-    - name: catalog
-      value: alauda
-    - name: kind
-      value: pipeline
-    - name: name
-      value: product-docs-pipeline
-    - name: version
-      value: "0.1"
+      - name: kind
+        value: pipeline
+      - name: name
+        value: product-docs-pipeline
+      - name: namespace
+        value: "{{ target_namespace }}"
 
   workspaces:
     - name: source
       volumeClaimTemplate:
         spec:
-          storageClassName: topolvm
+          storageClassName: sc-topolvm
           accessModes:
             - ReadWriteOnce
           resources:
             requests:
               storage: 25Gi
-    - name: cache
-      persistentVolumeClaim:
-        claimName: doc-build-cache
-      subPath: yarn_cache
-
-    # This secret will be replaced by the pac controller
+    # Cloning the site repository: the docs project's GitHub connector. The volume holds a
+    # .gitconfig that sends https://github.com through the connector's proxy, which also
+    # reads the private site repositories.
     - name: basic-auth
-      secret:
-        secretName: "{{ git_auth_secret }}"
-
+      csi:
+        driver: connectors-csi
+        readOnly: true
+        volumeAttributes:
+          connector.name: github-com
+          connector.namespace: docs
+          configuration.names: gitconfig
+          token.expiration: 30m
+    # The translation repositories on code.alauda.io: the docs project's GitLab connector.
+    # Download and upload are separate tasks, so each pod gets a fresh 30-minute token.
+    - name: gitlab-connector
+      csi:
+        driver: connectors-csi
+        readOnly: true
+        volumeAttributes:
+          connector.name: code-alauda-io
+          connector.namespace: docs
+          configuration.names: gitconfig
+          token.expiration: 30m
 
   taskRunTemplate:
-    # Default: run tasks as root (UID 0) since most build tasks require root privileges.
-    # Individual tasks can override this as needed (see taskRunSpecs below).
+    # Reads and writes the Cloudflare project mapping (a ConfigMap) and nothing else in the
+    # cluster; defined in docs/engineering/gitops next to the pipeline body.
+    serviceAccountName: docs-site-build
     podTemplate:
+      # The namespace enforces the restricted Pod Security standard: no task runs as root.
       securityContext:
-        runAsUser: 0
-        runAsGroup: 0
-        fsGroup: 0
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
         fsGroupChangePolicy: "OnRootMismatch"
+        seccompProfile:
+          type: RuntimeDefault
+      # The release notes come from Jira. This cluster reaches jira.alauda.cn only at this
+      # address, on another port; JIRA_BASE_URL in the pipeline body names that port.
+      hostAliases:
+        - ip: "117.50.122.12"
+          hostnames:
+            - jira.alauda.cn
 
   taskRunSpecs:
-    - pipelineTaskName: git-clone
-      # Override: run git-clone as non-root user for security.
-      podTemplate:
-        securityContext:
-          runAsUser: 65532
-          runAsGroup: 65532
-          fsGroup: 65532
-          fsGroupChangePolicy: "OnRootMismatch"
-
     - pipelineTaskName: build-online-docs-io
       computeResources:
         requests:
@@ -96,7 +124,7 @@ spec:
           memory: 6Gi
         limits:
           cpu: 4
-          memory: 12Gi
+          memory: 16Gi
     - pipelineTaskName: build-online-docs-cn
       computeResources:
         requests:
@@ -104,7 +132,7 @@ spec:
           memory: 6Gi
         limits:
           cpu: 4
-          memory: 12Gi
+          memory: 16Gi
     - pipelineTaskName: build-offline-docs
       computeResources:
         requests:
@@ -112,7 +140,7 @@ spec:
           memory: 6Gi
         limits:
           cpu: 4
-          memory: 12Gi
+          memory: 16Gi
     - pipelineTaskName: build-exports-docs
       computeResources:
         requests:
@@ -120,7 +148,7 @@ spec:
           memory: 6Gi
         limits:
           cpu: 4
-          memory: 12Gi
+          memory: 16Gi
     - pipelineTaskName: export-docs
       computeResources:
         requests:
@@ -128,7 +156,7 @@ spec:
           memory: 6Gi
         limits:
           cpu: 4
-          memory: 12Gi
+          memory: 16Gi
     - pipelineTaskName: build-online-docs-russian
       computeResources:
         requests:
@@ -136,7 +164,7 @@ spec:
           memory: 6Gi
         limits:
           cpu: 4
-          memory: 12Gi
+          memory: 16Gi
     - pipelineTaskName: build-offline-docs-russian
       computeResources:
         requests:
@@ -144,7 +172,7 @@ spec:
           memory: 6Gi
         limits:
           cpu: 4
-          memory: 12Gi
+          memory: 16Gi
     - pipelineTaskName: build-exports-docs-russian
       computeResources:
         requests:
@@ -152,7 +180,7 @@ spec:
           memory: 6Gi
         limits:
           cpu: 4
-          memory: 12Gi
+          memory: 16Gi
     - pipelineTaskName: export-docs-russian
       computeResources:
         requests:
@@ -160,4 +188,4 @@ spec:
           memory: 6Gi
         limits:
           cpu: 4
-          memory: 12Gi
+          memory: 16Gi

@@ -3,16 +3,17 @@ title: "etcd Backup and Restore"
 weight: 10
 ---
 
+# etcd Backup and Restore
 
 The etcd service on the cluster is a distributed key-value store responsible for storing cluster configuration information. etcd is deployed on all control plane nodes of the cluster.
 
-After installing the Alauda Container Platform Cluster Enhancer plugin, an EtcdBackupConfiguration resource is automatically created for the cluster configuration. The EtcdBackupConfiguration contains information about backup data sources (control nodes, backup paths), backup data storage locations, backup methods, and more. Each backup execution based on the policy generates a new backup record, enabling you to back up cluster configurations on-demand or automatically on a periodic basis.
+After installing the <Term name="product" /> Cluster Enhancement plugin, an `EtcdBackupConfiguration` resource is automatically created for the cluster configuration. The `EtcdBackupConfiguration` contains backup data sources, control plane node paths, backup data storage locations, and backup methods. Each backup execution based on the policy generates a new backup record, enabling on-demand and scheduled cluster-configuration backups.
 
 ## Prerequisites
 
 To enable etcd backup:
 
-1. Download **Alauda Container Platform Cluster Enhancer** from the <Term name="company" /> Customer Portal.
+1. Download **<Term name="product" /> Cluster Enhancement** from the <Term name="company" /> Customer Portal.
 2. [Upload the package](/extend/upload_package.mdx) to the platform.
 3. [Install the plugin](/extend/cluster_plugin.mdx) on your cluster.
 
@@ -20,9 +21,9 @@ After installation, an EtcdBackupConfiguration resource is automatically created
 
 ## How it works
 
-- etcd backup is provided by **Alauda Container Platform Cluster Enhancer**
-- Supports both local storage and S3-compatible object storage. By default, backups are stored locally in `/cpaas`. Configuring S3 storage creates an additional copy in the S3 bucket; local backups continue to be generated.
-- For clusters running on Immutable OS, S3 storage is **required** (local storage is not supported)
+- etcd backup is provided by **<Term name="product" /> Cluster Enhancement**.
+- Supports both local storage and S3-compatible object storage. Local backups are written to a directory on each control plane node — `/var/cpaas/backup` by default. Plan this directory with enough capacity for your etcd data size and retention period. Configuring S3 storage creates an additional copy in the S3 bucket; local backups continue to be generated.
+- For clusters whose nodes run Alauda OS, local backup uses `/var/cpaas/backup` by default. S3 storage remains supported through `remoteStorage.s3`.
 
 ## Configuration Reference
 
@@ -33,10 +34,14 @@ You can configure the `EtcdBackupConfiguration` resource to customize backup sch
 - **`schedule`**: Defines the backup frequency using standard cron syntax.
   - Example: `0 0 * * *` (Run backup daily at midnight).
 - **`localStorage`**: Configures local backup storage.
-  - **`path`**: The directory on the host where backups are stored. Default is `/cpaas`.
+  - **`path`**: The directory on each control plane node where backups are stored. Default is `/var/cpaas/backup`. Set this to a directory with enough capacity for the etcd data size and the configured retention period; see the storage note below.
   - **`ttl`**: The retention period for backup files in seconds. Backups older than this duration will be automatically deleted.
     - Example: `7776000` (approximately 90 days).
 - **`paused`**: Set to `true` to temporarily suspend automatic backups without deleting the configuration.
+
+:::warning
+Plan storage capacity for local backups before enabling etcd backup. Local backups accumulate on the control plane nodes and are kept until their `ttl` expires, so `/var/cpaas/backup` must have enough free space for the expected backup size and retention period.
+:::
 
 Example configuration:
 
@@ -49,7 +54,7 @@ spec:
   schedule: "0 0 * * *"       # Run daily at 00:00
   paused: false               # Enable backups
   localStorage:
-    path: /cpaas-backup       # Custom backup path
+    path: /var/cpaas/backup   # Local backup directory on each control plane node
     ttl: "7776000"            # Retain for 90 days
   # ... other fields
 ```
@@ -83,7 +88,7 @@ To enable S3 storage for etcd backups, follow these steps:
 
 ### Prerequisites
 
-- Alauda Container Platform Cluster Enhancer is installed on the cluster.
+- <Term name="product" /> Cluster Enhancement is installed on the cluster.
 
 ### Step 1: Create S3 Secret
 
@@ -132,20 +137,34 @@ curl $platform_url/kubernetes/$cluster_name/apis/enhancement.cluster.alauda.io/v
 
 After the backup completes, verify that backup files exist in your S3 bucket.
 
-## etcd Restore
+For restore preparation, use the `fileName` shown in the backup record and the configured `remoteStorage.s3.dir` value to download the tar archive from S3:
+
+```bash
+aws --endpoint-url <s3-endpoint> s3 cp \
+  s3://<bucket>/<dir>/<backup-file-name> \
+  /tmp/snapshot-etcd.tar
+
+mkdir -p /tmp/etcd-restore
+tar -xf /tmp/snapshot-etcd.tar -C /tmp/etcd-restore
+find /tmp/etcd-restore -name 'snapshot-etcd-*.db' -type f
+```
+
+## etcd Restore \{#etcd-restore}
 
 > **Warning:**
 >
-> *   This operation performs a disastrous recovery of the etcd cluster. It will overwrite the existing data. Ensure you have a valid backup snapshot before proceeding.
-> *   This procedure entails significant risks. If you are unsure about the operation, please contact technical support.
+> *   This operation performs a destructive recovery of the etcd cluster. It will overwrite the existing data. Ensure you have a valid backup snapshot before proceeding.
+> *   This procedure entails significant risks. If you are unsure about the operation, contact technical support.
 > *   During the recovery process, the Kubernetes API Server will be unavailable.
 
 ### Prerequisites
 
 - The Kubernetes cluster is deployed using hostnames (`kubectl get node` shows hostnames as node names).
 - An etcd backup snapshot is available.
-- The cluster is malfunctioning due to the failure of etcd nodes (e.g., more than half of the control plane nodes are down).
-- This recovery procedure is specifically designed for a **3-node control plane** cluster. If your cluster has 5 or more control plane nodes, please contact technical support for assistance.
+- The cluster is malfunctioning due to the failure of etcd (e.g., more than half of the control plane nodes are down).
+- This recovery procedure is specifically designed for a **3-node control plane** cluster. If your cluster has 5 or more control plane nodes, contact technical support for assistance.
+- On Alauda OS, confirm that `/var/lib/etcd`, `/etc/kubernetes/manifests/etcd.yaml`, and `/etc/kubernetes/pki/etcd/` exist on each control plane node before starting restore.
+- On Alauda OS, `etcdctl` might not be available in the host `PATH`. Locate it under `/var/lib/containerd`, or use a container image that includes a compatible `etcdctl` binary.
 
 ### Step 1: Backup Original Data and Modify etcd Configuration
 
@@ -158,8 +177,14 @@ mkdir -p /root/backup_$(date +%Y%m%d%H)/old-etcd/
 # Stop kubelet
 systemctl stop kubelet
 
-# Backup etcdctl binary
-cp $(find /var/lib/containerd/ -name etcdctl | tail -1) /root/etcdctl
+# Prepare etcdctl binary
+ETCDCTL_PATH="$(find /var/lib/containerd/ -name etcdctl -type f | tail -1)"
+if [ -z "$ETCDCTL_PATH" ]; then
+  echo "etcdctl was not found under /var/lib/containerd. Use a container image that includes a compatible etcdctl binary."
+  exit 1
+fi
+cp "$ETCDCTL_PATH" /root/etcdctl
+chmod +x /root/etcdctl
 
 # Remove etcd containers
 crictl ps -a | grep etcd | awk '{print $1}' | xargs -r crictl rm -f
@@ -178,13 +203,33 @@ sed -i '/initial-cluster=/a\    - --initial-cluster-state=existing' /etc/kuberne
 
 ### Step 2: Copy Backup Snapshot
 
-Copy the latest etcd backup snapshot to the `/tmp` directory on the **first control plane node** and name it `snapshot.db`.
+Copy the selected etcd backup snapshot to the `/tmp` directory on the **first control plane node** and name it `snapshot.db`.
+
+If the backup tar archive is available locally, extract it from `/var/cpaas/backup`:
+
+```bash
+mkdir -p /tmp/etcd-restore
+tar -xf "$(ls -1t /var/cpaas/backup/snapshot-etcd-*.tar | head -1)" -C /tmp/etcd-restore
+cp "$(find /tmp/etcd-restore -name 'snapshot-etcd-*.db' -type f | head -1)" /tmp/snapshot.db
+```
+
+If the backup tar archive is stored in S3, download it first, and then extract the snapshot file:
+
+```bash
+aws --endpoint-url <s3-endpoint> s3 cp \
+  s3://<bucket>/<dir>/<backup-file-name> \
+  /tmp/snapshot-etcd.tar
+
+mkdir -p /tmp/etcd-restore
+tar -xf /tmp/snapshot-etcd.tar -C /tmp/etcd-restore
+cp "$(find /tmp/etcd-restore -name 'snapshot-etcd-*.db' -type f | head -1)" /tmp/snapshot.db
+```
 
 ### Step 3: Restore etcd
 
 Execute the following script on the **first control plane node** to restore the snapshot.
 
-> **Note:** The following script assumes a 3-node control plane cluster. If your cluster has 5 or more nodes, please contact technical support.
+> **Note:** The following script assumes a 3-node control plane cluster. If your cluster has 5 or more nodes, contact technical support.
 
 ```bash
 #!/usr/bin/env bash
