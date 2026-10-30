@@ -19,11 +19,10 @@ const DEFAULT_OS_ID = 'alaudaos.m.55'
 
 const ARCHITECTURES = ['amd64', 'arm64'] as const
 
-// Alauda OS KO and KU report the same OS identifier and share a repository;
-// only their image tags differ.
+// Bare Metal supports Alauda OS M55 and Alauda OS KU only; the OS select
+// offers the variants listed here.
 const BARE_METAL_IMAGES: Partial<Record<string, { osId: string; repository: string }>> = {
   m55: { osId: DEFAULT_OS_ID, repository: 'tkestack/baremetal-base-image' },
-  ko: { osId: 'alaudaos.k.25', repository: 'tkestack/kubeos-rootfs' },
   ku: { osId: 'alaudaos.k.25', repository: 'tkestack/kubeos-rootfs' },
 }
 
@@ -138,10 +137,7 @@ const notes = (
       Do not change the image catalog while an upgrade is in progress. A host replaced after the change
       installs the new image, so the nodes of one pool can end up on different images.
     </p>
-    <p>
-      Use one Alauda OS variant per cluster. Alauda OS KO and Alauda OS KU share the same key, so for each
-      Kubernetes version and architecture the image catalog holds the image of only one of them.
-    </p>
+    <p>Use one Alauda OS variant per cluster.</p>
   </>
 )
 
@@ -155,11 +151,11 @@ const placeholderNote = (
       <code>{'<os-image-key>'}</code> is the Kubernetes version itself for <code>amd64</code> hosts with
       Alauda OS M55, and <code>{'<kubernetes-version>_<arch>_<os-id>'}</code> for other hosts. The{' '}
       <code>{'<os-id>'}</code> is <code>alaudaos.m.55</code> for Alauda OS M55 and <code>alaudaos.k.25</code>{' '}
-      for Alauda OS KO and Alauda OS KU.
+      for Alauda OS KU.
     </p>
     <p>
       <code>{'<os-image-repository>'}</code> is <code>tkestack/baremetal-base-image</code> for Alauda OS M55
-      and <code>tkestack/kubeos-rootfs</code> for Alauda OS KO and Alauda OS KU.
+      and <code>tkestack/kubeos-rootfs</code> for Alauda OS KU.
     </p>
   </>
 )

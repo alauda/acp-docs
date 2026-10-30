@@ -4,32 +4,33 @@ weight: 50
 
 # Upgrade Validation
 
-Validate each upgraded cluster before closing its maintenance window. In a global DR environment, validate the standby and primary global clusters separately before upgrading workload clusters. For an Alauda OS cluster, run this validation after Upgrade Kubernetes on Alauda OS completes for the [`global` cluster](./global/upgrade_kubernetes_on_alauda_os.mdx) or the [workload cluster](./workload/alauda_os/index.mdx).
+Validate each upgraded cluster before you close its maintenance window. In a DR environment, validate the standby and the primary `global` cluster separately, before you upgrade any workload cluster. If a check fails, keep the window open and see [Upgrade Troubleshooting](./troubleshooting.mdx).
 
-## Confirm Distribution Version and CVO Completion
+## Check the ACP Version \{#check-distribution-version}
 
-From the global cluster, inspect the target cluster's `ClusterVersionShadow`:
+Select the `global` cluster and read the upgrade status and history of the cluster. Replace `<cluster-name>` with `global` or the workload cluster name. In a DR environment, select the primary for a workload cluster, and the side you validate for a `global` cluster:
 
 ```bash
-kubectl -n cpaas-system get cvsh <cluster> \
-  -o jsonpath='{.status.current.version}{"\t"}{.status.desired.version}{"\n"}{range .status.conditions[*]}{.type}{"\t"}{.status}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
-
-kubectl -n cpaas-system get cvsh <cluster> \
+export KUBECONFIG=<global-kubeconfig>
+kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}{"\n"}'
+ac adm upgrade status --cluster=<cluster-name>
+kubectl -n cpaas-system get cvsh <cluster-name> \
   -o jsonpath='{range .status.history[*]}{.version}{"\t"}{.state}{"\t"}{.startedTime}{"\t"}{.completionTime}{"\n"}{end}'
 ```
 
-The current and desired Distribution Versions must match the target. `Ready` must be `True`, `Reconciling` must no longer be `True`, and `Stalled` must not be `True`. The newest history entry must show the target version completed successfully.
+The ACP version (Distribution Version) is correct when `Upgrade` is `Completed`, `Current` shows `4.5.0`, the `Ready` condition is `True`, and `Stalled` is not `True`. The first history entry shows `4.5.0` with the state `Completed`.
 
-## Validate Kubernetes, Nodes, Core, and Aligned Plugins
+## Check Kubernetes, Nodes, and Extensions \{#check-kubernetes-nodes-plugins}
 
-From the global-cluster management context, confirm the Core and installed Aligned module state:
+On the `global` cluster, check the Core and the installed Extensions of the cluster. Every module is `Running` with `CURRENT` equal to `TARGET`, and `deployStatus` is not `Upgrading`, `DeployFailed`, or `UpgradeFailed`:
 
 ```bash
-kubectl get clustermodule <cluster> -o yaml
-kubectl get moduleinfo -l cpaas.io/cluster-name=<cluster>
+kubectl get moduleinfo -l cpaas.io/cluster-name=<cluster-name> \
+  -o custom-columns='MODULE:.metadata.labels.cpaas\.io/module-name,CURRENT:.status.version,TARGET:.spec.version,PHASE:.status.phase'
+kubectl get clustermodule <cluster-name> -o jsonpath='{.status.base.deployStatus}{"\n"}'
 ```
 
-Then use a `kubectl` context for the upgraded cluster to confirm the Kubernetes server version, node readiness, and Pods:
+Then, with a kubeconfig for the upgraded cluster, check Kubernetes, the nodes, and the Pods:
 
 ```bash
 kubectl version
@@ -39,36 +40,81 @@ kubectl get pods --all-namespaces \
   | awk -F'[/ ]+' '{if ($3 != $4)print}'
 ```
 
-All nodes must be `Ready`; Core and installed Aligned modules must report the target version in a healthy phase; critical Pods must be `Running` or `Completed`.
+The server version is the Kubernetes version of the target ACP release, and every node is `Ready` with that version. Critical Pods are `Running` or `Completed`, and no Pod reports `ImagePullBackOff` or `ErrImagePull`.
 
-## Validate Installed Extension Availability
+## Additional Checks for Alauda OS Clusters \{#alauda-os-checks}
 
-From the global cluster, review the cluster plugin catalog when you need to confirm that an upgraded application remains discoverable:
+Run these checks on the `global` cluster that you selected above. Check that the platform has taken over Kube-OVN and CoreDNS; use the kind that matches the provider of the cluster, `dcscluster`, `baremetalcluster`, `hcscluster`, or `vspherecluster`:
 
 ```bash
-kubectl get moduleplugins
+kubectl -n cpaas-system get <provider-cluster-kind> <cluster-name> \
+  -o jsonpath='{range .status.conditions[?(@.type=="CoreAddonsHandedOff")]}{.status}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
 ```
 
-Upgrade acceptance applies to the Core and Aligned applications actually installed on the upgraded cluster. Use the `ClusterVersionShadow` completion state and the `ModuleInfo` versions from the previous sections as the authoritative result, and confirm that no related Pod reports `ImagePullBackOff` or `ErrImagePull`.
+The status is `True`. A cluster that does not use Kube-OVN has no such condition. With the reason `CoreAddonsHandoffPending`, the takeover is still in progress; read the condition again later. With the reason `CoreAddonsHandoffBlocked`, the message names the setting that blocks the takeover: move a customized CoreDNS Corefile to the configuration of the `coredns` `ModuleInfo`; for any other setting, contact technical support. Then run the checks for the provider of the cluster:
 
-Do not require every entry in `ProductBase.status.artifacts` to be `Ready`. `ProductBase` includes optional or uninstalled catalog packages, including Agnostic applications, which can legitimately remain `Absent` after a successful cluster upgrade.
+<Tabs>
+  <Tab label="Huawei DCS">
 
-## Validate the Web UI and In-Use Agnostic Plugins
+```bash
+kubectl -n cpaas-system get infraclusterversion <cluster-name>
+kubectl -n cpaas-system get infraclusterversion <cluster-name> \
+  -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{"\t"}{.message}{"\n"}{end}'
+```
 
-Open the platform Web UI and confirm that login, cluster pages, and Marketplace pages load. Upgrade each in-use Agnostic plugin required for the target Kubernetes version, then verify its UI and primary function.
+`PHASE` is `Succeeded` and `Ready` is `True`. If the message starts with `kube-proxy rollout pending`, wait until the `kube-proxy` DaemonSet in `kube-system` of the cluster has rolled out.
 
-When upgrading from a release earlier than ACP 4.3, use target-compatible versions of these Agnostic plugins or their pages can fail to open:
+  </Tab>
+  <Tab label="Bare Metal">
 
-- `Alauda DevOps v3`
-- `Alauda AI Essentials`
-- `Alauda Hyperflux`
-- `Alauda Container Platform Data Services Essentials`
+```bash
+kubectl -n cpaas-system get infraclusterversion <cluster-name>
+kubectl -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io -l cluster.x-k8s.io/cluster-name=<cluster-name> \
+  -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,INVENTORY:.status.machineInventoryRef.name,PLAN_SECRET:.status.planSecretRef.name'
+kubectl -n cpaas-system get machineinventories.elemental.cattle.io <inventory-name> \
+  -o jsonpath='{.status.plan.state}{" storage="}{.status.storage.phase}{"\n"}'
+kubectl -n cpaas-system get secret <plan-secret-name> \
+  -o jsonpath='{.metadata.annotations.baremetal\.alauda\.io/plan\.type}{"\n"}'
+```
 
-Complete any product-specific procedures that apply:
+`PHASE` of the `InfraClusterVersion` is `Succeeded`, and every `BaremetalMachine` is `Running`. For each listed `INVENTORY` and `PLAN_SECRET`, the inventory reports `Applied` and the plan Secret reports `reprovision`. An inventory with managed volumes also reports `storage=Active`. Compare the `INVENTORY` column with the inventories you recorded during preparation: a node that now runs on a different inventory does not have the data of the data volumes declared on its previous host.
 
-- <ExternalSiteLink name="ai" href="/upgrade/upgrade-from-aml-1.2.html" children="Upgrade Alauda AI" />
-- <ExternalSiteLink name="devops" href="/upgrade/index.html" children="Upgrade Alauda DevOps" />
+  </Tab>
+  <Tab label="Huawei Cloud Stack">
 
-If the source release is earlier than ACP 4.3 and PKCE hardening has not already been completed, wait until the global tier and all workload clusters reach the target Distribution Version, then follow [Disabling the PKCE Plain Method](/security/platform_security_configurations/disable_pkce_plain_method.mdx).
+```bash
+kubectl -n cpaas-system get kubeadmcontrolplane,machinedeployment -l cluster.x-k8s.io/cluster-name=<cluster-name>
+```
 
-If any acceptance check fails, keep the maintenance window open and use [Upgrade Troubleshooting](./troubleshooting.mdx).
+On every row, `VERSION` is the target Kubernetes version, and `READY` and `UPDATED` equal `REPLICAS`.
+
+  </Tab>
+  <Tab label="VMware vSphere">
+
+```bash
+kubectl -n cpaas-system get kubeadmcontrolplane,machinedeployment -l cluster.x-k8s.io/cluster-name=<cluster-name>
+kubectl -n cpaas-system get vspheremachineconfigpool
+kubectl -n cpaas-system get vspheremachineconfigpool <pool-name> \
+  -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}{range .status.persistentDiskStatuses[*]}{.hostname}{" "}{.name}{" "}{.phase}{"\n"}{end}'
+```
+
+On every `KubeadmControlPlane` and `MachineDeployment` row, `VERSION` is the target Kubernetes version, and `READY` and `UPDATED` equal `REPLICAS`. Each pool of the cluster reports `Ready=True` and `PersistentDisksReady=True`, its `ALLOCATED` count equals the number of running machines drawn from it, and its `TOTAL` count is unchanged. Every persistent disk on an allocated slot is `Attached`.
+
+  </Tab>
+</Tabs>
+
+## Check the Web UI \{#check-web-ui}
+
+Open the platform Web UI and confirm that login, cluster pages, and Marketplace pages load. For each Extension with the `Agnostic` lifecycle that you upgraded, confirm that its pages open and its main function works.
+
+## Next Step
+
+After you validate the `global` clusters, continue with [Upgrade Workload Clusters](./workload/upgrade_workload_cluster.mdx). After you validate a workload cluster, continue with the next cluster; after the last one, continue with [After All Clusters Are Upgraded](#after-all-clusters).
+
+## After All Clusters Are Upgraded \{#after-all-clusters}
+
+When `global` and every workload cluster run the target ACP version:
+
+- If the source ACP version was earlier than 4.3 and the PKCE hardening is not done yet, follow [Disabling the PKCE Plain Method](../security/platform_security_configurations/disable_pkce_plain_method.mdx).
+- On Bare Metal, rebuild the `SeedImage` with the target `base-image-iso` before you add new hosts. Take it from the same archive as the `base-image` in the image catalog. See [Build the SeedImage and Register Hosts](../workload_clusters/alauda_os/bare-metal/create_cluster.mdx#step-1-machineregistration-seedimage).
+- Delete a VM template, cloud image, or Bare Metal OS image of an earlier version only after the last cluster that uses it is upgraded.

@@ -78,7 +78,22 @@ After the import, `<base-image>` is `<registry-address>/tkestack/baremetal-base-
 
 If the hosts use more than one architecture or OS, run the generated command for each combination.
 
-Every value used as `Machine.spec.version` (for both the control plane and worker `MachineDeployment` resources) must have a key in this ConfigMap for the architecture and OS of the hosts, with the leading `v` preserved, that resolves to the imported OS image; see [OS Image Keys per Architecture and OS](../../../upgrade/workload/alauda_os/bare-metal.mdx#catalog-key-format). The provider resolves the image at reprovision time by substituting the platform registry address for the registry portion of the entry. If a target version is missing, no `reprovision` plan is written and `BaremetalMachine` ends up in `Failed / Reason=ImageCatalogMiss`. Adding the entry afterwards does not clear that state; delete the affected `Machine` so that its owner recreates it.
+Every value used as `Machine.spec.version` (for both the control plane and worker `MachineDeployment` resources) must have a key in this ConfigMap for the architecture and OS of the hosts, with the leading `v` preserved, that resolves to the imported OS image; see [OS Image Keys per Architecture and OS](#catalog-key-format). The provider resolves the image at reprovision time by substituting the platform registry address for the registry portion of the entry. If a target version is missing, no `reprovision` plan is written and `BaremetalMachine` ends up in `Failed / Reason=ImageCatalogMiss`. Adding the entry afterwards does not clear that state; delete the affected `Machine` so that its owner recreates it.
+
+#### OS Image Keys per Architecture and OS \{#catalog-key-format}
+
+The provider looks up the OS image of a host by the key `<kubernetes-version>_<arch>_<os-id>`, for example `v1.36.4-acp.3_amd64_alaudaos.k.25`. Both parts come from labels on the host's `MachineInventory`:
+
+- `<arch>` is the value of `os.baremetal.alauda.io/arch`, or `amd64` when the label is absent.
+- `<os-id>` is the value of `os.baremetal.alauda.io/id`, or `alaudaos.m.55` when the label is absent. Alauda OS M55 uses `alaudaos.m.55`, and Alauda OS KU uses `alaudaos.k.25`.
+
+Only hosts with the OS identifier `alaudaos.m.55` fall back to `<kubernetes-version>_<arch>`, and only `amd64` hosts with that identifier fall back further to the bare `<kubernetes-version>` key. The generator writes the bare key for `amd64` hosts with Alauda OS M55 and the full key for every other combination. If a pool contains hosts of another architecture or OS, add a key for every combination at every version.
+
+A new host gets both labels when it registers, from `MachineRegistration.spec.machineInventoryLabels`; see [Step 1](#step-1-machineregistration-seedimage). A host registered without them resolves to `amd64` and `alaudaos.m.55`. That needs no action for `amd64` hosts with Alauda OS M55. For other hosts that are already registered without the labels, contact technical support.
+
+#### Add the etcd Image for Each Version \{#catalog-etcd-key}
+
+For each Kubernetes version, the catalog also holds a `<kubernetes-version>_etcd` key whose value is the etcd image of the same ACP version, with the tag from the **etcd** column of [Version Mapping](../../../overview/alauda_os_support_matrix.mdx#version-mapping). The generator above adds this key. The platform upgrade reads the etcd tag from it when it upgrades the control plane to that version.
 
 ### 3. Network Connectivity \{#network-connectivity}
 
@@ -238,6 +253,7 @@ The example manifests below use `<placeholder>` syntax for environment-specific 
 | `<etcd-image-tag>` | etcd version baked into the bare-metal base image for `<kubernetes-version>`. | See the `etcd` column in the [OS Support Matrix](../../../overview/alauda_os_support_matrix.mdx). |
 | `<dns-server>` | Operator-supplied when the first-boot registration path needs an explicit resolver. | Prefer `MachineRegistration.config.cloud-config` or later `KubeadmControlPlane` bootstrap data (`format: cloud-config`). Do not write `/etc/resolv.conf` from `SeedImage.cloud-config`. |
 | `<ssh-authorized-keys>` | Operator-supplied OpenSSH public key — required for any interactive debugging on the node. | n/a |
+| `<os-id>` | OS identifier of the image that the registration installs: `alaudaos.m.55` for Alauda OS M55, `alaudaos.k.25` for Alauda OS KU. | See [OS Image Keys per Architecture and OS](#catalog-key-format). |
 | `<inventory-name>` | Allocated by `elemental-operator` after the host boots the ISO and registers. Cannot be predicted before registration. | `kubectl -n cpaas-system get machineinventories.elemental.cattle.io` |
 | `<pool-name>` | Name of the `MachineInventoryPool` that claims an inventory. | Use `<cluster-name>-control-plane-pool` or `<cluster-name>-worker-pool` in the examples below. |
 | `<control-plane-inventory-1/2/3>` / `<worker-inventory-1/2/3>` | Exact `MachineInventory` names selected for each role. | Use the names from `kubectl -n cpaas-system get machineinventories.elemental.cattle.io`. |
@@ -254,6 +270,8 @@ The example manifests below use `<placeholder>` syntax for environment-specific 
 Create a `MachineRegistration` that describes the registration URL and first-install cloud-config, and a `SeedImage` that points `elemental-operator` at the matching ISO base image.
 
 Set `SeedImage.spec.baseImage` to the final target-platform registry reference of the imported `base-image-iso`. It must be paired with the imported `base-image` used by the image catalog for later reprovisioning: take both images from the same OS archive, never from different archives.
+
+Keep the `os.baremetal.alauda.io/arch` and `os.baremetal.alauda.io/id` labels in `machineInventoryLabels`. The provider uses them to find the image catalog key of each host; see [OS Image Keys per Architecture and OS](#catalog-key-format).
 
 ```yaml title="01-machineregistration-seedimage.yaml"
 apiVersion: elemental.cattle.io/v1beta1
@@ -272,6 +290,10 @@ spec:
     app.kubernetes.io/part-of: cluster-api-provider-baremetal
     pool.baremetal.alauda.io/eligible: "true"
     elemental.cattle.io/serial-number: "${System Information/Serial Number}"
+    # Architecture of the host, reported by elemental-register. Keep the value as is.
+    os.baremetal.alauda.io/arch: "${Runtime/Architecture}"
+    # OS identifier of the image this registration installs.
+    os.baremetal.alauda.io/id: <os-id>
   machineInventoryAnnotations:
     elemental.cattle.io/machine-uuid: "${System Information/UUID}"
   config:
@@ -866,7 +888,7 @@ After creating a cluster:
 
 - [Manage Nodes](../../../configure/nodes/alauda_os/bare-metal.mdx)
 - [Manage Data Disks](../../../configure/nodes/alauda_os/manage-bare-metal-storage.mdx)
-- [Upgrade Cluster](../../../upgrade/workload/alauda_os/bare-metal.mdx)
+- [Upgrade Overview](../../../upgrade/overview.mdx#upgrade-steps-by-node-os)
 
 ---
 

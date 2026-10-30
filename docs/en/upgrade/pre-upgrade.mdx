@@ -2,182 +2,490 @@
 weight: 20
 ---
 
-# Pre-Upgrade Preparation
+import AlaudaOsUpgradePath /* eslint-disable-line no-unused-vars */ from '../../shared/components/AlaudaOsUpgradePath'
+import DcsVmTemplateConfigMap /* eslint-disable-line no-unused-vars */ from '../../shared/components/DcsVmTemplateConfigMap'
+import BareMetalImageCatalog /* eslint-disable-line no-unused-vars */ from '../../shared/components/BareMetalImageCatalog'
 
-**Supported upgrade paths:**
+# Prepare for the Upgrade
 
-At the minor-release policy level, ACP 4.2, 4.3, and 4.4 are within the n-3 direct-upgrade window for the ACP 4.5 release line. This policy does not make every source patch eligible for every target patch.
+Start at least two weeks before the first maintenance window: uploads are slow, and problems found now can be fixed before the window. Most steps do not change running clusters; the exceptions are marked in [Items That Need Lead Time](#lead-time). Prepare again for every upgrade, including a patch upgrade of the ACP version (Distribution Version) and an upgrade of `global` before every workload cluster has caught up.
 
-Upgrade only to a target 4.5.x version that the platform offers for the current source patch. After the target `ProductManifest` is registered, confirm that the target appears in `availableUpdates` in the Web Console or `ac adm upgrade`, and confirm that the `VersionUpgradePath` preflight check passes. If no 4.5.x target is offered, use a later 4.5.x target that includes the current source patch or first follow an intermediate target offered by the platform. Do not use an explicit upgrade request or disable `VersionUpgradePath` to bypass an unsupported source-to-target combination.
+In a DR environment, do every step that names `global` on both `global` clusters: the Alauda Container Platform Global Cluster Disaster Recovery plugin does not synchronize packages, images, or the objects these steps create. If your clusters use more than one infrastructure provider, complete the tab of every provider in use, including the one that `global` runs on.
 
-ACP 4.1.x and earlier releases are outside the direct-upgrade window for ACP 4.5. Follow the intermediate upgrade chain offered by the platform, and verify `availableUpdates` and `VersionUpgradePath` at every hop.
+## Items That Need Lead Time \{#lead-time}
 
-:::info
-For clusters that use Alauda OS, the ACP Distribution Version must follow the same CVO-offered source-to-target path. When the target ACP version is more than one Kubernetes minor above the cluster's current version, [Upgrade Kubernetes on Alauda OS](./workload/alauda_os/index.mdx) requires additional pre-staging of intermediate-version artifacts. See [Preparing for Cross-Version Upgrades](./workload/alauda_os/index.mdx#cross-version-preparation) before starting the upgrade window.
+:::warning
+Items marked **Change window** change running clusters, `global` included; the persistent disk migration and a host reinstall replace nodes. Schedule each in its own change window before the first upgrade window.
 :::
 
-## Prepare Huawei DCS and Bare Metal Clusters \{#prepare-dcs-and-bare-metal}
+| Item | Applies to | What to do |
+| --- | --- | --- |
+| ACP version earlier than v4.3.2 | Alauda OS clusters | Contact technical support. |
+| Fewer than three control-plane nodes | Alauda OS clusters | Contact technical support. |
+| Control plane and node pools on different VM templates | Huawei DCS | Contact technical support. |
+| Kube-OVN not in `geneve` overlay mode with IPv4 | Huawei DCS, Huawei Cloud Stack, and VMware vSphere clusters upgraded from before v4.5 | Contact technical support. |
+| Customized CoreDNS Corefile | Alauda OS clusters upgraded from before v4.5 | **Change window**: move the customization to the configuration of the `coredns` `ModuleInfo`. Contact technical support to plan it. |
+| `/var/cpaas` not on a pool-managed persistent disk | Huawei DCS, Huawei Cloud Stack | **Change window**: [Migrate to Pool-Managed Persistent Disks](./persistent_disk_migration.mdx). |
+| `maxSurge` not `0`, or a vSphere pool not `Ready` | Alauda OS clusters | **Change window**: correct it as described in [Check the Rollout Settings](#rollout-settings). |
+| `COS_STATE` of 8 GiB | Bare Metal hosts | **Change window**: reinstall the host. |
+| Infrastructure provider of the IaaS that `global` runs on, or the Cluster Bootstrap Provider, not installed on `global` | Alauda OS `global` clusters, both clusters in DR | Install them on `global` before the first window. |
+| x86_64 CPUs without the `x86-64-v2` baseline | Alauda OS x86_64 nodes | Confirm the CPU of every host or hypervisor; the target Alauda OS images require this baseline. |
+| A recent successful etcd backup | Every cluster | Install Alauda Container Platform Cluster Enhancement on every cluster so that each cluster has a recent successful etcd backup before its upgrade. See [etcd Backup and Restore](../configure/backup/etcd.mdx). |
+| Linux kernel 5.8 or later and cgroup v2 | Non-Alauda OS nodes | Update the node OS before the first window. See [Kubernetes 1.35 or Later Node Readiness](#kubernetes-135-node-readiness). |
 
-On Huawei DCS and Bare Metal, the platform upgrade also upgrades Kubernetes and Alauda OS, so finish preparing these clusters before you request the platform upgrade. This applies to workload clusters and to the `global` cluster.
+## Prepare the Execution Host \{#execution-host}
 
-**Huawei DCS**: complete [Prepare the Cluster](./workload/alauda_os/huawei-dcs.mdx#automatic-prepare).
+Run every upgrade command from one execution host:
 
-- Upload the Alauda OS images and register them as VM templates.
-- Create the VM template ConfigMaps with the generator on that page.
-- Keep `/var/cpaas` on a persistent disk of the IP pool.
-- Set `maxSurge` to `0`, and use VM templates `4.2.1` or later.
-- When upgrading from a release earlier than v4.5, restore the default Kube-OVN and CoreDNS settings.
-- Back up etcd.
+- A Linux host (x86_64 or aarch64) outside every cluster that reaches the VIP, the registry, and the platform address of each `global` cluster.
+- `kubectl`, ACP CLI (`ac`), and Violet v4.2.13 or later (`violet version`).
+- One kubeconfig per `global` cluster, pointing to the VIP of that cluster: `<global-kubeconfig>`, and in DR `<primary-kubeconfig>` and `<standby-kubeconfig>`. On this page, `<global-kubeconfig>` means the primary in DR. `ac`, `kubectl`, and `upgrade.sh` use the exported `KUBECONFIG`.
+- The extracted target Core Package, kept on this host until the last window ends.
 
-**Bare Metal**: complete [Prepare the Cluster](./workload/alauda_os/bare-metal.mdx#automatic-prepare).
+:::info
+On Alauda OS, do not use a node of any cluster as the execution host. The upgrade replaces the nodes, and files and sessions on a replaced node are lost.
+:::
 
-- Import the Alauda OS images.
-- Update the image catalog with the generator on that page.
-- Free at least 4 GiB on `COS_STATE` on every host.
-- Check registry access from every host and the state of managed storage.
-- Set `maxSurge` to `0`.
-- When upgrading from a release earlier than v4.5, restore the default Kube-OVN and CoreDNS settings.
-- Back up etcd.
-
-Prepare the images of the target version and of every intermediate version. For a cross-version upgrade, see [Preparing for Cross-Version Upgrades](./workload/alauda_os/index.mdx#cross-version-preparation).
-
-For a `global` cluster on these providers, see [Huawei DCS and Bare Metal: Automatic Upgrade](./global/upgrade_kubernetes_on_alauda_os.mdx#automatic-upgrade). In a DR environment, prepare both `global` clusters.
-
-If a cluster runs an ACP version earlier than v4.3.2, contact technical support before you upgrade it.
-
-## Important Notes
-
-* Ensure the directory `/cpaas/minio` on the control plane nodes of global cluster has at least **120 GB** of free disk space.
-* Before upgrading the global tier, verify that all workload clusters remain within the target Distribution Version's **Compatible Versions** documented in [Kubernetes Support Matrix](/overview/kubernetes-support-matrix.html).
-* If any workload cluster is outside the target compatible range, upgrade that workload cluster first until it enters the range before upgrading the global tier.
-* A workload cluster can be upgraded only to a Distribution Version that the global tier has already reached.
-
-## Verify Module Stability Before You Upgrade \{#module-stability-self-check}
-
-The cluster upgrade preflight requires every installed **Core** and **Aligned** plugin module on the target cluster to be in a stable state. If any such module is mid-install, mid-upgrade, or failed, the `ModuleInfoStable` and `ClusterModuleStable` preflight checks block the upgrade until it is resolved. A common cause is a standalone plugin upgrade that is still running when the cluster upgrade is requested.
-
-Before you request the upgrade, list the installed modules on the target cluster and confirm every one is in the `Running` phase:
+Before each command block that targets a `global` cluster, select it and confirm that the printed address is its VIP. For an Alauda OS workload cluster, save its kubeconfig from `global`:
 
 ```bash
-kubectl get moduleinfo -l cpaas.io/cluster-name=<cluster> \
+export KUBECONFIG=<global-kubeconfig>
+kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}{"\n"}'
+kubectl -n cpaas-system get secret <cluster-name>-kubeconfig -o jsonpath='{.data.value}' | base64 -d > <cluster-name>.kubeconfig
+```
+
+## Check the Upgrade Path \{#check-upgrade-path}
+
+ACP 4.2, 4.3, and 4.4 are within the direct upgrade window of ACP 4.5. Not every source patch can reach every target patch: upgrade only to a target that the platform offers for the current version, as the `VersionUpgradePath` preflight check confirms. Do not bypass it with an explicit upgrade request. In the window, request the version exactly as `ac adm upgrade` lists it, for example `4.5.0`. ACP 4.1 and earlier are outside the direct upgrade window: follow the intermediate upgrade chain that the platform offers, and check `VersionUpgradePath` at every step.
+
+## Check Workload Cluster Compatibility \{#check-compatibility}
+
+Before you upgrade `global`, every cluster registered on it must meet these rules. Upgrade a cluster that breaks one on the current `global` first.
+
+- Its ACP version is within the direct upgrade window of the target. This includes the ACP components on imported and registered clusters.
+- A cluster created by ACP runs a Kubernetes version within the target's Compatible Versions in the [Kubernetes Support Matrix](../overview/kubernetes-support-matrix.mdx). The Kubernetes version of an imported or registered third-party cluster is not covered by Compatible Versions and does not block the upgrade.
+
+On `global`, list the ACP version, the Kubernetes version, and the infrastructure provider of every cluster. `DCSCluster`, `BaremetalCluster`, `HCSCluster`, and `VSphereCluster` mark the provider of an Alauda OS cluster:
+
+```bash
+kubectl -n cpaas-system get cvsh
+kubectl -n cpaas-system get clusters.clusterregistry.k8s.io -o custom-columns='NAME:.metadata.name,KUBERNETES:.status.version'
+kubectl -n cpaas-system get clusters.cluster.x-k8s.io -o custom-columns='NAME:.metadata.name,INFRASTRUCTURE:.spec.infrastructureRef.kind'
+```
+
+## Determine the Versions to Prepare \{#alauda-os-versions}
+
+On Alauda OS, ACP Core goes straight to the target, while Kubernetes moves one minor version at a time: a cluster passes through an intermediate Kubernetes version for each ACP minor version in between, using the latest patch release of that minor. Select the current version of each cluster, and prepare the versions of all paths together:
+
+<AlaudaOsUpgradePath>
+  The Kubernetes version and the etcd tag of every ACP version are listed in [Version Mapping](../overview/alauda_os_support_matrix.mdx#version-mapping).
+</AlaudaOsUpgradePath>
+
+For example, a cluster on v4.3.2 passes through v4.4.1 (Kubernetes v1.35.6-acp.9) to v4.5.0 (Kubernetes v1.36.4-acp.3). From any v4.4.x to a v4.5.x version, there is no intermediate version.
+
+:::info
+Prepare every image in the Alauda OS variant that the cluster runs today. Bare Metal supports Alauda OS M55 and Alauda OS KU.
+:::
+
+On non-Alauda OS clusters, Kubernetes is upgraded in place to the target version. Skip this section.
+
+## Download the Packages \{#download-packages}
+
+<Steps>
+
+### Download the Core Package and the Alauda OS Images \{#download-core-package}
+
+From the <Term name="company" /> Customer Portal, download the ACP 4.5 Core Package for your architecture, and extract it on the execution host. On Alauda OS, also download:
+
+- The Core Package of each intermediate version. You use it only to publish its images.
+- From the OS download page, the image of the target version and of each intermediate version, for the architecture and OS variant of your nodes: `qcow2` for Huawei DCS and Huawei Cloud Stack, `ova` for VMware vSphere, and the archive of an OCI image layout for Bare Metal.
+
+### Download ACP Upgrade to v4.5 \{#download-acp-upgrade-to-v45}
+
+**ACP Upgrade to v4.5** holds the target packages of eleven Extensions (Operators and Cluster Plugins) with the `Aligned` lifecycle. Log in to the Customer Portal with Violet and download it, with `<arch>` set to `amd64`, `arm64`, or `hybrid` to match the Core Package. As an alternative, select the same scenario in **Marketplace > Batch Download** of the Customer Portal.
+
+```bash
+read -rsp "Customer Portal token: " AC_TOKEN; printf '\n'
+violet ac login --access-token="${AC_TOKEN}" --ac-url=<customer-portal-url>
+violet ac scenarios --arch=<arch> --platformVersion=v4.5.0
+violet ac download-app --arch=<arch> --platformVersion=v4.5.0 --scenario="ACP Upgrade to v4.5"
+```
+
+Files are named `<package-name>.<arch>.<version>.tgz`. Confirm that you have all eleven:
+
+| Application | Package | Application | Package |
+| --- | --- | --- | --- |
+| Alauda Container Platform Web Console | `console` | Alauda Container Platform Essentials | `container-platform` |
+| Alauda Container Platform Web Console Central | `console-central` | Alauda Container Platform Cluster Essentials | `acp-business` |
+| Alauda Container Platform Marketplace Web Console | `console-marketplace` | Alauda Container Platform GatewayAPI Plugin | `gatewayapi-plugin` |
+| Alauda Container Platform Application Catalog | `application-catalog` | Alauda Container Platform Basic Monitoring | `prometheus` |
+| Alauda Container Platform Observability Essentials | `aiops-base` | Alauda Language Pack for Chinese | `i18n-zh` |
+| Alauda Container Platform Networking E1 | `calico` | | |
+
+### Download the Other Extension Packages \{#download-other-extensions}
+
+Export the installed Extensions to `apps.yaml`, import the file into the Customer Portal, and download the target-version packages of the other installed Aligned Extensions, including the infrastructure providers and the Cluster Bootstrap Provider. Skip the eleven applications above. For each Extension (Operator or Cluster Plugin) with the `Agnostic` lifecycle in use, also confirm in the Customer Portal that a version compatible with the target ACP version exists, and download it; Agnostic Extensions are upgraded separately, following each Extension's own documentation. Violet versions earlier than v4.2.13 fail here with `failed to get user info from platform server`.
+
+```bash
+read -rsp "Platform token: " PLATFORM_TOKEN; printf '\n'
+violet list --platform-address "https://<platform-address>" --platform-token "${PLATFORM_TOKEN}" --output-file "./apps.yaml"
+```
+
+### Download the Global Cluster Disaster Recovery Package \{#download-dr-package}
+
+In a DR environment only: download the target-version package of Alauda Container Platform Global Cluster Disaster Recovery (`etcd-sync`) separately. It is not part of **ACP Upgrade to v4.5**, and it is installed only on the standby, so `apps.yaml` does not list it.
+
+</Steps>
+
+## Publish the Packages \{#sync-upgrade-artifacts}
+
+Publishing uploads images and packages; it does not change running applications. Run the steps from the `installer/` directory of the extracted target Core Package, against `global`, and do not open the maintenance window until publishing is complete.
+
+<Steps>
+
+### Stage the ACP Upgrade to v4.5 Packages \{#stage-plugins}
+
+Copy each of the eleven packages into `plugins/`, then list the directory:
+
+```bash
+cp <path-to-upgrade-package> ./plugins/
+ls -1 ./plugins/
+```
+
+:::info
+Publishing checks the version of each package in `plugins/`, but not whether all eleven are there. Compare the list with [Download ACP Upgrade to v4.5](#download-acp-upgrade-to-v45).
+:::
+
+### Publish Core and the Staged Packages \{#publish-core}
+
+Select `global` and read the registry type: the second value is `false` for the platform built-in Registry and `true` for an external registry. Every Aligned Extension installed on a cluster needs its target-version package before that cluster's upgrade; otherwise the upgrade stops until you publish it.
+
+```bash
+export KUBECONFIG=<global-kubeconfig>
+kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}{"\n"}'
+kubectl get productbase base -o jsonpath='{.spec.registry.address}{"\t"}{.spec.registry.external}{"\n"}'
+```
+
+<Tabs>
+  <Tab label="Platform built-in Registry">
+
+```bash
+bash upgrade.sh --only-sync-image
+```
+
+  </Tab>
+  <Tab label="External registry">
+
+`upgrade.sh` does not upload to an external registry. Run both upload modes; both must succeed:
+
+```bash
+export REGISTRY_ADDRESS="<registry-address>"
+export REGISTRY_USERNAME="<registry-username>"
+read -rsp "Registry password: " REGISTRY_PASSWORD; export REGISTRY_PASSWORD; printf '\n'
+bash res/upload.sh all "$REGISTRY_ADDRESS" "$REGISTRY_USERNAME" "$REGISTRY_PASSWORD"
+bash res/upload.sh necessary "$REGISTRY_ADDRESS" "$REGISTRY_USERNAME" "$REGISTRY_PASSWORD"
+```
+
+  </Tab>
+</Tabs>
+
+### Publish the Intermediate Core Images \{#sync-intermediate-images}
+
+On Alauda OS, when the path has an intermediate version, publish the images of each intermediate Core Package from its `installer/` directory. Do not request an upgrade to the intermediate version.
+
+```bash
+bash upgrade.sh --only-sync-image                                                       # built-in Registry
+bash res/upload.sh all "$REGISTRY_ADDRESS" "$REGISTRY_USERNAME" "$REGISTRY_PASSWORD"    # external registry
+```
+
+### Publish the Other Extensions \{#publish-other-extensions}
+
+Publish the packages from [Download the Other Extension Packages](#download-other-extensions) with `violet push`:
+
+| Packages | Publish to | When |
+| --- | --- | --- |
+| Other Aligned cluster plugins, including the providers | `global` | Before the `global` upgrade |
+| Other Aligned operators | `global` and each workload cluster that runs the operator | Before the upgrade of each such cluster |
+| Agnostic Extensions | The clusters where you upgrade them | Before their own upgrade |
+
+```bash
+# A cluster plugin: the platform distributes it
+violet push <cluster-plugin-package>.tgz --platform-address "https://<platform-address>" --platform-token "${PLATFORM_TOKEN}"
+# An operator: global and every workload cluster that runs it
+violet push <operator-package>.tgz --platform-address "https://<platform-address>" --platform-token "${PLATFORM_TOKEN}" \
+  --clusters "global,<cluster-name-1>,<cluster-name-2>"
+```
+
+### Publish to the Standby global Cluster \{#publish-standby}
+
+In a DR environment only. Repeat the Core and intermediate image steps on the standby; when both `global` clusters use the same external registry, the images are already there. Then push the other Aligned packages and the Global Cluster Disaster Recovery package to the standby; without its `--platform-address` and `--dest-repo`, they go to the primary.
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}{"\n"}'
+bash upgrade.sh --only-sync-image     # also from the installer/ directory of each intermediate Core Package
+REGISTRY_USERNAME=$(kubectl -n cpaas-system get secret registry-admin -o jsonpath='{.data.username}' | base64 -d)
+REGISTRY_PASSWORD=$(kubectl -n cpaas-system get secret registry-admin -o jsonpath='{.data.password}' | base64 -d)
+read -rsp "Standby platform token: " STANDBY_TOKEN; printf '\n'
+violet push <package>.tgz --platform-address "https://<standby-vip>" --platform-token "${STANDBY_TOKEN}" \
+  --dest-repo "<standby-vip>:11443" --username "${REGISTRY_USERNAME}" --password "${REGISTRY_PASSWORD}"
+kubectl get moduleconfigs -l cpaas.io/module-name=etcd-sync      # continue when it lists the target version
+```
+
+</Steps>
+
+## Stage the Alauda OS Images \{#stage-alauda-os-images}
+
+Stage the image of the target version and of every intermediate version for each provider in use:
+
+<Tabs>
+  <Tab label="Huawei DCS">
+
+Upload the `qcow2` image of each version to every DCS site that your clusters use, and register it as a VM template with the same name on every site. Then generate the VM template ConfigMaps and apply them on `global`:
+
+<DcsVmTemplateConfigMap mode="path">
+  Replace `<os>` with the OS of the VM templates, such as `m55`, `ko`, or `ku`, and take the ACP version, Kubernetes version, and etcd tag of each ConfigMap from [Version Mapping](../overview/alauda_os_support_matrix.mdx#version-mapping). Repeat the intermediate ConfigMap for each intermediate version, and omit it when there is none.
+</DcsVmTemplateConfigMap>
+
+  </Tab>
+  <Tab label="Bare Metal">
+
+On a host that has containerd and reaches the registry of `global`, such as a `global` control-plane node, import the archive of each version and push both images it holds. For Alauda OS M55, the repositories are `baremetal-base-image` and `baremetal-base-image-iso`; for Alauda OS KU, use the names that the list command prints. The `admin` password is in the `cpaas-system/registry-admin` Secret of `global`. In DR, push to the registry of both `global` clusters.
+
+```bash
+ctr -n bare-metal-os images import --all-platforms --no-unpack <bare-metal-os-archive>
+ctr -n bare-metal-os images ls -q
+read -rsp "Registry password: " REGISTRY_PASSWORD; printf '\n'
+for repo in <os-image-repository> <os-iso-repository>; do
+  ctr -n bare-metal-os images push --local --skip-verify -u "<registry-username>:${REGISTRY_PASSWORD}" \
+    "<registry-address>/tkestack/${repo}:<os-image-tag>" "${repo}:<os-image-tag>"
+done
+```
+
+Add the keys of every version to the image catalog on `global` before you request the upgrade: a host replaced while its key is missing fails and does not recover when you add the key later. Run the command once for each combination of architecture and OS in the pools:
+
+<BareMetalImageCatalog mode="path">
+  The command creates a `ResourcePatch` on `global`. Do not delete it. Exempt it for the target version before the `global` upgrade and before every later upgrade, as described in [Resolve Preflight Blocks](#resolve-preflight-blocks).
+</BareMetalImageCatalog>
+
+The key of a host combines the Kubernetes version with the architecture and OS labels of the host; see [OS Image Keys per Architecture and OS](../workload_clusters/alauda_os/bare-metal/create_cluster.mdx#catalog-key-format). A host without the labels resolves to `amd64` and Alauda OS M55. That needs no action for `amd64` hosts with Alauda OS M55; for any other host without the labels, contact technical support. List the labels with `kubectl -n cpaas-system get machineinventories.elemental.cattle.io -L os.baremetal.alauda.io/arch,os.baremetal.alauda.io/id`.
+
+  </Tab>
+  <Tab label="Huawei Cloud Stack">
+
+Upload the `qcow2` image of each version as an ECS image, and record its name for the Kubernetes upgrade.
+
+  </Tab>
+  <Tab label="VMware vSphere">
+
+In every vCenter that your clusters use, create a VM template from the `ova` of each version, with the same name in every vCenter. Record the name for the Kubernetes upgrade.
+
+  </Tab>
+</Tabs>
+
+## Prepare the Clusters \{#prepare-alauda-os-clusters}
+
+Run these checks for each Alauda OS cluster, `global` included. Unless a step says otherwise, run the commands on `global` with `<cluster-name>` set to the cluster: the Cluster API objects of every cluster are in `cpaas-system` there. In DR, check each `global` cluster on its own side, and workload clusters on the primary. The checks only read; make the fixes they lead to before the first window.
+
+<Steps>
+
+### Check the Disks and Hosts \{#persistent-disk-layout}
+
+:::warning
+Application data stored on a node itself, in `hostPath` volumes or local PersistentVolumes, is lost when the node is replaced. Move it to CSI storage before the window. On Huawei Cloud Stack and VMware vSphere, the platform does not check for it.
+:::
+
+<Tabs>
+  <Tab label="Huawei DCS">
+
+`/var/cpaas` must be a `persistentDisk` of the IP pool, and every machine must use the same VM template. Continue when the first command lists no `/var/cpaas` and the second shows one VM template. Otherwise, migrate the disks first, as listed in [Items That Need Lead Time](#lead-time); for different VM templates, contact technical support.
+
+```bash
+kubectl -n cpaas-system get dcsmachinetemplate -o custom-columns='NAME:.metadata.name,TEMPLATE_DISKS:.spec.template.spec.vmConfig.dcsMachineDiskSpec[*].path'
+kubectl -n cpaas-system get dcsmachine -l cluster.x-k8s.io/cluster-name=<cluster-name> -o custom-columns='NAME:.metadata.name,VM_TEMPLATE:.spec.vmTemplateName'
+```
+
+  </Tab>
+  <Tab label="Bare Metal">
+
+Every inventory with a storage declaration must report `StoragePrepared=True`, and every allocated inventory `StorageActive=True`. Do not add a storage declaration to a host installed before managed storage was available. A replaced node is not guaranteed to come back on the same host, so record which inventory backs each machine and the filesystem UUIDs:
+
+```bash
+kubectl -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io -l cluster.x-k8s.io/cluster-name=<cluster-name> \
+  -o custom-columns='NAME:.metadata.name,INVENTORY:.status.machineInventoryRef.name'
+kubectl -n cpaas-system get machineinventories.elemental.cattle.io \
+  -o custom-columns='NAME:.metadata.name,STORAGE:.status.storage.phase,UUIDS:.status.storage.appliedVolumes[*].filesystemUUID'
+```
+
+On every host in the pools of the cluster, spare hosts included, `COS_STATE` needs at least 4 GiB `Free (estimated)` and no snapshot left from a failed upgrade; if not, see [Free Space on COS_STATE](./troubleshooting.mdx#check-cos-state-free-space). Every host must also reach the platform registry. The platform does not check either item. On each host:
+
+```bash
+btrfs filesystem usage -h /
+snapper --no-dbus list
+```
+
+  </Tab>
+  <Tab label="Huawei Cloud Stack">
+
+`/var/cpaas` must be in `persistentDisks` of the `HCSMachineConfigPool`. Continue when no machine template lists it in `dataVolumes`; otherwise, migrate first, as listed in [Items That Need Lead Time](#lead-time):
+
+```bash
+kubectl -n cpaas-system get hcsmachinetemplate -o custom-columns='NAME:.metadata.name,DATA_VOLUMES:.spec.template.spec.dataVolumes[*].mountPath'
+```
+
+  </Tab>
+  <Tab label="VMware vSphere">
+
+No action is needed on this provider. Do not restructure the disk lists of the machine config pools as part of an upgrade.
+
+  </Tab>
+</Tabs>
+
+### Check the Rollout Settings \{#rollout-settings}
+
+Nodes are replaced one at a time, which needs `maxSurge: 0` on the `KubeadmControlPlane` and on every `MachineDeployment`. Read the current values; an empty value is unset, which counts as `1`:
+
+```bash
+KCP=$(kubectl -n cpaas-system get clusters.cluster.x-k8s.io <cluster-name> -o jsonpath='{.spec.controlPlaneRef.name}')
+kubectl -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='replicas={.spec.replicas} maxSurge={.spec.rolloutStrategy.rollingUpdate.maxSurge}{"\n"}'
+kubectl -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=<cluster-name> \
+  -o custom-columns='NAME:.metadata.name,SURGE:.spec.strategy.rollingUpdate.maxSurge,UNAVAILABLE:.spec.strategy.rollingUpdate.maxUnavailable,BOOTSTRAP:.spec.template.spec.bootstrap.configRef.name'
+```
+
+Continue when `replicas` is 3 or more and every `maxSurge` is `0`. With fewer than three control-plane replicas, contact technical support. Correct `maxSurge` in its own change, before the window:
+
+```bash
+kubectl -n cpaas-system patch kubeadmcontrolplane "${KCP}" --type merge \
+  -p '{"spec":{"rolloutStrategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":0}}}}'
+kubectl -n cpaas-system patch machinedeployment <md-name> --type merge \
+  -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":0,"maxUnavailable":1}}}}'
+```
+
+On Bare Metal, a node pool with a single host has no worker while that host is reinstalled; make sure its workloads can run on other nodes, or accept the interruption. On Huawei Cloud Stack, the platform does not check these values; set them anyway, because with a larger `maxSurge` every additional machine needs a free hostname and IP address in the `HCSMachineConfigPool`.
+
+On VMware vSphere, the platform does not check the cluster before the upgrade, and the admission webhook rejects the version change of a control plane whose `maxSurge` is not `0`. Also check that every machine config pool is ready. If a pool is not `True`, read its `MembersValid`, `MembersUnique`, and `PersistentDisksReady` conditions and correct the pool:
+
+```bash
+kubectl -n cpaas-system get vspheremachineconfigpool -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status'
+```
+
+### Check the Kubelet Patch File \{#kubernetes-1-35-kubelet-patch}
+
+From Kubernetes 1.35, the bootstrap configuration of every new node needs the kubelet patch file `/etc/kubernetes/patches/kubeletconfiguration0+strategic.json`. With `KCP` from the previous step, print it from the control plane and from each `BOOTSTRAP` template listed there:
+
+```bash
+kubectl -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{range .spec.kubeadmConfigSpec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{.content}{.contentFrom.secret.name}{"\n"}{end}'
+kubectl -n cpaas-system get kubeadmconfigtemplate <bootstrap-template> -o jsonpath='{range .spec.template.spec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{.content}{.contentFrom.secret.name}{"\n"}{end}'
+```
+
+Continue when each command prints the file content, or the name of a Secret in `cpaas-system` that holds it. If a file is missing, contact technical support. On Kubernetes 1.35 or later, the file must contain `"imagePullCredentialsVerificationPolicy": "NeverVerify"`; do not add it for Kubernetes 1.34 or earlier. On Huawei DCS and Bare Metal, the platform adds the setting when the upgrade reaches 1.35. On Huawei Cloud Stack and VMware vSphere, add it in the same edit that moves the cluster to 1.35; on a cluster that already runs 1.35 or later, confirm that it is there.
+
+### Check Kube-OVN and CoreDNS Takeover \{#network-addon-takeover}
+
+For an Alauda OS cluster that uses Kube-OVN and is upgraded from a version earlier than v4.5, the platform takes over Kube-OVN and CoreDNS once the cluster and `global` both run v4.5, but only when the current setup matches what the platform renders from the cluster definition. Read the definition on `global`, then the setup with the `kubeconfig` of the cluster (for `global`, keep its `kubeconfig`):
+
+```bash
+kubectl -n cpaas-system get clusters.cluster.x-k8s.io <cluster-name> -o jsonpath='{.spec.clusterNetwork.pods.cidrBlocks[0]} {.spec.clusterNetwork.services.cidrBlocks[0]} {.metadata.annotations.cpaas\.io/kube-ovn-join-cidr} {.metadata.annotations.kube-ovn\.cpaas\.io/network-device}{"\n"}'
+export KUBECONFIG=<cluster-name>.kubeconfig
+kubectl -n cpaas-system get apprelease cni-kube-ovn -o jsonpath='{.spec.source.charts[0].name}{"\n"}{.spec.values.networking}{"\n"}{.spec.values.ipv4}{"\n"}'
+kubectl -n kube-system get configmap coredns -o jsonpath='{.data.Corefile}'
+kubectl -n kube-system get service kube-dns -o jsonpath='{.spec.clusterIP}{"\n"}'
+```
+
+Continue when all of the following hold; for anything else that does not match, contact technical support. Until the takeover succeeds, Kube-OVN and CoreDNS stay at their previous versions.
+
+1. Kube-OVN: the chart is `acp/chart-kube-ovn` or `acp/chart-cpaas-kube-ovn`. On Huawei DCS, Huawei Cloud Stack, and VMware vSphere, `NETWORK_TYPE` is `geneve`, `NET_STACK` is `ipv4`, and `POD_CIDR`, `SVC_CIDR`, and `JOIN_CIDR` equal the first three values of the definition. On Huawei Cloud Stack and VMware vSphere, `IFACE` and `vlan.VLAN_INTERFACE_NAME` also equal the fourth value, or `eth0` when it is empty. On Bare Metal, the values must match the network settings that the cluster was created with, underlay and IPv6 included; if you changed them by hand, contact technical support.
+2. CoreDNS: the Corefile has one server block, `.:53`, and uses only the plugins `errors`, `health`, `ready`, `kubernetes`, `prometheus`, `forward`, `cache`, `loop`, `reload`, and `loadbalance`. A customized Corefile must be moved to the configuration of the `coredns` `ModuleInfo`; see [Items That Need Lead Time](#lead-time).
+3. The `kube-dns` ClusterIP is the 10th address of the Service CIDR, for example `10.96.0.10` for `10.96.0.0/12`.
+4. For `global` only: every node is `Ready`, and the `ovn-central` Deployment in `kube-system` has all replicas ready. Keep it so through the first window.
+
+### Check the global Cluster Yourself \{#check-global-cluster}
+
+For a `global` cluster on Huawei DCS or Bare Metal, the platform checks the Kubernetes upgrade of `global` only inside the first window, after the new provider is installed. Until then, preflight reports `InfraClusterVersionPreflight` with `ProviderCapabilityNotDeclared`; this is expected. Run the previous steps with `<cluster-name>` set to `global`, then check each `global` cluster:
+
+```bash
+export KUBECONFIG=<global-kubeconfig>        # then <standby-kubeconfig> in DR
+kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}{"\n"}'
+```
+
+<Tabs>
+  <Tab label="Huawei DCS">
+
+Continue when there is a ConfigMap for every version on the path, its VM template exists on every DCS site that `global` uses, and the Secrets that the `DCSCluster` references exist:
+
+```bash
+kubectl -n cpaas-system get configmap -l cpaas.io/dcs-vm-template -L cpaas.io/dcs-vm-template,cpaas.io/distribution-version
+kubectl -n cpaas-system get dcscluster global -o jsonpath='{.spec.credentialSecretRef.name} {.spec.encryptionProviderConfigRef.name}{"\n"}'
+kubectl -n cpaas-system get secret <credential-secret-name> <encryption-secret-name>
+```
+
+  </Tab>
+  <Tab label="Bare Metal">
+
+Continue when the catalog has the OS image key and the `_etcd` key of every version on the path, for every architecture and OS of the `global` hosts:
+
+```bash
+kubectl -n cpaas-system get configmap elemental-image-catalog -o yaml
+```
+
+  </Tab>
+</Tabs>
+
+</Steps>
+
+## Check Module Stability \{#module-stability-self-check}
+
+Preflight blocks the upgrade while a Core or Aligned module of the cluster is installing, upgrading, or failed, for example during a separate plugin upgrade. On `global`, for each cluster, confirm that every module is `Running` and that `deployStatus` is not `Upgrading`, `DeployFailed`, or `UpgradeFailed`. Wait for a module that is still upgrading; resolve a module that is `Failed` or `Blocked` before the window.
+
+```bash
+kubectl get moduleinfo -l cpaas.io/cluster-name=<cluster-name> \
   -o custom-columns='MODULE:.metadata.labels.cpaas\.io/module-name,CURRENT:.status.version,TARGET:.spec.version,PHASE:.status.phase'
+kubectl get clustermodule <cluster-name> -o jsonpath='{.status.base.deployStatus}{"\n"}'
 ```
 
-Also confirm the cluster module itself is not in a deploy or upgrade failure state:
+On a non-Alauda OS `global` cluster that uses the platform built-in Registry, also confirm that `/cpaas/minio` on each control-plane node has at least 120 GB free.
+
+## Run Preflight Checks \{#run-preflight}
+
+Run preflight on `global` from the `installer/` directory of the target Core Package; in DR, repeat it with `<standby-kubeconfig>`. If `kubectl get productmanifests` reports `the server doesn't have a resource type`, the cluster has never been upgraded with the Cluster Version Operator (CVO): run preflight in the window, after you deploy CVO.
 
 ```bash
-kubectl get clustermodule <cluster> -o jsonpath='{.status.base.deployStatus}{"\n"}'
+export KUBECONFIG=<global-kubeconfig>
+kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}{"\n"}'
+kubectl get productmanifests
+bash upgrade.sh --preflight
 ```
 
-Every module `PHASE` must be `Running`, and `deployStatus` must not be `Upgrading`, `DeployFailed`, or `UpgradeFailed`. If a module is still upgrading, wait for it to reach `Running`; if a module is `Failed` or `Blocked`, resolve it before you request the cluster upgrade.
+Continue when the summary is `Passed` or `PassedWithWarnings`. Workload clusters are checked later, after both `global` clusters run the target version.
 
-## Kubernetes 1.35 or Later Node Readiness \{#kubernetes-135-node-readiness}
+### Resolve Preflight Blocks \{#resolve-preflight-blocks}
 
-If the target release is ACP 4.4 or later, upgrades the cluster to Kubernetes 1.35 or later, and reports an administrator acknowledgement gate for node readiness, verify every production node that will run the target cluster before acknowledging the gate.
+For blocks not described here, see [Handle Preflight Blocks](./troubleshooting.mdx#handle-preflight-blocks-when-needed). `ResourcePatchUpgradeable` lists customizations that need an exemption. Review each patch with technical support, then exempt it on the cluster that is upgraded, with the target version as the value; do not use `*`. In DR, do it on each side. Requests made with `ac` do not add the exemption:
 
-Log in to each node through SSH or another administrative node access method available in your environment, and run the following checks directly on the node operating system. The account and credentials depend on how the cluster nodes were provisioned.
+```bash
+kubectl get resourcepatches <rp-name> -o yaml
+kubectl annotate resourcepatches <rp-name> config.cpaas.io/exempt-for-ver=4.5.0 --overwrite
+```
 
-Verify the Linux kernel version:
+`AdminAckRequired` asks for an administrator acknowledgement on every `global` cluster upgraded from v4.4 or earlier, on each side in DR. Complete [Kubernetes 1.35 or Later Node Readiness](#kubernetes-135-node-readiness), then copy the key from `admin-gates`, record it, and run preflight again:
+
+```bash
+kubectl -n cpaas-system get configmap admin-gates -o yaml
+ACK_KEY='<key-from-admin-gates>'
+kubectl -n cpaas-system patch configmap admin-acks --type merge -p "{\"data\":{\"${ACK_KEY}\":\"true\"}}"
+bash upgrade.sh --preflight
+```
+
+### Kubernetes 1.35 or Later Node Readiness \{#kubernetes-135-node-readiness}
+
+The acknowledgement confirms Linux kernel 5.8 or later and cgroup v2 on the nodes. Alauda OS nodes are replaced with the target image during the upgrade, so check only non-Alauda OS nodes. On each node, the kernel must be `5.8` or later and within the supported OS matrix, and the second command must print `cgroup2fs`:
 
 ```bash
 uname -r
-```
-
-The kernel must be `5.8` or later and must also be within the ACP supported operating system and kernel matrix for the target release.
-
-Verify that the node uses cgroup v2:
-
-```bash
 stat -fc %T /sys/fs/cgroup/
 ```
 
-The expected output is:
+## Next Step
 
-```text
-cgroup2fs
-```
-
-On Alauda OS clusters, Kubernetes is upgraded by replacing nodes. On the hop to Kubernetes 1.35 or later, also apply the [required kubelet patch](./workload/alauda_os/index.mdx#kubernetes-1-35-kubelet-patch) to the control-plane and worker bootstrap configurations. The automatic upgrade on Huawei DCS and Bare Metal applies this setting itself.
-
-## Download the Packages for Offline Environments
-
-A production maintenance window typically upgrades **<Term name="productShort" /> Core**, the **Aligned plugins** (cluster plugins and operators released together with the same ACP version), and the in-use **Agnostic plugins** (independently released cluster plugins and operators) in the same window. Core and Extension packages are separate downloads. Prepare all three package sets before the maintenance window so that artifact synchronization can finish early.
-
-### Step 1: Download the Core Package
-
-From the **<Term name="company" /> Customer Portal**, download the **<Term name="productShort" /> 4.5 Core Package** that matches your target architecture. The Core Package contains Core artifacts only; it does not contain any Aligned or Agnostic Extension package.
-
-### Step 2: Download ACP Upgrade to v4.5 \{#download-acp-upgrade-to-v45}
-
-Use **Violet v4.2.13 or later** to download the scenario packages directly. Run `violet version` to verify the version, and use `violet ac login` to log in to the <Term name="company" /> Customer Portal. For installation and login instructions, see [Download Packages](/extend/download_package.mdx).
-
-Set `<target-platform-version>` to the exact ACP Distribution Version of the Core Package, such as `v4.5.0`. Set `<arch>` to `amd64`, `arm64`, or `hybrid` to match the Core Package. List the scenarios first, and then download **ACP Upgrade to v4.5**:
-
-```bash
-violet ac scenarios --arch=<arch> --platformVersion=<target-platform-version>
-violet ac download-app --arch=<arch> --platformVersion=<target-platform-version> --scenario="ACP Upgrade to v4.5"
-```
-
-Confirm that **ACP Upgrade to v4.5** appears in the scenario list before downloading it.
-
-As an alternative to Violet, in the Customer Portal, go to **Marketplace > Batch Download > Install**. On the page, select the target Core Package version from **Your ACP Version**, select the matching **Architecture**, select **ACP Upgrade to v4.5** from **Scenarios**, and download the packages.
-
-This package set provides the target-version packages for the following Aligned applications. These packages remain separate from the Core Package.
-
-Downloaded files are named `<package-name>.<arch>.<version>.tgz`, which does not repeat the display name. Each entry below gives the package name so that you can confirm you received all eleven:
-
-| Application | Package name |
-| ----------- | ------------ |
-| **Alauda Container Platform Web Console** | `console` |
-| **Alauda Container Platform Web Console Central** | `console-central` |
-| **Alauda Container Platform Marketplace Web Console** | `console-marketplace` |
-| **Alauda Container Platform Application Catalog** | `application-catalog` |
-| **Alauda Container Platform Observability Essentials** | `aiops-base` |
-| **Alauda Container Platform Essentials** | `container-platform` |
-| **Alauda Container Platform Cluster Essentials** | `acp-business` |
-| **Alauda Container Platform GatewayAPI Plugin** | `gatewayapi-plugin` |
-| **Alauda Container Platform Basic Monitoring** | `prometheus` |
-| **Alauda Language Pack for Chinese** | `i18n-zh` |
-| **Alauda Container Platform Networking E1** | `calico` |
-
-Before publishing upgrade artifacts, manually copy all eleven packages into the `plugins/` directory of the extracted Core Package. [Sync upgrade artifacts](./global/upgrade_global_cluster.mdx#sync-upgrade-artifacts) describes the built-in and external Registry publication branches.
-
-### Step 3: Inventory other Extensions on every cluster in scope
-
-Cluster plugins and operators are managed by different mechanisms. Both are needed in this step:
-
-- **Cluster plugins** are global resources. A cluster plugin pushed to the global tier becomes installable and upgradable on every cluster in the platform; you only push each cluster plugin once.
-- **Operators** are scoped to each cluster. Pushing an operator to the global tier is the recommended starting point, but the same operator package must be available on each workload cluster before that cluster's upgrade.
-
-Use the same `violet` installation from Step 2 to inventory installed Extensions and publish packages that are not part of **ACP Upgrade to v4.5**. For more information, see [Download Packages](/extend/download_package.html) and [Upload Packages](/extend/upload_package.html).
-
-On any machine with network access to the **<Term name="company" />** platform endpoint, run `violet list` to list the plugins (both Aligned and Agnostic) installed in the current environment and export the result to `./apps.yaml`:
-
-```bash
-violet list \
-  --platform-address "https://<your-platform-domain>" \
-  --platform-token "<platform_token>" \
-  --output-file "./apps.yaml"
-```
-
-Prefer `--platform-token` over `--platform-password` to avoid exposing passwords in shell history and process listings (`ps aux`).
-
-Violet v4.2.13 or later is required for this token-based inventory workflow. Earlier versions can fail with `failed to get user info from platform server`; upgrade Violet before continuing.
-
-### Step 4: Download the other Extension packages
-
-Import the exported `apps.yaml` file into the **<Term name="company" /> Customer Portal** to align the package list with what your clusters currently run. Download the matching target-version packages for the other Aligned and Agnostic Extensions that your clusters use.
-
-If the result includes one of the eleven applications from **ACP Upgrade to v4.5**, do not publish that duplicate with `violet`. Use the package from **ACP Upgrade to v4.5** through the Core Package's `plugins/` directory instead. Use `violet push` only for the remaining Extension packages.
-
-Download every package you will need so they are all available locally before the upgrade window starts. The next page, [Upgrade the global cluster](./global/upgrade_global_cluster.mdx), describes how the selected Registry path publishes Core and the eleven manually staged packages, and how `violet` publishes the other Extensions. Artifact publication does not upgrade any already-running plugin, so complete it before the maintenance window.
-
-:::warning Required Aligned Plugin Packages
-Every Aligned plugin installed on a cluster being upgraded must have its target-version package available before the upgrade request. CVO does not require target packages for Aligned applications that are not installed, and synchronizing a package does not install an application that is not currently installed.
-
-If a required package is unavailable, CVO blocks progress and keeps retrying the existing request. For an installed Aligned cluster plugin, the `ClusterVersionShadow` condition reports a missing or non-Ready target `ModulePluginConfig`. For an installed Aligned operator, inspect its target catalog, `Subscription`, `InstallPlan`, and `ModuleInfo`. Add packages from **ACP Upgrade to v4.5** through the `plugins/` publication path in [Sync upgrade artifacts](./global/upgrade_global_cluster.mdx#sync-upgrade-artifacts); publish other packages with `violet`.
-:::
-
-:::warning
-Starting with v4.2, we introduced a new plugin named **Alauda Container Platform Log Essentials**. If you previously installed the log storage plugin, you also have to upload that plugin before starting the upgrade.
-:::
+- With Global Cluster Disaster Recovery: [Upgrade `global` Clusters in a DR Environment](./global/upgrade_global_dr.mdx).
+- Otherwise: [Upgrade the `global` Cluster](./global/upgrade_global_cluster.mdx).
