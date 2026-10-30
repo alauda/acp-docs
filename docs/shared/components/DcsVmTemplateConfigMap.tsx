@@ -59,7 +59,7 @@ const renderConfigMap = ({
   ].join('\n')
 
 const renderCommand = (configMaps: ConfigMapValues[]) =>
-  ["kubectl apply -f - <<'EOF'", configMaps.map(renderConfigMap).join('\n---\n'), 'EOF'].join('\n')
+  ["ac apply -f - <<'EOF'", configMaps.map(renderConfigMap).join('\n---\n'), 'EOF'].join('\n')
 
 // `prefix` tells the ConfigMaps of a multi-version example apart, such as
 // `intermediate-` and `target-`.

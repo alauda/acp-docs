@@ -12,47 +12,47 @@ import AlaudaOsUpgradePath /* eslint-disable-line no-unused-vars */ from '../../
 
 # Upgrade Kubernetes on Huawei Cloud Stack and VMware vSphere
 
-On Huawei Cloud Stack and VMware vSphere, the upgrade request moves ACP Core and the installed Extensions (Operators and Cluster Plugins) with the `Aligned` lifecycle to the target ACP version (Distribution Version), but the nodes keep the previous Kubernetes version and Alauda OS image. Use this page to replace the nodes in the same maintenance window, as soon as `ac adm upgrade status --cluster=<cluster-name>` shows the target version and `Ready`. Go through the procedure once for each Kubernetes version on the upgrade path: every intermediate Kubernetes version, then the target.
+On Huawei Cloud Stack and VMware vSphere, the upgrade request moves ACP Core and the installed Extensions (Operators and Cluster Plugins) with the `Aligned` lifecycle to the target ACP version (Distribution Version), but the nodes keep the previous Kubernetes version and Alauda OS image. Use this page to replace the nodes. Go through the procedure once for each Kubernetes version on the upgrade path: every intermediate Kubernetes version, then the target.
 
 :::warning
-Every upgrade must bring Kubernetes to the version of the target ACP release, including a patch upgrade whose Kubernetes build changes. Until you finish this page, the cluster runs the new ACP Core on the previous Kubernetes version.
+Every upgrade must bring Kubernetes to the version of the target ACP release, including a patch upgrade whose Kubernetes build changes. Upgrade Kubernetes right after the upgrade request of the cluster completes; do not leave the cluster on the new ACP version with the previous Kubernetes version.
 :::
 
-Run every command on the `global` cluster that manages the cluster you upgrade. All objects are in the `cpaas-system` namespace.
+Run every command from the execution host, after `ac login`, on the `global` cluster that manages the cluster you upgrade. All objects are in the `cpaas-system` namespace.
 
-- For the `global` cluster, use its own kubeconfig and `global` as `<cluster-name>`. In a DR environment, use the kubeconfig of the side you are upgrading.
+- For a `global` cluster, use `global` as `<cluster-name>`. For the standby `global` cluster in a DR environment, use its kubeconfig instead of `ac login`.
 - For a workload cluster, use the primary `global` cluster. The standby does not act on workload clusters.
 
 ## Before You Begin \{#before-you-begin}
 
-Select the `global` cluster that runs the commands and confirm that the printed API address is its VIP:
+Select the `global` cluster that runs the commands, and confirm that the printed address ends with `/kubernetes/global/`:
 
 ```bash
-export KUBECONFIG=<global-kubeconfig>
-kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}{"\n"}'
+ac config use-cluster global
+ac whoami --show-server
 ```
+
+For the standby `global` cluster in a DR environment, replace the first command with `export KUBECONFIG=<standby-kubeconfig>`; the second command then prints the VIP of the standby, and every later `ac` command on this page uses this kubeconfig.
 
 Confirm each of the following:
 
 - The upgrade request is complete: `ac adm upgrade status --cluster=<cluster-name>` shows the target version in `Current`, and `Ready` is `True`.
-- The platform has taken over Kube-OVN and CoreDNS: the first command below prints `True`. Replace `<hcscluster-or-vspherecluster>` with `hcscluster` on Huawei Cloud Stack or `vspherecluster` on VMware vSphere. While it prints `False` with `CoreAddonsHandoffPending` or `CoreAddonsHandoffNotApplicable`, wait and run it again. With `CoreAddonsHandoffBlocked`, see [Kube-OVN and CoreDNS Takeover Is Blocked](./troubleshooting.mdx#core-addons-handoff-blocked). On a cluster that does not use Kube-OVN, the command prints nothing; skip this check.
+- The platform has taken over Kube-OVN and CoreDNS: the first command below prints `True`. Replace `<hcscluster-or-vspherecluster>` with `hcscluster` on Huawei Cloud Stack or `vspherecluster` on VMware vSphere. While it prints `False` with `CoreAddonsHandoffPending` or `CoreAddonsHandoffNotApplicable`, wait and run it again. With `CoreAddonsHandoffBlocked`, the message names the setting; contact technical support. On a cluster that does not use Kube-OVN, the command prints nothing; skip this check.
 - The control plane has three or more nodes, and `maxSurge` is `0` on the KubeadmControlPlane and on every MachineDeployment. With fewer than three control-plane nodes, contact technical support. If `maxSurge` is not `0`, correct it now with the commands in [Check the Rollout Settings](./pre-upgrade.mdx#rollout-settings), then continue; changing `maxSurge` does not replace any node.
-- The Alauda OS image of every version on the path is uploaded, and you have its name: the image in Huawei Cloud Stack, or the VM template in every vCenter that the cluster uses.
+- The Alauda OS image of every version on the path is staged, and you recorded its name: the image in each Huawei Cloud Stack region and project that the cluster uses, or the VM template in each vCenter datacenter that the cluster uses. See [Stage the Alauda OS Images](./pre-upgrade.mdx#stage-alauda-os-images).
 - The cluster has a recent successful etcd backup. See [etcd Backup and Restore](../configure/backup/etcd.mdx).
 - The infrastructure provider has finished its upgrade. See [Check the Provider Version](#identify-the-installed-provider-version).
-
-If the takeover is blocked, the cluster does not pass validation, and on Huawei Cloud Stack and VMware vSphere the manual Kubernetes upgrade cannot start, so the window cannot be closed. Resolve it with technical support before you schedule the cluster. For a customized Corefile, the takeover continues only after the `kube-system/coredns` Corefile is back to the default.
 
 Read these values on the same cluster:
 
 ```bash
-kubectl -n cpaas-system get <hcscluster-or-vspherecluster> <cluster-name> \
+ac -n cpaas-system get <hcscluster-or-vspherecluster> <cluster-name> \
   -o jsonpath='{range .status.conditions[?(@.type=="CoreAddonsHandedOff")]}{.status}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
-kubectl -n cpaas-system get clusters.cluster.x-k8s.io <cluster-name> \
+ac -n cpaas-system get clusters.cluster.x-k8s.io <cluster-name> \
   -o jsonpath='{.spec.controlPlaneRef.name}{"\n"}'
-kubectl -n cpaas-system get kubeadmcontrolplane <kcp-name> \
+ac -n cpaas-system get kubeadmcontrolplane <kcp-name> \
   -o custom-columns='NAME:.metadata.name,REPLICAS:.spec.replicas,SURGE:.spec.rolloutStrategy.rollingUpdate.maxSurge,VERSION:.spec.version,TEMPLATE:.spec.machineTemplate.infrastructureRef.name'
-kubectl -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=<cluster-name> \
+ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=<cluster-name> \
   -o custom-columns='NAME:.metadata.name,SURGE:.spec.strategy.rollingUpdate.maxSurge,VERSION:.spec.template.spec.version,TEMPLATE:.spec.template.spec.infrastructureRef.name,BOOTSTRAP:.spec.template.spec.bootstrap.configRef.name'
 ```
 
@@ -63,7 +63,7 @@ The second command prints the KubeadmControlPlane name, `<kcp-name>`. Keep the o
 The infrastructure provider runs on the `global` cluster and is upgraded together with it. Read its version from the provider `AppRelease`; do not infer it from the ACP version:
 
 ```bash
-kubectl -n cpaas-system get apprelease \
+ac -n cpaas-system get apprelease \
   -o custom-columns='APPRELEASE:.metadata.name,CHART:.spec.source.charts[*].name,REQUESTED:.spec.source.charts[*].targetRevision,INSTALLED:.status.charts.*.installedRevision,SYNC:.status.conditions[?(@.type=="Sync")].status,HEALTH:.status.conditions[?(@.type=="Health")].status'
 ```
 
@@ -99,7 +99,7 @@ Export the template that the control plane uses now, from the `TEMPLATE` column 
   <Tab label="Huawei Cloud Stack">
 
 ```bash
-kubectl -n cpaas-system get hcsmachinetemplate <current-cp-template-name> -o yaml > new-cp-template.yaml
+ac -n cpaas-system get hcsmachinetemplate <current-cp-template-name> -o yaml > new-cp-template.yaml
 ```
 
 In `new-cp-template.yaml`, set `spec.template.spec.imageName` to the image name of the row. Leave `spec.template.spec.providerID` and `spec.template.spec.serverId` unset.
@@ -108,7 +108,7 @@ In `new-cp-template.yaml`, set `spec.template.spec.imageName` to the image name 
   <Tab label="VMware vSphere">
 
 ```bash
-kubectl -n cpaas-system get vspheremachinetemplate <current-cp-template-name> -o yaml > new-cp-template.yaml
+ac -n cpaas-system get vspheremachinetemplate <current-cp-template-name> -o yaml > new-cp-template.yaml
 ```
 
 In `new-cp-template.yaml`, set `spec.template.spec.template` to the VM template name of the row. Leave `spec.template.spec.providerID` unset.
@@ -125,7 +125,7 @@ In the same file:
 Create the template:
 
 ```bash
-kubectl apply -f new-cp-template.yaml
+ac apply -f new-cp-template.yaml
 ```
 
 ### Update the KubeadmControlPlane \{#update-kcp}
@@ -133,7 +133,7 @@ kubectl apply -f new-cp-template.yaml
 Open the KubeadmControlPlane:
 
 ```bash
-kubectl -n cpaas-system edit kubeadmcontrolplane <kcp-name>
+ac -n cpaas-system edit kubeadmcontrolplane <kcp-name>
 ```
 
 :::info
@@ -150,8 +150,8 @@ Save and close the editor. The control plane nodes are now replaced with new VMs
 ### Wait for the Control Plane Rollout \{#wait-cp}
 
 ```bash
-kubectl -n cpaas-system get kubeadmcontrolplane <kcp-name>
-kubectl -n cpaas-system get machines.cluster.x-k8s.io -l cluster.x-k8s.io/cluster-name=<cluster-name>,cluster.x-k8s.io/control-plane
+ac -n cpaas-system get kubeadmcontrolplane <kcp-name>
+ac -n cpaas-system get machines.cluster.x-k8s.io -l cluster.x-k8s.io/cluster-name=<cluster-name>,cluster.x-k8s.io/control-plane
 ```
 
 Run the commands again until every control plane Machine is `Running` with the new `VERSION`, and the KubeadmControlPlane shows `REPLICAS` equal to `DESIRED`, `READY` and `UPDATED` equal to `REPLICAS`, and `UNAVAILABLE` at `0`. For the `global` cluster, a command can fail to connect while its control plane nodes are replaced; run it again.
@@ -164,7 +164,7 @@ For each template in the `TEMPLATE` column of the MachineDeployment list, export
   <Tab label="Huawei Cloud Stack">
 
 ```bash
-kubectl -n cpaas-system get hcsmachinetemplate <current-worker-template-name> -o yaml > <new-worker-template-name>.yaml
+ac -n cpaas-system get hcsmachinetemplate <current-worker-template-name> -o yaml > <new-worker-template-name>.yaml
 ```
 
 In the file, set `spec.template.spec.imageName` to the image name of the row.
@@ -173,7 +173,7 @@ In the file, set `spec.template.spec.imageName` to the image name of the row.
   <Tab label="VMware vSphere">
 
 ```bash
-kubectl -n cpaas-system get vspheremachinetemplate <current-worker-template-name> -o yaml > <new-worker-template-name>.yaml
+ac -n cpaas-system get vspheremachinetemplate <current-worker-template-name> -o yaml > <new-worker-template-name>.yaml
 ```
 
 In the file, set `spec.template.spec.template` to the VM template name of the row.
@@ -181,36 +181,36 @@ In the file, set `spec.template.spec.template` to the VM template name of the ro
   </Tab>
 </Tabs>
 
-Edit the rest of the file as for the control plane template: a new `metadata.name`, and the same server-generated fields deleted. Then create it with `kubectl apply -f <new-worker-template-name>.yaml`.
+Edit the rest of the file as for the control plane template: a new `metadata.name`, and the same server-generated fields deleted. Then create it with `ac apply -f <new-worker-template-name>.yaml`.
 
 When the row is Kubernetes 1.35 or later, print the kubelet patch file of each template in the `BOOTSTRAP` column:
 
 ```bash
-kubectl -n cpaas-system get kubeadmconfigtemplate <current-bootstrap-template-name> \
+ac -n cpaas-system get kubeadmconfigtemplate <current-bootstrap-template-name> \
   -o jsonpath='{range .spec.template.spec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{.content}{"\n"}{end}'
 ```
 
 For each template whose output lacks `"imagePullCredentialsVerificationPolicy": "NeverVerify"`, create a new bootstrap template:
 
 ```bash
-kubectl -n cpaas-system get kubeadmconfigtemplate <current-bootstrap-template-name> -o yaml > <new-bootstrap-template-name>.yaml
+ac -n cpaas-system get kubeadmconfigtemplate <current-bootstrap-template-name> -o yaml > <new-bootstrap-template-name>.yaml
 ```
 
-In the file, set a new `metadata.name`, add `"imagePullCredentialsVerificationPolicy": "NeverVerify"` to the content of `/etc/kubernetes/patches/kubeletconfiguration0+strategic.json` in `spec.template.spec.files`, and delete the same server-generated fields. Then create it with `kubectl apply -f <new-bootstrap-template-name>.yaml`.
+In the file, set a new `metadata.name`, add `"imagePullCredentialsVerificationPolicy": "NeverVerify"` to the content of `/etc/kubernetes/patches/kubeletconfiguration0+strategic.json` in `spec.template.spec.files`, and delete the same server-generated fields. Then create it with `ac apply -f <new-bootstrap-template-name>.yaml`.
 
 ### Update Each MachineDeployment \{#worker-node-upgrades}
 
 Patch every MachineDeployment in the list. Use the Kubernetes version of the row and the new template that replaces the one the MachineDeployment uses now:
 
 ```bash
-kubectl -n cpaas-system patch machinedeployment <machinedeployment-name> --type=merge \
+ac -n cpaas-system patch machinedeployment <machinedeployment-name> --type=merge \
   -p '{"spec":{"template":{"spec":{"version":"<kubernetes-version>","infrastructureRef":{"name":"<new-worker-template-name>"}}}}}'
 ```
 
 If you created a new bootstrap template, change it in the same patch:
 
 ```bash
-kubectl -n cpaas-system patch machinedeployment <machinedeployment-name> --type=merge \
+ac -n cpaas-system patch machinedeployment <machinedeployment-name> --type=merge \
   -p '{"spec":{"template":{"spec":{"version":"<kubernetes-version>","infrastructureRef":{"name":"<new-worker-template-name>"},"bootstrap":{"configRef":{"name":"<new-bootstrap-template-name>"}}}}}}'
 ```
 
@@ -219,17 +219,18 @@ Each MachineDeployment now replaces its worker nodes with new VMs.
 ### Wait for the Worker Rollout \{#wait-workers}
 
 ```bash
-kubectl -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=<cluster-name>
-kubectl -n cpaas-system get machines.cluster.x-k8s.io -l cluster.x-k8s.io/cluster-name=<cluster-name>
+ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=<cluster-name>
+ac -n cpaas-system get machines.cluster.x-k8s.io -l cluster.x-k8s.io/cluster-name=<cluster-name>
 ```
 
 Run the commands again until every MachineDeployment shows `READY` and `UPDATED` equal to `REPLICAS` and `UNAVAILABLE` at `0`, and every Machine is `Running` with the new `VERSION`.
 
-Then check the nodes. For the `global` cluster, run `kubectl get nodes`. For a workload cluster, read its `kubeconfig` from the `global` cluster first:
+Then check the nodes. For a `global` cluster, run `ac get nodes`. For a workload cluster, switch to it, and back to `global` afterwards:
 
 ```bash
-kubectl -n cpaas-system get secret <cluster-name>-kubeconfig -o jsonpath='{.data.value}' | base64 -d > <cluster-name>.kubeconfig
-kubectl --kubeconfig=<cluster-name>.kubeconfig get nodes
+ac config use-cluster <cluster-name>
+ac get nodes
+ac config use-cluster global
 ```
 
 Continue when every node is `Ready` and its `VERSION` is the Kubernetes version of the row.
@@ -249,6 +250,6 @@ An upgrade cannot be rolled back: do not set the versions or the templates back 
 ## Return to the Page You Came From
 
 - `global` cluster without DR: [Upgrade the Agnostic Extensions](./global/upgrade_global_cluster.mdx#upgrade-agnostic-extensions).
-- Standby `global` cluster in a DR environment: [Check the Standby Before Upgrading the Primary](./global/upgrade_global_dr.mdx#go-no-go).
+- Standby `global` cluster in a DR environment: run `unset KUBECONFIG`, then continue at [Check the Standby Before Upgrading the Primary](./global/upgrade_global_dr.mdx#go-no-go).
 - Primary `global` cluster in a DR environment: [Reinstall the Global Cluster Disaster Recovery Plugin](./global/upgrade_global_dr.mdx#reinstall-dr-plugin).
 - Workload cluster: [Upgrade the Agnostic Extensions](./workload/upgrade_workload_cluster.mdx#upgrade-agnostic-extensions).

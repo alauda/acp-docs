@@ -65,7 +65,7 @@ type CatalogEntry = [key: string, value: string]
 // The same source as the image catalog command on the provider installation
 // page, which exists whether or not the `global` cluster runs Alauda OS.
 const READ_REGISTRY = [
-  'REGISTRY=$(kubectl get productbase.product.alauda.io base \\',
+  'REGISTRY=$(ac get productbase.product.alauda.io base \\',
   "  -o jsonpath='{.spec.registry.address}')",
 ]
 
@@ -78,11 +78,11 @@ const renderCommand = (entries: CatalogEntry[], registry: string) => {
   const delimiter = registry === '' ? 'EOF' : "'EOF'"
   return [
     ...(registry === '' ? READ_REGISTRY : []),
-    `kubectl -n cpaas-system patch configmap elemental-image-catalog --type merge --patch-file /dev/stdin <<${delimiter}`,
+    `ac -n cpaas-system patch configmap elemental-image-catalog --type merge --patch-file /dev/stdin <<${delimiter}`,
     patch,
     'EOF',
     '',
-    'kubectl -n cpaas-system get configmap elemental-image-catalog -o yaml',
+    'ac -n cpaas-system get configmap elemental-image-catalog -o yaml',
   ].join('\n')
 }
 

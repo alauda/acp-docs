@@ -4,7 +4,7 @@
 
 - The **Version Mapping** table in `docs/en/overview/alauda_os_support_matrix.mdx`, rendered by `docs/shared/components/VersionMappingTable.tsx`.
 - The VM template ConfigMap generator, rendered by `docs/shared/components/DcsVmTemplateConfigMap.tsx`: the **Huawei DCS** tab of **Stage the Alauda OS Images** in `docs/en/upgrade/pre-upgrade.mdx`, and `docs/en/workload_clusters/alauda_os/huawei-dcs/infrastructure.mdx`.
-- The image catalog generator, rendered by `docs/shared/components/BareMetalImageCatalog.tsx`: the **Bare Metal** tab of **Stage the Alauda OS Images** in `docs/en/upgrade/pre-upgrade.mdx`, and `docs/en/workload_clusters/alauda_os/bare-metal/create_cluster.mdx`.
+- The image catalog generator, rendered by `docs/shared/components/BareMetalImageCatalog.tsx`: the **Bare Metal** tab of **Stage the Alauda OS Images** in `docs/en/upgrade/pre-upgrade.mdx`, and `docs/en/workload_clusters/alauda_os/bare-metal/install_provider.mdx`.
 - The upgrade path calculator in **Determine the Versions to Prepare** in `docs/en/upgrade/pre-upgrade.mdx`, rendered by `docs/shared/components/AlaudaOsUpgradePath.tsx`.
 
 The generators and the calculator read the file through `docs/shared/components/alauda-os.ts`, which also plans the upgrade path: for each Kubernetes minor version between the current and the target version, it selects the entry with the highest `kubernetes` value in that minor.

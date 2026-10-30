@@ -13,43 +13,45 @@ queries:
 Use this page for a Huawei DCS or Huawei Cloud Stack cluster that still keeps platform data, such as `/var/cpaas`, on disks declared in its machine template. After the migration, these disks are declared in the machine pool, and the upgrade keeps them when it replaces the nodes. Migrate every affected cluster, the `global` cluster included.
 
 :::warning
-The migration replaces every node of the cluster with a new VM, one at a time. Schedule it in its own change window, before the first upgrade window. With fewer than three control-plane nodes, contact technical support.
+Complete the migration before you upgrade the cluster. It replaces every node of the cluster with a new VM, one at a time. With fewer than three control-plane nodes, contact technical support.
 :::
 
-Run the commands on the `global` cluster that manages the cluster: the `global` cluster itself with its own kubeconfig and `global` as `<cluster-name>`, or the primary `global` cluster for a workload cluster. In a DR environment, migrate each `global` cluster with its own kubeconfig. All objects are in the `cpaas-system` namespace.
+Run the commands from the execution host, after `ac login`, on the `global` cluster that manages the cluster: the `global` cluster itself, with `global` as `<cluster-name>`, or the primary `global` cluster for a workload cluster. In a DR environment, migrate each `global` cluster; for the standby, use its kubeconfig instead of `ac login`. All objects are in the `cpaas-system` namespace.
 
 ## Before You Start \{#before-you-start}
 
-Select the `global` cluster that runs the commands and confirm that the printed API address is its VIP:
+Select the `global` cluster that runs the commands, and confirm that the printed address ends with `/kubernetes/global/`:
 
 ```bash
-export KUBECONFIG=<global-kubeconfig>
-kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}{"\n"}'
+ac config use-cluster global
+ac whoami --show-server
 ```
+
+For the standby `global` cluster in a DR environment, replace the first command with `export KUBECONFIG=<standby-kubeconfig>`; the second command then prints the VIP of the standby, and every later `ac` command on this page uses this kubeconfig. Run `unset KUBECONFIG` when the migration of the standby is complete.
 
 Confirm the following:
 
 - All nodes of the cluster are `Ready`, and the cluster has a recent successful etcd backup. See [etcd Backup and Restore](../configure/backup/etcd.mdx).
 - The control plane has three or more nodes, `maxSurge` is `0` on the KubeadmControlPlane and on every MachineDeployment, and `maxUnavailable` is `1` on every MachineDeployment. The commands below also list the machine templates in use; the procedure works on each of them.
-- Each IP pool or machine config pool that the cluster uses has no free entry, for control-plane and worker pools alike. A replacement node takes over the disks of the node it replaces only then; check it as described in [Check the Disks and Hosts](./pre-upgrade.mdx#persistent-disk-layout), and contact technical support if a pool has a free entry.
+- Each IP pool or machine config pool that the cluster uses has no free entry, for control-plane and worker pools alike: a replacement node takes over the disks of the node it replaces only then. Find the free entries as described in [Check the Disks and Hosts](./pre-upgrade.mdx#persistent-disk-layout), and remove them from the pool before the migration, with the cautions for the provider below.
 
 Read the rollout settings and templates on the same cluster:
 
 ```bash
-kubectl -n cpaas-system get clusters.cluster.x-k8s.io <cluster-name> \
+ac -n cpaas-system get clusters.cluster.x-k8s.io <cluster-name> \
   -o jsonpath='{.spec.controlPlaneRef.name}{"\n"}'
-kubectl -n cpaas-system get kubeadmcontrolplane <kcp-name> \
+ac -n cpaas-system get kubeadmcontrolplane <kcp-name> \
   -o custom-columns='NAME:.metadata.name,REPLICAS:.spec.replicas,SURGE:.spec.rolloutStrategy.rollingUpdate.maxSurge,TEMPLATE:.spec.machineTemplate.infrastructureRef.name'
-kubectl -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=<cluster-name> \
+ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=<cluster-name> \
   -o custom-columns='NAME:.metadata.name,SURGE:.spec.strategy.rollingUpdate.maxSurge,UNAVAILABLE:.spec.strategy.rollingUpdate.maxUnavailable,TEMPLATE:.spec.template.spec.infrastructureRef.name'
 ```
 
 The first command prints the KubeadmControlPlane name, `<kcp-name>`. An empty `SURGE` is unset, which counts as `1`. If a `SURGE` value is not `0`, or a MachineDeployment `UNAVAILABLE` value is not `1`, set them before you continue:
 
 ```bash
-kubectl -n cpaas-system patch kubeadmcontrolplane <kcp-name> --type=merge \
+ac -n cpaas-system patch kubeadmcontrolplane <kcp-name> --type=merge \
   -p '{"spec":{"rolloutStrategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":0}}}}'
-kubectl -n cpaas-system patch machinedeployment <machinedeployment-name> --type=merge \
+ac -n cpaas-system patch machinedeployment <machinedeployment-name> --type=merge \
   -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":0,"maxUnavailable":1}}}}'
 ```
 
@@ -62,7 +64,8 @@ Also confirm the conditions for the provider:
 - Guest tools (`vmtools`) run inside the VMs, so that a VM can be shut down safely and its disks detached.
 - Each node has a fixed IP entry in a `DCSIpHostnamePool`.
 - You can read the disks of each VM, with their `sequenceNum`, from the DCS platform or the DCS API (`QueryVmInfo`).
-- `kubectl explain dcsiphostnamepools.spec.pool.persistentDisk` describes the field. If it reports that the field does not exist, stop and contact technical support.
+- `ac explain dcsiphostnamepools.spec.pool.persistentDisk` describes the field. If it reports that the field does not exist, stop and contact technical support.
+- When you remove free entries from a `DCSIpHostnamePool`, keep the entry of the internal control-plane load balancer VIP. Removing an entry that a node used before also deletes the disks kept for it.
 
 </Tab>
 <Tab label="Huawei Cloud Stack">
@@ -70,7 +73,8 @@ Also confirm the conditions for the provider:
 - The cluster runs ACP v4.3.1 or later.
 - The cluster assigns fixed hostnames and IP addresses through `HCSMachineConfigPool`.
 - Every disk to keep has a non-empty `mountPath` in `HCSMachineTemplate.spec.template.spec.dataVolumes[]`. For a disk without one, contact technical support.
-- `kubectl explain hcsmachineconfigpools.spec.configs.persistentDisks` describes the field. If it reports that the field does not exist, stop and contact technical support.
+- `ac explain hcsmachineconfigpools.spec.configs.persistentDisks` describes the field. If it reports that the field does not exist, stop and contact technical support.
+- A free configuration of an `HCSMachineConfigPool` that was used before cannot be removed; contact technical support for it.
 
 </Tab>
 </Tabs>
@@ -89,8 +93,8 @@ Do each step for the control plane template and for every MachineDeployment temp
 List the VMs of the cluster and the pools:
 
 ```bash
-kubectl -n cpaas-system get dcsmachine -l cluster.x-k8s.io/cluster-name=<cluster-name>
-kubectl -n cpaas-system get dcsiphostnamepool
+ac -n cpaas-system get dcsmachine -l cluster.x-k8s.io/cluster-name=<cluster-name>
+ac -n cpaas-system get dcsiphostnamepool
 ```
 
 For every disk to keep on each VM, record:
@@ -120,7 +124,7 @@ For example, with the old disk order 1 system disk, 2 `/var/lib/kubelet`, 3 `/va
 Read each template in use, and record its pool in `spec.template.spec.configPoolRef.name`:
 
 ```bash
-kubectl -n cpaas-system get hcsmachinetemplate <template-name> -o yaml
+ac -n cpaas-system get hcsmachinetemplate <template-name> -o yaml
 ```
 
 The provider claims an existing data volume by its `mountPath`. For every entry of `spec.template.spec.dataVolumes[]` to keep, record `mountPath`, `size`, `type`, and `format`. Keep only the disks that must survive node replacement:
@@ -142,7 +146,7 @@ The provider claims an existing data volume by its `mountPath`. For every entry 
 Edit each template in place and keep its name:
 
 ```bash
-kubectl -n cpaas-system get dcsmachinetemplate <template-name> -o yaml > current-template.yaml
+ac -n cpaas-system get dcsmachinetemplate <template-name> -o yaml > current-template.yaml
 ```
 
 In `current-template.yaml`:
@@ -150,7 +154,7 @@ In `current-template.yaml`:
 - In `spec.template.spec.vmConfig.dcsMachineDiskSpec[]`, keep the system disk and the disks that may be recreated with the VM. Remove every disk to keep, and the disks that you move with it to make it claimable.
 - Keep `metadata.name`. Remove `metadata.resourceVersion`, `metadata.uid`, `metadata.creationTimestamp`, and `metadata.managedFields`.
 
-Then apply it with `kubectl apply -f current-template.yaml`.
+Then apply it with `ac apply -f current-template.yaml`.
 
 </Tab>
 <Tab label="Huawei Cloud Stack">
@@ -158,7 +162,7 @@ Then apply it with `kubectl apply -f current-template.yaml`.
 Create a new template for each template in use; do not edit the old one:
 
 ```bash
-kubectl -n cpaas-system get hcsmachinetemplate <current-template-name> -o yaml > new-template.yaml
+ac -n cpaas-system get hcsmachinetemplate <current-template-name> -o yaml > new-template.yaml
 ```
 
 In `new-template.yaml`:
@@ -167,7 +171,7 @@ In `new-template.yaml`:
 - Leave `spec.template.spec.providerID` and `spec.template.spec.serverId` unset.
 - Remove the disks to keep from `spec.template.spec.dataVolumes[]`, so that it lists only disks that may be recreated with the VM. Keep every other field, `imageName` included.
 
-Then create it with `kubectl apply -f new-template.yaml`.
+Then create it with `ac apply -f new-template.yaml`.
 
 </Tab>
 </Tabs>
@@ -180,7 +184,7 @@ Then create it with `kubectl apply -f new-template.yaml`.
 Edit the `DCSIpHostnamePool` that the template references in `spec.template.spec.ipHostPoolRef.name`:
 
 ```bash
-kubectl -n cpaas-system edit dcsiphostnamepool <pool-name>
+ac -n cpaas-system edit dcsiphostnamepool <pool-name>
 ```
 
 Under the IP entry of each node, add one `persistentDisk` entry for each disk to keep, with the `slot` you computed:
@@ -210,7 +214,7 @@ The existing disk is claimed only when `quantityGB` (exact size), `datastoreName
 Edit the `HCSMachineConfigPool` that the old and the new templates reference in `spec.template.spec.configPoolRef.name`:
 
 ```bash
-kubectl -n cpaas-system edit hcsmachineconfigpool <pool-name>
+ac -n cpaas-system edit hcsmachineconfigpool <pool-name>
 ```
 
 Under the hostname of each node, add one `persistentDisks` entry for each disk to keep:
@@ -249,7 +253,7 @@ Before you start the replacement, confirm that the provider has claimed every di
 <Tab label="Huawei DCS">
 
 ```bash
-kubectl -n cpaas-system get dcsiphostnamepool <pool-name> \
+ac -n cpaas-system get dcsiphostnamepool <pool-name> \
   -o jsonpath='{range .status.persistentDiskStatus[*]}{.ip}{"\t"}{.slot}{"\t"}{.path}{"\t"}{.phase}{"\t"}{.volumeUrn}{"\t"}{.lastError}{"\n"}{end}'
 ```
 
@@ -259,7 +263,7 @@ Continue when every disk to keep is `Attached` and its `volumeUrn` is the volume
 <Tab label="Huawei Cloud Stack">
 
 ```bash
-kubectl -n cpaas-system get hcsmachineconfigpool <pool-name> \
+ac -n cpaas-system get hcsmachineconfigpool <pool-name> \
   -o jsonpath='{range .status.persistentDiskStatus[*]}{.hostname}{"\t"}{.slot}{"\t"}{.phase}{"\t"}{.volumeID}{"\t"}{.lastError}{"\n"}{end}'
 ```
 
@@ -278,21 +282,21 @@ If a disk is missing from the output or a column is empty, read the pool with `-
 Start the replacement of the control plane, then of each MachineDeployment:
 
 ```bash
-kubectl -n cpaas-system patch kubeadmcontrolplane <kcp-name> --type=merge \
+ac -n cpaas-system patch kubeadmcontrolplane <kcp-name> --type=merge \
   -p '{"spec":{"rolloutAfter":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}}'
-kubectl -n cpaas-system patch machinedeployment <machinedeployment-name> --type=merge \
+ac -n cpaas-system patch machinedeployment <machinedeployment-name> --type=merge \
   -p '{"spec":{"rolloutAfter":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}}'
 ```
 
 </Tab>
 <Tab label="Huawei Cloud Stack">
 
-Right after the disks are claimed, in the same window, point the control plane and each MachineDeployment to the new templates. Do not leave the pool declaring a disk while a controller still uses an old template that declares the same path.
+Right after the disks are claimed, point the control plane and each MachineDeployment to the new templates. Do not leave the pool declaring a disk while a controller still uses an old template that declares the same path.
 
 ```bash
-kubectl -n cpaas-system patch kubeadmcontrolplane <kcp-name> --type=merge \
+ac -n cpaas-system patch kubeadmcontrolplane <kcp-name> --type=merge \
   -p '{"spec":{"machineTemplate":{"infrastructureRef":{"name":"<new-template-name>"}}}}'
-kubectl -n cpaas-system patch machinedeployment <machinedeployment-name> --type=merge \
+ac -n cpaas-system patch machinedeployment <machinedeployment-name> --type=merge \
   -p '{"spec":{"template":{"spec":{"infrastructureRef":{"name":"<new-template-name>"}}}}}'
 ```
 
@@ -306,9 +310,9 @@ If a controller already uses its new template, start its replacement by setting 
 Follow the replacement:
 
 ```bash
-kubectl -n cpaas-system get kubeadmcontrolplane <kcp-name>
-kubectl -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=<cluster-name>
-kubectl -n cpaas-system get machines.cluster.x-k8s.io -l cluster.x-k8s.io/cluster-name=<cluster-name>
+ac -n cpaas-system get kubeadmcontrolplane <kcp-name>
+ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=<cluster-name>
+ac -n cpaas-system get machines.cluster.x-k8s.io -l cluster.x-k8s.io/cluster-name=<cluster-name>
 ```
 
 Then read the disk states of each pool with the commands in [Confirm the Disks Are Claimed](#confirm-claimed). Each disk goes from `Attached` on the old VM to `Available` after it is detached, then to `Attached` on the replacement VM; `Detaching` and `Attaching` appear in between. The migration is complete when the KubeadmControlPlane shows `REPLICAS` equal to `DESIRED`, the KubeadmControlPlane and every MachineDeployment show `UPDATED` equal to `REPLICAS` and `UNAVAILABLE` at `0`, every Machine is `Running`, and every disk is `Attached`.

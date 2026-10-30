@@ -4,54 +4,63 @@ weight: 50
 
 # Upgrade Validation
 
-Validate each upgraded cluster before you close its maintenance window. In a DR environment, validate the standby and the primary `global` cluster separately, before you upgrade any workload cluster. If a check fails, keep the window open and see [Upgrade Troubleshooting](./troubleshooting.mdx).
+Validate each upgraded cluster to finish its upgrade. In a DR environment, validate the standby and the primary `global` cluster separately, before you upgrade any workload cluster. If a check fails, the upgrade of the cluster is not finished; see [Upgrade Troubleshooting](./troubleshooting.mdx).
 
 ## Check the ACP Version \{#check-distribution-version}
 
-Select the `global` cluster and read the upgrade status and history of the cluster. Replace `<cluster-name>` with `global` or the workload cluster name. In a DR environment, select the primary for a workload cluster, and the side you validate for a `global` cluster. `KUBECONFIG` stays on this `global` cluster for every block on this page; commands for a workload cluster itself use `--kubeconfig`:
+Run the commands on this page from the execution host. Select the `global` cluster, which is the primary in a DR environment, for the `global` cluster and for every workload cluster:
 
 ```bash
-export KUBECONFIG=<global-kubeconfig>
-kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}{"\n"}'
+ac config use-cluster global
+ac whoami --show-server
+```
+
+Continue when the address ends with `/kubernetes/global/`. To validate the standby `global` cluster in a DR environment, run `export KUBECONFIG=<standby-kubeconfig>` instead, confirm that `ac whoami --show-server` prints the standby VIP, keep it for every block on this page, skip the `ac config use-cluster` lines, and run `unset KUBECONFIG` when you finish.
+
+Read the upgrade status and history of the cluster. Replace `<cluster-name>` with `global` or the workload cluster name:
+
+```bash
 ac adm upgrade status --cluster=<cluster-name>
-kubectl -n cpaas-system get cvsh <cluster-name> \
+ac -n cpaas-system get cvsh <cluster-name> \
   -o jsonpath='{range .status.history[*]}{.version}{"\t"}{.state}{"\t"}{.startedTime}{"\t"}{.completionTime}{"\n"}{end}'
 ```
 
-The ACP version (Distribution Version) is correct when `Upgrade` is `Completed`, `Current` shows `4.5.0`, the `Ready` condition is `True`, and `Stalled` is not `True`. The first history entry shows `4.5.0` with the state `Completed`.
+The ACP version (Distribution Version) is correct when `Upgrade` is `Completed`, `Current` shows the target version, the `Ready` condition is `True`, and `Stalled` is not `True`. The first history entry shows the target version with the state `Completed`.
 
 ## Check Kubernetes, Nodes, and Extensions \{#check-kubernetes-nodes-plugins}
 
 On the `global` cluster, check the Core and the installed Extensions of the cluster. Every module is `Running` with `CURRENT` equal to `TARGET`, and `deployStatus` is not `Upgrading`, `DeployFailed`, or `UpgradeFailed`:
 
 ```bash
-kubectl get moduleinfo -l cpaas.io/cluster-name=<cluster-name> \
+ac get moduleinfo -l cpaas.io/cluster-name=<cluster-name> \
   -o custom-columns='MODULE:.metadata.labels.cpaas\.io/module-name,CURRENT:.status.version,TARGET:.spec.version,PHASE:.status.phase'
-kubectl get clustermodule <cluster-name> -o jsonpath='{.status.base.deployStatus}{"\n"}'
+ac get clustermodule <cluster-name> -o jsonpath='{.status.base.deployStatus}{"\n"}'
 ```
 
-Then check Kubernetes, the nodes, and the Pods of the upgraded cluster with its kubeconfig, saved as described in [Prepare the Execution Host](./pre-upgrade.mdx#execution-host). For a `global` cluster, use the kubeconfig that you selected above:
+Then check Kubernetes, the nodes, and the Pods of the upgraded cluster itself. For a workload cluster, the first line switches to it and the last line switches back to `global`; for a `global` cluster, skip both lines:
 
 ```bash
-kubectl --kubeconfig=<cluster-name>.kubeconfig version
-kubectl --kubeconfig=<cluster-name>.kubeconfig get nodes
-kubectl --kubeconfig=<cluster-name>.kubeconfig get pods --all-namespaces \
+ac config use-cluster <cluster-name>   # workload cluster only
+ac version
+ac get nodes
+ac get pods --all-namespaces \
   | awk '{if ($4 != "Running" && $4 != "Completed")print}' \
   | awk -F'[/ ]+' '{if ($3 != $4)print}'
+ac config use-cluster global           # workload cluster only
 ```
 
 The server version is the Kubernetes version of the target ACP release, and every node is `Ready` with that version. Critical Pods are `Running` or `Completed`, and no Pod reports `ImagePullBackOff` or `ErrImagePull`.
 
 ## Additional Checks for Alauda OS Clusters \{#alauda-os-checks}
 
-Run these checks with the `KUBECONFIG` that you exported in [Check the ACP Version](#check-distribution-version), which selects the `global` cluster (the primary for a workload cluster in a DR environment). Check that the platform has taken over Kube-OVN and CoreDNS; use the kind that matches the provider of the cluster, `dcscluster`, `baremetalcluster`, `hcscluster`, or `vspherecluster`:
+Run these checks on the `global` cluster that you selected in [Check the ACP Version](#check-distribution-version) (the primary for a workload cluster in a DR environment). Check that the platform has taken over Kube-OVN and CoreDNS; use the kind that matches the provider of the cluster, `dcscluster`, `baremetalcluster`, `hcscluster`, or `vspherecluster`:
 
 ```bash
-kubectl -n cpaas-system get <provider-cluster-kind> <cluster-name> \
+ac -n cpaas-system get <provider-cluster-kind> <cluster-name> \
   -o jsonpath='{range .status.conditions[?(@.type=="CoreAddonsHandedOff")]}{.status}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
 ```
 
-The status is `True`. A cluster that does not use Kube-OVN has no such condition. With the reason `CoreAddonsHandoffPending`, the takeover is still in progress; read the condition again later. With the reason `CoreAddonsHandoffNotApplicable`, the cluster is not on v4.5 yet; read the condition again after its upgrade completes. With the reason `CoreAddonsHandoffBlocked`, the message names the item that blocks the takeover. If the takeover is blocked, the cluster does not pass validation, and on Huawei Cloud Stack and VMware vSphere the manual Kubernetes upgrade cannot start, so the window cannot be closed. Resolve it with technical support before you schedule the cluster. For a customized Corefile, the takeover continues only after the `kube-system/coredns` Corefile is back to the default.
+The status is `True`. A cluster that does not use Kube-OVN has no such condition. With the reason `CoreAddonsHandoffPending`, the takeover is still in progress; read the condition again later. With the reason `CoreAddonsHandoffNotApplicable`, the cluster is not on v4.5 yet; read the condition again after its upgrade completes. With `False` and the reason `CoreAddonsHandoffBlocked`, the message names the setting; contact technical support.
 
 Then run the checks for the provider of the cluster:
 
@@ -59,8 +68,8 @@ Then run the checks for the provider of the cluster:
   <Tab label="Huawei DCS">
 
 ```bash
-kubectl -n cpaas-system get infraclusterversion <cluster-name>
-kubectl -n cpaas-system get infraclusterversion <cluster-name> \
+ac -n cpaas-system get infraclusterversion <cluster-name>
+ac -n cpaas-system get infraclusterversion <cluster-name> \
   -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{"\t"}{.message}{"\n"}{end}'
 ```
 
@@ -70,12 +79,12 @@ kubectl -n cpaas-system get infraclusterversion <cluster-name> \
   <Tab label="Bare Metal">
 
 ```bash
-kubectl -n cpaas-system get infraclusterversion <cluster-name>
-kubectl -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io -l cluster.x-k8s.io/cluster-name=<cluster-name> \
+ac -n cpaas-system get infraclusterversion <cluster-name>
+ac -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io -l cluster.x-k8s.io/cluster-name=<cluster-name> \
   -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,INVENTORY:.status.machineInventoryRef.name,PLAN_SECRET:.status.planSecretRef.name'
-kubectl -n cpaas-system get machineinventories.elemental.cattle.io <inventory-name> \
+ac -n cpaas-system get machineinventories.elemental.cattle.io <inventory-name> \
   -o jsonpath='{.status.plan.state}{" storage="}{.status.storage.phase}{"\n"}'
-kubectl -n cpaas-system get secret <plan-secret-name> \
+ac -n cpaas-system get secret <plan-secret-name> \
   -o jsonpath='{.metadata.annotations.baremetal\.alauda\.io/plan\.type}{"\n"}'
 ```
 
@@ -85,7 +94,7 @@ kubectl -n cpaas-system get secret <plan-secret-name> \
   <Tab label="Huawei Cloud Stack">
 
 ```bash
-kubectl -n cpaas-system get kubeadmcontrolplane,machinedeployment -l cluster.x-k8s.io/cluster-name=<cluster-name>
+ac -n cpaas-system get kubeadmcontrolplane,machinedeployment -l cluster.x-k8s.io/cluster-name=<cluster-name>
 ```
 
 On every row, `VERSION` is the target Kubernetes version, and `READY` and `UPDATED` equal `REPLICAS`.
@@ -94,9 +103,9 @@ On every row, `VERSION` is the target Kubernetes version, and `READY` and `UPDAT
   <Tab label="VMware vSphere">
 
 ```bash
-kubectl -n cpaas-system get kubeadmcontrolplane,machinedeployment -l cluster.x-k8s.io/cluster-name=<cluster-name>
-kubectl -n cpaas-system get vspheremachineconfigpool
-kubectl -n cpaas-system get vspheremachineconfigpool <pool-name> \
+ac -n cpaas-system get kubeadmcontrolplane,machinedeployment -l cluster.x-k8s.io/cluster-name=<cluster-name>
+ac -n cpaas-system get vspheremachineconfigpool
+ac -n cpaas-system get vspheremachineconfigpool <pool-name> \
   -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}{range .status.persistentDiskStatuses[*]}{.hostname}{" "}{.name}{" "}{.phase}{"\n"}{end}'
 ```
 
@@ -111,7 +120,7 @@ Open the platform Web UI and confirm that login, cluster pages, and Marketplace 
 
 ## Next Step
 
-After you validate the `global` clusters, continue with [Upgrade Workload Clusters](./workload/upgrade_workload_cluster.mdx). After you validate a workload cluster, return to [Upgrade Workload Clusters](./workload/upgrade_workload_cluster.mdx) for the next cluster of the window; close the window when every cluster of the window is validated. After the last cluster, continue with [After All Clusters Are Upgraded](#after-all-clusters).
+After you validate the `global` clusters, continue with [Upgrade Workload Clusters](./workload/upgrade_workload_cluster.mdx). After you validate a workload cluster, return to that page for the next cluster. After the last cluster, continue with [After All Clusters Are Upgraded](#after-all-clusters).
 
 ## After All Clusters Are Upgraded \{#after-all-clusters}
 
