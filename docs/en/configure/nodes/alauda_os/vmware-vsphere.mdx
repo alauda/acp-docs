@@ -1,0 +1,288 @@
+---
+weight: 60
+title: Manage Nodes on VMware vSphere
+author: dev@alauda.io
+category: howto
+queries:
+  - manage vmware vsphere worker nodes
+  - scale worker nodes on vsphere cluster
+  - update worker node pool on vsphere
+  - change vsphere worker network or disks
+---
+
+# Manage Nodes on VMware vSphere
+
+This document explains how to manage worker nodes on VMware vSphere after the baseline cluster is running. Node lifecycle operations are managed through `VSphereMachineConfigPool`, `VSphereMachineTemplate`, `KubeadmConfigTemplate`, and `MachineDeployment` resources.
+
+To add another worker node pool with YAML, follow [Create the worker objects](../../../workload_clusters/alauda_os/vmware-vsphere/create_cluster.mdx#create-the-worker-objects) on the cluster creation page.
+
+:::info
+To upgrade the Kubernetes version of the nodes, see [Upgrade Kubernetes on VMware vSphere](../../../upgrade/workload/alauda_os/vmware-vsphere.mdx).
+:::
+
+## Prerequisites \{#prerequisites}
+
+Before you begin, ensure the following conditions are met:
+
+- The workload cluster was created successfully. See [Create a Cluster on VMware vSphere](../../../workload_clusters/alauda_os/vmware-vsphere/create_cluster.mdx).
+- The worker machine config pool has enough available slots.
+- The control plane is healthy and reachable.
+- You know which manifest files currently define the worker nodes.
+- You know the rollout and pool rules in [Provider Requirements](../../../workload_clusters/alauda_os/vmware-vsphere/create_cluster.mdx#provider-requirements).
+- To manage the nodes of the `global` cluster itself, the provider must be installed on `global` first; see [Manage Nodes on Alauda OS Clusters](./index.mdx).
+
+:::warning
+**A Day-2 `apply` can be rejected**
+
+The rollout and pool rules apply to every edit this page makes:
+
+- Re-applying an archived `MachineDeployment` manifest re-submits the whole object, including an apply whose only intended change is `replicas`. Before you apply it, confirm the file sets `strategy.rollingUpdate.maxSurge: 0`; the examples use `maxUnavailable: 1`. With the default `maxSurge` of `1`, the rollout needs an extra slot that a full pool does not have, and it stalls. `strategy.type: OnDelete` needs no surge setting.
+- A `KubeadmControlPlane` must set `spec.rolloutStrategy.rollingUpdate.maxSurge: 0` and `spec.replicas` of `3` or more, or an edit to it is rejected. See [Check the manifests against the admission rules](../../../upgrade/workload/alauda_os/vmware-vsphere.mdx#preflight-admission-rules).
+- A slot whose `status.configStatuses[].state` is `InUse` or `Released` cannot be removed, cannot have its `network.primary.ip` or `.ipv6` changed, and cannot lose a disk from `persistentDisks[]` or change one's `sizeGiB` or `mountPath`. Adding a slot is accepted. Do not add a disk to such a slot; see [Allocated slot restrictions](../../../workload_clusters/alauda_os/vmware-vsphere/create_cluster.mdx#create-the-machine-config-pools).
+
+Match a rejection message against [Admission rejections](../../../workload_clusters/alauda_os/vmware-vsphere/create_cluster.mdx#admission-rejections).
+:::
+
+## Steps
+
+<Steps>
+### Scale out worker nodes
+
+When you add more worker nodes, update the worker machine config pool before you increase the replica count.
+
+Worker scale-out depends on the relationship between `MachineDeployment.spec.replicas` and the available node slots in `VSphereMachineConfigPool.spec.configs[]`. The number of slots can be greater than `replicas`, and idle slots do not affect a running cluster. If `replicas` exceeds the number of available slots, CAPV cannot assign the new workers correctly.
+
+1. Add one or more new node slots to `17-vspheremachineconfigpool-worker.yaml`.
+2. Update `replicas` in `30-workers-md-0.yaml`.
+3. Apply the updated manifests.
+
+The following example adds a worker slot with the required data disks:
+
+```yaml
+- hostname: "<worker_node_name_2>"
+  datacenter: "<worker_02_datacenter>"
+  network:
+    primary:
+      networkName: "<nic1_network_name>"
+      ip: "<worker_02_nic1_ip>/<nic1_prefix>"
+      gateway: "<nic1_gateway>"
+      dns:
+      - "<nic1_dns_1>"
+  persistentDisks:
+  - name: var-cpaas
+    sizeGiB: <worker_var_cpaas_size_gib>
+    mountPath: /var/cpaas
+    fsFormat: ext4
+  ephemeralDisks:
+  - name: var-lib-kubelet
+    sizeGiB: <worker_var_lib_kubelet_size_gib>
+    mountPath: /var/lib/kubelet
+    fsFormat: ext4
+  - name: var-lib-containerd
+    sizeGiB: <worker_var_lib_containerd_size_gib>
+    mountPath: /var/lib/containerd
+    fsFormat: ext4
+```
+
+The example uses the disk layout of a cluster created on provider `v1.0.17`. A pool created on an earlier provider has no `ephemeralDisks[]` and declares `/var/cpaas`, `/var/lib/containerd`, and `/var/lib/etcd` in `persistentDisks[]`; match the slots that pool already has instead of introducing `ephemeralDisks[]` into it.
+
+To attach an additional raw disk without formatting or mounting, omit `mountPath` and `fsFormat`:
+
+```yaml
+  persistentDisks:
+  # ...standard persistent disks...
+  - name: app-data
+    sizeGiB: 50
+```
+
+The raw disk is available inside the guest OS at `/dev/disk/by-capv/app-data`. On rolling updates, the same VMDK is re-attached to the replacement VM and the symlink is recreated. The application remains responsible for the disk contents and runtime mount.
+
+Then increase the worker replicas:
+
+```yaml
+replicas: <worker_replicas>
+```
+
+Use the following order:
+
+```bash
+kubectl apply -f 17-vspheremachineconfigpool-worker.yaml
+kubectl apply -f 30-workers-md-0.yaml
+```
+
+The second command replaces the whole `MachineDeployment` spec, not only `replicas`. Confirm the archived file carries `strategy.rollingUpdate.maxSurge: 0` before you apply it.
+
+**Note:** Keep the same existing `VSphereMachineConfigPool.metadata.name` when scale-out or replacement must preserve the logical pool. Slots and VMDKs are not reused across differently named pool objects. `releaseDelayHours` is the reclaim grace period for an unused `Released` slot, not a delay before same-pool reuse.
+
+### Roll out updated worker node configuration \{#roll-out-updated-worker-node-configuration}
+
+When you need to change worker VM specifications, create a new `VSphereMachineTemplate` and update the `MachineDeployment` to reference it. This triggers a rolling update that replaces worker nodes with the new configuration.
+
+Typical changes include:
+
+- VM template name (`spec.template.spec.template`)
+- CPU or memory sizing (`numCPUs`, `memoryMiB`)
+- System disk sizing (`diskGiB`)
+- VM network devices (`network.devices`)
+
+To move nodes onto a new Alauda OS image while the Kubernetes version stays the same, follow [OS Image Update Without a Kubernetes Version Change](../../../upgrade/workload/alauda_os/vmware-vsphere.mdx#os-image-only-rollout) instead. If the Kubernetes version changes too, see [Upgrade Kubernetes on VMware vSphere](../../../upgrade/workload/alauda_os/vmware-vsphere.mdx).
+
+Persistent disks are declared in `VSphereMachineConfigPool` slots rather than in `VSphereMachineTemplate`, so a new template does not change them. A slot that is `InUse` or `Released` rejects changing an existing disk's `sizeGiB` or `mountPath`, so a different geometry for an existing disk needs a new slot, not an edit of the current one. See [Allocated slot restrictions](../../../workload_clusters/alauda_os/vmware-vsphere/create_cluster.mdx#create-the-machine-config-pools).
+
+1. **Export the existing template**
+
+   ```bash
+   kubectl get vspheremachinetemplate <cluster_name>-worker -n <namespace> -o yaml > new-worker-template.yaml
+   ```
+
+2. **Modify the template**
+
+   Edit `new-worker-template.yaml`:
+   - Set `metadata.name` to a new unique name (for example, `<cluster_name>-worker-v2`)
+   - Update the desired specification fields
+   - Remove server-generated fields: `metadata.resourceVersion`, `metadata.uid`, `metadata.generation`, `metadata.creationTimestamp`, `metadata.managedFields`, `metadata.annotations["kubectl.kubernetes.io/last-applied-configuration"]`, and `status`
+
+3. **Apply the new template**
+
+   ```bash
+   kubectl apply -f new-worker-template.yaml
+   ```
+
+4. **Update the MachineDeployment reference**
+
+   ```bash
+   kubectl patch machinedeployment <cluster_name>-md-0 -n <namespace> \
+     --type='merge' -p='{
+       "spec": {
+         "template": {
+           "spec": {
+             "infrastructureRef": {
+               "name": "<new-template-name>"
+             }
+           }
+         }
+       }
+     }'
+   ```
+
+   If you also need to change bootstrap settings, see [Updating Bootstrap Templates](#updating-bootstrap-templates) below.
+
+5. **Monitor the rolling update**
+
+   ```bash
+   kubectl -n <namespace> get machinedeployment <cluster_name>-md-0 -w
+   kubectl -n <namespace> get machine
+   ```
+
+To change the machine specification of control plane nodes, use the same steps and patch `KubeadmControlPlane.spec.machineTemplate.infrastructureRef.name` instead.
+
+:::tip
+**Rolling back a failed update**
+
+If the rolling update fails (for example, new VMs fail to boot), revert the `MachineDeployment` reference back to the previous template name. This works only while the Kubernetes minor version is unchanged. The old template still exists and Cluster API will roll back to it.
+:::
+
+### Verify worker node status
+
+Run the following commands to verify the management-cluster and workload-cluster status:
+
+```bash
+kubectl -n <namespace> get machinedeployment,machine,vspheremachine,vspherevm
+kubectl --kubeconfig=/tmp/<cluster_name>.kubeconfig get nodes -o wide
+```
+
+Confirm the following results:
+
+- The target worker replica count is reached.
+- Every new worker node joins the cluster.
+- The nodes eventually become `Ready`.
+
+</Steps>
+
+## Updating Bootstrap Templates \{#updating-bootstrap-templates}
+
+To update bootstrap configuration, create a new `KubeadmConfigTemplate` and update the `MachineDeployment` reference.
+
+1. **Export the existing template**
+
+   ```bash
+   kubectl get kubeadmconfigtemplate <cluster_name>-worker-bootstrap -n <namespace> -o yaml > new-bootstrap-template.yaml
+   ```
+
+2. **Modify the template**
+
+   Edit `new-bootstrap-template.yaml`:
+   - Set `metadata.name` to a new unique name (for example, `<cluster_name>-worker-bootstrap-v2`)
+   - Update the desired bootstrap configuration fields
+   - For Kubernetes 1.35 or later, add the [required kubelet patch settings](../../../upgrade/workload/alauda_os/index.mdx#kubernetes-1-35-kubelet-patch) to `/etc/kubernetes/patches/kubeletconfiguration0+strategic.json`
+   - Remove the same server-generated fields listed in [Roll out updated worker node configuration](#roll-out-updated-worker-node-configuration) step 2
+
+3. **Apply the new template**
+
+   ```bash
+   kubectl apply -f new-bootstrap-template.yaml
+   ```
+
+4. **Update the MachineDeployment reference**
+
+   ```bash
+   kubectl patch machinedeployment <cluster_name>-md-0 -n <namespace> \
+     --type='merge' -p='{
+       "spec": {
+         "template": {
+           "spec": {
+             "bootstrap": {
+               "configRef": {
+                 "name": "<new-bootstrap-template-name>"
+               }
+             }
+           }
+         }
+       }
+     }'
+   ```
+
+   The Cluster API controller triggers a rolling update. Existing machines continue using the old bootstrap configuration until they are replaced.
+
+## Runtime Topology Changes \{#runtime-topology-changes}
+
+Networking, placement, and disk topology are part of the machine templates and machine config pool. Treat a change to these fields as a rollout of replacement machines, not as an in-place VM edit:
+
+1. Add the required slot definitions to the existing `VSphereMachineConfigPool` before increasing replicas or starting replacement. An allocated slot rejects some changes; see the warning in [Prerequisites](#prerequisites).
+2. Create a new `VSphereMachineTemplate` when its VM, network, placement, or system-disk fields change.
+3. Create a new `KubeadmConfigTemplate` when bootstrap files or node configuration change.
+4. Update the `MachineDeployment` references only after the new pool capacity and templates exist.
+5. Monitor replacement Machines and confirm that every node becomes `Ready` before removing old templates.
+
+For the exact second-NIC, failure-domain, and persistent-disk fields, use the creation-time variants in [Create a Cluster on VMware vSphere](../../../workload_clusters/alauda_os/vmware-vsphere/create_cluster.mdx#creation-time-topology-variants). Preserve the same cross-resource relationships during Day-2 changes:
+
+- Keep `VSphereMachineConfigPool.spec.configs[].network.additional`, `VSphereMachineTemplate.spec.template.spec.network.devices`, and `VSphereFailureDomain.spec.topology.networks` consistent when NIC topology changes.
+- Configure `VSphereCluster.spec.failureDomainSelector` and the CPI `[Labels]` block together when enabling failure domains.
+- Do not remove the required `var-cpaas` persistent disk, or the required `var-lib-kubelet` and `var-lib-containerd` ephemeral disks, or the control-plane `var-lib-etcd` ephemeral disk.
+- Keep a new slot's disk lists identical to the slots already in that pool. `ephemeralDisks[]` exists from provider `v1.0.17`, but a pool created on an earlier provider declares `/var/cpaas`, `/var/lib/containerd`, and `/var/lib/etcd` in `persistentDisks[]`; do not convert those slots, and do not mix layouts inside one pool.
+- Do not reshape or add disks to an allocated slot. A slot that is `InUse` or `Released` rejects removing a persistent disk or changing its `sizeGiB` or `mountPath`. Resizing means planning a new slot.
+- Do not treat `machineNamingStrategy`, `wipeFilesystem`, or `releaseDelayHours` as a switch that moves disks between pools or accelerates datastore cleanup.
+
+When you expand from one NIC to two NICs, update all of the following fields together:
+
+1. Append the second NIC entry to `VSphereMachineConfigPool.spec.configs[].network.additional`; keep `network.primary` unchanged.
+2. Add the second device to `VSphereMachineTemplate.spec.template.spec.network.devices` in the new template.
+3. Add the second network to `VSphereFailureDomain.spec.topology.networks` when failure domains are enabled.
+
+When you revert from two NICs to one NIC, remove the corresponding second entry from all three fields. Leave `network.additional` empty or remove the key entirely, and roll out a new `VSphereMachineTemplate`; do not edit existing VMs directly.
+
+## Troubleshooting
+
+Use the following checks first when worker node management fails:
+
+- Check `VSphereMachine` conditions for `MachineConfigPoolReady`. If `False`, the reason indicates why slot allocation failed:
+  - `PoolBoundToOtherConsumer`: the pool is already bound to a different `KubeadmControlPlane` or `MachineDeployment`.
+  - `NoAvailableSlots`: no slots match the required datacenter or failure domain.
+- Verify that the worker machine config pool still has free slots.
+- Verify that the worker IP addresses, gateway, and DNS settings are correct.
+- Verify that the worker VM template still matches the required Kubernetes version and guest-tools requirements.
+- Check `VSphereVM.status.addresses` when a node is waiting for IP allocation.
+
+## Next Steps
+
+For infrastructure preparation and persistent-disk diagnostics, see [VMware vSphere Infrastructure Preparation](../../../workload_clusters/alauda_os/vmware-vsphere/infrastructure.mdx). For cluster creation manifest fields, see [Create a Cluster on VMware vSphere](../../../workload_clusters/alauda_os/vmware-vsphere/create_cluster.mdx).
