@@ -1,0 +1,314 @@
+---
+weight: 30
+title: Huawei Cloud Stack
+author: chaozhou@alauda.io
+category: howto
+queries:
+  - upgrade hcs cluster
+  - hcs kubernetes upgrade
+  - hcs cluster version update
+  - hcs upgrade preserve persistent disks
+---
+
+# Upgrade Kubernetes on Huawei Cloud Stack
+
+This guide explains how to upgrade Kubernetes clusters on Huawei Cloud Stack with minimal downtime, while preserving stability and data integrity.
+
+:::info
+**Where this page fits in the full ACP upgrade flow**
+
+This page covers only the Kubernetes step of the upgrade. The full ACP upgrade flow — including upgrade artifact synchronization, ACP Core upgrade through CVO, Aligned plugin upgrades, and Agnostic plugin upgrades from Marketplace — is documented in the following pages. Complete those steps before you start the Kubernetes step on this page:
+
+- [Upgrade Overview (scope and sequencing)](../../overview.mdx)
+- [Pre-Upgrade Preparation](../../pre-upgrade.mdx)
+- [Upgrade the Distribution Version of the `global` cluster (Core, Aligned, Agnostic)](../../global/upgrade_global_cluster.mdx)
+- [Upgrade the Distribution Version of workload clusters (Core, Aligned, Agnostic)](../upgrade_workload_cluster.mdx)
+
+Use this page when the same cluster runs on Alauda OS, because the Kubernetes step there replaces nodes from a new VM template rather than upgrading binaries in place.
+:::
+
+:::info
+**Existing Cluster Migration**
+
+If your cluster runs ACP `v4.3.1` or later and still keeps preserved data in `HCSMachineTemplate.spec.template.spec.dataVolumes[]`, complete the migration procedure in [Migrate Existing Huawei Cloud Stack Clusters to Pool-Managed Persistent Disks](./hcs_persistent_disk_upgrade.mdx) before you rely on upgrade-time disk preservation.
+:::
+
+## Overview
+
+Cluster upgrades on HCS encompass multiple components and follow a structured approach to ensure system reliability:
+
+- **Control Plane Upgrades**: Update Kubernetes control plane components and underlying infrastructure
+- **Worker Node Upgrades**: Upgrade worker nodes with new machine images and Kubernetes versions
+- **Infrastructure Updates**: Modify virtual machine specifications, storage, and network configurations
+
+## Upgrade Sequence
+
+Upgrade HCS clusters in the following order:
+
+1. **(Prerequisite)** Upgrade the ACP platform on the management cluster first. This brings the `cluster-api-provider-hcs` controller and the related CAPI components to versions that understand the new schema. Trigger workload-cluster upgrades only after the management-side controllers have rolled out and become Ready.
+2. Upgrade the Distribution Version on the workload cluster. See [Upgrade the Distribution Version](../upgrade_workload_cluster.mdx).
+3. Upgrade Kube-OVN to the chart version required by the target ACP release and wait for the `AppRelease` to reach `Success`.
+4. Upgrade the control plane Kubernetes version.
+5. Upgrade worker nodes to the target Kubernetes version.
+
+Cluster API orchestrates rolling updates with built-in safety mechanisms to reduce service disruption.
+
+:::warning
+Skipping step 1 risks two failure modes: the old controller silently ignores new schema fields written to `HCSMachineConfigPool` / `HCSMachineTemplate`; or a controller image swap mid-rollout interrupts persistent-disk state-machine progression. Always settle the management-side upgrade before touching workload rollout.
+:::
+
+## Prerequisites \{#prerequisites}
+
+Before you start, ensure all of the following prerequisites are met:
+
+- The Distribution Version upgrade is complete.
+- The control plane is reachable.
+- All nodes are healthy and in `Ready` state.
+- A current etcd backup has been taken and verified by using the supported ACP backup procedure.
+- The VM image created from the Alauda OS image published for the target ACP release is present in the HCS environment. The upgrade fails if the image is not present when the new `HCSMachineTemplate` is applied.
+- For cross-version upgrades that span more than one Kubernetes minor, the intermediate-version Core images and VM images are pre-staged. See [Cross-Version Upgrade Preparation](./index.mdx#cross-version-preparation).
+- The target Kubernetes version is compatible with your workloads and add-ons.
+- Review the Kubernetes upgrade path and version skew policy.
+- Any node-local state that must survive replacement is declared in `HCSMachineConfigPool.spec.configs[].persistentDisks[]`, not in `HCSMachineTemplate.spec.template.spec.dataVolumes[]`.
+
+For initial deployment, see the [Create Cluster](../../../workload_clusters/alauda_os/huawei-cloud-stack/create_cluster.mdx) guide.
+
+:::warning
+**Single-Control-Plane Clusters**
+
+The upgrade workflow in this document applies to HCS clusters with a highly available control plane. Single-control-plane HCS clusters are supported for creation, but they are not supported for upgrade through this workflow.
+:::
+
+:::warning
+**Disk Preservation Model**
+
+Upgrades rely on Cluster API's rolling replacement mechanism. The HCS provider has four disk classes:
+
+| Disk class | Declared in | Survives upgrade? | Use for |
+|---|---|---|---|
+| System disk (root volume) | `HCSMachineTemplate.spec.template.spec.rootVolume` | ❌ Never | OS + kubelet/kubeadm/containerd. Rebuilt from the new VM image every replacement. |
+| Data volumes | `HCSMachineTemplate.spec.template.spec.dataVolumes` | ❌ Never | Temporary node-local paths that can be recreated with each ECS. Volumes attached to the old VM may be deleted together with it. |
+| Pool-managed persistent disks | `HCSMachineConfigPool.spec.configs[].persistentDisks[]` | ✅ Yes | Node-local state that must survive delete-recreate replacement, such as `/var/cpaas`. |
+| External CSI volumes (HCS EVS CSI, etc.) | Workload PVCs / CSI driver | ✅ Unrelated to node lifecycle | Application data. Use this path for any state that must survive upgrades. |
+
+Do not treat node-local data on HCS `dataVolumes[]` as preserved state. Move `/var/cpaas` and any other retained node-local paths to pool-managed persistent disks before the rolling replacement.
+:::
+
+:::info
+**Use a New Machine Template for Each Upgrade Step**
+
+Every upgrade step on this page creates a new `HCSMachineTemplate` with a new `metadata.name`, applies it, and then patches the `infrastructureRef.name` of the `KubeadmControlPlane` or `MachineDeployment` to the new template. Keep the previous template until the new rollout is healthy in case rollback is required.
+:::
+
+:::info
+**Fleet Essentials boundary**
+
+Fleet Essentials 1.0.4 and later can request the ACP 4.3-and-later Distribution Version upgrade through CVO. It does not perform the HCS Kubernetes and Alauda OS replacement described on this page. Complete Phase 1 with the ACP workflow, then use the YAML procedure below for Phase 2.
+:::
+
+## Control Plane Upgrades
+
+Control plane upgrades update the Kubernetes API server, etcd, scheduler, and controller manager, along with the underlying VM infrastructure.
+
+For HCS control planes backed by an `HCSMachineConfigPool` that uses pool-managed persistent disks, keep `KubeadmControlPlane.spec.rolloutStrategy.rollingUpdate.maxSurge: 0` during upgrades. Persistent disks are bound to fixed `(hostname, slot)` identities, so the rollout must remove the old machine before the replacement machine can reuse the same disk.
+
+### Infrastructure Image Updates
+
+Upgrading the underlying machine images for control plane nodes provides security patches, performance improvements, and updated system components.
+
+#### Procedure
+
+1. **Create Updated Machine Template**
+
+   Copy the existing `HCSMachineTemplate` referenced by `KubeadmControlPlane` and modify the required specifications:
+
+   ```bash
+   kubectl get hcsmachinetemplate <current-template-name> -n cpaas-system -o yaml > new-cp-template.yaml
+   ```
+
+2. **Modify Template Specifications**
+
+   Modify the new template:
+   - Set `metadata.name` to `<new-template-name>`
+   - Remove server-generated metadata and status fields from the copied manifest.
+   - Leave runtime identity fields unset, including `spec.template.spec.providerID` and `spec.template.spec.serverId`. The HCS provider assigns these values when it creates instances.
+   - Keep preserved paths such as `/var/cpaas` out of `spec.template.spec.dataVolumes[]`. Declare those paths in the referenced `HCSMachineConfigPool.spec.configs[].persistentDisks[]`.
+   - Update as needed:
+     - `spec.template.spec.imageName`
+     - `spec.template.spec.flavorName`
+     - `spec.template.spec.rootVolume.size`
+     - `spec.template.spec.dataVolumes` for temporary disks only
+
+3. **Deploy Updated Template**
+
+   Apply the new machine template:
+
+   ```bash
+   kubectl apply -f new-cp-template.yaml -n cpaas-system
+   ```
+
+4. **Update Control Plane Reference**
+
+   Modify the `KubeadmControlPlane` resource to reference the new template:
+
+   ```bash
+   kubectl patch kubeadmcontrolplane <kcp-name> -n cpaas-system --type='merge' -p='{"spec":{"machineTemplate":{"infrastructureRef":{"name":"<new-template-name>"}}}}'
+   ```
+
+5. **Monitor Rolling Update**
+
+   The control plane will automatically perform a rolling update:
+
+   ```bash
+   kubectl get kubeadmcontrolplane <kcp-name> -n cpaas-system -w
+   kubectl get machines -n cpaas-system -l cluster.x-k8s.io/control-plane
+   ```
+
+### Kubernetes Version Upgrades
+
+Upgrading the Kubernetes version involves updating both the control plane software and the supporting virtual machine images.
+
+#### Required Values From the OS Support Matrix \{#required-values}
+
+The authoritative mapping between an ACP release, the Kubernetes version, and the matching CoreDNS, etcd, and Kube-OVN versions lives in [OS Support Matrix](../../../overview/alauda_os_support_matrix.mdx). Locate the row that corresponds to the target ACP version before you start; the row supplies the component values the procedure below needs.
+
+The ECS image name is not in the matrix. It is the name the image was uploaded under in HCS from the Alauda OS image published for the target ACP release — see [Downloading Alauda OS](../../../overview/alauda_os_support_matrix.mdx#downloading-alauda-os) — and it is what `HCSMachineTemplate.spec.template.spec.imageName` must be set to on both the control plane and worker templates.
+
+The cells you read from that row map to the upgrade manifests as follows:
+
+| OS Support Matrix column | Used to set | Where it lands |
+|---|---|---|
+| **Kubernetes Version** | `KubeadmControlPlane.spec.version` and `MachineDeployment.spec.template.spec.version` | Both control plane and worker |
+| **coredns** | `KubeadmControlPlane.spec.kubeadmConfigSpec.clusterConfiguration.dns.imageTag` | Control plane only |
+| **etcd** | `KubeadmControlPlane.spec.kubeadmConfigSpec.clusterConfiguration.etcd.local.imageTag` | Control plane only |
+| **kube-ovn (chart)** | `Cluster.metadata.annotations["cpaas.io/kube-ovn-version"]` and the provider-managed `cni-kube-ovn` `AppRelease` | Complete the shared [provider-version-specific Kube-OVN procedure](./index.mdx#upgrade-kube-ovn-before-the-control-plane) before changing `KubeadmControlPlane`. The provider version and target chart version determine the chart name and whether a legacy direct revision patch is required. |
+
+The CoreDNS and etcd image tags are control-plane-only because `clusterConfiguration` is a `KubeadmControlPlane` field. Worker nodes inherit container image versions from the new VM template; the `MachineDeployment` does not carry its own `dns`/`etcd` tags. The Kube-OVN annotation lives on the `Cluster` resource, not on `KubeadmControlPlane`, because the HCS provider watches it independently of the Kubernetes control plane rollout.
+
+#### Upgrade Kube-OVN Before the Control Plane \{#upgrade-kube-ovn-before-the-control-plane}
+
+Follow [Upgrade Kube-OVN Before the Control Plane](./index.mdx#upgrade-kube-ovn-before-the-control-plane) and select the Huawei Cloud Stack procedure that matches the **installed** HCS provider version. That shared procedure owns the provider version boundary, the Kube-OVN chart-name migration at `v4.4`, legacy behavior, and the required `AppRelease` health checks.
+
+Do not use the legacy direct `targetRevision` patch for a Kube-OVN `v4.4+` target. Upgrade the HCS provider to `v1.0.4` or later first so it can reconcile the complete source and the related component repository changes.
+
+#### Upgrade the Control Plane Kubernetes Version
+
+Complete the shared [Upgrade Kube-OVN Before the Control Plane](./index.mdx#upgrade-kube-ovn-before-the-control-plane) procedure and verify that the `cni-kube-ovn` `AppRelease` is at the target revision with `phase=Success` before continuing.
+
+1. **Create a new `HCSMachineTemplate` for the target Kubernetes version**
+
+   Copy the existing control-plane template and apply it under a new `metadata.name` with the target `imageName`:
+
+   ```bash
+   kubectl get hcsmachinetemplate <current-cp-template-name> -n cpaas-system -o yaml > new-cp-template.yaml
+   ```
+
+   In `new-cp-template.yaml`:
+   - Set `metadata.name` to `<new-template-name>`.
+   - Set `spec.template.spec.imageName` to the name of the target Alauda OS image as uploaded to HCS.
+   - Strip server-generated metadata (`resourceVersion`, `uid`, `generation`, `creationTimestamp`, `managedFields`, `kubectl.kubernetes.io/last-applied-configuration` annotation) and the entire `status` field.
+   - Leave runtime identity fields unset, including `spec.template.spec.providerID` and `spec.template.spec.serverId`. The HCS provider sets `providerID` to `hcs://<cluster-name>/<machine-name>` and `serverId` to the HCS ECS instance ID after the VM is created; pre-filling them in the template breaks the controller's identity binding.
+
+     ```bash
+     kubectl apply -f new-cp-template.yaml -n cpaas-system
+     ```
+
+2. **Patch the `KubeadmControlPlane` with the target Kubernetes values**
+
+   Update the `KubeadmControlPlane` resource in a single edit to keep `spec.version`, the CoreDNS image tag, the etcd image tag, and the infrastructure template reference consistent with the same Alauda OS release:
+
+   - `spec.version` ← **Kubernetes Version** from the OS Support Matrix row
+   - `spec.kubeadmConfigSpec.clusterConfiguration.dns.imageTag` ← **coredns** column from the same row
+   - `spec.kubeadmConfigSpec.clusterConfiguration.etcd.local.imageTag` ← **etcd** column from the same row
+   - `spec.machineTemplate.infrastructureRef.name` ← the new `HCSMachineTemplate` name created in step 1
+   - When the target is Kubernetes 1.35 or later, update `/etc/kubernetes/patches/kubeletconfiguration0+strategic.json` in `spec.kubeadmConfigSpec.files` in this same edit, as described in [Required kubelet patch for Kubernetes 1.35](./index.mdx#kubernetes-1-35-kubelet-patch)
+
+     ```bash
+     kubectl edit kubeadmcontrolplane <kcp-name> -n cpaas-system
+     ```
+
+   Updating only `spec.version` is not sufficient. The CoreDNS and etcd image tags must move together with the Kubernetes version because they are built from the same Alauda OS release; leaving them at the previous values can result in CoreDNS and etcd pods that do not match the new Kubernetes minor version.
+
+   Keep `spec.rolloutStrategy.rollingUpdate.maxSurge: 0` when the referenced control plane pool uses persistent disks. The replacement machine must reuse the same fixed hostname and disk slot after the old machine is removed.
+
+3. **Verify Upgrade Progress**
+
+   Monitor the rolling upgrade process:
+
+   ```bash
+   # Check control plane status
+   kubectl get kubeadmcontrolplane <kcp-name> -n cpaas-system
+
+   # Monitor individual machines
+   kubectl get machines -n cpaas-system -l cluster.x-k8s.io/control-plane
+
+   # Verify cluster health
+   kubectl get nodes
+   ```
+
+## Worker Node Upgrades \{#worker-node-upgrades}
+
+Worker node upgrades are managed via `MachineDeployment` resources.
+
+### Upgrade the Worker Kubernetes Version \{#upgrade-worker-kubernetes-version}
+
+Kubernetes version upgrades require coordinated updates to both the `MachineDeployment` and the underlying VM template.
+
+**Note:** Ensure the VM template's Kubernetes version matches the version specified in the `MachineDeployment`. Mismatched versions will cause node join failures.
+
+**Procedure**:
+
+1. **Update Machine Template**
+
+   Create a new `HCSMachineTemplate` with an updated `imageName` that supports the target Kubernetes version. For the export, rename, and apply commands, see [Changing Machine Infrastructure](../../../configure/nodes/alauda_os/huawei-cloud-stack.mdx#changing-machine-infrastructure).
+
+2. **Create a new bootstrap template for Kubernetes 1.35 or later**
+
+   If the target is Kubernetes 1.35 or later, clone the current `KubeadmConfigTemplate` under a new name and add the [required kubelet patch settings](./index.mdx#kubernetes-1-35-kubelet-patch) to `/etc/kubernetes/patches/kubeletconfiguration0+strategic.json`. For the export, edit, and apply steps, see [Updating Bootstrap Templates](../../../configure/nodes/alauda_os/huawei-cloud-stack.mdx#updating-bootstrap-templates). Skip this step for earlier versions unless the release has another bootstrap change.
+
+3. **Update MachineDeployment**
+
+   Modify the following fields:
+   - `spec.template.spec.version` - Target Kubernetes version
+   - `spec.template.spec.infrastructureRef.name` - New machine template name
+   - `spec.template.spec.bootstrap.configRef.name` - New bootstrap template name; required for Kubernetes 1.35 or later
+
+     ```bash
+     kubectl patch machinedeployment <cluster-name>-md-0 -n cpaas-system \
+       --type='merge' -p='{"spec":{"template":{"spec":{"version":"<kubernetes-version>","infrastructureRef":{"name":"<new-template>"},"bootstrap":{"configRef":{"name":"<new-bootstrap-template>"}}}}}}'
+     ```
+
+   The command includes the bootstrap reference required for Kubernetes 1.35 or later. For an earlier target with no bootstrap change, omit the `bootstrap` object.
+
+4. **Monitor Upgrade**
+
+   Verify that new nodes join the cluster with the correct Kubernetes version:
+
+   ```bash
+   kubectl get nodes
+   ```
+
+## Recovering From a Failed Phase 2 Upgrade
+
+Do not treat a Kubernetes minor downgrade as an ordinary rollback. Choose the recovery path from the rollout stage:
+
+1. **No target-version control-plane `Machine` has been created**: restore the previous Kube-OVN state and the previous `KubeadmControlPlane` and `MachineDeployment` manifest values. This cancels the target rollout before a new control-plane data format is introduced.
+2. **Only the machine template or OS image changed, and the Kubernetes minor did not change**: point the controlling resource back to the previous template. Cluster API performs another replacement rollout. Keep the Kubernetes minor unchanged.
+3. **A control-plane `Machine` on the target Kubernetes minor has joined the cluster**: do not patch Kubernetes, CoreDNS, or etcd back to the previous minor. Stop further rollout, repair forward on the target minor, or restore the cluster from the verified pre-upgrade backup by using the supported ACP recovery procedure.
+
+If a target-minor control-plane `Machine` was created but never joined, first restore healthy etcd quorum and determine whether the failed replacement can be removed safely. Do not assume that changing the version fields alone is sufficient.
+
+Keep these infrastructure facts in mind during any recovery:
+
+- **The old VMs are gone.** They were destroyed during the upgrade. Template recovery builds a fresh set of replacement machines; it does not restore the original VMs.
+- **The old `HCSMachineTemplate` resource must still exist.** Do not delete the previous template until the new rollout is healthy. If you already deleted it, recreate it from version control or backup before attempting same-minor template recovery.
+- **Only pool-managed persistent disks preserve node-local state.** Data written to `HCSMachineTemplate.spec.template.spec.dataVolumes[]` during the upgrade window is lost when that VM is replaced. Data written to disks declared in `HCSMachineConfigPool.spec.configs[].persistentDisks[]` is retained and reattached to the replacement VM. Application data should still use external persistent storage such as HCS EVS CSI unless your operational design explicitly depends on node-local state.
+
+For stage 1, use the HCS rule in [Restore Kube-OVN During Stage-1 Recovery](./index.mdx#restore-kube-ovn-during-stage-1-recovery). The recovery action depends on the installed provider version: current providers restore the complete source from the annotation, while legacy providers require the earlier-chart revision patch. Wait until the restored `AppRelease` passes the shared verification before changing control-plane manifests.
+
+The `KubeadmControlPlane` controller can block replacement while etcd is unhealthy. Recover quorum before retrying any safe replacement action.
+
+## Additional Resources
+
+- [Cluster API Upgrade Documentation](https://cluster-api.sigs.k8s.io/tasks/upgrading-clusters)
+- [Kubernetes Version Skew Policy](https://kubernetes.io/docs/setup/release/version-skew-policy/)
