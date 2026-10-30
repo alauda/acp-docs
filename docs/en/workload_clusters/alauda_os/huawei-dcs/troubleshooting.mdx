@@ -1,7 +1,12 @@
 ---
-weight: 50
-title: Troubleshoot a DCSMachine Stuck in Deleting
+weight: 70
+title: Troubleshooting
+author: dev@alauda.io
+category: howto
 queries:
+  - dcs cluster creation stuck
+  - dcs preflight credential sign in failed
+  - dcsmachine provisioning stuck
   - dcsmachine stuck deleting
   - VMStopPending condition huawei dcs
   - machine deletion stuck FC site policy
@@ -9,11 +14,39 @@ queries:
   - retain-vm annotation dcs cluster api provider
 ---
 
-# Troubleshoot a DCSMachine Stuck in Deleting
+# Troubleshooting Huawei DCS Workload Clusters
 
-Use this guide when a `DCSMachine` on a Huawei DCS workload cluster stays in `Phase: Deleting` for longer than the expected ~60 seconds, blocking node turnover during scale-down, rolling upgrade, or full-cluster teardown.
+Start from the preflight error or the stage that `ac adm alpha cluster status` reports. For failures that every provider shares, see [Troubleshooting](../troubleshooting/index.mdx).
 
-## Scope
+| Symptom | Where to look first |
+|---|---|
+| Preflight reports that the DCS infrastructure provider or the kubeadm control plane provider is not installed | [Providers](./prerequisites.mdx#providers). |
+| Preflight reports that the credential cannot sign in | That `authKey` is the plain-text password and `site` the bare site ID; see [DCS Credential Secret](./prerequisites.mdx#credential-secret). Correct the Secret before retrying: repeated failed sign-ins lock the DCS account. |
+| Preflight reports a missing template, folder, switch, port group, datastore, or compute resource | The name in `install-config.yaml` against the DCS site, and for a port group, that it belongs to the named switch. |
+| Stage 1 stays `NotFound` | The cluster name or namespace: `kubectl get clusters.cluster.x-k8s.io -n cpaas-system`. |
+| Stage 2 does not advance | `kubectl -n cpaas-system describe machine <name>` and the `DCSMachine`: the credential, the template name, the capacity, the folder, and the port group. |
+| A `DCSMachine` stays in `Provisioning` while the DCS VM stays in `creating` | [VM Stuck in `creating`](#stuck-creating). |
+| The control plane does not come up | Whether the endpoint works: an `external` load balancer forwards `6443` to the control plane nodes; for `internal`, see [Verify the Self-built VIP](./create_cluster.mdx#verify-self-built-vip). |
+| `ControlPlaneHAReady` is not `True` | See [Control Plane HA](./create_cluster.mdx#verify-control-plane-ha). |
+| Stage 3 shows the wrong node groups | `computes[].name` and the `hosts` of each group. |
+| Stage 4 does not advance | The platform `ClusterView` and the provider manager log. |
+| The cluster reaches `Provisioned` but never becomes Ready, for example nodes stay `NotReady` because the CNI is not deployed | [Troubleshoot a Workload Cluster Stuck in Provisioned](../troubleshooting/troubleshoot-cluster-not-ready.mdx). |
+| A `DCSMachine` stays in `Deleting` | [DCSMachine Stuck in Deleting](#dcsmachine-stuck-deleting). |
+| The `Cluster` stays in `Deleting` after its machines are gone | [Troubleshoot a Cluster Stuck in Deleting](../troubleshooting/troubleshoot-cluster-stuck-deleting.mdx). |
+
+## VM Stuck in `creating` \{#stuck-creating}
+
+A `DCSMachine` stays in `Provisioning` with `status.cdRomFile` set, so the sign-in and the ISO upload succeeded, while the DCS VM stays in `creating` with no host, and its deploy task stays at the same progress for more than about five minutes. The DCS scheduler cannot place the VM; this is a DCS platform issue, not a provider one.
+
+1. In the DCS portal, check the free space of the datastores that the node group uses and the load of the hosts. A nearly full datastore, or hosts that are all heavily overcommitted, block placement; see [DCS Objects, Capacity, and Addresses](./prerequisites.mdx#dcs-objects).
+2. Ask the DCS platform team to free space or rebalance the hosts. Unless the node group is pinned through `resource`, DCS picks the host.
+3. If the deploy task does not respond to cancellation or to the VM deletion that the provider issues, a DCS administrator cancels it in the portal. Where DCS serializes VM deployment, one stuck task stalls every later one at the same progress, so clear the first one.
+
+## DCSMachine Stuck in Deleting \{#dcsmachine-stuck-deleting}
+
+Use this section when a `DCSMachine` on a Huawei DCS workload cluster stays in `Phase: Deleting` for longer than the expected ~60 seconds, blocking node turnover during scale-down, rolling upgrade, or full-cluster teardown.
+
+### Scope
 
 This guide covers the DCS-side failure modes that prevent `cluster-api-provider-dcs` from completing the `reconcileDelete` flow on a node. The provider's normal delete sequence is:
 
@@ -25,7 +58,7 @@ Each step depends on the DCS platform responding. When DCS is unresponsive or re
 
 This guide does **not** cover normal pre-deletion gating (CAPI `Machine` drain timeouts, finalizers held by other controllers) — those belong to upstream Cluster API troubleshooting.
 
-## Symptoms
+### Symptoms
 
 | Where to look | What you see |
 |---|---|
@@ -36,7 +69,7 @@ This guide does **not** cover normal pre-deletion gating (CAPI `Machine` drain t
 
 If `VMStopPending` is absent and `Machine.status.phase` is still `Deleting`, the issue is more likely upstream of `reconcileDelete` (e.g., CAPI drain, kubeadm pre-delete hooks). Consult the [CAPI troubleshooting docs](https://cluster-api.sigs.k8s.io/user/troubleshooting.html) for that case.
 
-## Reading the VMStopPending Condition
+### Reading the VMStopPending Condition
 
 The `VMStopPending` condition is the primary signal for this guide.
 
@@ -63,16 +96,16 @@ The `Reason` field is the diagnostic:
 | `VMMidTransition` | Warning | VM is in a transient state other than `running` / `stopped` (e.g., `stopping`, `starting`, `migrating`, `paused`, `hibernated`) | Inspect the `Message` field for the specific status. See [VM Stuck in Mid-Transition](#vm-stuck-in-mid-transition). |
 | *(condition absent)* | — | VM is either already `stopped` or already gone — controller is past the stop phase. | Check the DCS portal for VM existence and the `Machine` finalizers. |
 
-## Diagnostic Flows
+### Diagnostic Flows
 
-### VM Stuck in `stopping` \{#vm-stuck-in-stopping}
+#### VM Stuck in `stopping` \{#vm-stuck-in-stopping}
 
 The controller issued a graceful `StopVm` (calling DCS API `/action/stop?mode=safe`) and the VM acknowledged but never converged.
 
 Common causes:
 
 1. **VM `pvDriverStatus` is not `running`** — guest tools (vmtools / pvdriver) needed for graceful shutdown isn't responding. Verify on the DCS portal: open the VM detail page, check the `pvDriverStatus` field. If it shows anything other than `running`, the VM cannot accept a safe stop.
-2. **VM template predates `4.2.1`** — older DCS VM templates lack the guest tools required for safe stop. Confirm the `vmTemplateName` in the DCSMachine matches a `4.2.1+` template (label `cpaas.io/dcs-vm-template` on the `cpaas-system/<release>-dcs-vm-template` ConfigMap, see [Resolving Placeholder Values](./create_cluster.mdx#resolving-placeholders)).
+2. **VM template predates `4.2.1`** — older DCS VM templates lack the guest tools required for safe stop. Confirm the `vmTemplateName` in the DCSMachine matches a `4.2.1+` template (label `cpaas.io/dcs-vm-template` on the `cpaas-system/<release>-dcs-vm-template` ConfigMap, see [VM Template and Kubernetes Version](./prerequisites.mdx#resolving-placeholders)).
 3. **Guest OS hung** — the VM kernel is stuck and is not processing the ACPI shutdown.
 
 **Resolution path**:
@@ -80,7 +113,7 @@ Common causes:
 - For (1) and (3): Manually issue a `force` stop from the DCS portal (VM detail → Operations → Stop → Force). Once the VM reaches `stopped`, the controller's next reconcile picks up the new state and continues with `DeleteVm`.
 - For (2): The VM cannot be safely deleted by this provider on that template; back the workload off the node, manually power-off the VM, then [use `cpaas.io/retain-vm` to skip controller-side delete](#use-retain-vm-as-an-escape-hatch).
 
-### VM Stuck in Mid-Transition \{#vm-stuck-in-mid-transition}
+#### VM Stuck in Mid-Transition \{#vm-stuck-in-mid-transition}
 
 `Message` shows a status like `migrating`, `starting`, `paused`, or `hibernated`. The controller will not issue any operation on a VM in these states (DCS would reject) and is waiting indefinitely for the VM to converge to `running` or `stopped`.
 
@@ -90,7 +123,7 @@ Common causes:
 | `starting` | Platform initiated VM start after a power event | Wait until `running`, then deletion proceeds. |
 | `paused` / `hibernated` | Platform-paused VM (does **not** self-recover) | Resume the VM manually from the DCS portal (Operations → Resume), or use [`cpaas.io/retain-vm`](#use-retain-vm-as-an-escape-hatch) to bypass and clean up the VM later. |
 
-### Controller Cannot Reach DCS API \{#controller-cannot-reach-dcs-api}
+#### Controller Cannot Reach DCS API \{#controller-cannot-reach-dcs-api}
 
 If the `VMStopPending` condition is **absent** but `Machine.status.phase` is still `Deleting` for an extended period, the controller may be unable to talk to DCS at all. Check the controller log:
 
@@ -104,9 +137,9 @@ Look for one of:
 |---|---|
 | `connection refused` / `timeout` | DCS API endpoint unreachable from the `global` cluster |
 | `errorCode: 10100116` "帐户锁定中" | DCS admin account locked. See [DCS Account Lockout](#dcs-account-lockout). |
-| `401 Unauthorized` | Credential Secret is stale; rotate per [Cloud Credentials](./infrastructure.mdx#cloud-credentials). |
+| `401 Unauthorized` | Credential Secret is stale; patch it as described in [DCS Credential Secret](./prerequisites.mdx#credential-secret). |
 
-### DCS Account Lockout \{#dcs-account-lockout}
+#### DCS Account Lockout \{#dcs-account-lockout}
 
 `errorCode: 10100116` indicates the DCS portal account in the cluster's credential Secret is in a brute-force lockout window. The DCS portal lockout policy resets per failed login, so a controller stuck in a retry loop will **indefinitely extend** the lockout.
 
@@ -126,9 +159,9 @@ kubectl -n cpaas-system scale deployment cluster-api-provider-dcs-manager --repl
 kubectl -n cpaas-system logs deployment/cluster-api-provider-dcs-manager --tail=20
 ```
 
-**Avoid reusing the DCS portal `admin` account for the provider's Secret in production.** Configure a dedicated DCS account (interconnect or domain user, see [Credential User Types](./infrastructure.mdx#user-types)) with the lockout policy relaxed, so a transient controller failure cannot lock the platform out for everyone.
+**Avoid reusing the DCS portal `admin` account for the provider's Secret in production.** Configure a dedicated DCS account (interconnect or domain user, see [DCS Credential Secret](./prerequisites.mdx#credential-secret)) with the lockout policy relaxed, so a transient controller failure cannot lock the platform out for everyone.
 
-### FC Site Policy "仅能删除已停止虚拟机" (errorCode `102212808`) \{#fc-site-policy-stopped-only}
+#### FC Site Policy "仅能删除已停止虚拟机" (errorCode `102212808`) \{#fc-site-policy-stopped-only}
 
 If the workload cluster runs on a DCS site whose underlying FusionCompute platform has the "delete-only-when-stopped" safety policy enabled, **DeleteVm will be rejected when the VM is still `running`**. The provider's normal delete flow handles this automatically by issuing safe `StopVm` before `DeleteVm`, but in rare race conditions an external actor (a human operator on the DCS portal, or another automation) can restart the VM between the controller's stop check and the `DeleteVm` call. The controller surfaces the race as:
 
@@ -143,7 +176,7 @@ This is **not** an error — the controller treats `errorCode 102212808` as reco
 
 If you see this errorCode repeatedly (more than 3 cycles), an external actor is racing the controller. Suspend the external automation, or apply [`cpaas.io/retain-vm`](#use-retain-vm-as-an-escape-hatch) to fully take control of VM lifecycle outside the controller.
 
-## Use `cpaas.io/retain-vm` as an Escape Hatch \{#use-retain-vm-as-an-escape-hatch}
+### Use `cpaas.io/retain-vm` as an Escape Hatch \{#use-retain-vm-as-an-escape-hatch}
 
 When the controller cannot finish `reconcileDelete` for any reason and you need to release the `Machine` finalizer so the workload cluster can proceed (scale-down, upgrade, removal), annotate either the `Machine` or the `DCSMachine`:
 
@@ -167,7 +200,7 @@ After applying `retain-vm`, plan to manually:
 2. Free the IP / hostname entry from the corresponding `DCSIpHostnamePool`.
 3. (Optional) Clean up any persistent disks that were attached.
 
-## Verify Recovery
+### Verify Recovery
 
 After applying any of the resolutions above, watch the `DCSMachine` until the condition clears:
 
@@ -182,9 +215,3 @@ kubectl -n <ns> get machines | grep <machine-name>
 
 If the `Machine` is fully gone and the VM is no longer listed on the DCS portal, recovery is complete.
 
-## See Also
-
-- [Create a Cluster on Huawei DCS](./create_cluster.mdx) — full cluster manifest reference
-- [Cloud Credentials for Huawei DCS](./infrastructure.mdx#cloud-credentials) — Secret format and User Types
-- [Troubleshoot a Workload Cluster Stuck in Provisioned](../troubleshooting/troubleshoot-cluster-not-ready.mdx) — symptom-adjacent guide for cluster bring-up issues
-- [Troubleshoot a Cluster Stuck in Deleting](../troubleshooting/troubleshoot-cluster-stuck-deleting.mdx) — top-level `Cluster` CR stuck in `Deleting` after every child machine is gone

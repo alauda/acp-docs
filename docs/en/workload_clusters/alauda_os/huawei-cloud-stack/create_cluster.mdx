@@ -7,45 +7,216 @@ queries:
   - create hcs cluster
   - huawei cloud stack kubernetes
   - hcs cluster creation
-  - hcs availability zone cluster node pool
+  - ac adm alpha cluster create --provider hcs
   - workload cluster naming cluster-name not global
 ---
 
 # Create a Cluster on Huawei Cloud Stack
 
-This document provides instructions for creating Kubernetes clusters on the Huawei Cloud Stack platform. YAML-based cluster creation is available through Cluster API manifests. If Fleet Essentials `1.0.2` or later is installed, you can also create clusters through a guided web UI.
+ACP CLI (ac) renders the Cluster API and HCS objects from one `install-config.yaml`, applies them to the `global` cluster, and reports the creation stages. Every object lives in the `cpaas-system` namespace of the `global` cluster. If Fleet Essentials `1.0.2` or later is installed, you can also [create the cluster in the web UI](#create-in-web-ui).
 
-:::info
-The web UI provides a guided workflow with built-in validation, while YAML offers more automation flexibility.
-:::
+## Prerequisites \{#prerequisites}
 
-## Prerequisites
+- You meet the [Huawei Cloud Stack prerequisites](./prerequisites.mdx): the providers, the Alauda OS image, the network path, the ELB addresses, the registry, the credential Secret, and the HCS objects and addresses.
+- `ac` is logged in to the `global` cluster with `ac login`, and the `global` cluster is the current context.
 
-Before creating clusters, ensure all of the following prerequisites are met:
+## Procedure
 
-### 1. Required Plugin Installation
+### 1. Write `install-config.yaml` \{#write-install-config}
 
-Before you create the first workload cluster on Huawei Cloud Stack, upload and install the following plugins on the <Term name="product" textCase="capitalize" />'s `global` cluster. This applies regardless of the IaaS platform that the `global` cluster itself runs on:
-- **Alauda Container Platform Cluster Bootstrap Provider**
-- **Alauda Container Platform Infrastructure Provider for Huawei Cloud Stack**
+Create an installation directory for the cluster and write `install-config.yaml` in it. `ac` writes `manifests/` and `logs/ac.log` next to it. The template holds the required fields. The optional fields, such as a dedicated registry, a second NIC, raw disks, and per-group placement, are in [Parameters](./reference/install-config-parameters.mdx#optional-fields).
 
-For the procedure, see [Install the Provider](./install_provider.mdx).
+```yaml title="install-config.yaml"
+cluster:
+  clusterName: <cluster-name> # [!code callout]
+  sshKeys: # [!code callout]
+    - <ssh-public-key>
 
-### 2. HCS Infrastructure Input Preparation
+credentialRef: # [!code callout]
+  name: <credential-secret-name>
+  namespace: cpaas-system
 
-Prepare all HCS-specific inputs before writing any YAML in this document:
+provider:
+  hcs:
+    imageName: <image-name> # [!code callout]
+    flavorName: <flavor-name> # [!code callout]
+    rootDisk:
+      sizeGiB: 200 # [!code callout]
+    network:
+      vpcName: <vpc-name> # [!code callout]
+      securityGroupName: <security-group> # [!code callout]
+      subnetName: <subnet-name> # [!code callout]
+    elb: # [!code callout]
+      vipAddress: <control-plane-vip> # [!code callout]
+      l4:
+        ips: [<l4-ip-1>, <l4-ip-2>] # [!code callout]
+      l7:
+        ips: [<l7-ip-1>, <l7-ip-2>] # [!code callout]
 
-- HCS credential Secret values
-- Provider-recognized compute values such as `imageName`, `flavorName`, and `availabilityZone`
-- Cluster network inventory, including the subnets and free IP ranges used by the cluster
-- Control plane ELB address planning, including `vipAddress`, `vipSubnetName`, and fixed L4 and L7 IPs
-- Static IP pool planning for control plane and worker nodes
+controlPlane:
+  replicas: 3 # [!code callout]
+  disks:
+    ephemeral: # [!code callout]
+      - name: var-lib-containerd
+        sizeGiB: 100
+      - name: var-lib-kubelet
+        sizeGiB: 100
+      - name: var-lib-etcd # [!code callout]
+        sizeGiB: 20
+    persistent: # [!code callout]
+      - name: var-cpaas
+        sizeGiB: 100
+  hosts: # [!code callout]
+    - hostname: <cp-0-hostname>
+      ip: <cp-0-ip>
+    - hostname: <cp-1-hostname>
+      ip: <cp-1-ip>
+    - hostname: <cp-2-hostname>
+      ip: <cp-2-ip>
 
-See [Infrastructure Resources for Huawei Cloud Stack](./infrastructure.mdx) for the complete checklist, source information, and constraints.
+computes: # [!code callout]
+  - name: worker
+    replicas: 3
+    disks:
+      ephemeral: # [!code callout]
+        - name: var-lib-containerd
+          sizeGiB: 100
+        - name: var-lib-kubelet
+          sizeGiB: 100
+      persistent:
+        - name: var-cpaas
+          sizeGiB: 100
+    hosts:
+      - hostname: <worker-0-hostname>
+        ip: <worker-0-ip>
+      - hostname: <worker-1-hostname>
+        ip: <worker-1-ip>
+      - hostname: <worker-2-hostname>
+        ip: <worker-2-ip>
+```
 
-### 3. OS Release Registration \{#os-release-registration}
+<Callouts>
 
-This prerequisite applies to the **web UI** workflow only. YAML-based creation sets the OS image and component versions directly and does not need it.
+1. `clusterName`: required. It must not be `global` or start with `global-`; see [Fields](./reference/install-config-parameters.mdx#fields).
+2. `sshKeys`: required. The SSH public keys installed on every node.
+3. `credentialRef`: required. The [credential Secret](./prerequisites.mdx#credential-secret).
+4. `imageName`: required. The exact name of the uploaded Alauda OS image.
+5. `flavorName`: required, unless every node group sets `hcs.flavorName`.
+6. `rootDisk.sizeGiB`: required. The system disk size.
+7. `vpcName`: required.
+8. `securityGroupName`: required.
+9. `subnetName`: required. The node subnet.
+10. `elb`: the control plane ELB, created by the provider. There is no `cluster.network.loadBalancer` block on Huawei Cloud Stack.
+11. `vipAddress`: required. An IPv4 address.
+12. `l4.ips`: required. Exactly two IPv4 addresses.
+13. `l7.ips`: required. Exactly two IPv4 addresses.
+14. `replicas`: an odd number, `1` or `3` or more. A single control plane node cannot be upgraded.
+15. `ephemeral`: disks recreated with the instance. The standard disks are required; see [Disks](./reference/install-config-parameters.mdx#disks).
+16. `var-lib-etcd`: control plane only.
+17. `persistent`: disks kept when the instance is replaced.
+18. `hosts`: required. At least `replicas` entries.
+19. `computes`: optional.
+20. Workers have no `var-lib-etcd`.
+
+</Callouts>
+
+### 2. Create the Cluster \{#create-with-ac}
+
+```bash
+ac adm alpha cluster create --dir <install-dir> --provider hcs
+```
+
+Before it applies anything, `ac` checks the following:
+
+- The `kube-public/base-component-version` ConfigMap names a default Kubernetes version and a matching etcd tag, and the Kube-OVN plugin version resolves on the `global` cluster.
+- The HCS provider CRDs and the kubeadm control plane provider are served on the `global` cluster.
+- The registry resolves: the Secret of `cluster.registrySecretRef`, or the `registry` key of `cpaas-system/public-registry-credential`.
+- The credential Secret exists and carries `accessKey`, `secretKey`, `projectID`, `region`, and `externalGlobalDomain`, and `schema`, when set, is `https` or `http`.
+- The IAM endpoint `<schema>://iam-apigateway-proxy.<externalGlobalDomain>` answers. For `https`, `ac` completes a TLS handshake without verifying the certificate. It does not sign in or verify the access key, and it does not look up the image, flavor, availability zone, VPC, subnet, or security group.
+- Every rendered object passes a server-side dry run on the `global` cluster. `ac` names any object it could not dry-run yet.
+
+`create` returns once the objects are applied, and the cluster keeps building. Add `--wait` to wait until all stages are ready. `--timeout` limits the wait and defaults to `2h`. A timeout ends only the wait, not the creation.
+
+To render without applying, run `ac adm alpha cluster manifests --dir <install-dir> --provider hcs`.
+
+### 3. Monitor the Creation \{#monitor-creation}
+
+```bash
+ac adm alpha cluster status --cluster <cluster-name>                      # prints the four stages once
+ac adm alpha cluster wait-for install-complete --cluster <cluster-name>   # waits until all four are ready
+```
+
+Both commands change nothing and need no installation directory. `--namespace` defaults to `cpaas-system`.
+
+| # | Stage | Done when |
+|---:|---|---|
+| 1 | `Cluster` | The object exists, is not being deleted, its `infrastructureRef` and `controlPlaneRef` resolve, it reports no failure, and `Available` is `True` when the `Cluster` reports it. |
+| 2 | Control plane | `KubeadmControlPlane` `status.readyReplicas` reaches `spec.replicas`. |
+| 3 | `MachineDeployment` | Every node group is ready. |
+| 4 | `ClusterView` | The platform's view of the cluster reports `status.phase: Running`. `status` also shows the control plane endpoint and the ready node counts. |
+
+When a stage does not advance, see [Troubleshooting](./troubleshooting.mdx).
+
+### 4. Verify the Cluster \{#verify-the-cluster}
+
+```bash
+kubectl get cluster -n cpaas-system <cluster-name>
+kubectl get kubeadmcontrolplane -n cpaas-system <cluster-name>-control-plane
+kubectl get machines -n cpaas-system -l cluster.x-k8s.io/cluster-name=<cluster-name>
+kubectl get clustermodule <cluster-name> -o jsonpath='{.status.base.deployStatus}'
+```
+
+Expect the cluster **Running** or **Provisioned**, every control plane machine and worker **Running**, every Kubernetes node **Ready**, and the cluster module status **Completed**.
+
+#### Control Plane HA \{#verify-control-plane-ha}
+
+When `HCSCluster.spec.controlPlaneHA.enabled` is `true`, inspect the `HCSCluster` condition first:
+
+```bash
+kubectl get hcscluster <cluster-name> -n cpaas-system \
+  -o jsonpath='{range .status.conditions[?(@.type=="ControlPlaneHAReady")]}{.status}{" "}{.reason}{" "}{.message}{"\n"}{end}'
+```
+
+Interpret the condition as follows:
+
+| Status and reason | Meaning | Next step |
+|-------------------|---------|-----------|
+| `True ControlPlaneHAReady` | The provider-managed server group exists and the current control-plane ECS members are tracked. | No action is required. |
+| `False ControlPlaneHAPending` | The provider is waiting for a recoverable state, such as ECS creation or server group membership convergence. | Read the message and wait for the referenced control-plane machine or ECS operation to finish. |
+| `False ControlPlaneHAFailed` | The provider could not create, validate, update, or clean up the server group, or HCS rejected ECS scheduling for the selected policy. | Read the message, then check HCS capacity, the selected policy, and controller logs if needed. |
+
+Inspect the observed server group and membership snapshot:
+
+```bash
+kubectl get hcscluster <cluster-name> -n cpaas-system \
+  -o jsonpath='serverGroup={.status.controlPlaneHA.name}{" id="}{.status.controlPlaneHA.id}{" policy="}{.status.controlPlaneHA.policy}{"\n"}{range .status.controlPlaneHA.members[*]}{.machineName}{" "}{.serverID}{"\n"}{end}'
+```
+
+For `anti-affinity`, HCS treats the server group policy as a hard scheduling constraint. If capacity is insufficient, ECS creation can fail and the condition message should be used as the first diagnostic signal. For `soft-anti-affinity`, HCS tries to spread members but may still place multiple ECS instances on the same host.
+
+## Run `create` Again \{#rerun-create}
+
+Running `create` again on the same directory puts back anything that has drifted, except Secrets, which `ac` creates once and then leaves as they are. When `manifests/` already exists, `create` asks whether to reuse it. Press Enter to reuse it, or answer `n` to render again after you change `install-config.yaml`. When standard input is not a terminal, pass `--reuse-manifests=true` or `--reuse-manifests=false`.
+
+- Reusing `manifests/` skips `install-config.yaml` and every check, and applies the files as they are.
+- Rendering again discards hand edits in `manifests/`.
+- A generated encryption key is kept only in `manifests/`. Keep that directory, or set `cluster.encryptionProviderConfig` explicitly: rendering again without either generates a new key. `create` keeps the existing encryption Secret, so the cluster keeps its key, but `manifests/` then records a different key that cannot restore it.
+
+## Add or Change Node Groups \{#deploy-worker-nodes}
+
+To add a worker node group, add it to `computes` with its own `hosts`, then run `create --reuse-manifests=false` on the same directory. `ac` renders a new `HCSMachineConfigPool`, `HCSMachineTemplate`, `KubeadmConfigTemplate`, and `MachineDeployment` for it. Changing `replicas` works the same way; keep at least `replicas` entries in `hosts`. A `computes[].name` must be unique, and `control-plane` is reserved. For other changes to a running cluster, see [Manage Nodes on Huawei Cloud Stack](../../../configure/nodes/alauda_os/huawei-cloud-stack.mdx).
+
+Plan each host's addresses and persistent disks before its node is created: some fields are frozen once the provider accepts them. See [Change Rendered Objects Later](./reference/install-config-parameters.mdx#change-rendered-objects).
+
+## Create in the Web UI \{#create-in-web-ui}
+
+The web UI creates the cluster from the HCS resources that it loads through the Infrastructure Credential you select: VPCs, subnets, security groups, flavors, and assignable IP addresses. It requires Fleet Essentials `1.0.2` or later, and it does not support a dedicated registry.
+
+Before you start, meet the [prerequisites](./prerequisites.mdx), label the [credential Secret](./prerequisites.mdx#credential-secret) for the web UI, and register the OS release as described below.
+
+### Register the OS Release \{#os-release-registration}
+
+Only the web UI needs this step: `ac` takes the image from `provider.hcs.imageName` and the component versions from the `global` cluster.
 
 The web UI does not ask you to type the OS image or its Kubernetes and component versions. It reads them from an **OS-release ConfigMap** that you register once per Alauda OS image. The wizard resolves the platform Distribution version from the `global` cluster, finds the registered OS image whose `supportedACPVersions` includes that Distribution, and derives the node image and control plane component versions from it.
 
@@ -102,54 +273,9 @@ kubectl -n cpaas-system get hcsmachinetemplate \
   -o custom-columns=NAME:.metadata.name,IMAGE:.spec.template.spec.imageName
 ```
 
-### 4. Workload Cluster Image Registry
+### Run the Wizard \{#using-the-web-ui}
 
-Decide which registry this cluster pulls its platform components from — Kube-OVN and the platform modules that Alauda Container Platform installs on the cluster. This choice does not affect the images kubeadm manages, which come from `KubeadmControlPlane.spec.kubeadmConfigSpec.clusterConfiguration.imageRepository`.
-
-| Option | What you configure | When to use it |
-|---|---|---|
-| Registry of the `global` cluster | Nothing. The cluster inherits it, and the wizard fills in the address for you. | Workload nodes reach the registry the `global` cluster uses with acceptable throughput. |
-| Dedicated registry | A RegistryCredential Secret in `cpaas-system`, referenced from the `Cluster` by the `cpaas.io/registry-reference` label. | Workload nodes sit in a different region or network segment and should pull from a registry close to them. |
-
-Either way, the registry must already hold Alauda Container Platform Core for the target version plus the packages for every platform plugin you intend to install on this cluster, and every workload cluster node must reach its address.
-
-For the dedicated-registry procedure and its constraints, see [Choose the Image Registry for a Workload Cluster](../prepare/workload-cluster-image-registry.mdx).
-
-:::warning
-A dedicated registry is configured through YAML only. The web UI wizard always uses the registry of the `global` cluster: it reads that address from the `global` cluster and writes it into the new cluster for you, and it does not offer a registry credential to select. Use [Using YAML](#using-yaml) when this cluster needs its own registry.
-
-The binding is also read only when the cluster is first created. Changing or removing `cpaas.io/registry-reference` on an existing `Cluster` does not move that cluster to another registry.
-:::
-
-### 5. Node Labels and Taints
-
-To give the nodes of a pool their own role label and taint — for example to reserve dedicated pools for monitoring, logging, or ingress — declare them on the pool's resources as described in [Infra Nodes](../../../configure/nodes/node_planning.mdx#create-infra-nodes-alauda-os). Plan them before you create the pools. This applies to every node pool, whether the cluster is created through the web UI or with YAML; the web UI node pool steps do not set labels or taints.
-
-## Using the Web UI \{#using-the-web-ui}
-
-**Requirement**: This workflow requires Fleet Essentials `1.0.2` or later. Without it, create clusters with the YAML manifests described in [Using YAML](#using-yaml).
-
-The web UI loads VPCs, subnets, security groups, flavors, and assignable IP addresses from the HCS platform using the Infrastructure Credential you select. Make sure the prerequisites above are met before you start, and that an HCS credential Secret exists in the `cpaas-system` namespace.
-
-### Creation Workflow
-
-The cluster creation follows a 6-step wizard:
-
-```
-Step 1: Basic Info
-  ↓
-Step 2: Networking
-  ↓
-Step 3: Infrastructure
-  ↓
-Step 4: Control Plane Node Pool
-  ↓
-Step 5: Worker Node Pools
-  ↓
-Step 6: Review
-```
-
-**Navigation**: Clusters → Clusters → Create Cluster → Select Huawei Cloud Stack
+Open **Clusters** → **Clusters** → **Create Cluster**, select **Huawei Cloud Stack**, and complete the six steps.
 
 :::info
 **How IP selection works**
@@ -157,18 +283,18 @@ Step 6: Review
 Every IP field in this wizard — the control plane ELB addresses in Step 3 and the node IP addresses in Steps 4 and 5 — is a picker, not a free-text box. Select the subnet first, and the picker lists only the assignable IP addresses of that subnet. HCS clusters use static IP addresses, so you must choose an address from the list; manual entry and DHCP are not supported. Changing the subnet clears the address you already picked. An IP address already chosen elsewhere in the same subnet is removed from the list, so the same address is never assigned twice. When a subnet has many free addresses, the list shows the first batch only; type to filter for a specific address.
 :::
 
-### Step 1: Basic Info
+#### Step 1: Basic Info
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| Infrastructure Credential | dropdown | Yes | Existing HCS credential Secret. Used to load VPCs, subnets, security groups, flavors, and assignable IP addresses. If the dropdown is empty, create a Secret in the `cpaas-system` namespace labeled `capi.cpaas.io/provider=cluster-api-provider-hcs`. |
-| Name | text | Yes | Unique cluster identifier (lowercase letters, numbers, and hyphens), up to 63 characters. Must not be `global`. |
+| Infrastructure Credential | dropdown | Yes | Existing HCS credential Secret. Used to load VPCs, subnets, security groups, flavors, and assignable IP addresses. If the dropdown is empty, create a Secret in the `cpaas-system` namespace labeled `capi.cpaas.io/provider=cluster-api-provider-hcs`; see [Credential Secret](./prerequisites.mdx#credential-secret). |
+| Name | text | Yes | Unique cluster identifier (lowercase letters, numbers, and hyphens), up to 63 characters. Must not be `global` or start with `global-`. |
 | Display Name | text | No | Custom description for easy identification, up to 256 characters. |
 | Distribution Version | readonly | - | Platform distribution version, inherited from the `global` cluster. |
 | Kubernetes Version | readonly | - | Determined by the Distribution Version. |
 | OS Version | readonly | - | Alauda OS image version derived from the [registered OS-release ConfigMap](#os-release-registration) that matches the Distribution Version. |
 
-### Step 2: Networking
+#### Step 2: Networking
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -177,7 +303,7 @@ Every IP field in this wizard — the control plane ELB addresses in Step 3 and 
 | Service CIDR | CIDR | Yes | Service network address range. Must not overlap the Pod CIDR. |
 | Join CIDR | CIDR | Yes | Kube-OVN join network address range. |
 
-### Step 3: Infrastructure
+#### Step 3: Infrastructure
 
 This step has two parts: the HCS infrastructure resources and the control plane load balancer.
 
@@ -189,7 +315,7 @@ This step has two parts: the HCS infrastructure resources and the control plane 
 | Security Group Name | dropdown | Yes | Existing security group. |
 | Subnets | dropdown list | Yes | One or more existing subnets. Every subnet referenced by the load balancer or by a node pool must be added here. |
 
-**Control Plane Load Balancer**: The HCS provider creates an Elastic Load Balance (ELB) for the Kubernetes API server and owns its VIP. Hybrid Load Balancing requires fixed L4 and L7 virtual subnet IPs.
+**Control Plane Load Balancer**: The HCS provider creates the control plane ELB and owns its VIP; see [Control Plane Endpoint](./reference/install-config-parameters.mdx#configure-hcscluster). Hybrid Load Balancing requires fixed L4 and L7 virtual subnet IPs.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -201,7 +327,7 @@ This step has two parts: the HCS infrastructure resources and the control plane 
 | L7 Virtual Subnet Name | dropdown | Yes | Subnet for the L7 Hybrid Load Balancing IPs. |
 | L7 Virtual Subnet IP 1 / IP 2 | IP picker | Yes | Two fixed L7 IP addresses. |
 
-### Step 4: Control Plane Node Pool
+#### Step 4: Control Plane Node Pool
 
 The control plane node pool is fixed at 3 replicas for high availability.
 
@@ -209,24 +335,24 @@ The control plane node pool is fixed at 3 replicas for high availability.
 |-------|------|----------|-------------|
 | Control Plane Node Pool Name | text | Yes | Pool name, automatically prefixed with `<cluster-name>-`. |
 | Flavor | dropdown | Yes | HCS flavor; the list shows vCPU and memory for each option. |
-| Availability Zone | dropdown | No | Target availability zone for every control plane node. Zones reported as unavailable are disabled. See [Availability Zone Placement](./infrastructure.mdx#availability-zone-placement). |
+| Availability Zone | dropdown | No | Target availability zone for every control plane node. Zones reported as unavailable are disabled. See [Availability Zone Placement](./reference/install-config-parameters.mdx#availability-zone-placement). |
 | Machine Configs | list | Yes | One entry per control plane node. At least 3 entries are required. See [Machine Config entry](#web-ui-machine-config) below. |
 | System Disk | number | Yes | Root disk size in GB; the type is fixed to SSD. |
 | Data Volumes | list | No | Fixed data disks mounted on every node in the pool; only the size is adjustable. The etcd data volume is included for the control plane. |
 | Replicas | readonly | - | Fixed at 3. |
-| Control Plane High Availability | toggle | No | On by default. Spreads control plane nodes across different physical hosts within the selected availability zone by using a provider-managed HCS server group. |
+| Control Plane High Availability | toggle | No | On by default. Spreads control plane nodes across different physical hosts within the selected availability zone by using a provider-managed HCS server group. See [Control Plane HA Placement](./reference/install-config-parameters.mdx#control-plane-ha-placement). |
 | Placement Policy | radio | Conditional | Shown when High Availability is on. **Preferred (soft anti-affinity)** (default) spreads nodes on a best-effort basis. **Required (strict anti-affinity)** forces each node onto a different host and fails creation if there are not enough hosts. |
 | SSH Authorized Keys | list | No | Public keys for node access. |
 
-#### Machine Config entry \{#web-ui-machine-config}
+##### Machine Config entry \{#web-ui-machine-config}
 
 Each entry in **Machine Configs** describes one node:
 
-- **Hostname** (required): Lowercase letters, numbers, hyphens, and dots, up to 253 characters (for example, `master-1` or `master-1.example.org`). For how a dotted hostname affects the node, see [Hostname behavior on the node](#hostname-behavior-on-the-node).
+- **Hostname** (required): Lowercase letters, numbers, hyphens, and dots, up to 253 characters (for example, `master-1` or `master-1.example.org`). For how a dotted hostname affects the node, see [Hostname behavior on the node](./reference/install-config-parameters.mdx#hostname-behavior-on-the-node).
 - **Networks** (required): One row per NIC. Each row has an **IP Address** picker and a **Subnet Name**. Add rows for multi-NIC nodes.
 - **Persistent Disks**: The platform-required `/var/cpaas` disk is pre-filled; its size is adjustable but the row cannot be removed. Add rows only for extra host-bound data that must survive node rebuild.
 
-### Step 5: Worker Node Pools
+#### Step 5: Worker Node Pools
 
 Click **Add Worker Node Pool** to open the pool dialog. You can add multiple pools.
 
@@ -234,7 +360,7 @@ Click **Add Worker Node Pool** to open the pool dialog. You can add multiple poo
 |-------|------|----------|-------------|
 | Worker Node Pool Name | text | Yes | Pool name, automatically prefixed with `<cluster-name>-`. Must be unique within the cluster. |
 | Flavor | dropdown | Yes | HCS flavor; the list shows vCPU and memory for each option. |
-| Availability Zone | dropdown | No | Target availability zone for every node in this worker pool. Different worker pools can select different zones; zones reported as unavailable are disabled. See [Availability Zone Placement](./infrastructure.mdx#availability-zone-placement). |
+| Availability Zone | dropdown | No | Target availability zone for every node in this worker pool. Different worker pools can select different zones; zones reported as unavailable are disabled. See [Availability Zone Placement](./reference/install-config-parameters.mdx#availability-zone-placement). |
 | Machine Configs | list | Yes | One entry per worker node. Uses the same [Machine Config entry](#web-ui-machine-config) layout as the control plane. |
 | System Disk | number | Yes | Root disk size in GB; the type is fixed to SSD. |
 | Data Volumes | list | No | Fixed data disks mounted on every node in the pool. |
@@ -242,866 +368,14 @@ Click **Add Worker Node Pool** to open the pool dialog. You can add multiple poo
 | Rollout Strategy | number | No | **Max Surge** and **Max Unavailable**. When Max Surge is `0`, Max Unavailable must be ≥ 1 and ≤ Replicas. |
 | SSH Authorized Keys | list | No | Public keys for node access. |
 
-### Step 6: Review
+#### Step 6: Review
 
 Review the **Basic Info**, **Infrastructure**, **Control Plane Load Balancer**, **Control Plane Node Pool**, **Worker Node Pools**, and **Networking** sections. Click **View YAML** to inspect the exact resources that will be created. Click **Create** to start the cluster creation process.
 
----
+Then [verify the cluster](#verify-the-cluster).
 
-## Using YAML \{#using-yaml}
+## Next Steps
 
-### Cluster Creation Overview
-
-At a high level, you'll create the following Cluster API resources in the <Term name="product" textCase="capitalize" />'s `global` cluster to provision infrastructure and bootstrap a functional Kubernetes cluster.
-
-Before you write any YAML in this page, complete the preparation checklist in [Infrastructure Resources for Huawei Cloud Stack](./infrastructure.mdx). This checklist covers the values that the provider expects, where to get them, and which values must be planned before you fill the manifests.
-
-:::warning
-**Important Namespace Requirement**
-
-To ensure proper integration with the <Term name="product" textCase="capitalize" /> as workload clusters, all resources must be deployed in the `cpaas-system` namespace. Deploying resources in other namespaces may result in integration issues.
-:::
-
-:::warning
-**Workload Cluster Naming**
-
-The workload `cluster-name` **must not** be `global`. That name is reserved for the `global` cluster, and reusing it causes the workload cluster's resources to collide with `global` cluster resources in `cpaas-system`. The `global-` prefix is reserved for resources owned by the `global` cluster's DR workflow; see [Common Prerequisites](../../../install/alauda_os/installing.mdx#common-prerequisites). Do not use `global-` for workload-cluster resources, because failover operations can select those resources as if they belonged to the `global` cluster.
-
-As a convention, keep the CAPI `Cluster` and provider cluster resource (`HCSCluster`) named exactly `<cluster-name>`, and prefix non-root CAPI and provider resources (`KubeadmControlPlane`, `KubeadmConfigTemplate`, `MachineDeployment`, machine templates, machine config pools, etc.) with `<cluster-name>-` — for example, the example manifests use `<cluster-name>-kcp`. This is a recommendation rather than a controller-enforced rule, but it prevents same-namespace collisions when multiple workload clusters live in `cpaas-system` and makes resource ownership obvious during operations.
-:::
-
-The cluster creation process follows this order:
-
-1. Configure HCS authentication (Secret)
-2. Create machine configuration pool (HCSMachineConfigPool)
-3. Configure machine template (HCSMachineTemplate)
-4. Configure KubeadmControlPlane
-5. Configure HCSCluster
-6. Create the Cluster
-7. Deploy worker nodes (`HCSMachineConfigPool`, `HCSMachineTemplate`, `KubeadmConfigTemplate`, and `MachineDeployment`). See [Deploy Worker Nodes](#deploy-worker-nodes).
-
-### Control Plane Configuration
-
-The control plane manages cluster state, scheduling, and the Kubernetes API. This section shows how to configure a highly available control plane.
-
-:::warning
-**Configuration Parameter Guidelines**
-
-When configuring resources, exercise caution with parameter modifications:
-- **Replace only values enclosed in `<>`** with your environment-specific values
-- **Preserve all other parameters** as they represent optimized or required configurations
-- Modifying non-placeholder parameters may result in cluster instability or integration issues
-:::
-
-#### Configure HCS Authentication
-
-HCS authentication information is stored in a Secret resource in `cpaas-system`.
-
-Author the credential file with an editor rather than typing the values at a shell prompt. A shell records the whole command, secret key included, in its history; a file written by an editor leaves no such copy.
-
-```text title="hcs-credential.env"
-accessKey=<access-key>
-secretKey=<secret-key>
-projectID=<project-id>
-region=<region>
-externalGlobalDomain=<domain>
-schema=https
-```
-
-Restrict the file, create the Secret from it, then remove it:
-
-```bash
-chmod 600 hcs-credential.env
-
-HCS_SECRET_NAME="<credential-secret-name>"
-
-kubectl create secret generic "${HCS_SECRET_NAME}" \
-  --namespace cpaas-system \
-  --from-env-file=hcs-credential.env
-
-rm -f hcs-credential.env
-```
-
-Write the values in plain text — `kubectl` base64-encodes them when it creates the Secret, so there is no separate encoding step. Each line is `key=value`. Do not quote the values: `kubectl` takes quote characters literally. A value may contain `=`; only the first `=` on a line separates the key from the value.
-
-<Directive type="warning" title="Do not create credential Secrets with kubectl apply">
-  Client-side apply stores the manifest it applied — including the HCS secret key — in the `kubectl.kubernetes.io/last-applied-configuration` annotation on the Secret itself. `kubectl create` writes no such annotation. This applies whether the values were written as `stringData` or as base64 `data`; base64 is an encoding, not protection.
-</Directive>
-
-| Key | Description |
-|-----------|-------------|
-| `accessKey` | HCS access key ID from **My Settings** > **Access Keys** |
-| `secretKey` | HCS secret access key from **My Settings** > **Access Keys** |
-| `projectID` | Resource Space ID from **My Settings** > **Resource Spaces** |
-| `region` | HCS region API value used by the provider. Tenant administrators cannot retrieve this value from the HCS UI; get it from the HCS administrator |
-| `externalGlobalDomain` | HCS platform access domain used by the provider |
-| `schema` | Optional API scheme for the HCS IAM endpoint, usually `https`. Omit the line to use the default |
-
-Existing credential Secrets created without `schema` continue to work unchanged. Only set `schema` if your HCS IAM endpoint uses `http` instead of the default `https`.
-
-You can reuse an existing HCS credential Secret. Its name does not need to match the cluster name, but `HCSCluster.spec.identityRef.name` must reference this Secret.
-
-#### Configure Machine Configuration Pool
-
-The `HCSMachineConfigPool` defines pre-configured hostnames, static IP addresses, and any pool-managed persistent disks for VMs.
-
-:::warning
-**Pool Size Requirement**
-
-The configuration pool must include at least as many entries as the number of control plane nodes you plan to deploy.
-:::
-
-Use one subnet selector per `networks[]` entry. For new manifests, set either `subnetName` or `subnetId`, but not both. Existing manifests may keep the deprecated `subenetName` field; if you also add `subnetName` while updating that manifest, its value must exactly match `subenetName`. Do not supply conflicting values across `subenetName`, `subnetName`, and `subnetId`.
-
-If you use `subnetName` in the machine configuration pool, include the same subnet name in `HCSCluster.spec.network.subnets`.
-
-For the initial cluster create flow, listing an existing subnet by name is enough because the controller resolves subnet metadata before the cluster becomes Ready. If you later add another subnet to an existing Ready `HCSCluster`, do not append only `name`. Patch the parent `HCSCluster.spec.network.subnets` entry with the full subnet object so later machine or ELB operations can reuse the resolved subnet metadata.
-
-```yaml
-apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: HCSMachineConfigPool
-metadata:
-  name: <cluster-name>-cp-pool
-  namespace: cpaas-system
-  labels:
-    cluster.x-k8s.io/cluster-name: <cluster-name>
-spec:
-  configs:
-    - hostname: master-1
-      networks:
-        - subnetName: <subnet-name>
-          ipAddress: 192.168.1.11
-      persistentDisks:
-        - slot: 0
-          size: 100
-          type: SSD
-          mountPath: /var/cpaas
-          format: xfs
-    - hostname: master-2
-      networks:
-        - subnetName: <subnet-name>
-          ipAddress: 192.168.1.12
-      persistentDisks:
-        - slot: 0
-          size: 100
-          type: SSD
-          mountPath: /var/cpaas
-          format: xfs
-    - hostname: master-3
-      networks:
-        - subnetName: <subnet-name>
-          ipAddress: 192.168.1.13
-      persistentDisks:
-        - slot: 0
-          size: 100
-          type: SSD
-          mountPath: /var/cpaas
-          format: xfs
-```
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `.spec.configs[]` | array | Yes | Non-empty list of machine configurations |
-| `.spec.configs[].hostname` | string | Yes | VM hostname. Use lowercase letters, numbers, hyphens (`-`), or dots (`.`); the value must start and end with a lowercase letter or number and must not exceed 253 characters (per the DNS name length limit in [RFC 1035](https://datatracker.ietf.org/doc/html/rfc1035#section-2.3.4)). Leading or trailing dots, all-dot strings, and uppercase letters are rejected and the controller surfaces the error on the owning `Machine` and `Cluster` status. See the **Hostname behavior on the node** subsection below for what `hostname` and `hostname -f` return when the value contains a dot. |
-| `.spec.configs[].networks[]` | array | Yes | Non-empty list of network configurations for the VM |
-| `.spec.configs[].networks[].subnetName` | string | No* | Recommended subnet name field for new manifests |
-| `.spec.configs[].networks[].subnetId` | string | No* | Subnet ID. Use this field instead of `subnetName` when the subnet name is ambiguous |
-| `.spec.configs[].networks[].ipAddress` | string | Yes | Static IP address for the VM |
-| `.spec.configs[].persistentDisks[]` | array | No | EVS disks that survive HCSMachine delete-recreate replacement |
-| `.spec.configs[].persistentDisks[].slot` | int | Yes* | Disk slot within one machine configuration. Slots must be unique and contiguous from `0` for the same hostname |
-| `.spec.configs[].persistentDisks[].size` | int | Yes* | EVS disk size in GB. For newly created EVS data disks, use `10` to `32768` GB. Existing claimed disks must match their current size |
-| `.spec.configs[].persistentDisks[].type` | string | Yes* | EVS disk type name available in the target availability zone |
-| `.spec.configs[].persistentDisks[].mountPath` | string | No | Guest mount path. Use `/var/cpaas` for platform state that must survive VM replacement |
-| `.spec.configs[].persistentDisks[].format` | string | No | File system format. If omitted, the provider uses `xfs` |
-| `.spec.configs[].persistentDisks[].mountOptions` | array | No | Mount options. If omitted, the provider uses `defaults,noatime` |
-
-*For new manifests, set either `subnetName` or `subnetId`. Existing manifests may continue to use `subenetName`, and may add `subnetName` only if both fields use the same value. Do not provide conflicting subnet selector values.
-
-**Persistent disk fields are required when `persistentDisks` is specified.**
-
-Use `persistentDisks[]` for node-local state that must survive VM replacement. Do not declare the same mount path in `HCSMachineTemplate.spec.template.spec.dataVolumes[]`.
-
-**Note:** The CRD schema lists `subnetName`, `subenetName`, and `subnetId` as optional fields and does not express their allowed combinations. Follow the provider-level rules above when writing manifests.
-
-**Note:** To attach multiple NICs to one node, add multiple `networks[]` entries. The provider only uses these entries to attach NICs and assign subnet selectors plus static IPs. It does not support declaring per-NIC roles, default gateways, static routes, or per-NIC DNS settings.
-
-##### Hostname behavior on the node \{#hostname-behavior-on-the-node}
-
-The provider derives the node's POSIX hostname and FQDN from `hostname` as follows:
-
-| Pool `hostname` value | Node `hostname` | Node `hostname -f` | `/etc/hosts` entry written |
-|---|---|---|---|
-| `master-1` (no dot) | `master-1` | `master-1` (resolver returns the short name) | none added by the provider |
-| `master-1.example.org` (dotted) | `master-1` (short label, dot and everything after it stripped) | `master-1.example.org` | `<node-ip> master-1.example.org master-1` |
-
-The dotted form is the path to set up applications that depend on FQDN resolution (`hostname -f`, certificates with SAN entries, log labels). The provider sets `prefer_fqdn_over_hostname: false` and enables cloud-init `manage_etc_hosts` only when a dotted hostname is supplied, so POSIX tools continue to see the short name and `hostname -f` returns the full FQDN.
-
-Invalid hostnames (leading dot, trailing dot, all-dot strings, uppercase letters, or anything that violates the field constraint) are rejected before the VM boots. The error is set on the owning `Machine.status` and surfaced on the `Cluster.status.conditions` so it shows up under `kubectl describe cluster <name>` and `kubectl get machines -n cpaas-system -o wide`.
-
-#### Configure Machine Template
-
-The `HCSMachineTemplate` defines the VM specifications for control plane nodes.
-
-:::warning
-**Storage Requirements**
-
-The following data disk mount points are recommended for control plane nodes:
-- `/var/lib/etcd` - etcd data (10GB+)
-- `/var/lib/kubelet` - kubelet data (100GB+)
-- `/var/lib/containerd` - container runtime data (100GB+)
-
-The `/var/cpaas` path stores platform state and logs. Declare it in `HCSMachineConfigPool.spec.configs[].persistentDisks[]` when it must survive VM replacement.
-:::
-
-```yaml
-apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: HCSMachineTemplate
-metadata:
-  name: <cluster-name>-control-plane
-  namespace: cpaas-system
-spec:
-  template:
-    spec:
-      imageName: <vm-image-name>
-      flavorName: <instance-flavor>
-      availabilityZone: <availability-zone>
-      rootVolume:
-        type: SSD
-        size: 100
-      configPoolRef:
-        name: <cluster-name>-cp-pool
-      dataVolumes:
-        - size: 10
-          type: SSD
-          mountPath: /var/lib/etcd
-          format: xfs
-        - size: 100
-          type: SSD
-          mountPath: /var/lib/kubelet
-          format: xfs
-        - size: 100
-          type: SSD
-          mountPath: /var/lib/containerd
-          format: xfs
-```
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `.spec.template.spec.imageName` | string | Yes | HCS image name. Use the name the Alauda OS image published for the target ACP release was uploaded under; placeholder shown as `<alaudaos-version>` in the manifest above. The exact name moves with each Alauda OS release, so do not hardcode the example value across versions. |
-| `.spec.template.spec.flavorName` | string | Yes | Provider-recognized HCS API value matched against `Flavor.Name`. Do not use the tenant UI display name |
-| `.spec.template.spec.availabilityZone` | string | No | Provider-recognized HCS API value matched against `ZoneName`. Every machine created from this template uses the selected zone. If omitted, the Provider selects a zone reported as available by HCS. See [Availability Zone Placement](./infrastructure.mdx#availability-zone-placement) |
-| `.spec.template.spec.rootVolume.type` | string | Yes | Volume type (`SSD` or `SATA`) |
-| `.spec.template.spec.rootVolume.size` | int | Yes | System disk size in GB |
-| `.spec.template.spec.configPoolRef.name` | string | Yes | Referenced HCSMachineConfigPool name |
-| `.spec.template.spec.dataVolumes[]` | array | No | Data volume configurations |
-| `.spec.template.spec.dataVolumes[].size` | int | Yes* | Data disk size in GB |
-| `.spec.template.spec.dataVolumes[].type` | string | Yes* | Volume type |
-| `.spec.template.spec.dataVolumes[].mountPath` | string | Yes* | Mount path |
-| `.spec.template.spec.dataVolumes[].format` | string | Yes* | File system format (`xfs` or `ext4`) |
-
-*Required when dataVolumes is specified.
-
-`dataVolumes[]` are recreated with the ECS. Do not use them for `/var/cpaas` or any other path that must survive rolling replacement. Put those paths in `HCSMachineConfigPool.spec.configs[].persistentDisks[]`.
-
-**Note:** Do not set runtime identity fields such as `providerID` or `serverId` in `HCSMachineTemplate` manifests. The provider assigns these values when it creates HCS instances.
-
-**Note:** The ACP web UI loads flavors and availability zones through the selected HCS credential. When you write YAML, get the exact provider-recognized `Flavor.Name` and `ZoneName` values from the HCS administrator because the native HCS tenant console might not expose them.
-
-#### Configure KubeadmControlPlane
-
-The `KubeadmControlPlane` defines the Kubernetes control plane configuration.
-
-<Directive type="warning" title="Kubernetes 1.35 kubelet settings">
-  `imagePullCredentialsVerificationPolicy: NeverVerify` is required only starting with Kubernetes 1.35. Omit this parameter when creating a cluster with Kubernetes 1.34 or earlier.
-</Directive>
-
-```yaml
-apiVersion: controlplane.cluster.x-k8s.io/v1beta1
-kind: KubeadmControlPlane
-metadata:
-  name: <cluster-name>-kcp
-  namespace: cpaas-system
-spec:
-  replicas: 3
-  version: <kubernetes-version>
-  rolloutStrategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 0
-  kubeadmConfigSpec:
-    files:
-      - path: /etc/kubernetes/admission/psa-config.yaml
-        owner: root:root
-        permissions: "0644"
-        content: |
-          apiVersion: apiserver.config.k8s.io/v1
-          kind: AdmissionConfiguration
-          plugins:
-          - name: PodSecurity
-            configuration:
-              apiVersion: pod-security.admission.config.k8s.io/v1
-              kind: PodSecurityConfiguration
-              defaults:
-                enforce: "privileged"
-                enforce-version: "latest"
-                audit: "baseline"
-                audit-version: "latest"
-                warn: "baseline"
-                warn-version: "latest"
-              exemptions:
-                usernames: []
-                runtimeClasses: []
-                namespaces:
-                - kube-system
-                - cpaas-system
-      - path: /etc/kubernetes/patches/kubeletconfiguration0+strategic.json
-        owner: root:root
-        permissions: "0644"
-        content: |
-          {
-            "apiVersion": "kubelet.config.k8s.io/v1beta1",
-            "kind": "KubeletConfiguration",
-            "imagePullCredentialsVerificationPolicy": "NeverVerify",
-            "protectKernelDefaults": true,
-            "tlsCertFile": "/etc/kubernetes/pki/kubelet.crt",
-            "tlsPrivateKeyFile": "/etc/kubernetes/pki/kubelet.key",
-            "streamingConnectionIdleTimeout": "5m",
-            "clientCAFile": "/etc/kubernetes/pki/ca.crt"
-          }
-      - path: /etc/kubernetes/encryption-provider.conf
-        owner: root:root
-        permissions: "0600"
-        content: |
-          apiVersion: apiserver.config.k8s.io/v1
-          kind: EncryptionConfiguration
-          resources:
-          - resources:
-            - secrets
-            providers:
-            - aescbc:
-                keys:
-                - name: key1
-                  secret: bootstrap-placeholder
-      - path: /etc/kubernetes/audit/policy.yaml
-        owner: root:root
-        permissions: "0644"
-        content: |
-          apiVersion: audit.k8s.io/v1
-          kind: Policy
-          rules:
-          - level: Metadata
-    clusterConfiguration:
-      imageRepository: <image-repository>
-      dns:
-        imageTag: <dns-image-tag>
-      etcd:
-        local:
-          imageTag: <etcd-image-tag>
-      apiServer:
-        extraArgs:
-          audit-log-format: json
-          audit-log-mode: batch
-          audit-log-path: /etc/kubernetes/audit/audit.log
-          audit-policy-file: /etc/kubernetes/audit/policy.yaml
-          admission-control-config-file: /etc/kubernetes/admission/psa-config.yaml
-          encryption-provider-config: /etc/kubernetes/encryption-provider.conf
-          kubelet-certificate-authority: /etc/kubernetes/pki/ca.crt
-          profiling: "false"
-          tls-min-version: VersionTLS12
-        extraVolumes:
-          - name: vol-dir-0
-            hostPath: /etc/kubernetes
-            mountPath: /etc/kubernetes
-            pathType: Directory
-      controllerManager:
-        extraArgs:
-          bind-address: "::"
-          flex-volume-plugin-dir: "/opt/libexec/kubernetes/kubelet-plugins/volume/exec/"
-          profiling: "false"
-          tls-min-version: VersionTLS12
-      scheduler:
-        extraArgs:
-          bind-address: "::"
-          profiling: "false"
-          tls-min-version: VersionTLS12
-    postKubeadmCommands:
-      - chmod 600 /var/lib/kubelet/config.yaml
-    initConfiguration:
-      patches:
-        directory: /etc/kubernetes/patches
-      nodeRegistration:
-        kubeletExtraArgs:
-          node-labels: "kube-ovn/role=master"
-          protect-kernel-defaults: "true"
-          volume-plugin-dir: "/opt/libexec/kubernetes/kubelet-plugins/volume/exec/"
-    joinConfiguration:
-      patches:
-        directory: /etc/kubernetes/patches
-      nodeRegistration:
-        kubeletExtraArgs:
-          node-labels: "kube-ovn/role=master"
-          volume-plugin-dir: "/opt/libexec/kubernetes/kubelet-plugins/volume/exec/"
-  machineTemplate:
-    nodeDrainTimeout: 1m
-    nodeDeletionTimeout: 5m
-    infrastructureRef:
-      apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-      kind: HCSMachineTemplate
-      name: <cluster-name>-control-plane
-```
-
-The HCS controller also injects files while resolving cloud-init data. It writes `/etc/kubernetes/pki/kubelet.crt`, `/etc/kubernetes/pki/kubelet.key`, and `/etc/kubernetes/encryption-provider.conf` for control plane machines. For the first control plane machine, the controller generates the encryption provider configuration. After the control plane is initialized, it tries to reuse the existing `kube-apiserver` encryption provider configuration. If you include a bootstrap file at `/etc/kubernetes/encryption-provider.conf`, treat it as a placeholder because the controller-generated or synchronized file takes precedence.
-
-**Note:** Configure `apiServer.extraArgs` and `apiServer.extraVolumes` together. If the volume is not mounted, `kube-apiserver` cannot read the files written under `/etc/kubernetes`.
-
-**Note:** The `rolloutStrategy.rollingUpdate.maxSurge: 0` example above is for highly available static-IP control planes. Keep this setting for fixed-size control plane pools with at least three replicas so replacements happen in a scale-down-then-scale-up order. If you create a single-control-plane HCS cluster (`spec.replicas: 1`), do not copy the `rolloutStrategy` block into the create manifest. `KubeadmControlPlane` validation rejects that scale-in style rollout configuration for a single replica.
-
-**Note:** HCS also supports creating a single-control-plane cluster by setting `spec.replicas: 1` and preparing one control plane config entry in the referenced `HCSMachineConfigPool`. Treat this as a creation-only topology, and leave the rollout strategy unset in that create manifest. The upgrade flow in this documentation does not support single-control-plane HCS clusters.
-
-Use the [OS Support Matrix](../../../overview/alauda_os_support_matrix.mdx) only for the component versions it explicitly lists, such as coredns and etcd image tags for supported Alauda OS images. It is not a complete source for all HCS manifest values. Before you apply this YAML, also use the approved release baseline for values such as `imageRepository`, DNS image repository, Kube-OVN version, Kube-OVN join CIDR, Pod CIDR, and Service CIDR.
-
-#### Configure HCSCluster \{#configure-hcscluster}
-
-The `HCSCluster` resource defines the HCS infrastructure configuration.
-
-The HCS provider creates an Elastic Load Balance (ELB) on the HCS platform for the Kubernetes API server. This ELB must keep Hybrid Load Balancing enabled so cluster nodes can also reach the API server through the ELB address.
-
-For the documented HCS workflow, provide `vipAddress`, `elbVirsubnetL4Ips`, and `elbVirsubnetL7Ips`. Each `elbVirsubnetL4Ips[].ips` and `elbVirsubnetL7Ips[].ips` entry must contain two IPs.
-
-Leave `vipDomainName` unset — cluster access by domain is not supported; see the field table below.
-
-List every cluster subnet in `spec.network.subnets` before you reference it anywhere else. `vipSubnetName`, `elbVirsubnetL4Ips[].subnetName`, `elbVirsubnetL7Ips[].subnetName`, and the `subnetName` values used by `HCSMachineConfigPool` must all exist in `spec.network.subnets`.
-
-For the initial cluster create flow, the controller can resolve existing subnet metadata from `name`. For an existing Ready cluster, append a full subnet object instead of only `name`. Include `id`, and include `neutronSubnetId` for any subnet that the control plane ELB will use. Keep `cidr`, `gatewayIp`, `primaryDNS`, and `secondaryDNS` in the subnet inventory as well.
-
-Do not disable Hybrid Load Balancing on the provider-created ELB after the cluster is created. The cluster depends on that ELB mode so nodes can reach the API server through the ELB address.
-
-```yaml
-apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: HCSCluster
-metadata:
-  name: <cluster-name>
-  namespace: cpaas-system
-spec:
-  # Optional. Include only when you want provider-managed control-plane ECS placement.
-  controlPlaneHA:
-    enabled: true
-    policy: soft-anti-affinity
-  controlPlaneLoadBalancer:
-    vipAddress: <control-plane-vip-address>
-    vipSubnetName: <vip-subnet-name>
-    elbVirsubnetL4Ips:
-      - subnetName: <subnet-name>
-        ips:
-          - <l4-ip-1>
-          - <l4-ip-2>
-    elbVirsubnetL7Ips:
-      - subnetName: <subnet-name>
-        ips:
-          - <l7-ip-1>
-          - <l7-ip-2>
-  networkType: kube-ovn
-  network:
-    vpc:
-      name: <vpc-name>
-    subnets:
-      - name: <subnet-name>
-    securityGroup:
-      name: <security-group-name>
-  identityRef:
-    name: <credential-secret-name>
-```
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `.spec.networkType` | string | Yes | Network type, currently supports `kube-ovn` |
-| `.spec.network.vpc.name` | string | Yes | VPC name |
-| `.spec.network.subnets[].name` | string | Yes | Subnet name in the cluster subnet inventory. Every subnet referenced elsewhere in the cluster manifests must appear in this list |
-| `.spec.network.subnets[].id` | string | Recommended | Subnet ID. For an existing Ready cluster, include this value when you append a subnet later so machine creation can reuse the subnet inventory safely |
-| `.spec.network.subnets[].neutronSubnetId` | string | Recommended for ELB subnets | Neutron subnet ID. Include this value for any subnet that the control plane ELB uses |
-| `.spec.network.subnets[].cidr` | string | Recommended | Subnet CIDR kept in the cluster subnet inventory |
-| `.spec.network.subnets[].gatewayIp` | string | Recommended | Subnet gateway kept in the cluster subnet inventory |
-| `.spec.network.subnets[].primaryDNS` | string | Recommended | Primary DNS kept in the cluster subnet inventory |
-| `.spec.network.subnets[].secondaryDNS` | string | Recommended | Secondary DNS kept in the cluster subnet inventory |
-| `.spec.network.securityGroup.name` | string | Yes | Security group name |
-| `.spec.identityRef.name` | string | Yes | Non-empty credential Secret name referenced by `HCSCluster`; this value does not need to match the cluster name |
-| `.spec.controlPlaneHA.enabled` | bool | Required when `controlPlaneHA` is set | Enables a provider-managed server group for control-plane ECS placement |
-| `.spec.controlPlaneHA.policy` | string | Required when `controlPlaneHA` is set | Server group placement policy. Allowed values are `anti-affinity` and `soft-anti-affinity` |
-| `.spec.controlPlaneLoadBalancer` | object | Yes | ELB settings for the provider-created control plane ELB |
-| `.spec.controlPlaneLoadBalancer.vipAddress` | string | Yes | Fixed VIP for the control plane ELB |
-| `.spec.controlPlaneLoadBalancer.vipSubnetName` | string | Yes | Subnet name that contains the ELB VIP. This subnet must also appear in `.spec.network.subnets` |
-| `.spec.controlPlaneLoadBalancer.vipDomainName` | string | No | Leave unset. The provider only uses it to backfill the derived `controlPlaneEndpoint`; cluster access by domain is not supported, and the API server certificate can only be issued by the cluster's own CA |
-| `.spec.controlPlaneLoadBalancer.elbVirsubnetL4Ips[]` | array | Yes | L4 virtual subnet IP groups used by Hybrid Load Balancing |
-| `.spec.controlPlaneLoadBalancer.elbVirsubnetL4Ips[].subnetName` | string | Yes | Subnet name for the L4 virtual subnet IPs. This subnet must also appear in `.spec.network.subnets` |
-| `.spec.controlPlaneLoadBalancer.elbVirsubnetL4Ips[].ips[]` | string | Yes | Two fixed L4 virtual subnet IPs |
-| `.spec.controlPlaneLoadBalancer.elbVirsubnetL7Ips[]` | array | Yes | L7 virtual subnet IP groups used by Hybrid Load Balancing |
-| `.spec.controlPlaneLoadBalancer.elbVirsubnetL7Ips[].subnetName` | string | Yes | Subnet name for the L7 virtual subnet IPs. This subnet must also appear in `.spec.network.subnets` |
-| `.spec.controlPlaneLoadBalancer.elbVirsubnetL7Ips[].ips[]` | string | Yes | Two fixed L7 virtual subnet IPs |
-
-Do not include `spec.controlPlaneEndpoint` in the create manifest. In the HCS create flow, the controller derives and populates this field from `spec.controlPlaneLoadBalancer` after the `HCSCluster` is created. Do not set `controlPlaneEndpoint` manually, and do not add an empty `controlPlaneEndpoint` object. If `controlPlaneEndpoint` is explicitly present in the manifest, it must include both `host` and `port`.
-
-`controlPlaneHA` is optional. When you include it, both `enabled` and `policy` are required. Use `anti-affinity` for strict host separation. Use `soft-anti-affinity` when you prefer host spread but do not want ECS creation to fail only because HCS cannot satisfy the hard placement rule. For planning guidance, including the rolling replacement requirement when enabling the feature on an existing cluster, see [Control Plane HA Placement Plan](./infrastructure.mdx#control-plane-ha-placement).
-
-#### Configure Cluster
-
-The `Cluster` resource in Cluster API declares the cluster and references the control plane and infrastructure resources.
-
-```yaml
-apiVersion: cluster.x-k8s.io/v1beta1
-kind: Cluster
-metadata:
-  name: <cluster-name>
-  namespace: cpaas-system
-  annotations:
-    cpaas.io/sentry-deploy-type: Baremetal
-    cpaas.io/alb-address-type: ClusterAddress
-    capi.cpaas.io/resource-group-version: infrastructure.cluster.x-k8s.io/v1beta1
-    capi.cpaas.io/resource-kind: HCSCluster
-    cpaas.io/kube-ovn-join-cidr: <kube-ovn-join-cidr>
-    cpaas.io/kube-ovn-version: <kube-ovn-version>
-  labels:
-    cluster-type: HCS
-spec:
-  clusterNetwork:
-    pods:
-      cidrBlocks:
-        - <pods-cidr>
-    services:
-      cidrBlocks:
-        - <services-cidr>
-  controlPlaneRef:
-    apiVersion: controlplane.cluster.x-k8s.io/v1beta1
-    kind: KubeadmControlPlane
-    name: <cluster-name>-kcp
-  infrastructureRef:
-    apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-    kind: HCSCluster
-    name: <cluster-name>
-```
-
-| Annotation | Description |
-|-----------|-------------|
-| `cpaas.io/sentry-deploy-type` | Deployment type, set to `Baremetal` |
-| `cpaas.io/alb-address-type` | ALB address type, set to `ClusterAddress` |
-| `capi.cpaas.io/resource-group-version` | Resource group version |
-| `capi.cpaas.io/resource-kind` | Resource type, set to `HCSCluster` |
-| `cpaas.io/kube-ovn-join-cidr` | Kube-OVN join subnet CIDR |
-| `cpaas.io/kube-ovn-version` | Kube-OVN version |
-
-### Deploy Worker Nodes \{#deploy-worker-nodes}
-
-The control plane alone is not a usable cluster. After the control plane is Ready, create the worker resources in the following order.
-
-Before you prepare worker YAML, complete the HCS input checklist in [Infrastructure Resources for Huawei Cloud Stack](./infrastructure.mdx). In particular, list every worker subnet in `HCSCluster.spec.network.subnets`, allocate worker IPs from planned free IP ranges, and collect the provider-recognized `flavorName` and `availabilityZone` API values. If you add a new worker subnet to an existing Ready cluster, patch `HCSCluster.spec.network.subnets` with the full subnet object instead of adding only the subnet name.
-
-#### Step 1: Configure Machine Configuration Pool \{#worker-step-1-machine-config-pool}
-
-The `HCSMachineConfigPool` defines the network configuration and any pool-managed persistent disks for worker node VMs. You must plan and configure the IP addresses, hostnames, persistent disk slots, and other parameters before deployment.
-
-:::warning
-**Pool Size Requirement**
-
-The pool must include at least as many entries as the number of worker nodes you plan to deploy. Insufficient entries will prevent node deployment.
-:::
-
-Use one subnet selector per `networks[]` entry. For new manifests, set either `subnetName` or `subnetId`, but not both. Existing manifests may keep the deprecated `subenetName` field; if you also add `subnetName` while updating that manifest, its value must exactly match `subenetName`. Do not supply conflicting values across `subenetName`, `subnetName`, and `subnetId`.
-
-If you use `subnetName` for worker nodes, include the same subnet name in the parent `HCSCluster.spec.network.subnets` list before you create or scale the worker pool. For an existing Ready cluster, append the full subnet object, including the subnet ID, instead of adding only the subnet name.
-
-```yaml
-apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: HCSMachineConfigPool
-metadata:
-  name: <cluster-name>-worker-pool
-  namespace: cpaas-system
-  labels:
-    cluster.x-k8s.io/cluster-name: <cluster-name>
-spec:
-  configs:
-    - hostname: <worker-1-hostname>
-      networks:
-        - subnetName: <subnet-name>
-          ipAddress: <worker-1-ip>
-      persistentDisks:
-        - slot: 0
-          size: 100
-          type: SSD
-          mountPath: /var/cpaas
-          format: xfs
-    - hostname: <worker-2-hostname>
-      networks:
-        - subnetName: <subnet-name>
-          ipAddress: <worker-2-ip>
-      persistentDisks:
-        - slot: 0
-          size: 100
-          type: SSD
-          mountPath: /var/cpaas
-          format: xfs
-    - hostname: <worker-3-hostname>
-      networks:
-        - subnetName: <subnet-name>
-          ipAddress: <worker-3-ip>
-      persistentDisks:
-        - slot: 0
-          size: 100
-          type: SSD
-          mountPath: /var/cpaas
-          format: xfs
-```
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `.spec.configs[]` | array | Yes | Non-empty list of worker node configurations |
-| `.spec.configs[].hostname` | string | Yes | VM hostname. Use lowercase letters, numbers, hyphens (`-`), or dots (`.`); the value must start and end with a lowercase letter or number and must not exceed 253 characters |
-| `.spec.configs[].networks[]` | array | Yes | Non-empty list of network configurations for the VM |
-| `.spec.configs[].networks[].subnetName` | string | No* | Recommended subnet name field for new manifests |
-| `.spec.configs[].networks[].subnetId` | string | No* | Subnet ID. Use this field instead of `subnetName` when the subnet name is ambiguous |
-| `.spec.configs[].networks[].ipAddress` | string | Yes | Static IP address for the worker VM |
-| `.spec.configs[].persistentDisks[]` | array | No | EVS disks that survive HCSMachine delete-recreate replacement |
-| `.spec.configs[].persistentDisks[].slot` | int | Yes* | Disk slot within one machine configuration. Slots must be unique and contiguous from `0` for the same hostname |
-| `.spec.configs[].persistentDisks[].size` | int | Yes* | EVS disk size in GB. For newly created EVS data disks, use `10` to `32768` GB. Existing claimed disks must match their current size |
-| `.spec.configs[].persistentDisks[].type` | string | Yes* | EVS disk type name available in the target availability zone |
-| `.spec.configs[].persistentDisks[].mountPath` | string | No | Guest mount path. Use `/var/cpaas` for platform state that must survive VM replacement |
-| `.spec.configs[].persistentDisks[].format` | string | No | File system format. If omitted, the provider uses `xfs` |
-| `.spec.configs[].persistentDisks[].mountOptions` | array | No | Mount options. If omitted, the provider uses `defaults,noatime` |
-
-*For new manifests, set either `subnetName` or `subnetId`. Existing manifests may continue to use `subenetName`, and may add `subnetName` only if both fields use the same value. Do not provide conflicting subnet selector values.
-
-**Persistent disk fields are required when `persistentDisks` is specified.**
-
-Use `persistentDisks[]` for node-local state that must survive worker replacement. Do not declare the same mount path in `HCSMachineTemplate.spec.template.spec.dataVolumes[]`.
-
-**Note:** The CRD schema lists `subnetName`, `subenetName`, and `subnetId` as optional fields and does not express their allowed combinations. Follow the provider-level rules above when writing manifests.
-
-**Note:** `networks[]` can contain more than one entry when a worker node needs multiple NICs. The current provider only uses each entry to attach a NIC with a subnet selector and static IP. It does not support per-NIC role declarations, default gateway selection, static routes, route metrics, or per-NIC DNS settings.
-
-#### Pool-Managed Persistent Disks for Workers \{#worker-persistent-disks}
-
-Declare worker-node disks that must survive replacement in the matching `HCSMachineConfigPool.spec.configs[].persistentDisks[]` entry. Use this model for `/var/cpaas` and for any other node-local state that must be retained during rolling replacement.
-
-- Keep `HCSMachineTemplate.spec.template.spec.dataVolumes[]` for temporary disks that may be recreated with each ECS.
-- Keep slots unique and contiguous from `0` for each hostname. The provider uses `(hostname, slot)` as the persistent-disk identity.
-- Treat `slot`, `size`, `type`, `format`, and `mountPath` as immutable after the provider accepts the entry.
-- You can update `mountOptions`. The change takes effect after the worker is replaced.
-- You can append new `persistentDisks[]` entries. The provider creates or claims the EVS disk, but it does not hot-mount the disk into the running ECS. Trigger a rolling replacement with `MachineDeployment.spec.strategy.rollingUpdate.maxSurge: 0` before you expect the new disk to be formatted and mounted inside the guest OS.
-
-To inspect persistent-disk runtime state during worker operations, check the pool status:
-
-```bash
-kubectl get hcsmachineconfigpool <cluster-name>-worker-pool -n cpaas-system -o yaml
-```
-
-#### Step 2: Configure Machine Template \{#worker-step-2-machine-template}
-
-The `HCSMachineTemplate` defines the VM specifications for worker nodes.
-
-Configure worker nodes with a system volume and temporary data volumes for paths that may be recreated with each ECS, such as `/var/lib/kubelet` and `/var/lib/containerd`. Put `/var/cpaas` in `HCSMachineConfigPool.spec.configs[].persistentDisks[]` when platform state must survive worker replacement.
-
-Use the provider-recognized `flavorName` and `availabilityZone` API values when you prepare the worker template. These values are not the tenant UI display names.
-
-```yaml
-apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: HCSMachineTemplate
-metadata:
-  name: <cluster-name>-worker-template
-  namespace: cpaas-system
-spec:
-  template:
-    spec:
-      imageName: <vm-image-name>
-      flavorName: <instance-flavor>
-      availabilityZone: <availability-zone>
-      rootVolume:
-        type: SSD
-        size: 100
-      configPoolRef:
-        name: <cluster-name>-worker-pool
-      dataVolumes:
-        - size: 20
-          type: SSD
-          mountPath: /var/lib/kubelet
-          format: xfs
-        - size: 20
-          type: SSD
-          mountPath: /var/lib/containerd
-          format: xfs
-```
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `.spec.template.spec.imageName` | string | Yes | VM image name |
-| `.spec.template.spec.flavorName` | string | Yes | Provider-recognized HCS API value matched against `Flavor.Name` |
-| `.spec.template.spec.availabilityZone` | string | No | Provider-recognized HCS API value matched against `ZoneName`. Every worker created from this template uses the selected zone. If omitted, the Provider selects a zone reported as available by HCS. See [Availability Zone Placement](./infrastructure.mdx#availability-zone-placement) |
-| `.spec.template.spec.rootVolume.type` | string | Yes | Volume type |
-| `.spec.template.spec.rootVolume.size` | int | Yes | System disk size in GB |
-| `.spec.template.spec.configPoolRef.name` | string | Yes | Referenced HCSMachineConfigPool name |
-| `.spec.template.spec.dataVolumes[]` | array | No | Data volume configurations |
-| `.spec.template.spec.dataVolumes[].size` | int | Yes* | Disk size in GB |
-| `.spec.template.spec.dataVolumes[].type` | string | Yes* | Volume type |
-| `.spec.template.spec.dataVolumes[].mountPath` | string | Yes* | Mount path |
-| `.spec.template.spec.dataVolumes[].format` | string | Yes* | File system format |
-
-*Required when dataVolumes is specified.
-
-`dataVolumes[]` are recreated with the ECS. Do not use them for `/var/cpaas` or any other path that must survive rolling replacement.
-
-**Note:** Do not set runtime identity fields such as `providerID` or `serverId` in `HCSMachineTemplate` manifests. The provider assigns these values when it creates HCS instances.
-
-**Note:** The ACP web UI loads flavors and availability zones through the selected HCS credential. When you write YAML, get the exact provider-recognized `Flavor.Name` and `ZoneName` values from the HCS administrator because the native HCS tenant console might not expose them.
-
-#### Step 3: Configure Bootstrap Template \{#worker-step-3-bootstrap-template}
-
-The `KubeadmConfigTemplate` defines the bootstrap configuration for worker nodes.
-
-`imagePullCredentialsVerificationPolicy: NeverVerify` is required only starting with Kubernetes 1.35. Omit this parameter when creating workers with Kubernetes 1.34 or earlier.
-
-```yaml
-apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
-kind: KubeadmConfigTemplate
-metadata:
-  name: <cluster-name>-worker-kct
-  namespace: cpaas-system
-spec:
-  template:
-    spec:
-      files:
-        - path: /etc/kubernetes/patches/kubeletconfiguration0+strategic.json
-          owner: root:root
-          permissions: "0644"
-          content: |
-            {
-              "apiVersion": "kubelet.config.k8s.io/v1beta1",
-              "kind": "KubeletConfiguration",
-              "imagePullCredentialsVerificationPolicy": "NeverVerify",
-              "protectKernelDefaults": true,
-              "staticPodPath": null,
-              "tlsCertFile": "/etc/kubernetes/pki/kubelet.crt",
-              "tlsPrivateKeyFile": "/etc/kubernetes/pki/kubelet.key",
-              "streamingConnectionIdleTimeout": "5m",
-              "clientCAFile": "/etc/kubernetes/pki/ca.crt"
-            }
-      postKubeadmCommands:
-        - chmod 600 /var/lib/kubelet/config.yaml
-      joinConfiguration:
-        patches:
-          directory: /etc/kubernetes/patches
-        nodeRegistration:
-          kubeletExtraArgs:
-            volume-plugin-dir: "/opt/libexec/kubernetes/kubelet-plugins/volume/exec/"
-```
-
-The HCS controller injects `/etc/kubernetes/pki/kubelet.crt` and `/etc/kubernetes/pki/kubelet.key` while resolving worker cloud-init data. The kubelet patch above configures kubelet to use those controller-provided certificate files.
-
-#### Step 4: Configure Machine Deployment \{#worker-step-4-machine-deployment}
-
-The `MachineDeployment` orchestrates the creation and management of worker nodes.
-
-```yaml
-apiVersion: cluster.x-k8s.io/v1beta1
-kind: MachineDeployment
-metadata:
-  name: <cluster-name>-md-0
-  namespace: cpaas-system
-spec:
-  clusterName: <cluster-name>
-  replicas: 3
-  strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 0
-      maxUnavailable: 1
-  template:
-    spec:
-      clusterName: <cluster-name>
-      version: <kubernetes-version>
-      nodeDrainTimeout: 1m
-      nodeDeletionTimeout: 5m
-      bootstrap:
-        configRef:
-          apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
-          kind: KubeadmConfigTemplate
-          name: <cluster-name>-worker-kct
-      infrastructureRef:
-        apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-        kind: HCSMachineTemplate
-        name: <cluster-name>-worker-template
-```
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `.spec.clusterName` | string | Yes | Target cluster name |
-| `.spec.replicas` | int | Yes | Number of worker nodes |
-| `.spec.template.spec.bootstrap.configRef` | object | Yes | Reference to KubeadmConfigTemplate |
-| `.spec.template.spec.infrastructureRef` | object | Yes | Reference to HCSMachineTemplate |
-| `.spec.template.spec.version` | string | Yes | Kubernetes version |
-| `.spec.strategy.rollingUpdate.maxSurge` | int | No | Maximum nodes above desired during update |
-| `.spec.strategy.rollingUpdate.maxUnavailable` | int | No | Maximum unavailable nodes during update |
-
-## Cluster Verification
-
-After deploying all cluster resources, verify that the cluster has been created successfully.
-
-### Using kubectl
-
-```bash
-# Check cluster status
-kubectl get cluster -n cpaas-system <cluster-name>
-
-# Verify control plane nodes
-kubectl get kubeadmcontrolplane -n cpaas-system <cluster-name>-kcp
-
-# Check machine status
-kubectl get machines -n cpaas-system
-
-# Verify cluster deployment status
-kubectl get clustermodule <cluster-name> -o jsonpath='{.status.base.deployStatus}'
-```
-
-### Verify Control Plane HA \{#verify-control-plane-ha}
-
-If you enabled `HCSCluster.spec.controlPlaneHA`, inspect the `HCSCluster` condition first:
-
-```bash
-kubectl get hcscluster <cluster-name> -n cpaas-system \
-  -o jsonpath='{range .status.conditions[?(@.type=="ControlPlaneHAReady")]}{.status}{" "}{.reason}{" "}{.message}{"\n"}{end}'
-```
-
-Interpret the condition as follows:
-
-| Status and reason | Meaning | Next step |
-|-------------------|---------|-----------|
-| `True ControlPlaneHAReady` | The provider-managed server group exists and the current control-plane ECS members are tracked. | No action is required. |
-| `False ControlPlaneHAPending` | The provider is waiting for a recoverable state, such as ECS creation or server group membership convergence. | Read the message and wait for the referenced control-plane machine or ECS operation to finish. |
-| `False ControlPlaneHAFailed` | The provider could not create, validate, update, or clean up the server group, or HCS rejected ECS scheduling for the selected policy. | Read the message, then check HCS capacity, the selected policy, and controller logs if needed. |
-
-Inspect the observed server group and membership snapshot:
-
-```bash
-kubectl get hcscluster <cluster-name> -n cpaas-system \
-  -o jsonpath='serverGroup={.status.controlPlaneHA.name}{" id="}{.status.controlPlaneHA.id}{" policy="}{.status.controlPlaneHA.policy}{"\n"}{range .status.controlPlaneHA.members[*]}{.machineName}{" "}{.serverID}{"\n"}{end}'
-```
-
-For `anti-affinity`, HCS treats the server group policy as a hard scheduling constraint. If capacity is insufficient, ECS creation can fail and the condition message should be used as the first diagnostic signal. For `soft-anti-affinity`, HCS tries to spread members but may still place multiple ECS instances on the same host.
-
-### Expected Results
-
-A successfully created cluster should show:
-- Cluster status: **Running** or **Provisioned**
-- All control plane machines: **Running**
-- Kubernetes nodes: **Ready**
-- Cluster Module Status: **Completed**
-
-## Managing Nodes
-
-For day-2 node operations such as scaling, template updates, and web UI node pools, refer to [Manage Nodes on Huawei Cloud Stack](../../../configure/nodes/alauda_os/huawei-cloud-stack.mdx).
-
-## Upgrading Clusters
-
-For instructions on upgrading cluster components, refer to [Upgrade Kubernetes](../../../upgrade/workload/alauda_os/huawei-cloud-stack.mdx).
-
-## Troubleshooting
-
-If the cluster reaches `Provisioned` but never becomes Ready — for example, workload nodes stay `NotReady` because the CNI is not deployed — start with the provider-agnostic [Troubleshoot a Workload Cluster Stuck in Provisioned](../troubleshooting/troubleshoot-cluster-not-ready.mdx).
-
-For HCS-specific failure patterns (for example, `kubeadm init` never completes because a dotted `HCSMachineConfigPool` hostname produced a POSIX hostname containing dots), see [Troubleshoot Huawei Cloud Stack Workload Clusters](./troubleshooting.mdx).
+- [Manage Nodes](../../../configure/nodes/alauda_os/huawei-cloud-stack.mdx)
+- [Upgrade Cluster](../../../upgrade/workload/alauda_os/huawei-cloud-stack.mdx)
+- [Delete the Cluster](./deleting.mdx)

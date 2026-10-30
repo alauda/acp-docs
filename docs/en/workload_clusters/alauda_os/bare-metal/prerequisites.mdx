@@ -1,0 +1,164 @@
+---
+weight: 30
+title: Prerequisites
+author: gangwang@alauda.io
+category: howto
+queries:
+  - bare metal cluster prerequisites
+  - which ports must be open for a bare metal cluster
+  - bare metal network requirements per stage
+  - bare metal host time synchronization ntp requirement
+  - elemental-image-catalog import baremetal-base-image
+---
+
+# Prerequisites for Bare Metal Workload Clusters
+
+Meet the following before you [register the hosts](./create_cluster.mdx#step-1-machineregistration-seedimage) and [create the cluster](./create_cluster.mdx). They also apply to every host that you add to a cluster later.
+
+## Providers \{#providers}
+
+Install these cluster plugins on the `global` cluster:
+
+- **Alauda Container Platform Cluster Bootstrap Provider**
+- **Alauda Container Platform Infrastructure Provider for Bare Metal**, which installs the bare-metal manager and `elemental-operator`
+
+A `global` cluster installed on Bare Metal with `ac` already runs both. Otherwise, download them from **Common ACP Extensions** (see [Download](../../../install/prepare/download.mdx)), upload them with `violet push` (see [Upload Packages](../../../extend/upload_package.mdx#violet_push_usage)), and install them as described in [Cluster Plugin](../../../extend/cluster_plugin.mdx). In a disaster recovery pair, install them on both `global` clusters.
+
+When the platform uses a third-party certificate, its `cpaas-system/dex.tls` Secret has no `ca.crt` key, and `elemental-operator` does not start with the default settings. Check the keys:
+
+```bash
+kubectl -n cpaas-system get secret dex.tls -o jsonpath='{.data}' | jq -r 'keys | join(",")'
+```
+
+Without `ca.crt`, install the Infrastructure Provider for Bare Metal with YAML, as described in [Installing via YAML](../../../extend/cluster_plugin.mdx#installing-via-yaml), and set `elemental.tls.caCertSecretKey: tls.crt` in `spec.valuesOverride` of its `ModuleInfo`; the Web Console form has no field for it:
+
+```yaml
+spec:
+  valuesOverride:
+    acp/chart-cluster-api-provider-baremetal:
+      elemental:
+        tls:
+          caCertSecretKey: tls.crt
+```
+
+## OS Images and Image Catalog \{#os-images-and-image-catalog}
+
+Both Bare Metal OS images are in the platform registry, and `elemental-image-catalog` maps the Kubernetes version that `ac` installs to the root filesystem image. When the `global` cluster was installed on Bare Metal with `ac`, both are already done; skip this section.
+
+| Image | Used by | Purpose |
+|---|---|---|
+| `baremetal-base-image` | `elemental-image-catalog` | Reprovisions a registered host with the Kubernetes-specific root filesystem. |
+| `baremetal-base-image-iso` | `SeedImage.spec.baseImage` | Builds the live ISO for initial installation and registration. |
+
+The provider package contains no OS image, and the provider chart creates the catalog with no entries; adding a catalog entry or a `SeedImage` reference does not import the image.
+
+1. **Import the images.** The Bare Metal OS download is an archive of one OCI image layout that holds both images under the same tag; see [Image Format by Provider](../../../overview/alauda_os_support_matrix.mdx#image-format-by-provider). On a host with containerd that reaches the registry, such as a `global` control plane node, run as root, with free space in `/var/lib/containerd` of at least the archive size:
+
+   ```bash
+   ctr -n bare-metal-os images import --all-platforms --no-unpack <bare-metal-os-archive>
+   ctr -n bare-metal-os images ls -q     # baremetal-base-image:<os-image-tag> and baremetal-base-image-iso:<os-image-tag>
+
+   for repo in baremetal-base-image baremetal-base-image-iso; do
+     ctr -n bare-metal-os images push --local --skip-verify \
+       -u "<registry-username>:<registry-password>" \
+       "<registry-address>/tkestack/${repo}:<os-image-tag>" "${repo}:<os-image-tag>"
+     curl -sk -u "<registry-username>:<registry-password>" \
+       "https://<registry-address>/v2/tkestack/${repo}/tags/list"
+   done
+
+   ctr -n bare-metal-os images rm \
+     "baremetal-base-image:<os-image-tag>" "baremetal-base-image-iso:<os-image-tag>"
+   ```
+
+   `--skip-verify` requires `--local`. For the registry of the `global` cluster, the `admin` password is in the `cpaas-system/registry-admin` Secret, and `<registry-address>` is the `cpaas.io/registry-address` annotation of `Cluster/global`. In a disaster recovery pair, import into the registry of both `global` clusters. Take both images from the same archive; do not pair images from different archives or point cluster resources at a build registry.
+
+2. **Add the catalog entry.** `<kubernetes-version>` is the version that `ac` installs, the latest Kubernetes version that the platform supports, with the leading `v`; `ac adm alpha cluster manifests` prints it as `Pinning Kubernetes <version>`, and `ac` does not check the catalog for you. Patch the ConfigMap so that existing entries are kept:
+
+   ```bash
+   kubectl -n cpaas-system patch configmap elemental-image-catalog --type merge \
+     -p '{"data":{"<kubernetes-version>":"<registry-address>/tkestack/baremetal-base-image:<os-image-tag>"}}'
+   kubectl -n cpaas-system get configmap elemental-image-catalog -o yaml
+   ```
+
+   The provider resolves the image at reprovision time by substituting the platform registry address. A version missing from the catalog leaves the `BaremetalMachine` in `Failed / Reason=ImageCatalogMiss`, and adding the entry afterwards does not clear it; delete the affected `Machine` so that its owner recreates it. In a disaster recovery pair, add the entry on both `global` clusters: the catalog is not synchronized.
+
+## Network Connectivity \{#network-connectivity}
+
+Hosts are registered, installed, and joined over the network, so every path below is open before the first host boots the ISO. The host firewall on an Alauda OS node is maintained by the platform; see [Managing Firewall Ports](../../../configure/machine_config/firewall.mdx). Plan the site firewalls, security groups, and router ACLs between the host subnet, the platform, and the registry.
+
+| Stage | Source | Destination | Protocol / port | Purpose |
+| --- | --- | --- | --- | --- |
+| First boot | Each host | Site DNS servers | UDP and TCP `53` | Resolve the platform access address and the registry |
+| First boot | Each host | Site NTP servers | UDP `123` | [Host time synchronization](#host-time-synchronization) |
+| First boot | Each host | Platform access address | TCP `443`, or the custom platform HTTPS port | `elemental-register` registers the host and creates its `MachineInventory` |
+| First boot and reprovision | Each host | Platform registry | TCP `11443` | `elemental install` and every later `elemental upgrade` pull the Alauda OS image |
+| Provisioning and steady state | Each host | Platform access address, path `/kubernetes/global` | TCP `443`, or the custom platform HTTPS port | `elemental-system-agent` polls its plan Secret through the platform ingress |
+| Cluster join | Every node | This cluster's control plane endpoint | TCP `6443`, or `cluster.network.loadBalancer.port` | `kubeadm join` and `kubelet` reach the API server |
+| Cluster join | Every node | Platform registry from the `cpaas.io/registry-address` annotation | TCP `11443` | Pull CoreDNS, kube-proxy, and Kube-OVN |
+| Cluster management | `global` cluster nodes | This cluster's control plane endpoint | TCP `6443`, or the configured port | The Cluster API controllers reconcile the cluster |
+| Cluster runtime | Every node | Every other node of the cluster | etcd `2379` and `2380` between control plane nodes; UDP `6081` for the default Geneve tunnel; `kubelet`; Pod and Service traffic | See [Communication Matrix](../../../install/prepare/communication_matrix.mdx). Confirm the tunnel port if you changed the Kube-OVN tunnel type |
+
+:::warning
+**`443` alone is not enough.** Registration and plan polling need only the platform HTTPS port, but the same host resolves names, pulls images on `11443`, joins the API server, and exchanges cluster traffic. A firewall approval that covers only `443` produces hosts that register and then fail during install or join.
+:::
+
+These paths are for workload cluster hosts. While the `global` cluster is installed, its hosts register against the bootstrap node instead; see [Bare Metal prerequisites for the global cluster](../../../install/alauda_os/bare-metal/prerequisites.mdx#network). After handoff, a `global` host's agent uses the `global` control plane endpoint; see [Endpoint and Identity](../../../install/alauda_os/bare-metal/reference/dr-model.mdx#endpoint-and-identity). A `SeedImage` built during the bootstrap phase points at the bootstrap endpoint and must not be reused after handoff; a workload `SeedImage` created on the `global` cluster stays valid, because its registration URL is the platform domain.
+
+**Control plane endpoint.** For `type: internal`, the VIP is in the same Layer 2 domain as the control plane node IPs, the `vrid` is unique in it, and VRRP and gratuitous ARP are allowed. For `type: external`, provision the listener and backends before you run `create`; see [Plan the Control Plane Endpoint](../prepare/control-plane-endpoint.mdx).
+
+**First-boot addressing.** If a host gets no DHCP address in the live ISO, configure it from the host console before you wait for registration:
+
+```bash
+nmcli connection show
+nmcli connection modify "Wired connection 1" \
+  ipv4.method manual \
+  ipv4.addresses 192.168.254.73/24 \
+  ipv4.gateway 192.168.254.1 \
+  ipv4.dns 192.168.16.19 \
+  ipv4.ignore-auto-dns yes
+nmcli connection up "Wired connection 1"
+```
+
+## Host Time Synchronization \{#host-time-synchronization}
+
+Every host carries the correct time when it boots the ISO: one time zone on every node and at most 10 seconds between nodes, as in [Node Checks](../../../install/non_alauda_os/node_preprocessing.mdx#node_checks). Nothing on this path verifies it for you.
+
+- Make the site NTP servers reachable on UDP `123`. A production cluster should not depend on public NTP.
+- Set the clock in the BIOS/UEFI setup or through the BMC; the install disk is wiped, so there is no OS to run a command in. Keep the hardware clock on UTC.
+- Compare the hosts with each other: the spread across the hosts of one cluster stays within 10 seconds.
+- After the nodes are `Ready`, confirm with `timedatectl` and `chronyc tracking` on each node.
+
+The cluster PKI inherits the clock of the host that runs `kubeadm init`: a host running ahead issues certificates that other nodes treat as not yet valid, and one running behind issues certificates that expire early. An unsynchronized hardware clock is typically off by minutes or hours, so the control plane does not come up.
+
+:::warning
+A Day-2 chrony `MachineConfig`, as in [Configuring the Chrony Time Service](../../../configure/machine_config/managing.mdx#configuring-the-chrony-time-service), configures running nodes. It cannot correct the clock of a host that is still installing Alauda OS or running `kubeadm`.
+:::
+
+## TPM \{#tpm-decision}
+
+Decide per host whether it exposes a working hardware TPM (`/dev/tpm0`), not whether it is physical or virtual. In the `MachineRegistration` of [Register the Hosts](./create_cluster.mdx#step-1-machineregistration-seedimage):
+
+- `emulate-tpm: false`, or the field omitted, only for hosts with a hardware TPM.
+- `emulate-tpm: true` with `emulated-tpm-seed: -1` for every other host, including physical servers without a TPM module. Otherwise `elemental-register` fails TPM attestation and never sends the registration request.
+
+## Image Registry \{#image-registry}
+
+By default the cluster uses the registry of the `global` cluster: `ac` reads its address from the `registry` key of `cpaas-system/public-registry-credential`, which must exist even when the registry needs no authentication. To pull platform component images from a dedicated registry instead, follow [Choose the Image Registry for a Workload Cluster](../prepare/workload-cluster-image-registry.mdx) and set `cluster.registrySecretRef`.
+
+The hosts install and join with the platform registry address alone; a credential matters only when platform components are installed on the cluster. The choice of registry is fixed when the cluster is created, so decide before you run `create`. Neither choice affects the OS images, which hosts always pull from the platform registry.
+
+## Host Disks and Boot Order \{#host-disk-and-boot-preparation}
+
+Classify every disk and virtual disk on each host before it boots the ISO, and record the OS install target and the disks that must keep data:
+
+- Wipe the OS install disk and any obsolete boot disk, so that the host boots the ISO and not an old OS. Set `install.device` in the `MachineRegistration` to the exact OS disk.
+- Do **not** wipe a data disk that you will manage with the `Adopt` policy. Back it up and record its stable ID and filesystem UUID. A disk for `InitializeIfBlank` must be disposable and blank, and still needs a separate initialization approval after registration.
+- Remove the Elemental labels `COS_STATE`, `COS_PERSISTENT`, `COS_OEM`, and `COS_RECOVERY` from **all** disks and every multipath path. Elemental resolves partitions by label, and a stale label on another disk makes the reprovision fail. Clean the disk rather than disabling multipath.
+- On a host with several disks, do not leave `install.device` empty or use `/dev/sda`; follow [Select a Fixed System Disk on Multi-Disk Bare-Metal Hosts](./reference/configure-fixed-install-disk.mdx).
+- Boot the virtual CD or ISO first.
+
+Use only stable storage identities reported by the registered inventory. Runtime paths such as `/dev/sdX`, `/dev/vdX`, `/dev/nvmeXnY`, and `/dev/mapper/mpathX` must not be placed in `MachineInventory.spec.storage`.
+
+## Node Labels and Taints \{#node-labels}
+
+To reserve the nodes of a pool for monitoring, logging, or ingress, plan their role labels and taints before you create the pools, as described in [Infra Nodes](../../../configure/nodes/node_planning.mdx#create-infra-nodes-alauda-os).

@@ -1,0 +1,72 @@
+---
+weight: 30
+title: Prerequisites
+author: dev@alauda.io
+category: howto
+queries:
+  - vsphere cluster prerequisites
+  - vsphere vm template requirements
+  - vsphere credential secret
+  - vsphere control plane endpoint mode
+---
+
+# Prerequisites for VMware vSphere Workload Clusters
+
+Meet the following before you [create the cluster](./create_cluster.mdx). `ac` creates none of the vCenter objects; it checks them before it applies anything, as listed in [Create the Cluster](./create_cluster.mdx#create-with-ac).
+
+## Providers \{#providers}
+
+The Cluster Bootstrap Provider and the Infrastructure Provider for Virtualization Platform are installed on the `global` cluster. A `global` cluster installed on VMware vSphere with `ac` already runs both; otherwise see [Install the Provider](./reference/install_provider.mdx).
+
+Some features depend on the provider version, such as the Self-built VIP and ephemeral disks, which require `v1.0.17` or later. Read the installed provider version from the provider `AppRelease` on the management cluster; do not infer it from the ACP release. See [Identify the Installed Provider Version](../../../upgrade/workload/alauda_os/index.mdx#identify-the-installed-provider-version).
+
+## vCenter Reachability \{#vcenter-reachability}
+
+The `global` cluster and the machine that runs `ac` reach vCenter on `TCP/443`: the provider manages the VMs through it, and `ac` signs in to vCenter to check the names in `install-config.yaml`.
+
+## VM Template \{#vm-template-requirements}
+
+The VM template, the datacenter, the port groups, the datastores, and the compute resource exist in vCenter. Create the VM template from the Alauda OS image published for the target platform release, without changes; it carries the Kubernetes version that `ac` installs, the latest Kubernetes version that the platform supports. See [OS Support Matrix](../../../overview/alauda_os_support_matrix.mdx).
+
+## Control Plane Endpoint \{#control-plane-endpoint-modes}
+
+Every cluster reaches its API server through a stable endpoint. Select the mode before you write `install-config.yaml`; see the warning below. `ac` records it in `VSphereCluster.spec.controlPlaneLoadBalancer`.
+
+| `cluster.network.loadBalancer.type` | What `ac` renders | Who owns the endpoint |
+|---|---|---|
+| `external` (default) | `spec.controlPlaneEndpoint` only; `spec.controlPlaneLoadBalancer` is absent | You do. Provision an external Layer 4 TCP LoadBalancer that forwards `6443` to the control plane nodes and satisfies [the endpoint contract](../prepare/control-plane-endpoint.mdx). |
+| `internal` | `spec.controlPlaneLoadBalancer` with `type: internal` | The provider does. It injects a bootstrap VIP on the first control plane node, then installs Alive (keepalived and IPVS) into the workload cluster and holds the VIP on the control plane nodes. Meet the [Self-built VIP prerequisites](./reference/install-config-parameters.mdx#self-built-vip-prerequisites) first. |
+
+<Directive type="warning" title="The Self-built VIP is a creation-time choice only">
+The Self-built VIP exists from provider `v1.0.17`, requires ACP `v4.4` or later, and is available only to clusters **created** with it. An existing cluster cannot adopt it, and neither can a cluster whose provider was upgraded to `v1.0.17` from an earlier release: the VIP is injected while the first control plane node bootstraps, and Alive then takes it over, so there is no in-place migration path. Those clusters keep their external LoadBalancer, and moving one onto a Self-built VIP means creating a new cluster. See [Upgrading the Provider](./reference/install_provider.mdx#upgrade-the-provider) and [`controlPlaneLoadBalancer` fields](./reference/install-config-parameters.mdx#control-plane-load-balancer-fields).
+</Directive>
+
+## Static IP Addresses \{#static-ip-addresses}
+
+Every node has a hostname and a static IPv4 address, plus one address for each additional NIC. All required addresses are allocated, are not in use, and are not already declared by a slot in another `VSphereMachineConfigPool` bound to the same `Cluster`. Plan each host's addresses and disks before the cluster is created: once a machine takes a slot, they are frozen; see [Allocated slot restrictions](./reference/install-config-parameters.mdx#create-the-machine-config-pools).
+
+## ClusterResourceSet \{#cluster-resource-set}
+
+`ClusterResourceSet=true` is enabled on the `global` cluster. The vSphere CPI reaches the workload cluster through a `ClusterResourceSet`; without it, the nodes stay uninitialized.
+
+## Image Registry \{#image-registry}
+
+The cluster inherits the registry of the `global` cluster: `ac` does not support a dedicated registry on vSphere. `ac` reads the address from the `registry` key of `cpaas-system/public-registry-credential`, which must exist even when the registry needs no authentication. The registry is reachable from workload nodes and contains the required Kube-OVN and vSphere CPI tags.
+
+## vCenter Credential Secret \{#before-you-start}
+
+Create the vCenter credential Secret in `cpaas-system` of the `global` cluster. `ac` references it through `credentialRef` and never creates it. Use `kubectl create`, not `kubectl apply`, which would store the password in an annotation of the Secret:
+
+```bash
+kubectl -n cpaas-system create secret generic <cluster-name>-credential \
+  --from-literal=username=<administrator@vsphere.local> \
+  --from-literal=password='<password>'
+```
+
+The provider takes ownership of the Secret and deletes it with the cluster, so create it again before each installation, and do not share one Secret between two vSphere clusters. `ac` renders the CPI credential from the same account; you do not prepare a second one.
+
+The account must be able to read the inventory, and to clone, power, reconfigure, and delete VMs and their disks. When custom attributes are in use, it also needs the privileges in [Install the Provider](./reference/install_provider.mdx#prerequisites).
+
+## Node Labels and Taints \{#node-labels}
+
+Role labels and taints for dedicated node groups, for example for monitoring, logging, or ingress, are planned before the cluster is created, as described in [Infra Nodes](../../../configure/nodes/node_planning.mdx#create-infra-nodes-alauda-os).
