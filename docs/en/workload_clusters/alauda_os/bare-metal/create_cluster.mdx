@@ -1,0 +1,1057 @@
+---
+weight: 40
+title: Create a Cluster
+author: gangwang@alauda.io
+category: howto
+queries:
+  - create baremetal cluster
+  - deploy kubernetes on bare metal
+  - baremetal cluster creation guide
+  - elemental seedimage iso install
+  - machineinventorypool cluster
+  - which ports must be open for a bare metal cluster
+  - bare metal network requirements per stage
+  - bare metal host time synchronization ntp requirement
+---
+
+# Create a Cluster on Bare Metal
+
+This document explains how to create Kubernetes clusters on physical servers using the bare-metal provider. The workflow is YAML-only — there is no Fleet Essentials UI for bare-metal clusters at this time.
+
+## Prerequisites
+
+Before creating clusters, ensure all of the following prerequisites are met.
+
+### 1. Required Plugin Installation
+
+Before you create the first workload cluster on Bare Metal, upload and install the following plugins on the `global` cluster. This applies regardless of the IaaS platform that the `global` cluster itself runs on:
+
+- **Alauda Container Platform Cluster Bootstrap Provider**
+- **Alauda Container Platform Infrastructure Provider for Bare Metal** (umbrella chart that installs both the bare-metal manager and `elemental-operator`)
+
+For the procedure, see [Install the Provider](./install_provider.mdx). If the `global` cluster was installed on Bare Metal, also complete [Prepare the global Cluster as a Management Cluster](./install_provider.mdx#prepare-global-as-management-cluster).
+
+### 2. OS Images Imported and Image Catalog Populated \{#os-images-and-image-catalog}
+
+Before creating any cluster resources, import **both** bare-metal OS images into the target platform registry, then add the target Kubernetes version to `elemental-image-catalog`. Neither step happens on its own: the provider package contains no OS image, and the provider chart creates the image catalog with no entries.
+
+| Image | Used by | Purpose |
+|---|---|---|
+| OS image (`base-image`), repository `baremetal-base-image` | `elemental-image-catalog` | Reprovisions a registered host with the Kubernetes-specific root filesystem. |
+| OS ISO image (`base-image-iso`), repository `baremetal-base-image-iso` | `SeedImage.spec.baseImage` | Builds the live ISO used for initial host installation and registration. |
+
+Importing only one image is not sufficient. Adding an image-catalog entry or a `SeedImage` reference does **not** import the corresponding image.
+
+**Import the images.** The Bare Metal OS download for your ACP release is an archive of one OCI image layout that holds both images under the same tag; see [Image Format by Provider](../../../overview/alauda_os_support_matrix.mdx#image-format-by-provider). Run the import as root on a host that has containerd and can reach the platform registry, such as a `global` control-plane node; Alauda OS ships `ctr` but not `skopeo`. `/var/lib/containerd` needs free space of at least the archive size. Import the archive into a dedicated containerd namespace and list the image names it creates:
+
+```bash
+ctr -n bare-metal-os images import --all-platforms --no-unpack <bare-metal-os-archive>
+ctr -n bare-metal-os images ls -q
+```
+
+The output lists `baremetal-base-image:<os-image-tag>` and `baremetal-base-image-iso:<os-image-tag>`. Push both images and confirm that the registry lists the tag for each of them. `--skip-verify` requires `--local`:
+
+```bash
+for repo in baremetal-base-image baremetal-base-image-iso; do
+  ctr -n bare-metal-os images push --local --skip-verify \
+    -u "<registry-username>:<registry-password>" \
+    "<registry-address>/tkestack/${repo}:<os-image-tag>" "${repo}:<os-image-tag>"
+  curl -sk -u "<registry-username>:<registry-password>" \
+    "https://<registry-address>/v2/tkestack/${repo}/tags/list"
+done
+
+ctr -n bare-metal-os images rm \
+  "baremetal-base-image:<os-image-tag>" "baremetal-base-image-iso:<os-image-tag>"
+```
+
+The last command removes the local copies after both pushes succeed. For the registry of the `global` cluster, the `admin` password is stored in the `cpaas-system/registry-admin` Secret. In a disaster recovery pair, import the images into the registry of both `global` clusters; see [Prepare the global Cluster as a Management Cluster](./install_provider.mdx#prepare-global-as-management-cluster).
+
+After the import, `<base-image>` is `<registry-address>/tkestack/baremetal-base-image:<os-image-tag>` and `<base-image-iso>` is `<registry-address>/tkestack/baremetal-base-image-iso:<os-image-tag>`. Take both images from the same archive. Do not point cluster resources at a build registry, pair images from different archives, or substitute an independently built image.
+
+**Populate the image catalog.** The `elemental-image-catalog` ConfigMap in `cpaas-system` maps `Machine.spec.version` to the `elemental upgrade` image used to (re)provision a node. The provider chart creates it with no entries, so no node can be provisioned until you add the target version. Patch the ConfigMap rather than replacing it, so that existing entries are kept, then check the result:
+
+```bash
+kubectl -n cpaas-system patch configmap elemental-image-catalog --type merge \
+  -p '{"data":{"<kubernetes-version>":"<base-image>"}}'
+
+kubectl -n cpaas-system get configmap elemental-image-catalog -o yaml
+```
+
+Every value used as `Machine.spec.version` (for both the control plane and worker `MachineDeployment` resources) must appear as a key in this ConfigMap, with the leading `v` preserved, and resolve to the imported `base-image`. The provider resolves the image at reprovision time by substituting the platform registry address for the registry portion of the entry. If a target version is missing, no `reprovision` plan is written and `BaremetalMachine` ends up in `Failed / Reason=ImageCatalogMiss`. Adding the entry afterwards does not clear that state; delete the affected `Machine` so that its owner recreates it.
+
+### 3. Network Connectivity \{#network-connectivity}
+
+Bare-metal hosts are registered, installed, and joined entirely over the network, so every path in the table below has to be open before the first host boots the `SeedImage` ISO.
+
+The host firewall on an Alauda OS node is preconfigured and maintained by the platform — you do not manage it, and this table is not a node firewall rule set. See [Managing Firewall Ports](../../../configure/machine_config/firewall.mdx). What you do have to plan is the network **between** the hosts and the endpoints they reach: site firewalls, security groups, and router ACLs between the host subnet, the platform, and the registry.
+
+| Stage | Source | Destination | Protocol / port | Purpose |
+| --- | --- | --- | --- | --- |
+| First boot | Each host booted from the `SeedImage` ISO | Site DNS servers | UDP and TCP `53` | The host resolves the platform access address and the registry host by name before it can reach either |
+| First boot | Each host | Site NTP servers | UDP `123` | The clock gate in [Host Time Synchronization](#host-time-synchronization) |
+| First boot | Each host booted from the `SeedImage` ISO | Platform access address (`global.platformUrl`) | TCP `443`, or the custom platform HTTPS port | `elemental-register` registers the host, which creates its `MachineInventory` |
+| First boot | Each host | Platform registry (`global.registry.address`) | TCP `11443` | `elemental install` pulls the Alauda OS image. Every later `elemental upgrade` reprovision pulls it again |
+| Provisioning and steady state | Each workload-cluster host | Platform access address, path `/kubernetes/global` | TCP `443`, or the custom platform HTTPS port | `elemental-system-agent` polls its plan Secret. This is the platform ingress path, not a direct connection to a kube-apiserver |
+| Cluster join | Every node of the new cluster | This cluster's control-plane endpoint | TCP `6443`, or the port set in `BaremetalCluster.spec.controlPlaneLoadBalancer.port` | `kubeadm join` and `kubelet` reach the API server |
+| Cluster join | Every node of the new cluster | Platform registry resolved from the `cpaas.io/registry-address` annotation | TCP `11443` | The node pulls the platform images — CoreDNS, kube-proxy, and kube-ovn |
+| Cluster management | `global` cluster nodes | This cluster's control-plane endpoint | TCP `6443`, or the configured control-plane port | The Cluster API controllers run on `global` and reconcile this cluster through its API server |
+| Cluster runtime | Every node of the new cluster | Every other node of the same cluster | etcd `2379` and `2380` between control-plane nodes; the Kube-OVN overlay tunnel, UDP `6081` for the default Geneve encapsulation; `kubelet`; and Pod and Service traffic that is not filtered by port | Cluster-internal traffic. For the full component port inventory, see [Communication Matrix](../../../install/prepare/communication_matrix.mdx). Confirm the tunnel port against your own configuration if you changed the Kube-OVN tunnel type or attached a secondary network |
+
+:::warning
+**`443` alone is not enough for a workload host**
+
+`elemental-register` and `elemental-system-agent` both reach the platform through the platform access address, so registration and plan polling need only the platform HTTPS port. That is not the whole requirement. The same host still resolves names through DNS, pulls its operating system and platform images from the registry on `11443`, joins the API server on the control-plane endpoint port, and exchanges cluster traffic with the other nodes. A firewall approval that covers only `443` produces hosts that register successfully and then fail during install or join, where the cause is much harder to see.
+:::
+
+**Scope of the table.** These are the paths for workload-cluster hosts, which is what this page creates. Two neighbouring cases are documented elsewhere and are not covered above:
+
+- **Bootstrap.** While `global` itself is still being installed, its hosts register against the temporary bootstrap endpoint and a different set of ports applies — see [Bootstrap node network](../../../install/alauda_os/installing.mdx#bootstrap-host-network).
+- **`global` hosts after handoff.** A `global` host's system agent uses the Global control-plane endpoint rather than the platform ingress path, and in a DR pair it uses the local control-plane VIP on `6443` directly. See [Endpoint and Identity](../../../install/alauda_os/global_dr.mdx#endpoint-and-identity).
+
+A `SeedImage` built during the bootstrap phase points at the bootstrap endpoint and must not be reused after handoff; create new `MachineRegistration` and `SeedImage` objects on the active `global` cluster. A workload `SeedImage` created on the `global` cluster stays valid across a handoff, because its registration URL is the platform domain rather than a bootstrap address.
+
+**Control-plane endpoint.**
+
+- For `Internal` Self-built VIP, the VIP must live in the same Layer-2 broadcast domain as the control-plane node IPs. The `vrid` must be unique in that domain, the network must allow VRRP and gratuitous ARP updates, and the node image must expose IPVS and allow Alive to set `net.ipv4.conf.all.arp_accept=1` and `net.ipv4.vs.conntrack=1`.
+- For `External` LoadBalancer, provision the listener and control-plane backends before cluster creation. Follow [Plan the Control Plane Endpoint](../prepare/control-plane-endpoint.mdx).
+
+**First-boot addressing.**
+
+If the target VM or physical host does not receive an address from DHCP while booted into the live ISO, configure the network manually from the host console before waiting for registration. Check the NetworkManager connection name first, then apply the site-specific address, gateway, and DNS values:
+
+```bash
+nmcli connection show
+nmcli connection modify "Wired connection 1" \
+  ipv4.method manual \
+  ipv4.addresses 192.168.254.73/24 \
+  ipv4.gateway 192.168.254.1 \
+  ipv4.dns 192.168.16.19 \
+  ipv4.ignore-auto-dns yes
+nmcli connection up "Wired connection 1"
+```
+
+### 4. Host Time Synchronization \{#host-time-synchronization}
+
+Every host that will become a cluster node — control plane and worker alike — must already carry the correct time when it boots the `SeedImage` ISO. The platform's cross-node requirement is a unified time zone on every cluster node and a time synchronization error between nodes of no more than 10 seconds; see [Node Checks](../../../install/non_alauda_os/node_preprocessing.mdx#node_checks). That requirement describes the cluster's nodes, so it applies here, but nothing on this path verifies it for you: the quick-configuration script and node checks on that page target non-Alauda OS machines that the platform joins over SSH, and they never run against an Alauda OS host installed by `elemental-operator`.
+
+Treat time synchronization as a gate before [Step 1](#step-1-machineregistration-seedimage):
+
+- Make the site NTP servers reachable from the host subnet, and open UDP `123` as listed in [Network Connectivity](#network-connectivity). A production cluster should not depend on public NTP.
+- Set the clock **from firmware**, not from an operating system. At this point the install disk has been wiped as described in [Host Disk and Boot Preparation](#host-disk-and-boot-preparation), so there is no OS on the host to run a command in. Correct the time in the BIOS/UEFI setup or through the BMC, and keep the hardware clock on UTC so that the time zone is applied consistently once Alauda OS is installed.
+- Compare the hosts against each other, not only against a reference. Across all hosts intended for the same cluster, the spread must stay inside the 10-second requirement before any of them boots the ISO.
+- After the nodes reach `Ready`, confirm the result on each node with `timedatectl` — it reports both the time zone and whether the clock is synchronized — and `chronyc tracking` for the source and current offset.
+
+The whole cluster PKI inherits the clock of the host that runs `kubeadm init`. kubeadm sets the certificate authority's `NotBefore` from that host's current time, every leaf certificate inherits that `NotBefore`, and each certificate's `NotAfter` is derived from it. A host running ahead therefore issues a PKI that the other nodes and any client treat as not yet valid until their own clocks catch up, and a host running behind issues one that expires earlier than the configured validity period implies. A server whose hardware clock has never been synchronized is typically wrong by minutes or hours rather than seconds, so the consequence is a control plane that will not come up at all — and it surfaces at control-plane bring-up, long after the registration step where the wrong clock was introduced.
+
+:::warning
+**A Day-2 chrony `MachineConfig` does not replace this**
+
+[Configuring the Chrony Time Service](../../../configure/machine_config/managing.mdx#configuring-the-chrony-time-service) writes `/etc/chrony.conf` to nodes that are already running and joined. It is the correct way to point a cluster at the site NTP servers for ongoing operation, and it is a different requirement from this one: it cannot correct the clock of a host that is still installing Alauda OS or running `kubeadm`. Deferring to it leaves the install and join window unprotected.
+:::
+
+### 5. TPM Decision
+
+Set `MachineRegistration.spec.config.elemental.registration.emulate-tpm` from whether the host exposes a **real hardware TPM** (`/dev/tpm0`), not from whether it is physical or virtual:
+
+- `emulate-tpm: false` (or omit the field) — only when the host has a working hardware TPM, so `elemental-register` can use it for `auth: tpm`.
+- `emulate-tpm: true` with `emulated-tpm-seed: -1` — for any host **without** a hardware TPM. This includes both virtual machines and physical servers that ship without a TPM module (for example a Dell R620). On such a host, `auth: tpm` combined with `emulate-tpm: false` makes `elemental-register` fail TPM attestation and never send the registration request, so `elemental-operator` records zero registration POSTs.
+
+### 6. Workload Cluster Image Registry
+
+Bringing the cluster up needs no registry credential. Bare-metal hosts install the operating system and join the cluster using the platform registry address alone, so you can reach a cluster whose Nodes are all `Ready` without configuring one.
+
+A credential matters at the next step — installing platform components on the new cluster. Those components pull their images from a registry, and a registry that requires authentication needs credentials the cluster can use.
+
+By default the cluster uses the registry of the `global` cluster, backed by the `public-registry-credential` Secret when that registry is authenticated. To have it pull platform component images from a dedicated registry instead, follow [Choose the Image Registry for a Workload Cluster](../prepare/workload-cluster-image-registry.mdx).
+
+:::warning
+The credential can wait, but the choice of registry cannot. A cluster is bound to its registry when it is created, and an existing cluster cannot be moved to another one. Decide before you apply the manifests below, even if you do not install platform components until later.
+:::
+
+Neither choice affects the operating system images described above. Hosts pull `base-image` and `base-image-iso` from the platform registry during `elemental install` and every reprovision, before any cluster-level binding exists.
+
+### 7. Host Disk and Boot Preparation \{#host-disk-and-boot-preparation}
+
+Classify **every** disk and virtual disk (VD) on each host before you boot the `SeedImage` ISO. Record which device is the OS install target and which devices, if any, must retain application data:
+
+- Wipe the selected OS install disk and any other obsolete boot disks so that no bootable previous operating system remains. The host must boot the ISO, not an old on-disk OS. Set `MachineRegistration.spec.config.elemental.install.device` to the exact OS disk.
+- Do **not** wipe a data disk that you intend to manage with the `Adopt` policy. Back it up independently, record its stable ID and filesystem UUID, and make sure it cannot be selected as the install device.
+- A disk intended for `InitializeIfBlank` must be disposable and objectively blank. Formatting still requires a separate initialization approval after the host registers; the registration manifest does not authorize it.
+- Remove residual Elemental partition labels — `COS_STATE`, `COS_PERSISTENT`, `COS_OEM`, `COS_RECOVERY` — from **all** disks, not only the intended install disk. Elemental resolves partitions by label (`blkid -L COS_STATE`); a stale label left on a second disk (for example from a previous install or a leftover multipath member) makes it resolve the wrong device and the reprovision snapshotter fails.
+- On hosts where the same disk can appear through more than one path (multipath), make sure none of those paths exposes a disk that still carries a `COS_*` label; a residual label on any path can be resolved ahead of the intended install disk. Clean the disk rather than disabling multipath — the image keeps it enabled for network-attached storage boot.
+- On a host with multiple disks, do not leave `install.device` empty and do not use `/dev/sda` as a persistent identity. Follow [Select a Fixed System Disk on Multi-Disk Bare-Metal Hosts](./configure-fixed-install-disk.mdx) to reuse one ISO while selecting each host's system disk by WWN.
+- Set the boot order so the host boots the virtual CD / ISO first.
+
+Use only stable storage identities reported by the registered inventory. Linux paths such as `/dev/sdX`, `/dev/vdX`, `/dev/nvmeXnY`, and `/dev/mapper/mpathX` are runtime paths and must not be placed in `MachineInventory.spec.storage`.
+
+### 8. Node Labels and Taints
+
+To give the nodes of a pool their own role label and taint — for example to reserve dedicated pools for monitoring, logging, or ingress — declare them on the pool's resources as described in [Infra Nodes](../../../configure/nodes/node_planning.mdx#create-infra-nodes-alauda-os). Plan them before you create the pools.
+
+---
+
+## Cluster Creation Workflow
+
+When using YAML, import the paired OS images first, then proceed through five required resource steps, with an optional storage-preparation step before pool membership. Every Kubernetes resource must be applied in the `cpaas-system` namespace.
+
+| Step | Apply or perform | Result |
+|---|---|---|
+| 0 | Import `base-image` and `base-image-iso` into the target platform registry and add the target Kubernetes version to `elemental-image-catalog` — see [OS Images Imported and Image Catalog Populated](#os-images-and-image-catalog) | Both OS images are available and the catalog resolves every `Machine.spec.version` before `SeedImage` build or host reprovisioning starts. |
+| 1 | `MachineRegistration` and `SeedImage` | `elemental-operator` builds the bootable ISO. |
+| 2 | Boot the ISO on each physical host | The host runs `elemental install` and registers as a `MachineInventory`. |
+| 2a (optional) | Declare and prepare `MachineInventory.spec.storage` | Explicit data volumes are validated and prepared while the inventory is unallocated. |
+| 3 | `MachineInventoryPool` resources, one per role | The allowed control-plane and worker inventories are declared before CAPI creates Machines. |
+| 4 | `BaremetalCluster`, control-plane `BaremetalMachineTemplate`, `KubeadmControlPlane`, and `Cluster` | Cluster API starts the control-plane rollout using the control-plane pool. |
+| 5 | Worker `KubeadmConfigTemplate`, worker `BaremetalMachineTemplate`, and `MachineDeployment` | Cluster API starts the worker rollout using the worker pool. |
+
+:::warning
+**Important Namespace Requirement**
+
+All bare-metal resources must be applied in the `cpaas-system` namespace. The provider and `elemental-operator` only reconcile objects in that namespace.
+:::
+
+:::warning
+**Workload Cluster Naming**
+
+The workload `cluster-name` **must not** be `global`. That name is reserved for the `global` cluster, and reusing it causes the workload cluster's resources to collide with `global` cluster resources in `cpaas-system`. As a convention, keep the CAPI `Cluster` and `BaremetalCluster` named exactly `<cluster-name>`, and prefix dependent resources (`KubeadmControlPlane`, `KubeadmConfigTemplate`, `MachineDeployment`, machine templates, pools, registrations) with `<cluster-name>-`.
+:::
+
+### Resolving Placeholder Values \{#resolving-placeholders}
+
+The example manifests below use `<placeholder>` syntax for environment-specific values:
+
+| Placeholder | Source of truth | How to retrieve |
+|---|---|---|
+| `<cluster-name>` | Operator-supplied workload cluster name. Must not be `global`. | Choose once and use consistently for `Cluster`, `BaremetalCluster`, pools, templates, and registration resources. |
+| `<kubernetes-version>` | Kubernetes version of the imported OS image, added as an `elemental-image-catalog` ConfigMap key (with leading `v`, for example `v1.33.7-2`). | [OS Support Matrix](../../../overview/alauda_os_support_matrix.mdx) for the value; `kubectl -n cpaas-system get cm elemental-image-catalog -o yaml` to confirm the key. |
+| `<bare-metal-os-archive>` | Bare Metal OS archive for the target ACP release. | Download page listed in [OS Support Matrix](../../../overview/alauda_os_support_matrix.mdx). |
+| `<os-image-tag>` | Tag shared by both images in the archive. | `ctr -n bare-metal-os images ls -q` after the import. |
+| `<registry-username>` / `<registry-password>` | Account that can push to `<registry-address>`. | For the `global` cluster's registry, user `admin` with the password from `kubectl -n cpaas-system get secret registry-admin -o jsonpath='{.data.password}' \| base64 -d`. |
+| `<base-image>` | Imported OS image used by the image catalog for host reprovisioning. | `<registry-address>/tkestack/baremetal-base-image:<os-image-tag>` after the import in [OS Images Imported and Image Catalog Populated](#os-images-and-image-catalog). |
+| `<base-image-iso>` | Imported OS ISO image paired with `<base-image>`. | `<registry-address>/tkestack/baremetal-base-image-iso:<os-image-tag>`, imported from the same archive as `<base-image>`. |
+| `<registry-address>` | Target platform registry into which both OS images are imported (same value as `global.registry.address` on the install chart). | `kubectl get cluster global -n cpaas-system -o jsonpath='{.metadata.annotations.cpaas\.io/registry-address}'` (when one exists). |
+| `<control-plane-load-balancer-type>` | Operator decision. Use `Internal` for provider-managed Alive or `External` for an existing load balancer. | Review [Plan the Control Plane Endpoint](../prepare/control-plane-endpoint.mdx). |
+| `<control-plane-vip>` / `<control-plane-port>` | Operator-supplied stable endpoint. For `Internal`, use an unused IPv4 VIP in the control-plane Layer-2 domain. For `External`, use the load balancer frontend address. | n/a |
+| `<vrid>` | Operator-supplied VRID for `Internal` only. It must be unique in the control-plane Layer-2 domain. Remove the field for `External`. | n/a |
+| `<install-device>` | Whole-disk target for `elemental install`. A direct kernel path is suitable only when its identity is stable and unambiguous. For multi-disk bare-metal hosts that reuse one ISO, use `/dev/elemental-install-target`. | Confirm the disk by WWN from the host console. See [Select a Fixed System Disk on Multi-Disk Bare-Metal Hosts](./configure-fixed-install-disk.mdx). |
+| `<dns-image-tag>` / `<etcd-image-tag>` | Component versions baked into the bare-metal base image for `<kubernetes-version>`. | See the `coredns` and `etcd` columns in the [OS Support Matrix](../../../overview/alauda_os_support_matrix.mdx). |
+| `<kube-ovn-version>` | Kube-OVN chart version matching the selected ACP and Kubernetes release. | Use the **kube-ovn (chart)** value from the [OS Support Matrix](../../../overview/alauda_os_support_matrix.mdx), not the Kube-OVN component version, and confirm it against the installed plugin: `kubectl get moduleplugins.cluster.alauda.io kube-ovn -o jsonpath='{.spec.mainChart}{" "}{.status.latestVersion}'`. |
+| `<dns-server>` | Operator-supplied when the first-boot registration path needs an explicit resolver. | Prefer `MachineRegistration.config.cloud-config` or later `KubeadmControlPlane` bootstrap data (`format: cloud-config`). Do not write `/etc/resolv.conf` from `SeedImage.cloud-config`. |
+| `<ssh-authorized-keys>` | Operator-supplied OpenSSH public key — required for any interactive debugging on the node. | n/a |
+| `<inventory-name>` | Allocated by `elemental-operator` after the host boots the ISO and registers. Cannot be predicted before registration. | `kubectl -n cpaas-system get machineinventories.elemental.cattle.io` |
+| `<pool-name>` | Name of the `MachineInventoryPool` that claims an inventory. | Use `<cluster-name>-control-plane-pool` or `<cluster-name>-worker-pool` in the examples below. |
+| `<control-plane-inventory-1/2/3>` / `<worker-inventory-1/2/3>` | Exact `MachineInventory` names selected for each role. | Use the names from `kubectl -n cpaas-system get machineinventories.elemental.cattle.io`. |
+| `<control-plane-host-1/2/3>` / `<worker-host-1>` | Optional Kubernetes node hostnames applied during reprovision. | Operator-supplied; omit `hostname` to fall back to the inventory name. |
+| `<pods-cidr>` / `<services-cidr>` / `<kube-ovn-join-cidr>` | Operator-supplied. Must not overlap with the host network, the `global` cluster's CIDRs, or any other CAPI cluster on the same `global`. | n/a |
+| `<workload-kubeconfig>` | Kubeconfig for the workload cluster. Published by Cluster API as a `Secret` once the control plane initializes. | `kubectl -n cpaas-system get secret <cluster-name>-kubeconfig -o jsonpath='{.data.value}' \| base64 -d` |
+| `<machine-name>` | Existing CAPI `Machine` name used for targeted removal or recovery. | `kubectl -n cpaas-system get machines.cluster.x-k8s.io` |
+| `<new-replica-count>` | Desired `MachineDeployment.spec.replicas` value after scaling. | Operator-supplied target worker count. |
+| `<new-template-name>` | Name of the new template for a changed `BaremetalMachineTemplate` or `KubeadmConfigTemplate`. | Operator-supplied; use a new name. |
+| `<new-kubernetes-version>` / `<new-tag>` / `<new-image>` | Target upgrade version and matching bare-metal base-image tag or resolved image. | Use the release support matrix and confirm the final key exists in `elemental-image-catalog`. |
+
+### Step 1: Build the SeedImage and Register Hosts \{#step-1-machineregistration-seedimage}
+
+Create a `MachineRegistration` that describes the registration URL and first-install cloud-config, and a `SeedImage` that points `elemental-operator` at the matching ISO base image.
+
+Set `SeedImage.spec.baseImage` to the final target-platform registry reference of the imported `base-image-iso`. It must be paired with the imported `base-image` used by the image catalog for later reprovisioning: take both images from the same OS archive, never from different archives.
+
+```yaml title="01-machineregistration-seedimage.yaml"
+apiVersion: elemental.cattle.io/v1beta1
+kind: MachineRegistration
+metadata:
+  name: <cluster-name>-registration
+  namespace: cpaas-system
+  labels:
+    app.kubernetes.io/part-of: cluster-api-provider-baremetal
+spec:
+  # ${...} placeholders are expanded by elemental-register from SMBIOS data.
+  # System UUID is preferred over Serial Number because it is more reliable
+  # across virtualised test environments.
+  machineName: "<cluster-name>-${System Information/UUID}"
+  machineInventoryLabels:
+    app.kubernetes.io/part-of: cluster-api-provider-baremetal
+    pool.baremetal.alauda.io/eligible: "true"
+    elemental.cattle.io/serial-number: "${System Information/Serial Number}"
+  machineInventoryAnnotations:
+    elemental.cattle.io/machine-uuid: "${System Information/UUID}"
+  config:
+    elemental:
+      install:
+        device: <install-device>
+        eject-cd: true
+        reboot: true
+        snapshotter:
+          type: btrfs
+          maxSnaps: 4
+      registration:
+        # false only when the host has a real hardware TPM (/dev/tpm0). Set true
+        # (with emulated-tpm-seed: -1) on any host without one, including physical
+        # servers that ship without a TPM module.
+        emulate-tpm: false
+---
+apiVersion: elemental.cattle.io/v1beta1
+kind: SeedImage
+metadata:
+  name: <cluster-name>-registration-iso
+  namespace: cpaas-system
+  labels:
+    app.kubernetes.io/part-of: cluster-api-provider-baremetal
+spec:
+  type: iso
+  baseImage: <base-image-iso>          # Use the imported target-platform registry reference.
+  registrationRef:
+    apiVersion: elemental.cattle.io/v1beta1
+    kind: MachineRegistration
+    name: <cluster-name>-registration
+    namespace: cpaas-system
+  targetPlatform: linux/amd64
+  size: 20Gi
+  cleanupAfterMinutes: 120
+  cloud-config:
+    stages:
+      boot:
+        - name: "Size COS_STATE for reprovisioning"
+          files:
+            - path: /etc/elemental/config.d/partitions.yaml
+              permissions: 0644
+              content: |
+                install:
+                  partitions:
+                    state:
+                      size: 20480
+```
+
+### Size COS_STATE before the first install \{#size-cos-state}
+
+The `state` partition holds the running system plus every retained snapshot. The Elemental default of 8192 MiB is not enough: snapshots of one image share extents, but an upgrade to a *different* image has to hold two unrelated systems of roughly 3.5 GiB at once and fails part-way through with `no space left on device`, leaving a partial snapshot behind on every retry. Every cluster upgrade goes through `elemental upgrade`, and partition sizes are fixed at install time, so this only surfaces later — on a cluster already in production that can no longer be repartitioned without a reinstall.
+
+Size it to at least 20480 MiB (20 GiB) at install time.
+
+<Directive type="warning" title="Placement and stage both matter">
+  The fragment must sit in `SeedImage.spec.cloud-config` under `stages.boot`. Putting it in `MachineRegistration.spec.config.cloud-config`, or under any other stage, leaves an 8 GiB partition and reports no error.
+</Directive>
+
+Verify the result on the first installed host before rolling out the rest of the fleet:
+
+```bash
+# Expect ~20G, not 8G
+lsblk -o NAME,SIZE,LABEL | grep COS_STATE
+df -h /
+```
+
+Do not add `/etc/resolv.conf` to `SeedImage.spec.cloud-config`. Keep the ISO generic, and put site-specific resolver configuration in `MachineRegistration.spec.config.cloud-config` only when the first-boot registration path needs it. During the tested Global deployment flow, the ISO did not carry resolver files; node DNS was configured later by the kubeadm bootstrap data.
+
+`install.device`, `install.eject-cd`, and `install.reboot` are intentional. If the target disk is omitted, `elemental install` can select an unintended device. On multi-disk physical hosts, use the [fixed system disk workflow](./configure-fixed-install-disk.mdx) instead of a changing `/dev/sdX` name. If `eject-cd` or `reboot` is false, a host can remain in the live environment after the first install and never become usable inventory for Cluster API.
+
+Apply the manifest and wait for the SeedImage build to finish:
+
+```bash
+kubectl apply -f 01-machineregistration-seedimage.yaml
+kubectl -n cpaas-system wait \
+  --for=condition=SeedImageReady=True \
+  seedimage/<cluster-name>-registration-iso \
+  --timeout=30m
+
+SEEDIMAGE_REASON="$(kubectl -n cpaas-system \
+  get seedimage <cluster-name>-registration-iso \
+  -o jsonpath='{.status.conditions[?(@.type=="SeedImageReady")].reason}')"
+SEEDIMAGE_DOWNLOAD_URL="$(kubectl -n cpaas-system \
+  get seedimage <cluster-name>-registration-iso \
+  -o jsonpath='{.status.downloadURL}')"
+SEEDIMAGE_CHECKSUM_URL="$(kubectl -n cpaas-system \
+  get seedimage <cluster-name>-registration-iso \
+  -o jsonpath='{.status.checksumURL}')"
+
+if [ "${SEEDIMAGE_REASON}" != "SeedImageBuildSuccess" ] || \
+   [ -z "${SEEDIMAGE_DOWNLOAD_URL}" ] || \
+   [ -z "${SEEDIMAGE_CHECKSUM_URL}" ]; then
+  echo "SeedImage did not produce a downloadable ISO and checksum" >&2
+  exit 1
+fi
+
+printf '%s\n%s\n' "${SEEDIMAGE_DOWNLOAD_URL}" "${SEEDIMAGE_CHECKSUM_URL}"
+```
+
+Do not use `status.state` as the success gate; the current controller does not populate it. Continue only when `SeedImageReady=True` has reason `SeedImageBuildSuccess` and both `status.downloadURL` and `status.checksumURL` are non-empty. A SeedImage whose download lifetime has expired can still report `SeedImageReady=True`, but its reason changes and its URLs are cleared.
+
+Boot every target host from this ISO. `elemental-register` runs first (creates the `MachineInventory` and uploads `observedNetwork`), then `elemental install` writes the on-disk OS. After install completes, the host stays available for plan execution. If the live ISO environment has no DHCP address, configure NetworkManager manually on the host console as described in [Network Connectivity](#network-connectivity) before waiting for the `MachineInventory`.
+
+Confirm registration:
+
+```bash
+kubectl -n cpaas-system get machineinventories.elemental.cattle.io
+```
+
+Every inventory you intend to use must:
+
+- Show `Ready=True`.
+- Have a non-empty `status.plan.secretRef.name`.
+- Have a `spec.observedNetwork` that matches the host's expected NIC (only required when you want the install-time IP to survive across reprovisions).
+- When managed data disks are required, run an observer-capable OS image, report a fresh `status.observedStorage`, and reach `status.storage.phase=Prepared` before pool allocation.
+
+Record the exact `MachineInventory` names — they are referenced by name in the next step.
+
+### Optional: Prepare Managed Data Disks \{#optional-prepare-managed-storage}
+
+Managed storage belongs to the long-lived `MachineInventory`, not to a CAPI `Machine` or `BaremetalMachineTemplate`. Configure it while the inventory is unallocated and before adding that inventory to a production pool.
+
+Follow [Manage Data Disks on Bare-Metal Hosts](../../../configure/nodes/alauda_os/manage-bare-metal-storage.mdx) to:
+
+1. Verify `elemental-storage-observer.service` and inspect `status.observedStorage`.
+2. Select each device by a stable ID and choose `Adopt` or `InitializeIfBlank`.
+3. Use the matching `storagectl` binary to validate and atomically patch the declaration and, when required, its initialization approval.
+4. Wait for `StoragePrepared=True/AllRequiredVolumesPrepared` and `status.storage.phase=Prepared`.
+
+If no disks should be managed, leave `spec.storage` absent or set `volumes: []`. The storage controller converges that inventory to `Unmanaged` with `StoragePrepared=True/NoManagedVolumes` and performs no disk operation.
+
+### Step 2: Create `MachineInventoryPool` Resources \{#step-2-pools}
+
+Create one pool per role. The pool reconciler validates that every member exists, computes capacity counters, and writes the `baremetal.alauda.io/pool=<pool-name>` annotation onto the inventory.
+
+```yaml title="02-machineinventorypool.yaml"
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: MachineInventoryPool
+metadata:
+  name: <cluster-name>-control-plane-pool
+  namespace: cpaas-system
+spec:
+  clusterName: <cluster-name>
+  machineInventories:
+    - name: <control-plane-inventory-1>
+      hostname: <control-plane-host-1>    # Optional; falls back to the inventory name.
+    - name: <control-plane-inventory-2>
+      hostname: <control-plane-host-2>
+    - name: <control-plane-inventory-3>
+      hostname: <control-plane-host-3>
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: MachineInventoryPool
+metadata:
+  name: <cluster-name>-worker-pool
+  namespace: cpaas-system
+spec:
+  clusterName: <cluster-name>
+  machineInventories:
+    - name: <worker-inventory-1>
+      hostname: <worker-host-1>
+    - name: <worker-inventory-2>
+    - name: <worker-inventory-3>
+```
+
+**Key parameters:**
+
+| Parameter | Type | Description | Required |
+|---|---|---|---|
+| `.spec.clusterName` | string | The workload cluster name this pool serves. A `MachineInventory` must not appear in two active pools. | Yes |
+| `.spec.machineInventories[].name` | string | Exact name of a registered `MachineInventory`. | Yes |
+| `.spec.machineInventories[].hostname` | string | Hostname applied during reprovision. Defaults to the inventory name when omitted. | No |
+
+Apply and verify:
+
+```bash
+kubectl apply -f 02-machineinventorypool.yaml
+kubectl -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io
+```
+
+A healthy pool reports `Ready=True`, `total = len(spec.machineInventories)`, and `available = total - allocated - preparing - reprovisioning - unavailable`. Inventories listed in `spec.machineInventories` that fail validation (missing, plan secret missing, Ready=False, or storage not prepared) raise the pool's `unavailable` counter and surface in the `MembersValid` condition. A non-empty storage declaration is an allocation gate: the inventory is not `Available` to CAPI until Prepare succeeds against a fresh observation.
+
+Size the control-plane pool to at least `KubeadmControlPlane.spec.replicas`. Size the worker pool to at least `MachineDeployment.spec.replicas`. For rolling upgrades the pool must hold the entire replica count — the provider uses delete-then-add semantics from the same pool, never both at once.
+
+### Step 3: Create the Control-Plane Cluster Resources \{#step-3-control-plane}
+
+Create the `BaremetalCluster` (declares the selected control-plane endpoint mode), the control-plane `BaremetalMachineTemplate` (points at the control-plane pool), the `KubeadmControlPlane` (replicas + kubeadm config), and the CAPI `Cluster`.
+
+The Bare Metal API supports both endpoint modes in the same workflow:
+
+- `Internal`: the provider deploys Alive and reconciles the VIP and control-plane backend membership.
+- `External`: the provider skips Alive; the load balancer owner maintains the listener, health check, and backend membership.
+
+Select the mode with `<control-plane-load-balancer-type>` in the manifest below.
+
+:::warning
+**Use the Kubernetes images built into the OS image**
+
+The supported bare-metal OS image preloads the kubeadm control-plane, CoreDNS, and etcd images under `cloud.alauda.io/alauda`. Keep that repository in the KCP configuration and use the component tags from the OS Support Matrix. Do not replace it with `<registry-address>/tkestack`: that produces image references that do not match the images preloaded in the OS. The OS configures its built-in pause image through containerd; do not add `pod-infra-container-image` to the KCP kubelet arguments.
+:::
+
+:::tip
+**Full Configuration Reference**
+
+The example below uses a minimal `KubeadmControlPlane`. For the full hardening profile recommended in production — admission, audit, kubelet patches, encryption provider — see [Complete KubeadmControlPlane Configuration](#complete-kubeadmcontrolplane-configuration) in the Appendix.
+:::
+
+```yaml title="03-cluster.yaml"
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: BaremetalCluster
+metadata:
+  name: <cluster-name>
+  namespace: cpaas-system
+spec:
+  controlPlaneLoadBalancer:
+    type: <control-plane-load-balancer-type>
+    host: <control-plane-vip>
+    port: <control-plane-port>
+    # Required only for Internal. Remove this field for External.
+    vrid: <vrid>
+  networkType: kube-ovn      # Enables provider-managed Kube-OVN AppRelease reconciliation.
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: BaremetalMachineTemplate
+metadata:
+  name: <cluster-name>-control-plane-template
+  namespace: cpaas-system
+spec:
+  template:
+    spec:
+      machineInventoryPoolRef:
+        name: <cluster-name>-control-plane-pool
+---
+apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+kind: KubeadmControlPlane
+metadata:
+  name: <cluster-name>-control-plane
+  namespace: cpaas-system
+spec:
+  replicas: 3
+  version: <kubernetes-version>
+  rolloutStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0            # Bare-metal does not over-provision; replace one at a time.
+  machineTemplate:
+    nodeDrainTimeout: 5m
+    nodeVolumeDetachTimeout: 5m
+    infrastructureRef:
+      apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+      kind: BaremetalMachineTemplate
+      name: <cluster-name>-control-plane-template
+  kubeadmConfigSpec:
+    users:
+      - name: boot
+        sudo: ALL=(ALL) NOPASSWD:ALL
+        shell: /bin/bash
+        sshAuthorizedKeys:
+          - "<ssh-authorized-keys>"
+    clusterConfiguration:
+      imageRepository: cloud.alauda.io/alauda
+      dns:
+        imageTag: <dns-image-tag>
+      etcd:
+        local:
+          imageTag: <etcd-image-tag>
+      apiServer:
+        extraArgs:
+          profiling: "false"
+          tls-min-version: VersionTLS12
+      controllerManager:
+        extraArgs:
+          profiling: "false"
+          tls-min-version: VersionTLS12
+      scheduler:
+        extraArgs:
+          profiling: "false"
+          tls-min-version: VersionTLS12
+    initConfiguration:
+      nodeRegistration:
+        kubeletExtraArgs:
+          node-labels: "kube-ovn/role=master"
+    joinConfiguration:
+      nodeRegistration:
+        kubeletExtraArgs:
+          node-labels: "kube-ovn/role=master"
+---
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  name: <cluster-name>
+  namespace: cpaas-system
+  annotations:
+    capi.cpaas.io/resource-group-version: infrastructure.cluster.x-k8s.io/v1beta1
+    capi.cpaas.io/resource-kind: BaremetalCluster
+    cpaas.io/kube-ovn-join-cidr: <kube-ovn-join-cidr>
+    cpaas.io/kube-ovn-version: <kube-ovn-version>
+    cpaas.io/sentry-deploy-type: Baremetal
+    cpaas.io/alb-address-type: ClusterAddress
+  labels:
+    cluster-type: ProviderBaremetal
+spec:
+  clusterNetwork:
+    pods:
+      cidrBlocks:
+        - <pods-cidr>
+    services:
+      cidrBlocks:
+        - <services-cidr>
+  controlPlaneRef:
+    apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+    kind: KubeadmControlPlane
+    name: <cluster-name>-control-plane
+  infrastructureRef:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+    kind: BaremetalCluster
+    name: <cluster-name>
+```
+
+**Cluster annotations.** The bare-metal provider relies on a small set of `Cluster` annotations during reconcile. Authoritative ones the operator must set:
+
+| Annotation | Required | Value source | Purpose |
+|---|---|---|---|
+| `capi.cpaas.io/resource-group-version` | Yes | Literal `infrastructure.cluster.x-k8s.io/v1beta1` | CAPI infrastructure binding. |
+| `capi.cpaas.io/resource-kind` | Yes | Literal `BaremetalCluster` | CAPI infrastructure binding. |
+| `cpaas.io/kube-ovn-join-cidr` | Yes | Operator-chosen `/16` CIDR that does not overlap with pods/services or any other cluster. | Kube-OVN inter-node tunnel. |
+| `cpaas.io/kube-ovn-version` | Recommended | **kube-ovn (chart)** value from the [OS Support Matrix](../../../overview/alauda_os_support_matrix.mdx). | Pins the chart version used when the provider creates `cni-kube-ovn`. If omitted, the provider falls back to the `kube-ovn` `ModulePlugin` version. |
+| `cpaas.io/sentry-deploy-type` | Yes | Literal `Baremetal`. | Marks the cluster for the bare-metal deploy profile. |
+| `cpaas.io/alb-address-type` | Yes | Literal `ClusterAddress`. | ALB address mode used on bare-metal clusters. |
+
+**`BaremetalCluster` parameters:**
+
+| Parameter | Type | Description | Required |
+|---|---|---|---|
+| `.spec.controlPlaneLoadBalancer.type` | string (`Internal` / `External`) | `Internal` deploys Alive static pods and manages the VIP. `External` skips Alive and requires a pre-provisioned Layer 4 TCP LoadBalancer. | No (defaults to `Internal`) |
+| `.spec.controlPlaneLoadBalancer.host` | string | Control-plane endpoint. For `Internal`, use the Self-built VIP. For `External`, use the load balancer frontend address. Backfilled into `.spec.controlPlaneEndpoint.host` when the endpoint is left empty. | Yes |
+| `.spec.controlPlaneLoadBalancer.port` | int (1–65535) | Control-plane port. Typically `6443`. | Yes |
+| `.spec.controlPlaneLoadBalancer.vrid` | int (0–255) | Keepalived `virtual_router_id`. Must be unique in the control-plane Layer-2 domain. Remove the field for `External`. | When `type=Internal` |
+| `.spec.controlPlaneEndpoint` | object | API server endpoint exposed to CAPI. Once set, must not change. Leave empty to let the reconciler backfill it from `controlPlaneLoadBalancer`. | No |
+| `.spec.networkType` | string | CNI implementation managed by the provider. Set it to `kube-ovn`; any other value causes the provider to skip Kube-OVN `AppRelease` reconciliation and node-removal integration. | Yes for Kube-OVN clusters |
+
+Apply and watch:
+
+```bash
+kubectl apply -f 03-cluster.yaml
+kubectl -n cpaas-system get clusters.cluster.x-k8s.io
+kubectl -n cpaas-system get kubeadmcontrolplanes.controlplane.cluster.x-k8s.io
+kubectl -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io -w
+```
+
+Each new control-plane `BaremetalMachine` advances `Pending → Allocated → Reprovisioning → Running`. Watch:
+
+- `BaremetalMachine.status.machineInventoryRef.name` — which inventory was picked.
+- `BaremetalMachine.status.planSecretRef.name` — plan secret being driven. The secret carries the annotation `baremetal.alauda.io/plan.type=reprovision`.
+- `MachineInventory.status.plan.state` — `Applied` once the host completes `cloud-init clean`, `elemental upgrade`, reboot, and `kubeadm init`/`join`.
+- `BaremetalCluster.status.conditions[EndpointReady]` — true once the configured control-plane endpoint is reachable.
+
+:::warning
+The bare-metal provider does not support single-node control planes. Provision at least three control-plane replicas (`KubeadmControlPlane.spec.replicas: 3`) so that etcd retains quorum. In `Internal` mode, the same nodes also participate in Alive VIP arbitration.
+:::
+
+### Step 4: Deploy Worker Nodes \{#worker-node-deployment}
+
+After the control plane is Ready, create the worker `BaremetalMachineTemplate`, the worker `KubeadmConfigTemplate`, and the `MachineDeployment`.
+
+#### Confirm the Worker Pool Capacity \{#worker-pool-capacity}
+
+```bash
+kubectl -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io <cluster-name>-worker-pool
+```
+
+`status.available` must be at least the target replica count. If you need additional capacity, register more hosts (boot the `SeedImage` ISO on them — see [Step 1](#step-1-machineregistration-seedimage)), prepare any managed storage while each inventory is still unallocated, and then add their names to `spec.machineInventories`.
+
+A host added this way goes through the same first boot as the original nodes, so it has to meet the same prerequisites: the network paths in [Network Connectivity](#network-connectivity) and the clock gate in [Host Time Synchronization](#host-time-synchronization). Confirm both for the new host rather than assuming the approval obtained at delivery time covers its subnet and its hardware clock.
+
+#### Configure the Worker `BaremetalMachineTemplate` \{#worker-machine-template}
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: BaremetalMachineTemplate
+metadata:
+  name: <cluster-name>-worker-template
+  namespace: cpaas-system
+spec:
+  template:
+    spec:
+      machineInventoryPoolRef:
+        name: <cluster-name>-worker-pool
+```
+
+**Key parameters:**
+
+| Parameter | Type | Description | Required |
+|---|---|---|---|
+| `.spec.template.spec.machineInventoryPoolRef.name` | string | Worker pool name (same namespace). To move the workers to a different pool, see [Moving Workers to a Different Pool](../../../configure/nodes/alauda_os/bare-metal.mdx#moving-workers-to-a-different-pool). | Yes |
+
+#### Configure the Bootstrap Template \{#worker-bootstrap-template}
+
+`imagePullCredentialsVerificationPolicy: NeverVerify` is required only starting with Kubernetes 1.35. Omit this parameter when creating workers with Kubernetes 1.34 or earlier.
+
+```yaml
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+kind: KubeadmConfigTemplate
+metadata:
+  name: <cluster-name>-worker-bootstrap
+  namespace: cpaas-system
+spec:
+  template:
+    spec:
+      users:
+        - name: boot
+          sudo: ALL=(ALL) NOPASSWD:ALL
+          shell: /bin/bash
+          sshAuthorizedKeys:
+            - "<ssh-authorized-keys>"
+      files:
+        - path: /etc/kubernetes/patches/kubeletconfiguration0+strategic.json
+          owner: "root:root"
+          permissions: "0644"
+          content: |
+            {
+              "apiVersion": "kubelet.config.k8s.io/v1beta1",
+              "kind": "KubeletConfiguration",
+              "imagePullCredentialsVerificationPolicy": "NeverVerify",
+              "protectKernelDefaults": true,
+              "staticPodPath": null,
+              "tlsCertFile": "/etc/kubernetes/pki/kubelet.crt",
+              "tlsPrivateKeyFile": "/etc/kubernetes/pki/kubelet.key",
+              "streamingConnectionIdleTimeout": "5m",
+              "clientCAFile": "/etc/kubernetes/pki/ca.crt"
+            }
+      joinConfiguration:
+        patches:
+          directory: /etc/kubernetes/patches
+```
+
+The provider applies a minimal normalization to bootstrap user-data before writing it into the `reprovision` plan, so leave the following fields out of the template:
+
+- **Hostname / FQDN** — set automatically from `MachineInventoryPool.spec.machineInventories[].hostname` (or the inventory name when omitted).
+- **`kubeletExtraArgs.provider-id`** — set automatically to `baremetal:///<inventory-name>`.
+- **`nodeRegistration.criSocket`** — set automatically to `unix:///var/run/containerd/containerd.sock` when unset.
+
+The normalized user-data is also written back into the bootstrap secret under `data["resolved-value"]` for debugging; the original `data["value"]` is left untouched.
+
+#### Configure the `MachineDeployment` \{#worker-machine-deployment}
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineDeployment
+metadata:
+  name: <cluster-name>-workers
+  namespace: cpaas-system
+spec:
+  clusterName: <cluster-name>
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0        # Bare-metal pools cannot over-provision.
+      maxUnavailable: 1
+  selector:
+    matchLabels: {}
+  template:
+    metadata:
+      labels:
+        cluster.x-k8s.io/cluster-name: <cluster-name>
+        pool.name: <cluster-name>-workers
+    spec:
+      clusterName: <cluster-name>
+      version: <kubernetes-version>
+      nodeDrainTimeout: 5m
+      nodeVolumeDetachTimeout: 5m
+      bootstrap:
+        configRef:
+          apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+          kind: KubeadmConfigTemplate
+          name: <cluster-name>-worker-bootstrap
+          namespace: cpaas-system
+      infrastructureRef:
+        apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+        kind: BaremetalMachineTemplate
+        name: <cluster-name>-worker-template
+        namespace: cpaas-system
+```
+
+**Key parameters:**
+
+| Parameter | Type | Description | Required |
+|---|---|---|---|
+| `.spec.clusterName` | string | Target cluster name. | Yes |
+| `.spec.replicas` | int | Number of worker nodes. Must satisfy `replicas ≤ MachineInventoryPool.status.available + status.allocated` (for the worker pool). | Yes |
+| `.spec.template.spec.version` | string | Worker Kubernetes version. Must be a key in `elemental-image-catalog`. May differ from the control-plane version while respecting the standard kubelet skew policy. | Yes |
+| `.spec.strategy.rollingUpdate.maxSurge` | int | Bare-metal does not over-provision — keep `0`. The provider has no spare physical host to bring up an extra node first. | Yes |
+| `.spec.strategy.rollingUpdate.maxUnavailable` | int | Must be `> 0` when `maxSurge=0`. Workers are recycled one-by-one within this budget. | Yes |
+
+Apply and watch:
+
+```bash
+kubectl apply -f workers.yaml
+kubectl -n cpaas-system get machinedeployments.cluster.x-k8s.io
+kubectl -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io -w
+kubectl get nodes -o wide                     # workload cluster
+```
+
+---
+
+## Cluster Verification
+
+### Using kubectl
+
+```bash
+# Cluster status
+kubectl -n cpaas-system get cluster <cluster-name>
+
+# Control plane progress
+kubectl -n cpaas-system get kubeadmcontrolplane <cluster-name>-control-plane
+
+# Per-machine state
+kubectl -n cpaas-system get machines.cluster.x-k8s.io
+kubectl -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io
+
+# Pool counters
+kubectl -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io
+
+# Storage lifecycle for inventories that declare managed volumes
+kubectl -n cpaas-system get machineinventories.elemental.cattle.io \
+  -o custom-columns='NAME:.metadata.name,PHASE:.status.storage.phase,PREPARED:.status.storage.conditions[?(@.type=="StoragePrepared")].status,ACTIVE:.status.storage.conditions[?(@.type=="StorageActive")].status'
+
+# Workload cluster Nodes (use the workload kubeconfig)
+kubectl get nodes -o wide
+```
+
+### Verify the Control Plane Endpoint
+
+Confirm the configured mode and endpoint:
+
+```bash
+kubectl -n cpaas-system get baremetalcluster <cluster-name> \
+  -o jsonpath='{.spec.controlPlaneLoadBalancer.type}{" "}{.spec.controlPlaneEndpoint.host}{":"}{.spec.controlPlaneEndpoint.port}{"\n"}'
+```
+
+For `Internal`, verify Alive and the node prerequisites:
+
+```bash
+kubectl --kubeconfig <workload-kubeconfig> -n kube-system get pods -l app=alive -o wide
+kubectl --kubeconfig <workload-kubeconfig> get --raw=/version
+```
+
+Run the following command on each control-plane node, not on the management cluster:
+
+```bash
+sysctl net.ipv4.conf.all.arp_accept net.ipv4.vs.conntrack
+```
+
+For `External`, verify the load balancer frontend and each backend according to [the External LoadBalancer contract](../prepare/control-plane-endpoint.mdx#external-loadbalancer-contract). Confirm that the load balancer owner has registered every current control-plane node and that HTTPS `/healthz` returns HTTP `200` for each backend.
+
+### Expected Results
+
+A successfully created cluster shows:
+
+- `Cluster.status.conditions[Ready]=True`.
+- `KubeadmControlPlane` replicas all `Ready`.
+- Every `BaremetalMachine.status.phase=Running` and `status.ready=true`.
+- Every used `MachineInventory.status.plan.state=Applied` with the annotation `baremetal.alauda.io/plan.type=reprovision` on its plan secret (an annotation, not a label — `-o jsonpath='{.metadata.annotations}'`).
+- Every used inventory with non-empty `spec.storage.volumes[]` reports `status.storage.phase=Active`, `StoragePrepared=True`, and `StorageActive=True`; the corresponding `BaremetalMachine` reports `StorageReady=True/AllVolumesReady`.
+- `MachineInventoryPool.status` satisfies `available + allocated + preparing + reprovisioning + unavailable = total`.
+- Kubernetes Nodes Ready.
+- For `Internal`, Alive Pods are Ready and the API is reachable through the Self-built VIP.
+- For `External`, the load balancer frontend is reachable and its backend list matches the current control-plane nodes.
+
+---
+
+## Common Failure Modes
+
+| Symptom | Likely cause | Where to look |
+|---|---|---|
+| `BaremetalMachine` stuck in `Pending`, `InventoryAllocated=False / Reason=PoolMissing` | `BaremetalMachineTemplate.spec.template.spec.machineInventoryPoolRef.name` points at a non-existent pool. | Pool name + namespace. |
+| `BaremetalMachine` stuck in `Pending`, `InventoryAllocated=False / Reason=PoolExhausted` | Pool has no `Available` inventory left. | `MachineInventoryPool.status.available`; allocation annotations on each member. |
+| `BaremetalMachine` stuck after allocation, `BootstrapReady=False / Reason=BootstrapWaiting` | KubeadmConfig has not produced a bootstrap data secret yet. | `Machine.spec.bootstrap.dataSecretName`. |
+| `BaremetalMachine` in `Failed`, `ImageResolved=False / Reason=ImageCatalogMiss` | The target `Machine.spec.version` is not a key in `elemental-image-catalog`. The chart creates the catalog with no entries. | `kubectl -n cpaas-system get cm elemental-image-catalog -o yaml`. Add the key as in [OS Images Imported and Image Catalog Populated](#os-images-and-image-catalog), then delete the affected `Machine`; the `BaremetalMachine` does not leave `Failed` on its own. |
+| `ImageResolved=False / Reason=ImageRegistryMissing` | Neither the optional `cpaas.io/registry-address` annotation nor the platform registry-credential Secret resolves a registry address. | Cluster annotations; platform registry-credential Secret. |
+| Inventory is registered but not counted as `Available` | Its managed storage declaration has not reached `StoragePrepared=True`, or the host storage observation is missing or stale. | `MachineInventory.status.storage`, `status.observedStorage`, `elemental-storage-observer.service`, and the `storage-prepare` plan output. |
+| `BaremetalMachine` waits with `StorageReady=False` | A required managed volume did not activate or no fresh post-reboot observation confirms its mount. | `BaremetalMachine.status.conditions[StorageReady]`, `MachineInventory.status.storage`, and host mount units. |
+| Reprovision never completes; `MachineInventory.status.plan.state=Failed` | `elemental upgrade` failed (registry unreachable, TLS, disk full). | Plan secret `failed-output` field; host serial console. |
+| `BaremetalCluster` uses `Internal`, but the VIP is not reachable | `vrid` collides with another cluster; VIP is not in the control-plane L2 domain; VRRP or gratuitous ARP is blocked; IPVS or required sysctls are unavailable. | Alive Pods, `ip addr show`, `ipvsadm -Ln`, and the two required sysctl keys on a control-plane host. |
+| `BaremetalCluster` uses `External`, but the endpoint is not reachable | Listener, backend membership, TLS passthrough, health check, route, DNS, or certificate SAN is incorrect. | Load balancer configuration, HTTPS `/healthz` per backend, and ACP workload-cluster port requirements. |
+
+For the full operator-side state machine reference (every condition reason and recovery action), see [Provider Overview → clean / reprovision plans](./overview.mdx#clean-reprovision).
+
+---
+
+## Next Steps
+
+After creating a cluster:
+
+- [Manage Nodes](../../../configure/nodes/alauda_os/bare-metal.mdx)
+- [Manage Data Disks](../../../configure/nodes/alauda_os/manage-bare-metal-storage.mdx)
+- [Upgrade Cluster](../../../upgrade/workload/alauda_os/bare-metal.mdx)
+
+---
+
+## Appendix
+
+### Complete `KubeadmControlPlane` Configuration \{#complete-kubeadmcontrolplane-configuration}
+
+The hardened configuration recommended for production bare-metal clusters — admission control, audit policy, kubelet patches, encryption provider, and IPv6 bind addresses. Substitute the placeholders from the table in [Resolving Placeholder Values](#resolving-placeholders).
+
+<Directive type="warning" title="Kubernetes 1.35 kubelet settings">
+  `imagePullCredentialsVerificationPolicy: NeverVerify` is required only starting with Kubernetes 1.35. Omit this parameter when creating a cluster with Kubernetes 1.34 or earlier.
+</Directive>
+
+```yaml
+apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+kind: KubeadmControlPlane
+metadata:
+  name: <cluster-name>-control-plane
+  namespace: cpaas-system
+spec:
+  replicas: 3
+  version: <kubernetes-version>
+  rolloutStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+  machineTemplate:
+    nodeDrainTimeout: 5m
+    nodeVolumeDetachTimeout: 5m
+    infrastructureRef:
+      apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+      kind: BaremetalMachineTemplate
+      name: <cluster-name>-control-plane-template
+  kubeadmConfigSpec:
+    users:
+      - name: boot
+        sudo: ALL=(ALL) NOPASSWD:ALL
+        shell: /bin/bash
+        sshAuthorizedKeys:
+          - "<ssh-authorized-keys>"
+    files:
+      - path: /etc/kubernetes/admission/psa-config.yaml
+        owner: "root:root"
+        permissions: "0644"
+        content: |
+          apiVersion: apiserver.config.k8s.io/v1
+          kind: AdmissionConfiguration
+          plugins:
+          - name: PodSecurity
+            configuration:
+              apiVersion: pod-security.admission.config.k8s.io/v1
+              kind: PodSecurityConfiguration
+              defaults:
+                enforce: "privileged"
+                enforce-version: "latest"
+                audit: "baseline"
+                audit-version: "latest"
+                warn: "baseline"
+                warn-version: "latest"
+              exemptions:
+                usernames: []
+                runtimeClasses: []
+                namespaces:
+                - kube-system
+                - cpaas-system
+      - path: /etc/kubernetes/patches/kubeletconfiguration0+strategic.json
+        owner: "root:root"
+        permissions: "0644"
+        content: |
+          {
+            "apiVersion": "kubelet.config.k8s.io/v1beta1",
+            "kind": "KubeletConfiguration",
+            "imagePullCredentialsVerificationPolicy": "NeverVerify",
+            "protectKernelDefaults": true,
+            "tlsCertFile": "/etc/kubernetes/pki/kubelet.crt",
+            "tlsPrivateKeyFile": "/etc/kubernetes/pki/kubelet.key",
+            "streamingConnectionIdleTimeout": "5m",
+            "clientCAFile": "/etc/kubernetes/pki/ca.crt"
+          }
+      - path: /etc/kubernetes/audit/policy.yaml
+        owner: "root:root"
+        permissions: "0644"
+        content: |
+          apiVersion: audit.k8s.io/v1
+          kind: Policy
+          omitStages:
+          - "RequestReceived"
+          rules:
+          - level: None
+            users:
+            - system:kube-controller-manager
+            - system:kube-scheduler
+            - system:serviceaccount:kube-system:endpoint-controller
+            verbs: ["get", "update"]
+            namespaces: ["kube-system"]
+            resources:
+            - group: ""
+              resources: ["endpoints"]
+          - level: None
+            nonResourceURLs:
+            - /healthz*
+            - /version
+            - /swagger*
+          - level: None
+            resources:
+            - group: ""
+              resources: ["events"]
+          - level: None
+            verbs: ["get", "list", "watch"]
+          - level: None
+            resources:
+            - group: "coordination.k8s.io"
+              resources: ["leases"]
+          - level: None
+            resources:
+            - group: "authorization.k8s.io"
+              resources: ["subjectaccessreviews", "selfsubjectaccessreviews"]
+            - group: "authentication.k8s.io"
+              resources: ["tokenreviews"]
+          - level: Metadata
+            resources:
+            - group: ""
+              resources: ["secrets", "configmaps"]
+          - level: RequestResponse
+            resources:
+            - group: ""
+            - group: "apps"
+            - group: "rbac.authorization.k8s.io"
+            - group: "storage.k8s.io"
+            - group: "networking.k8s.io"
+          - level: Metadata
+    postKubeadmCommands:
+      - chmod 600 /var/lib/kubelet/config.yaml
+    clusterConfiguration:
+      imageRepository: cloud.alauda.io/alauda
+      dns:
+        imageTag: <dns-image-tag>
+      etcd:
+        local:
+          imageTag: <etcd-image-tag>
+      apiServer:
+        extraArgs:
+          audit-log-format: json
+          audit-log-maxage: "30"
+          audit-log-maxbackup: "10"
+          audit-log-maxsize: "200"
+          profiling: "false"
+          audit-log-mode: batch
+          audit-log-path: /etc/kubernetes/audit/audit.log
+          audit-policy-file: /etc/kubernetes/audit/policy.yaml
+          tls-cipher-suites: "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"
+          admission-control-config-file: /etc/kubernetes/admission/psa-config.yaml
+          tls-min-version: VersionTLS12
+          kubelet-certificate-authority: /etc/kubernetes/pki/ca.crt
+        extraVolumes:
+        - name: vol-dir-0
+          hostPath: /etc/kubernetes
+          mountPath: /etc/kubernetes
+          pathType: Directory
+      controllerManager:
+        extraArgs:
+          bind-address: "::"
+          profiling: "false"
+          tls-min-version: VersionTLS12
+      scheduler:
+        extraArgs:
+          bind-address: "::"
+          tls-min-version: VersionTLS12
+          profiling: "false"
+    initConfiguration:
+      patches:
+        directory: /etc/kubernetes/patches
+      nodeRegistration:
+        kubeletExtraArgs:
+          node-labels: "kube-ovn/role=master"
+    joinConfiguration:
+      patches:
+        directory: /etc/kubernetes/patches
+      nodeRegistration:
+        kubeletExtraArgs:
+          node-labels: "kube-ovn/role=master"
+```
+
+Worker bootstrap is symmetric — see [Configure the Bootstrap Template](#worker-bootstrap-template) for the worker `KubeadmConfigTemplate`.
