@@ -1,0 +1,316 @@
+---
+weight: 50
+title: Manage Nodes on Huawei Cloud Stack
+author: chaozhou@alauda.io
+category: howto
+queries:
+  - hcs worker nodes
+  - hcs node management
+  - hcs machine deployment
+  - hcs worker persistent disks
+  - hcs node pools web ui manage ips
+  - hcs worker node pool availability zone
+---
+
+# Manage Nodes on Huawei Cloud Stack
+
+This document explains how to manage worker nodes using Cluster API `Machine` resources on the Huawei Cloud Stack platform.
+
+:::info
+To upgrade the Kubernetes version of the nodes, see [Upgrade Kubernetes on Huawei Cloud Stack](../../../upgrade/workload/alauda_os/huawei-cloud-stack.mdx).
+:::
+
+## Prerequisites
+
+:::warning
+**Important Prerequisites**
+- The control plane must be deployed before performing node operations. See [Create Cluster](../../../workload_clusters/alauda_os/huawei-cloud-stack/create_cluster.mdx) for setup instructions.
+- Ensure you have proper access to the HCS platform and required permissions.
+- To manage the nodes of the `global` cluster itself, the provider must be installed on `global` first; see [Manage Nodes on Alauda OS Clusters](./index.mdx).
+:::
+
+When using the YAML examples in this document, replace only values enclosed in `<>` with environment-specific values. Preserve the remaining fields unless your cluster policy requires a different value.
+
+## Overview
+
+Worker nodes are managed through Cluster API `Machine` resources, providing declarative and automated node lifecycle management. A worker node pool is built from four resources:
+
+1. **Machine Configuration Pool** - Network settings for worker nodes
+2. **Machine Template** - VM specifications
+3. **Bootstrap Configuration** - Node initialization settings
+4. **Machine Deployment** - Orchestration of node creation and management
+
+You can manage these resources through the web UI or with YAML manifests. The web UI provides a guided experience and requires Fleet Essentials; YAML works without it.
+
+## Using the Web UI \{#managing-node-pools-using-the-web-ui}
+
+**Requirement**: This workflow requires Fleet Essentials `1.0.2` or later. Without it, manage node pools with the YAML workflows in the [Using YAML](#using-yaml) section.
+
+The Node Pools tab lets you view the control plane and worker node pools, add or delete worker node pools, and edit the reserved IP addresses of an existing pool.
+
+:::info
+**Navigation**: Clusters → Clusters → Select cluster → Node Pools tab
+:::
+
+### Viewing Node Pools
+
+The Node Pools tab shows the Control Plane Node Pool and each Worker Node Pool as a card. Both card types share the same fields:
+
+| Field | Description |
+|-------|-------------|
+| Name | Resource name. Links to the underlying `KubeadmControlPlane` (control plane) or `MachineDeployment` (worker). The control plane card carries a **Control Plane** tag. |
+| Status | Badge showing pool health. |
+| Conditions | Count of status conditions; click to view the condition list. |
+| Ready Replicas | Ready node count over the desired count (for example, `3 / 3`). |
+| Kubernetes Version | Current Kubernetes version of the pool. |
+| Machine Template | Associated `HCSMachineTemplate`; click to open it. |
+| Config Pool | Associated `HCSMachineConfigPool`; click to open it. |
+| SSH Authorized Keys | Number of configured public keys. |
+| Update Strategy | For the control plane, nodes are replaced one at a time, each keeping its node IP. For workers, a rolling update governed by the pool's Max Surge and Max Unavailable values. |
+
+### Adding a Worker Node Pool
+
+Click **Add Worker Node Pool** and complete the dialog. The fields match Step 5 of the [creation wizard](../../../workload_clusters/alauda_os/huawei-cloud-stack/create_cluster.mdx#using-the-web-ui): pool name (prefixed with `<cluster-name>-`), Flavor, Availability Zone, Machine Configs (hostname, networks, persistent disks), System Disk, Data Volumes, Replicas, Rollout Strategy, and SSH Authorized Keys. New nodes appear in the Nodes tab after the pool is created.
+
+The selected Availability Zone applies to every node in the new worker pool. To place worker nodes in another zone, create a separate worker pool and select that zone; one pool does not automatically spread its replicas across zones. The dropdown disables zones that HCS reports as unavailable. See [Availability Zone Placement](../../../workload_clusters/alauda_os/huawei-cloud-stack/infrastructure.mdx#availability-zone-placement) for automatic selection, persistent disk, and control plane placement constraints.
+
+### Managing Node IP Addresses \{#manage-ips}
+
+Each node in an HCS pool uses a reserved static IP address from its subnet. To change which addresses a pool reserves — for example, to add capacity before scaling the pool up — open the pool card's action menu and select **Update Config Pool** to open the **Manage IPs** dialog.
+
+The dialog edits the machine configurations of the pool's `HCSMachineConfigPool`. For each node you can set the hostname, the networks (each an IP address chosen from its subnet, plus the subnet), and the persistent disks. IP selection follows the same rules as the creation wizard: choose the subnet first, then pick an assignable address from the list; addresses already in use are not offered.
+
+:::warning
+HCS clusters use static IP addresses with no DHCP. Reserve enough addresses in the pool before you scale a node pool up — a new node cannot start unless the pool provides an address for it.
+:::
+
+### Deleting a Worker Node Pool
+
+Open the Worker Node Pool card's action menu, select **Delete**, and confirm.
+
+:::warning
+Deleting a worker node pool permanently removes all of its nodes and the underlying ECS instances. Ensure workloads can tolerate the loss of these nodes through proper replication. The Control Plane Node Pool cannot be deleted.
+:::
+
+## Using YAML \{#using-yaml}
+
+Manage worker nodes with Cluster API manifests. To add another worker node pool with YAML, follow [Deploy Worker Nodes](../../../workload_clusters/alauda_os/huawei-cloud-stack/create_cluster.mdx#deploy-worker-nodes) on the cluster creation page.
+
+### Scaling Worker Nodes
+
+Worker node scaling allows you to adjust cluster capacity based on workload demands.
+
+#### Adding Worker Nodes
+
+Increase the number of worker nodes to handle increased workload.
+
+**Procedure**:
+
+1. **Check Current Node Status**
+
+   ```bash
+   # List all machines in the cluster
+   kubectl get machines -n cpaas-system
+
+   # List machines for a specific MachineDeployment
+   kubectl get machines -n cpaas-system -l cluster.x-k8s.io/deployment-name=<cluster-name>-md-0
+   ```
+
+2. **Extend Configuration Pool**
+
+   Add new machine configurations to the pool for the additional nodes. If the new workers need preserved node-local state such as `/var/cpaas`, include the matching `persistentDisks[]` entries in each new configuration.
+
+   ```bash
+   kubectl get hcsmachineconfigpool <cluster-name>-worker-pool -n cpaas-system -o yaml
+   ```
+
+   Modify the pool to include new IP entries, then apply:
+
+   ```bash
+   kubectl apply -f <updated-pool-config.yaml>
+   ```
+
+   When you edit the pool, keep all existing `configs[]` entries and their accepted `persistentDisks[]` entries unchanged unless you are intentionally appending a new disk slot.
+
+3. **Scale Up the MachineDeployment**
+
+   Update the `replicas` field to the desired number of nodes:
+
+   ```bash
+   kubectl patch machinedeployment <cluster-name>-md-0 -n cpaas-system \
+     --type='json' -p='[{"op": "replace", "path": "/spec/replicas", "value": <new-replica-count>}]'
+   ```
+
+4. **Monitor the Scaling Progress**
+
+   ```bash
+   # Watch machines being created
+   kubectl get machines -n cpaas-system -w
+
+   # Check MachineDeployment status
+   kubectl get machinedeployment <cluster-name>-md-0 -n cpaas-system
+   ```
+
+#### Removing Worker Nodes
+
+Decrease the number of worker nodes to reduce cluster capacity.
+
+:::warning
+**Data Loss Warning**
+
+Scaling down removes worker nodes and their ECS instances. Template-owned `dataVolumes[]` are not preserved. Pool-managed persistent disks declared in `HCSMachineConfigPool.spec.configs[].persistentDisks[]` remain tracked by the pool and can be reused while the corresponding hostname entry stays in the pool. Ensure:
+- Workloads can tolerate node loss through proper replication
+- No critical data is stored only on the nodes being removed
+- Applications are designed for horizontal scaling
+:::
+
+**Procedure**:
+
+1. **Scale Down the MachineDeployment**
+
+   ```bash
+   kubectl patch machinedeployment <cluster-name>-md-0 -n cpaas-system \
+     --type='json' -p='[{"op": "replace", "path": "/spec/replicas", "value": <new-replica-count>}]'
+   ```
+
+2. **Monitor the Removal Progress**
+
+   ```bash
+   kubectl get machines -n cpaas-system -w
+   ```
+
+   The Cluster API controller will:
+   - Drain the selected nodes (evict pods if possible)
+   - Delete the underlying VMs from the HCS platform
+   - Remove the machine resources
+
+### Changing Machine Infrastructure \{#changing-machine-infrastructure}
+
+To change worker machine specifications (CPU, memory, disk, VM image), create a new machine template and point the `MachineDeployment` at it. The worker nodes are then replaced one by one. Follow these steps:
+
+**Note:** HCS `dataVolumes[]` are not preserved during replacement. To preserve node-local state such as `/var/cpaas`, declare it in `HCSMachineConfigPool.spec.configs[].persistentDisks[]` before the rollout and keep `MachineDeployment.spec.strategy.rollingUpdate.maxSurge: 0`. If your cluster still keeps these disks in `HCSMachineTemplate.spec.template.spec.dataVolumes[]`, first complete [Migrate Existing Huawei Cloud Stack Clusters to Pool-Managed Persistent Disks](../../../upgrade/workload/alauda_os/hcs_persistent_disk_upgrade.mdx).
+
+1. **Create New Machine Template**
+
+   Copy the existing `HCSMachineTemplate` and modify the required values:
+   - `imageName` - VM image
+   - `flavorName` - Instance type
+   - `rootVolume.size` - System disk size
+   - `dataVolumes` - Temporary data disk configurations
+
+   If you need to add a new pool-managed persistent disk, append it to the worker `HCSMachineConfigPool` first. The provider creates or claims the EVS disk, but the running ECS does not mount it until this rolling replacement creates a replacement worker.
+
+     ```bash
+     kubectl get hcsmachinetemplate <current-template> -n cpaas-system -o yaml > new-template.yaml
+     ```
+
+   Then edit `new-template.yaml` before applying:
+   - Change `metadata.name` to `<new-template>`
+   - Leave runtime identity fields unset, including `spec.template.spec.providerID` and `spec.template.spec.serverId`
+   - Remove server-generated fields such as:
+     - `metadata.resourceVersion`
+     - `metadata.uid`
+     - `metadata.creationTimestamp`
+     - `metadata.managedFields`
+     - `status`
+
+2. **Deploy New Template**
+
+   ```bash
+   kubectl apply -f new-template.yaml -n cpaas-system
+   ```
+
+3. **Update Machine Deployment**
+
+   Modify the `MachineDeployment` to reference the new template:
+
+   ```bash
+   kubectl patch machinedeployment <cluster-name>-md-0 -n cpaas-system \
+     --type='merge' -p='{"spec":{"template":{"spec":{"infrastructureRef":{"name":"<new-template>"}}}}}'
+   ```
+
+4. **Monitor Rolling Update**
+
+   ```bash
+   kubectl get machines -n cpaas-system -w
+   ```
+
+To change the machine specification of control plane nodes, use the same steps and patch `KubeadmControlPlane.spec.machineTemplate.infrastructureRef.name` instead.
+
+### Updating Bootstrap Templates \{#updating-bootstrap-templates}
+
+To change the bootstrap configuration of worker nodes (for example kubelet settings or the commands that run when a node joins), create a new `KubeadmConfigTemplate` and point the `MachineDeployment` at it. Modifying an existing template in place does not roll out existing machines; only newly created machines pick up the change.
+
+1. **Export the Existing Template**
+
+   ```bash
+   kubectl get kubeadmconfigtemplate <cluster-name>-worker-kct -n cpaas-system -o yaml > new-bootstrap-template.yaml
+   ```
+
+2. **Modify the Template**
+
+   Edit `new-bootstrap-template.yaml`:
+   - Set `metadata.name` to a new unique name, `<new-bootstrap-template>`
+   - Remove server-generated metadata (`resourceVersion`, `uid`, `creationTimestamp`, `managedFields`, the `kubectl.kubernetes.io/last-applied-configuration` annotation) and the entire `status` field
+   - Edit the fields you want to change. Keep the existing entries of the kubelet patch file `/etc/kubernetes/patches/kubeletconfiguration0+strategic.json`, including the certificate paths, and change only what you need
+   - For Kubernetes 1.35 or later, add the [required kubelet patch settings](../../../upgrade/workload/alauda_os/index.mdx#kubernetes-1-35-kubelet-patch) to that file
+
+3. **Apply the New Template**
+
+   ```bash
+   kubectl apply -f new-bootstrap-template.yaml -n cpaas-system
+   ```
+
+4. **Update the MachineDeployment**
+
+   ```bash
+   kubectl patch machinedeployment <cluster-name>-md-0 -n cpaas-system \
+     --type='merge' -p='{"spec":{"template":{"spec":{"bootstrap":{"configRef":{"name":"<new-bootstrap-template>"}}}}}}'
+   ```
+
+   The rolling replacement of the worker nodes then starts:
+
+   ```bash
+   kubectl get machines -n cpaas-system -w
+   ```
+
+## Verification
+
+After deploying worker nodes, verify the deployment:
+
+```bash
+# Check machine status
+kubectl get machines -n cpaas-system
+
+# Verify nodes are Ready
+kubectl get nodes
+
+# Check MachineDeployment status
+kubectl get machinedeployment -n cpaas-system
+```
+
+## Troubleshooting
+
+### Viewing Controller Logs
+
+```bash
+# View HCS controller logs
+kubectl logs -n cpaas-system deployment/hcs-controller-manager
+
+# View machine details
+kubectl describe hcsmachine <machine-name> -n cpaas-system
+```
+
+### Common Issues
+
+**Node fails to join cluster**
+
+- Verify the VM template matches the Kubernetes version
+- Check network connectivity between nodes
+- Ensure the configuration pool has available entries
+
+**Machine stuck in provisioning**
+
+- Check HCS platform for resource availability
+- Verify credentials and permissions
+- Review controller logs for error messages

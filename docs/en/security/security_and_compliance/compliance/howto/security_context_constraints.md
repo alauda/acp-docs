@@ -1133,6 +1133,8 @@ apiVersion: policies.kyverno.io/v1alpha1
 kind: ValidatingPolicy
 metadata:
   name: scc-auto-pick
+  labels:
+    reports.kyverno.io/disabled: "true"
   annotations:
     policies.kyverno.io/title: SCC Auto-Pick (CEL, CRD + RBAC)
     pod-policies.kyverno.io/autogen-controllers: "none"
@@ -1428,6 +1430,8 @@ apiVersion: policies.kyverno.io/v1alpha1
 kind: MutatingPolicy
 metadata:
   name: scc-fill-defaults
+  labels:
+    reports.kyverno.io/disabled: "true"
   annotations:
     policies.kyverno.io/title: SCC default value filler (CRD + RBAC, explicit-wins)
     pod-policies.kyverno.io/autogen-controllers: "none"
@@ -1865,6 +1869,8 @@ spec:
           }
 ```
 
+Keep `reports.kyverno.io/disabled: "true"` on both policies. SCC selection depends on the admission request User, Groups, and ServiceAccount, while a background report scan does not have the equivalent request identity. The mutating policy also fills defaults only during admission. Excluding these admission-only policies from background reporting avoids misleading PolicyReports and unnecessary recompilation for every existing Pod.
+
 Both policies skip the following namespaces by default: namespaces starting with `kube-`, `cpaas-`, or `alauda-`, plus `kyverno`, `cattle-system`, `operators`, and `default`. Adjust the `skip-system-ns` expression in both policies if your platform uses different system namespaces.
 
 #### Step 1.4 — Roll out safely with Warn → Deny
@@ -2274,6 +2280,330 @@ If you are coming from OpenShift, the following `oc` commands translate to plain
 | `oc adm policy add-scc-to-user <scc> -z <sa> -n <ns>` | Same ClusterRole as above, plus a `RoleBinding` in namespace `<ns>` with `subjects: [{kind: ServiceAccount, name: <sa>, namespace: <ns>}]`. |
 | `oc adm policy add-scc-to-group <scc> <group>` | Same ClusterRole, plus a ClusterRoleBinding with `subjects: [{kind: Group, name: <group>}]`. |
 | `oc get scc` | `kubectl get scc` (the CRD's `shortNames: [scc]` keeps the command identical). |
+
+## Best Practice: Grant a Privileged Exception in an Existing Namespace
+
+Use this procedure when an existing namespace normally follows the PSA `restricted` standard, but one workload in that same namespace must run a privileged container. The namespace remains unchanged; instead, the platform administrator removes PSA restricted enforcement from that namespace and makes the Kyverno SCC engine the enforcing admission boundary.
+
+The isolation model is:
+
+- Every ServiceAccount in the namespace can use `restricted-v2` as the default security ceiling.
+- The exceptional workload uses a dedicated ServiceAccount.
+- Only that ServiceAccount can use the built-in `privileged` SCC.
+- The workload pins `privileged` with `alauda.io/required-scc`.
+- Other ServiceAccounts are not granted `privileged` and continue to be rejected if they request privileged settings.
+
+::: warning
+PSA and the Kyverno SCC engine are independent admission controls. An SCC grant cannot override `pod-security.kubernetes.io/enforce: restricted`. Complete the restricted SCC baseline and the exceptional workload binding before removing PSA enforcement, so the namespace never has an unprotected transition window.
+:::
+
+### Step 1 - Audit existing SCC grants
+
+Before changing PSA, check whether ordinary ServiceAccounts already receive permissive SCCs through User, Group, RoleBinding, or ClusterRoleBinding grants. Pay particular attention to bindings for `system:authenticated`, `system:serviceaccounts`, and `system:serviceaccounts:payments`.
+
+For example, the default ServiceAccount should not be able to use the built-in `privileged` SCC:
+
+```shell
+kubectl auth can-i use \
+  securitycontextconstraints.security.alauda.io/privileged \
+  --as=system:serviceaccount:payments:default \
+  -n payments
+```
+
+The expected output is `no`. Remove unintended broad grants before proceeding. The optional `rbac.alauda.io/scc-use=true` label described earlier can help locate SCC-related RBAC objects, but do not rely on the label alone because an unlabeled Role can still grant `use` permission.
+
+### Step 2 - Bind the restricted baseline to all namespace ServiceAccounts
+
+Create a namespaced RoleBinding from the synthesized `system:serviceaccounts:payments` group to the `scc-use-restricted-v2` ClusterRole from Step 2.4. This covers existing and future ServiceAccounts in the namespace.
+
+Save as `payments-restricted-baseline.yaml`:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: all-serviceaccounts-restricted-v2
+  namespace: payments
+  labels:
+    rbac.alauda.io/scc-use: "true"
+subjects:
+  - kind: Group
+    name: system:serviceaccounts:payments
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: scc-use-restricted-v2
+```
+
+Apply the binding and verify an ordinary ServiceAccount can use only the restricted baseline:
+
+```shell
+kubectl apply -f payments-restricted-baseline.yaml
+
+kubectl auth can-i use \
+  securitycontextconstraints.security.alauda.io/restricted-v2 \
+  --as=system:serviceaccount:payments:default \
+  -n payments
+```
+
+The expected output is `yes`.
+
+### Step 3 - Create a dedicated ServiceAccount
+
+SCC authorization is subject-based; it does not grant permissions to a Pod name. Model a single-workload exception with an exclusive ServiceAccount that is not shared by unrelated workloads.
+
+Save as `payment-agent-serviceaccount.yaml`:
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: payment-agent-privileged
+  namespace: payments
+automountServiceAccountToken: false
+```
+
+Apply the ServiceAccount:
+
+```shell
+kubectl apply -f payment-agent-serviceaccount.yaml
+```
+
+::: warning
+The built-in `privileged` SCC is intentionally unrestricted. In addition to privileged containers, it allows host networking, host namespaces, host ports, host paths, all Linux capabilities, all volume types, all seccomp profiles, and unsafe sysctls. Grant it only when the workload genuinely requires full privilege. If the workload needs a smaller exception, such as only `anyuid`, `hostNetwork`, or `hostPath`, bind one of the narrower built-in profiles instead.
+:::
+
+Leave `automountServiceAccountToken: false` unless the workload must call the Kubernetes API. Enabling token automount adds API credentials to a container that already has elevated runtime privileges.
+
+### Step 4 - Grant `privileged` only to the dedicated ServiceAccount
+
+Create a ClusterRole whose `resourceNames` contains only the built-in `privileged` SCC, then bind it to the dedicated ServiceAccount with a RoleBinding in the workload namespace.
+
+Save as `payment-agent-scc-binding.yaml`:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: scc-use-privileged
+  labels:
+    rbac.alauda.io/scc-use: "true"
+rules:
+  - apiGroups: ["security.alauda.io"]
+    resources: ["securitycontextconstraints"]
+    resourceNames: ["privileged"]
+    verbs: ["use"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: payment-agent-privileged-scc
+  namespace: payments
+  labels:
+    rbac.alauda.io/scc-use: "true"
+subjects:
+  - kind: ServiceAccount
+    name: payment-agent-privileged
+    namespace: payments
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: scc-use-privileged
+```
+
+Apply and verify the binding:
+
+```shell
+kubectl apply -f payment-agent-scc-binding.yaml
+
+kubectl auth can-i use \
+  securitycontextconstraints.security.alauda.io/privileged \
+  --as=system:serviceaccount:payments:payment-agent-privileged \
+  -n payments
+
+kubectl auth can-i use \
+  securitycontextconstraints.security.alauda.io/privileged \
+  --as=system:serviceaccount:payments:default \
+  -n payments
+```
+
+The expected outputs are `yes` for `payment-agent-privileged` and `no` for `default`. The dedicated ServiceAccount also inherits `restricted-v2` from the namespace group binding.
+
+### Step 5 - Prevent other workloads from reusing the ServiceAccount
+
+This procedure grants `privileged` to a ServiceAccount, not to a Pod or controller name. Kubernetes RBAC does not provide field-level authorization for `spec.serviceAccountName`. A user who can create arbitrary Pods, Deployments, StatefulSets, DaemonSets, Jobs, or CronJobs in `payments` may otherwise reference `payment-agent-privileged` from another workload and receive the same SCC access.
+
+Before continuing, enforce at least one of these controls:
+
+- Allow only a dedicated GitOps or deployment identity to create or update workloads that reference `payment-agent-privileged`, and prevent ordinary namespace users from modifying those workloads.
+- Add an admission guard that rejects references to `payment-agent-privileged` unless the request is authorized. Apply the guard to direct Pods and every Pod-template controller enabled in the namespace.
+
+Do not rely only on a workload label or annotation to authorize use of the dedicated ServiceAccount; users who can create workloads can normally copy those values. If neither deployment ownership nor admission-time ServiceAccount usage can be restricted, this pattern provides a ServiceAccount-level exception only and must not be represented as a single-Pod exception.
+
+Do not continue to the PSA transition until one of these controls is enforced.
+
+### Step 6 - Transfer enforcement from PSA to Kyverno SCC
+
+Remove only the PSA restricted enforcement labels. Keep restricted audit and warning labels so the API server continues to report workloads that would violate the restricted standard.
+
+```shell
+kubectl label namespace payments \
+  pod-security.kubernetes.io/enforce- \
+  pod-security.kubernetes.io/enforce-version- \
+  --overwrite
+
+kubectl label namespace payments \
+  pod-security.kubernetes.io/audit=restricted \
+  pod-security.kubernetes.io/audit-version=latest \
+  pod-security.kubernetes.io/warn=restricted \
+  pod-security.kubernetes.io/warn-version=latest \
+  --overwrite
+```
+
+Removing namespace labels does not override a cluster-wide PSA default configured through the API server admission configuration. If the cluster default still enforces `restricted`, explicitly opt this namespace out of enforcement while retaining audit and warning visibility:
+
+```shell
+kubectl label namespace payments \
+  pod-security.kubernetes.io/enforce=privileged \
+  pod-security.kubernetes.io/enforce-version=latest \
+  --overwrite
+```
+
+Here `enforce=privileged` means PSA does not impose additional restrictions. It does not grant privileged access to Pods; the Kyverno SCC bindings remain the enforcing authorization boundary.
+
+### Step 7 - Pin the approved SCC in the workload
+
+Put `alauda.io/required-scc` in the Pod template metadata and use the dedicated ServiceAccount. Do not put the annotation only on the Deployment metadata because controller metadata is not copied automatically to its Pods.
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-agent
+  namespace: payments
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: payment-agent
+  template:
+    metadata:
+      labels:
+        app: payment-agent
+      annotations:
+        alauda.io/required-scc: privileged
+    spec:
+      serviceAccountName: payment-agent-privileged
+      securityContext:
+        seccompProfile:
+          type: Unconfined
+      containers:
+        - name: agent
+          image: registry.example.com/payments/agent:1.0.0
+          securityContext:
+            privileged: true
+            allowPrivilegeEscalation: true
+            runAsUser: 0
+```
+
+The annotation does not grant SCC permission. If the SCC is missing or the ServiceAccount does not have `use` permission, the validating policy rejects the Pod.
+
+### Step 8 - Verify that the exception is isolated
+
+Run admission probes as the real application deployment identity, not as `cluster-admin`. SCC selection takes the request User and Groups into account for directly created Pods, so an administrator with separate broad SCC grants can produce a different result from the workload identity used in production.
+
+Verify the exceptional workload is admitted under the intended SCC:
+
+```shell
+kubectl -n payments get pod -l app=payment-agent \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.annotations.alauda\.io/scc}{"\n"}{end}'
+```
+
+The SCC column should be `privileged`.
+
+Next, confirm an ordinary restricted Pod remains admissible under `restricted-v2`:
+
+```shell
+cat <<'EOF' | kubectl create --dry-run=server -f - \
+  -o jsonpath='{.metadata.annotations.alauda\.io/scc}{"\n"}'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: restricted-probe
+  namespace: payments
+spec:
+  serviceAccountName: default
+  securityContext:
+    runAsUser: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: probe
+      image: registry.example.com/library/pause:3.10
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+EOF
+```
+
+The expected output is `restricted-v2`.
+
+Finally, confirm an ordinary ServiceAccount cannot request `privileged`:
+
+```shell
+cat <<'EOF' | kubectl create --dry-run=server -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: unauthorized-privileged-probe
+  namespace: payments
+  annotations:
+    alauda.io/required-scc: privileged
+spec:
+  serviceAccountName: default
+  containers:
+    - name: probe
+      image: registry.example.com/library/pause:3.10
+      securityContext:
+        privileged: true
+EOF
+```
+
+When submitted by the normal application deployment identity, the request must be rejected with a message stating that the required SCC is not bound to ServiceAccount `default`. If this Pod is admitted, stop and inspect broad SCC RoleBindings, ClusterRoleBindings, and User or Group grants before allowing production workloads.
+
+### Roll back the exception
+
+To restore PSA restricted enforcement safely:
+
+1. Stop or replace the privileged workload with a `restricted`-compliant specification.
+2. Remove the RoleBinding that grants `privileged` to the dedicated ServiceAccount:
+
+   ```shell
+   kubectl -n payments delete rolebinding payment-agent-privileged-scc
+   ```
+
+3. Confirm the ServiceAccount can no longer use `privileged`:
+
+   ```shell
+   kubectl auth can-i use \
+     securitycontextconstraints.security.alauda.io/privileged \
+     --as=system:serviceaccount:payments:payment-agent-privileged \
+     -n payments
+   ```
+
+   The authorization check must return `no`. Do not delete the built-in `privileged` SCC. Delete the reusable `scc-use-privileged` ClusterRole only when no other RoleBinding or ClusterRoleBinding references it.
+
+4. Run server-side dry-run checks for the remaining workloads.
+5. Restore PSA restricted enforcement last:
+
+   ```shell
+   kubectl label namespace payments \
+     pod-security.kubernetes.io/enforce=restricted \
+     pod-security.kubernetes.io/enforce-version=latest \
+     --overwrite
+   ```
 
 ## Next Steps
 
