@@ -5,17 +5,15 @@ title: DR Environment
 
 # Upgrade `global` Clusters in a DR Environment
 
-Use this page in the first maintenance window when the platform has a primary and a standby `global` cluster connected by Alauda Container Platform Global Cluster Disaster Recovery. Upgrade the standby first, then the primary, in the same window. Upgrade no workload cluster until both `global` clusters run the target ACP version (Distribution Version). Synchronization stops from the plugin uninstall until the reinstall, so the window has no DR protection. In the plugin settings, the `active_*` parameters refer to the primary.
+Use this page when the platform has a primary and a standby `global` cluster connected by Alauda Container Platform Global Cluster Disaster Recovery, in every maintenance window in which you upgrade `global`: the first window and every later `global` upgrade, patch upgrades included. Upgrade the standby first, then the primary, in the same window. Upgrade no workload cluster until both `global` clusters run the target ACP version (Distribution Version). Synchronization stops from the plugin uninstall until the reinstall, so the window has no DR protection, and clusters on both sides must stay unchanged; see [Uninstall the Global Cluster Disaster Recovery Plugin from the Standby](#uninstall-dr-plugin). In the plugin settings, the `active_*` parameters refer to the primary.
 
-:::warning
-From uninstalling the Global Cluster Disaster Recovery plugin until you reinstall it, do not change clusters on either `global` cluster: do not create, scale, or delete clusters or nodes, do not change cluster configuration, and do not request any upgrade other than the two `global` upgrades. A change made on one side can be reconciled back by the providers of the other side. Finish both upgrades and the reinstall in the same window.
-:::
+The commands on this page use `4.5.0` as the target ACP version. For another target, such as a later patch, use that version in every command, including `productmanifest v<version>`.
 
 ## Before You Begin \{#before-you-begin}
 
 - [Prepare for the Upgrade](../pre-upgrade.mdx) is complete on both `global` clusters. These items are not synchronized between them, so each side has its own: published packages, including the target Global Cluster Disaster Recovery package on the standby; Alauda OS image ConfigMaps or catalog entries; the administrator acknowledgement; `ResourcePatch` exemptions; and a passed preflight check.
 - Each `global` cluster has a recent successful etcd backup. See [etcd Backup and Restore](../../configure/backup/etcd.mdx).
-- You are on the execution host, in the directory of the extracted target Core Package, with one kubeconfig per `global` cluster, each pointing to the VIP of its cluster: `<primary-kubeconfig>` and `<standby-kubeconfig>`. Every command block below starts by selecting a cluster; `ac`, `kubectl`, and `upgrade.sh` use the exported `KUBECONFIG`. Confirm that the printed API address belongs to the intended cluster before you continue.
+- You are on the execution host, in the `installer/` directory of the extracted target Core Package, with one kubeconfig per `global` cluster, each pointing to the VIP of its cluster: `<primary-kubeconfig>` and `<standby-kubeconfig>`. Every command block below starts by selecting a cluster; `ac`, `kubectl`, and `upgrade.sh` use the exported `KUBECONFIG`. Confirm that the printed API address belongs to the intended cluster before you continue.
 
 :::info
 On Alauda OS, run the upgrade commands from the execution host, not from a node of either `global` cluster. The upgrade replaces the nodes, and files and sessions on a replaced node are lost.
@@ -28,71 +26,98 @@ On Alauda OS, run the upgrade commands from the execution host, not from a node 
 ### Verify Data Consistency \{#verify-dr-consistency}
 
 :::warning
-If the standby is not consistent with the primary, do not uninstall the plugin; contact technical support. Uninstalling it while the standby misses data can delete workload cluster `Machine` objects and, on Alauda OS, the nodes behind them.
+If the standby is not consistent with the primary, do not uninstall the plugin; contact technical support. Uninstalling it while the standby misses data lets the standby providers act on workload cluster `Machine` objects with incomplete data and, on Alauda OS, on the nodes behind them.
 :::
 
-On a control plane node of the standby `global` cluster, where the Service address is reachable, check synchronization:
+Check synchronization on a control plane node of the standby `global` cluster; the check address is reachable only from inside the cluster. This check, here and after the reinstall, is the only command on this page that runs on a node; then return to the execution host.
 
 ```bash
+export KUBECONFIG=/etc/kubernetes/admin.conf
 mirror_svc=$(kubectl get svc -n cpaas-system etcd-sync-monitor -o jsonpath='{.spec.clusterIP}')
 if [[ $mirror_svc =~ ^[0-9a-fA-F:]+$ ]]; then mirror_host="[$mirror_svc]"; else mirror_host="$mirror_svc"; fi
 curl -g "http://${mirror_host}/check"
 ```
 
-Continue when the output lists no missed keys and no surplus keys. If it reports `check too frequent`, wait one minute and run it again.
-
-On the standby, check that every machine is `Running`:
+Continue when the output shows `localMissedKeys [0]` and `localSurplusKeys [0]`. If it reports `check too frequent`, wait one minute and run it again. Then, from the execution host, check on the primary that every machine is `Running` and that no workload cluster upgrade is running; the platform does not block a `global` upgrade while one runs:
 
 ```bash
-export KUBECONFIG=<standby-kubeconfig>
+export KUBECONFIG=<primary-kubeconfig>
 kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}{"\n"}'
 kubectl get machines.platform.tkestack.io
 kubectl get machines.cluster.x-k8s.io -A   # Alauda OS
+kubectl -n cpaas-system get cvsh \
+  -o custom-columns='CLUSTER:.metadata.name,REQUESTED:.spec.desiredUpdate.version,CURRENT:.status.current.version'
 ```
 
-Run the same commands with `<primary-kubeconfig>`. Resolve every machine that is not `Running` before you continue.
+Continue when every machine is `Running` and, on every row of the last command, `REQUESTED` is empty or equal to `CURRENT`; otherwise, resolve the machine or wait until that upgrade completes. If the last command reports `the server doesn't have a resource type`, no upgrade has used the Cluster Version Operator yet; continue. Run the first four commands again with `<standby-kubeconfig>`, and resolve every machine that is not `Running` before you continue.
 
 ### Uninstall the Global Cluster Disaster Recovery Plugin from the Standby \{#uninstall-dr-plugin}
 
 :::warning
-From now until you reinstall the plugin, do not change clusters on either `global` cluster: do not create, scale, or delete clusters or nodes, do not change cluster configuration, and do not request any upgrade other than the two `global` upgrades. A change made on one side can be reconciled back by the providers of the other side.
+From now until you reinstall the plugin, do not change clusters on either `global` cluster: do not create, scale, or delete clusters or nodes, do not change cluster configuration, and do not request any upgrade other than the two `global` upgrades, including their Kubernetes upgrade on Huawei Cloud Stack or VMware vSphere. A change made on one side can be reconciled back by the providers of the other side. Finish both upgrades and the reinstall in the same window.
 :::
+
+The plugin settings are removed with the plugin. Record them first, without the token, in a file on the execution host:
 
 ```bash
 export KUBECONFIG=<standby-kubeconfig>
 kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}{"\n"}'
-kubectl delete moduleinfo -l cpaas.io/module-name=etcd-sync,cpaas.io/cluster-name=global
-kubectl get moduleinfo -l cpaas.io/module-name=etcd-sync
-kubectl -n cpaas-system get pod -l app=etcd-sync
+kubectl get moduleinfo -l cpaas.io/module-name=etcd-sync,cpaas.io/cluster-name=global -o jsonpath='{range .items[*]}version: {.spec.version}
+active_cluster_vip: {.spec.config.active_cluster_vip}
+active_cluster_etcd_endpoints: {.spec.config.active_cluster_etcd_endpoints}
+dest_etcd_endpoints: {.spec.config.dest_etcd_endpoints}
+active_cluster_token_secret_ref: {.spec.config.active_cluster_token_secret_ref}
+monitor_check_interval: {.spec.config.monitor_check_interval}
+detail: {.spec.config.detail}
+{end}' | tee etcd-sync-settings.txt
 ```
 
-Continue when the last two commands return nothing. The plugin settings are removed with the plugin; you enter them again when you reinstall it.
+Continue when `active_cluster_vip` shows the primary VIP. Keep the file until the reinstall. Then uninstall the plugin, and continue when the last two commands return nothing:
+
+```bash
+kubectl delete moduleinfo -l cpaas.io/module-name=etcd-sync,cpaas.io/cluster-name=global
+kubectl get moduleinfo -l cpaas.io/module-name=etcd-sync
+kubectl -n cpaas-system get pod -l 'app in (etcd-sync,etcd-sync-monitor)'
+```
 
 ### Upgrade the Standby `global` Cluster \{#upgrade-standby}
 
 :::warning
-An upgrade cannot be rolled back. On Huawei DCS, the request replaces every node with a new VM; on Bare Metal, it reinstalls every host, one at a time. On Huawei Cloud Stack and VMware vSphere, finish the Kubernetes upgrade in this window, also for a patch upgrade whose Kubernetes build changes.
+An upgrade cannot be rolled back. On Huawei DCS, the request also replaces every node with a new VM, one at a time; on Bare Metal, it reinstalls every host, one at a time. This happens on every minor upgrade, and on a patch upgrade when the target changes the Kubernetes build or the Alauda OS image.
 :::
 
-Deploy the Cluster Version Operator (CVO) on the standby, run the final preflight check, and request the upgrade. Run the commands one at a time and check each result, as noted in the comments, before you run the next one:
+Select the standby and **deploy the Cluster Version Operator (CVO)** and the target release information. Run each block below in the same shell, and check its result before you run the next one:
 
 ```bash
 export KUBECONFIG=<standby-kubeconfig>
 kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}{"\n"}'   # the standby VIP
-bash upgrade.sh --skip-sync-image                  # completes without an error
-kubectl get productmanifest v4.5.0                 # READY is True
-bash upgrade.sh --preflight                        # Summary is Passed or PassedWithWarnings
-ac adm upgrade                                     # 4.5.0 is listed in the available updates
+bash upgrade.sh --skip-sync-image
+kubectl get productmanifest v4.5.0
+```
+
+Continue when the script completes without an error and `READY` is `True`. Otherwise, see [Recover a Missing Aligned Extension Package](../troubleshooting.mdx#recover-missing-aligned-package). Then **run the final preflight check**:
+
+```bash
+bash upgrade.sh --preflight
+```
+
+Continue when `Summary` shows `Passed` or `PassedWithWarnings`. Otherwise, resolve the checks on the standby as described in [Handle Preflight Blocks](../troubleshooting.mdx#handle-preflight-blocks-when-needed) and run the check again; `AdminAckRequired` can appear for the first time here, see [Handle Administrator Acknowledgement Gates](../troubleshooting.mdx#handle-administrator-acknowledgement-gates). Then **request the upgrade** with the target version exactly as `ac adm upgrade` lists it:
+
+```bash
+ac adm upgrade
 ac adm upgrade --cluster=global --to=4.5.0
+```
+
+**Monitor the upgrade:**
+
+```bash
 ac adm upgrade status --cluster=global
 kubectl -n cpaas-system get infraclusterversion global   # Huawei DCS and Bare Metal
 ```
 
-If the preflight check reports `AdminAckRequired`, which can appear for the first time after the target CVO is deployed, handle it as described in [Handle Administrator Acknowledgement Gates](../troubleshooting.mdx#handle-administrator-acknowledgement-gates) and run the check again before you request the upgrade.
+Run the commands again until `Current` shows `4.5.0` and `Ready` is `True`, and on Huawei DCS and Bare Metal `PHASE` is `Succeeded`. While control plane nodes are replaced, a command can fail to connect; run it again. If `Upgrade` shows `Blocked` or `Retrying`, see [Inspect Upgrade State](../troubleshooting.mdx#inspect-upgrade-state). On Huawei DCS and Bare Metal, if the upgrade stays `InProgress` in the `Kubernetes` stage, read the `Stalled` condition of the `InfraClusterVersion` as described there. Fix the reported cause and the upgrade continues; if it cannot be fixed, contact technical support.
 
-Run the last two commands again until `Current` shows `4.5.0` and `Ready` is `True`, and on Huawei DCS and Bare Metal `PHASE` is `Succeeded`. While control plane nodes are replaced, a command can fail to connect; run it again. If `Stalled` is `True` or a step does not complete, fix the reported cause by following [Upgrade Troubleshooting](../troubleshooting.mdx); the upgrade then continues. If the cause cannot be fixed, contact technical support.
-
-On Huawei Cloud Stack or VMware vSphere, now follow [Upgrade Kubernetes on Huawei Cloud Stack and VMware vSphere](../upgrade_kubernetes_hcs_vsphere.mdx) with `<standby-kubeconfig>`, then return to this page.
+Then, on Huawei Cloud Stack or VMware vSphere, finish the Kubernetes upgrade in this window, also for a patch upgrade whose Kubernetes build changes: follow [Upgrade Kubernetes on Huawei Cloud Stack and VMware vSphere](../upgrade_kubernetes_hcs_vsphere.mdx) with `<standby-kubeconfig>`, then return to this page.
 
 ### Check the Standby Before Upgrading the Primary \{#go-no-go}
 
@@ -104,39 +129,50 @@ kubectl get nodes
 kubectl get moduleinfo -l cpaas.io/module-name=etcd-sync
 ```
 
-Upgrade the primary only when all three checks pass: `Current` shows `4.5.0` and `Ready` is `True`; on Alauda OS, every node is `Ready` and shows the target Kubernetes version in `VERSION`; the last command returns nothing, because the plugin is not reinstalled yet.
-
-When the standby passes, upgrade the primary immediately. If any check fails, do not upgrade the primary; contact technical support.
+Upgrade the primary only when all three checks pass: `Current` shows `4.5.0` and `Ready` is `True`; on Alauda OS, every node is `Ready` and shows the target Kubernetes version in `VERSION`; the last command returns nothing, because the plugin is not reinstalled yet. When the standby passes, upgrade the primary immediately. If any check fails, do not upgrade the primary; contact technical support.
 
 ### Upgrade the Primary `global` Cluster \{#upgrade-primary}
 
 :::warning
-An upgrade cannot be rolled back. As on the standby, Huawei DCS and Bare Metal replace or reinstall every node, and Huawei Cloud Stack and VMware vSphere need the Kubernetes upgrade in this window.
+An upgrade cannot be rolled back. On Huawei DCS, the request also replaces every node with a new VM, one at a time; on Bare Metal, it reinstalls every host, one at a time. This happens on every minor upgrade, and on a patch upgrade when the target changes the Kubernetes build or the Alauda OS image.
 :::
 
-Run the same commands on the primary, one at a time, and check each result before you run the next one:
+Select the primary and **deploy CVO** and the target release information. Run each block below in the same shell, and check its result before you run the next one:
 
 ```bash
 export KUBECONFIG=<primary-kubeconfig>
 kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}{"\n"}'   # the primary VIP
-bash upgrade.sh --skip-sync-image                  # completes without an error
-kubectl get productmanifest v4.5.0                 # READY is True
-bash upgrade.sh --preflight                        # Summary is Passed or PassedWithWarnings
-ac adm upgrade                                     # 4.5.0 is listed in the available updates
+bash upgrade.sh --skip-sync-image
+kubectl get productmanifest v4.5.0
+```
+
+Continue when the script completes without an error and `READY` is `True`. Otherwise, see [Recover a Missing Aligned Extension Package](../troubleshooting.mdx#recover-missing-aligned-package). Then **run the final preflight check**:
+
+```bash
+bash upgrade.sh --preflight
+```
+
+Continue when `Summary` shows `Passed` or `PassedWithWarnings`. Otherwise, resolve the checks on the primary as described in [Handle Preflight Blocks](../troubleshooting.mdx#handle-preflight-blocks-when-needed) and run the check again; `AdminAckRequired` can appear for the first time here, see [Handle Administrator Acknowledgement Gates](../troubleshooting.mdx#handle-administrator-acknowledgement-gates). Then **request the upgrade** with the target version exactly as `ac adm upgrade` lists it:
+
+```bash
+ac adm upgrade
 ac adm upgrade --cluster=global --to=4.5.0
+```
+
+**Monitor the upgrade:**
+
+```bash
 ac adm upgrade status --cluster=global
 kubectl -n cpaas-system get infraclusterversion global   # Huawei DCS and Bare Metal
 ```
 
-Continue under the same conditions as for the standby. If `Stalled` is `True` or a step does not complete, fix the reported cause by following [Upgrade Troubleshooting](../troubleshooting.mdx); if it cannot be fixed, contact technical support.
+Run the commands again until `Current` shows `4.5.0` and `Ready` is `True`, and on Huawei DCS and Bare Metal `PHASE` is `Succeeded`. While control plane nodes are replaced, a command can fail to connect; run it again. If `Upgrade` shows `Blocked` or `Retrying`, see [Inspect Upgrade State](../troubleshooting.mdx#inspect-upgrade-state). On Huawei DCS and Bare Metal, if the upgrade stays `InProgress` in the `Kubernetes` stage, read the `Stalled` condition of the `InfraClusterVersion` as described there. Fix the reported cause and the upgrade continues; if it cannot be fixed, contact technical support.
 
-On Huawei Cloud Stack or VMware vSphere, now follow [Upgrade Kubernetes on Huawei Cloud Stack and VMware vSphere](../upgrade_kubernetes_hcs_vsphere.mdx) with `<primary-kubeconfig>`, then return to this page.
+Then, on Huawei Cloud Stack or VMware vSphere, finish the Kubernetes upgrade in this window, also for a patch upgrade whose Kubernetes build changes: follow [Upgrade Kubernetes on Huawei Cloud Stack and VMware vSphere](../upgrade_kubernetes_hcs_vsphere.mdx) with `<primary-kubeconfig>`, then return to this page.
 
 ### Reinstall the Global Cluster Disaster Recovery Plugin \{#reinstall-dr-plugin}
 
-Reinstall the plugin on the standby after both `global` clusters run the target ACP version. The standby reads the primary etcd on port `2379`, through the primary VIP or, when the VIP does not forward that port, directly from the primary control plane nodes.
-
-Create the token Secret on the standby from the primary token without printing it. Then read the plugin version of the target release and, on Bare Metal, confirm that the `baremetal-dr-rules` ConfigMap exists:
+Reinstall the plugin on the standby after both `global` clusters run the target ACP version. The standby reads the primary etcd on port `2379`, through the primary VIP or, when the VIP does not forward that port, directly from the primary control plane nodes; `etcd-sync-settings.txt` shows which one the plugin used before. Create the token Secret on the standby from the primary token without printing it. Then list the plugin versions on the standby and, on Bare Metal, confirm that the `baremetal-dr-rules` ConfigMap exists; if it is missing, do not install the plugin, and contact technical support:
 
 ```bash
 export KUBECONFIG=<primary-kubeconfig>
@@ -151,9 +187,7 @@ kubectl get moduleconfigs -l cpaas.io/module-name=etcd-sync -o custom-columns='N
 kubectl -n cpaas-system get configmap baremetal-dr-rules   # Bare Metal
 ```
 
-If the ConfigMap is missing, do not install the plugin; contact technical support.
-
-Install the plugin on the standby. Set `version` to the `VERSION` of the target release from the previous output:
+Install the plugin on the standby. Set `version` to the version that you pushed to the standby in [Publish to the Standby global Cluster](../pre-upgrade.mdx#publish-standby), the highest `VERSION` in the previous output. For `active_cluster_vip`, `active_cluster_etcd_endpoints`, `dest_etcd_endpoints`, `monitor_check_interval`, and `detail`, use the values recorded in `etcd-sync-settings.txt` instead of the example values:
 
 ```bash
 export KUBECONFIG=<standby-kubeconfig>
@@ -162,7 +196,7 @@ kubectl create -f - <<'EOF'
 apiVersion: cluster.alauda.io/v1alpha1
 kind: ModuleInfo
 metadata:
-  name: global-temporary-name
+  name: global-temporary-name   # keep this name; the platform renames the object
   labels:
     cpaas.io/cluster-name: global
     cpaas.io/module-name: etcd-sync
@@ -179,18 +213,14 @@ spec:
     detail: false
 EOF
 kubectl get moduleinfo -l cpaas.io/module-name=etcd-sync
-kubectl -n cpaas-system get pod -l app=etcd-sync
+kubectl -n cpaas-system get pod -l 'app in (etcd-sync,etcd-sync-monitor)'
 ```
 
-Continue when the `ModuleInfo` shows `STATUS` `Running` and `CURRENT_VERSION` equal to the version you set, every Pod is `Running`, and the `/check` command from [Verify Data Consistency](#verify-dr-consistency), run again on a standby control plane node, lists no missed keys and no surplus keys. Otherwise, see [Global Cluster Disaster Recovery Does Not Synchronize](../troubleshooting.mdx#dr-sync-diagnostics).
+Continue when the `ModuleInfo` shows `STATUS` `Running` and `CURRENT_VERSION` equal to the version you set, every Pod is `Running`, and the `/check` command from [Verify Data Consistency](#verify-dr-consistency), run again on a standby control plane node, shows `localMissedKeys [0]` and `localSurplusKeys [0]`. Otherwise, see [Global Cluster Disaster Recovery Does Not Synchronize](../troubleshooting.mdx#dr-sync-diagnostics).
 
 ### Upgrade the Agnostic Extensions and Validate \{#upgrade-agnostic-extensions}
 
-The upgrade requests do not upgrade Extensions (Operators and Cluster Plugins) with the `Agnostic` lifecycle. On the primary, upgrade each Agnostic Extension separately by following its own documentation, for example <ExternalSiteLink name="ai" href="/upgrade/upgrade-from-aml-1.2.html" children="Upgrade Alauda AI" /> and <ExternalSiteLink name="devops" href="/upgrade/index.html" children="Upgrade Alauda DevOps" />.
-
-If the source ACP version is earlier than 4.3, also upgrade these Agnostic Extensions to versions compatible with the target, or their pages can fail to open: Alauda DevOps v3, Alauda AI Essentials, Alauda Hyperflux, and Alauda Container Platform Data Services Essentials.
-
-Then complete [Upgrade Validation](../validation.mdx) on the primary and on the standby.
+The upgrade requests do not upgrade Extensions (Operators and Cluster Plugins) with the `Agnostic` lifecycle. Upgrade each Agnostic Extension installed on the primary, and each one installed on the standby, by following its own documentation; the plugin does not synchronize installed Extensions. For example, see <ExternalSiteLink name="ai" href="/upgrade/upgrade-from-aml-1.2.html" children="Upgrade Alauda AI" /> and <ExternalSiteLink name="devops" href="/upgrade/index.html" children="Upgrade Alauda DevOps" />. If the source ACP version is earlier than 4.3, also upgrade these Agnostic Extensions to versions compatible with the target, or their pages can fail to open: Alauda DevOps v3, Alauda AI Essentials, Alauda Hyperflux, and Alauda Container Platform Data Services Essentials. Then complete [Upgrade Validation](../validation.mdx) on the primary and on the standby.
 
 </Steps>
 

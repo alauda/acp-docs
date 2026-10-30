@@ -5,9 +5,13 @@ title: Upgrade Procedure
 
 # Upgrade Workload Clusters
 
-Use this page in the maintenance windows after the `global` cluster is upgraded; in a DR environment, after both `global` clusters are upgraded. In one window you can upgrade one or several workload clusters, and each moves to the ACP version (Distribution Version) that `global` runs now. Unless a step says otherwise, run the commands from the execution host against the `global` cluster, which is the primary `global` cluster in a DR environment.
+Use this page in the maintenance windows after the `global` cluster is upgraded; in a DR environment, after both `global` clusters are upgraded. In one window you can upgrade one or several workload clusters, and each moves to the ACP version (Distribution Version) that `global` runs now. Unless a step says otherwise, run the commands from the execution host against the `global` cluster, which is the primary `global` cluster in a DR environment. Commands for a workload cluster itself use `kubectl --kubeconfig=<cluster-name>.kubeconfig`; `KUBECONFIG` stays on `global`.
 
-Do not start another `global` upgrade while a workload cluster upgrade is running; the platform does not block it. See [Upgrade Order and Compatibility](../overview.mdx#upgrade-order).
+The commands on this page use `4.5.0` as the target ACP version. For another target, such as a later patch, use that version in every command.
+
+:::warning
+Do not start another `global` upgrade while a workload cluster upgrade is running; the platform does not block it. The `global` upgrade pages check this before the upgrade. See [Upgrade Order and Compatibility](../overview.mdx#upgrade-order).
+:::
 
 ## Before the Maintenance Window \{#before-the-window}
 
@@ -30,14 +34,14 @@ ac adm upgrade status --cluster=global
 Extensions (Operators and Cluster Plugins) with the `Aligned` lifecycle upgrade with the cluster. An Aligned Operator needs its target package on every cluster where it is installed; Cluster Plugins published to `global` are available to every cluster. If a cluster did not receive its Operator packages during preparation, for example because it was added later, push the target package of each Aligned Operator installed on it. Packages of Operators that are not installed on the cluster do not block its upgrade. From the execution host:
 
 ```bash
-read -rsp "Platform token: " PLATFORM_TOKEN; echo
-violet push <operator-package> --platform-address "https://<platform-address>" \
-  --platform-token "$PLATFORM_TOKEN" --clusters "<cluster-name>"
+read -rsp "Platform token: " PLATFORM_TOKEN; printf '\n'
+violet push <operator-package>.tgz --platform-address "https://<platform-address>" \
+  --platform-token "${PLATFORM_TOKEN}" --clusters "<cluster-name>"
 ```
 
 ### Run Preflight Checks for the Cluster \{#run-preflight}
 
-Run this check only after the `global` clusters are upgraded; before that, it reports `Retry` with the reason `GlobalVersionPending`. Select the `global` cluster and, in the directory of the extracted target Core Package, run:
+Run this check only after the `global` clusters are upgraded; before that, it reports `Retry` with the reason `GlobalVersionPending`. Select the `global` cluster and, in the `installer/` directory of the extracted target Core Package, run:
 
 ```bash
 export KUBECONFIG=<global-kubeconfig>
@@ -45,9 +49,9 @@ kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}{"\n"}'
 bash upgrade.sh --preflight --cluster=<cluster-name>
 ```
 
-Continue when `Summary` shows `Passed` or `PassedWithWarnings`. Otherwise, fix each blocking check before the window as described in [Handle Preflight Blocks](../troubleshooting.mdx#handle-preflight-blocks-when-needed), and run the check again. The `ResourcePatch` objects that `ResourcePatchUpgradeable` names are on the workload cluster, so add their exemptions there, with a `kubeconfig` for that cluster.
+Continue when `Summary` shows `Passed` or `PassedWithWarnings`. Otherwise, fix each blocking check before the window as described in [Handle Preflight Blocks](../troubleshooting.mdx#handle-preflight-blocks-when-needed), and run the check again. The `ResourcePatch` objects that `ResourcePatchUpgradeable` names are on the workload cluster, so run the exemption commands against it with `kubectl --kubeconfig=<cluster-name>.kubeconfig`.
 
-On Huawei DCS and Bare Metal, if `InfraClusterVersionPreflight` reports `PreflightPending`, the checks are not evaluated yet; run the preflight again after 5 minutes. To read its individual checks, run the following on the `global` cluster; for the meaning of each check and what to do, see [Kubernetes Upgrade Checks](../troubleshooting.mdx#infra-preflight-checks).
+On Huawei DCS and Bare Metal, if `InfraClusterVersionPreflight` reports `PreflightPending`, the checks are not evaluated yet; run the preflight again after 5 minutes. If it reports `PreflightUnconsumed`, contact technical support. To read its individual checks, run the following on the `global` cluster; for the meaning of each check and what to do, see [Kubernetes Upgrade Checks](../troubleshooting.mdx#infra-preflight-checks).
 
 ```bash
 kubectl -n cpaas-system get infraclusterversionpreflight -l upgrade.alauda.io/cluster=<cluster-name>
@@ -60,24 +64,26 @@ kubectl -n cpaas-system get infraclusterversionpreflight <preflight-name> \
 The platform does not check the Kubernetes upgrade of VMware vSphere clusters in advance. For each vSphere cluster in the window, read its rollout settings, its pools, and the vSphere provider on the `global` cluster:
 
 ```bash
+export KUBECONFIG=<global-kubeconfig>
+kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}{"\n"}'
 KCP=$(kubectl -n cpaas-system get clusters.cluster.x-k8s.io <cluster-name> -o jsonpath='{.spec.controlPlaneRef.name}')
 kubectl -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='replicas={.spec.replicas} maxSurge={.spec.rolloutStrategy.rollingUpdate.maxSurge}{"\n"}'
 kubectl -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=<cluster-name> \
   -o custom-columns='NAME:.metadata.name,TYPE:.spec.strategy.type,SURGE:.spec.strategy.rollingUpdate.maxSurge'
-kubectl -n cpaas-system get vspheremachineconfigpool \
-  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .status.conditions[?(@.type=="Ready")]}{.status}{end}{"\n"}{end}'
+kubectl -n cpaas-system get vspheremachineconfigpool -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status'
 kubectl -n cpaas-system get apprelease \
-  -o custom-columns='NAME:.metadata.name,CHART:.spec.source.charts[*].name,REQUESTED:.spec.source.charts[*].targetRevision,INSTALLED:.status.charts[*].installedRevision,PHASE:.status.charts[*].phase' \
+  -o custom-columns='NAME:.metadata.name,CHART:.spec.source.charts[*].name,REQUESTED:.spec.source.charts[*].targetRevision,INSTALLED:.status.charts.*.installedRevision,SYNC:.status.conditions[?(@.type=="Sync")].status,HEALTH:.status.conditions[?(@.type=="Health")].status' \
   | grep -E '^NAME|chart-cluster-api-provider-vsphere'
 ```
 
-Continue when `replicas` is 3 or more, `maxSurge` and every `SURGE` are `0` (an empty value counts as `1`; a MachineDeployment of `TYPE` `OnDelete` needs none), every pool of the cluster reports `True`, and the vSphere provider shows `REQUESTED` equal to `INSTALLED` with `PHASE` `Success`. If the control plane has fewer than 3 replicas or the provider differs, contact technical support. If another rollout setting or a pool differs, leave the cluster out of this window and correct it in a separate change first.
+Continue when `replicas` is 3 or more, `maxSurge` and every `SURGE` are `0` (an empty value counts as `1`; a MachineDeployment of `TYPE` `OnDelete` needs none), every pool of the cluster reports `True`, and the vSphere provider shows `REQUESTED` equal to `INSTALLED` with `SYNC` and `HEALTH` `True`. With fewer than three control-plane nodes, contact technical support. If the provider does not match, also contact technical support. If another rollout setting or a pool differs, leave the cluster out of this window and correct it in a separate change first.
 
 ### Check DR Synchronization \{#check-dr-sync}
 
-In a DR environment, check synchronization on a control plane node of the standby `global` cluster, where the Service address is reachable. Continue when the output lists no missed keys and no surplus keys; otherwise, restore synchronization before the window. See [Global Cluster Disaster Recovery Does Not Synchronize](../troubleshooting.mdx#dr-sync-diagnostics).
+In a DR environment, check synchronization on a control plane node of the standby `global` cluster; the check address is reachable only from inside the cluster. This check is the only command on this page that runs on a node; then return to the execution host. Continue when the output lists no missed keys and no surplus keys; otherwise, restore synchronization before the window. See [Global Cluster Disaster Recovery Does Not Synchronize](../troubleshooting.mdx#dr-sync-diagnostics).
 
 ```bash
+export KUBECONFIG=/etc/kubernetes/admin.conf
 mirror_svc=$(kubectl get svc -n cpaas-system etcd-sync-monitor -o jsonpath='{.spec.clusterIP}')
 if [[ $mirror_svc =~ ^[0-9a-fA-F:]+$ ]]; then mirror_host="[$mirror_svc]"; else mirror_host="$mirror_svc"; fi
 curl -g "http://${mirror_host}/check"
@@ -92,10 +98,10 @@ curl -g "http://${mirror_host}/check"
 ### Request the Upgrade \{#request-the-upgrade}
 
 :::warning
-An upgrade cannot be rolled back. On Huawei DCS, this request also replaces every node with a new VM; on Bare Metal, it reinstalls every host. Both happen one node at a time.
+An upgrade cannot be rolled back. On Huawei DCS, the request also replaces every node with a new VM, one at a time; on Bare Metal, it reinstalls every host, one at a time. This happens on every minor upgrade, and on a patch upgrade when the target changes the Kubernetes build or the Alauda OS image.
 :::
 
-Select the `global` cluster, list the available updates of the workload cluster, then request the version it lists. Repeat the request for each cluster in the window; the platform upgrades a limited number of clusters at the same time and queues the rest, and a queued request starts when an earlier one finishes.
+Select the `global` cluster, list the available updates of the workload cluster, then request the version it lists. Each cluster has its own request; repeat it for each cluster in the window. The platform upgrades a limited number of clusters at the same time, and the rest wait.
 
 ```bash
 export KUBECONFIG=<global-kubeconfig>
@@ -111,7 +117,7 @@ ac adm upgrade status --cluster=<cluster-name>
 kubectl -n cpaas-system get infraclusterversion <cluster-name>   # Huawei DCS and Bare Metal
 ```
 
-Run the commands again until `Current` shows `4.5.0` and the `Ready` condition is `True`; add `--verbose` to see every check and stage. If `Stalled` is `True`, fix the reported cause by following [Inspect Upgrade State](../troubleshooting.mdx#inspect-upgrade-state); the upgrade then continues. If the cause cannot be fixed, contact technical support.
+Run the commands again until `Current` shows `4.5.0` and the `Ready` condition is `True`; add `--verbose` to see every check and stage. If `Upgrade` shows `Blocked` or `Retrying`, see [Inspect Upgrade State](../troubleshooting.mdx#inspect-upgrade-state). On Huawei DCS and Bare Metal, if the upgrade stays `InProgress` in the `Kubernetes` stage, read the `Stalled` condition of the `InfraClusterVersion` as described there. Fix the reported cause and the upgrade continues; if it cannot be fixed, contact technical support.
 
 On Huawei DCS and Bare Metal, `CURRENT` of the `InfraClusterVersion` advances through each intermediate Kubernetes version; also wait until `PHASE` is `Succeeded`. Until then, do not edit the cluster's `KubeadmControlPlane`, `MachineDeployment` resources, or their templates.
 
@@ -134,6 +140,6 @@ If the source ACP version is earlier than 4.3, also upgrade these Agnostic Exten
 
 ### Validate the Cluster \{#validate}
 
-Complete [Upgrade Validation](../validation.mdx) for the workload cluster before you close the maintenance window.
+Complete [Upgrade Validation](../validation.mdx) for each workload cluster of the window before you close the maintenance window.
 
 </Steps>
