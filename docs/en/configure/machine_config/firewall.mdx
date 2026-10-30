@@ -1,0 +1,92 @@
+---
+weight: 30
+title: Managing Firewall Ports
+---
+
+# Managing Firewall Ports
+
+Each node's host firewall is preconfigured with the ports required by the platform. You do not need to manage these ports, and you should not modify the platform's preconfigured port list directly.
+
+When a workload needs an additional host port to be open—for example, a component that listens directly on the node—you can open it by installing a small systemd unit with a `MachineConfig` object. The unit opens the ports at runtime with `firewall-cmd --add-port`, leaving the platform's preconfigured ports untouched.
+
+## Why This Uses a Runtime Unit, Not a Firewalld Reload
+
+Reloading or restarting firewalld (`firewall-cmd --reload`, `systemctl restart firewalld`) rebuilds the host firewall from scratch. On a cluster node this can drop packet-filtering rules that other components program directly—such as Istio's traffic-redirection rules, `kube-proxy`, or the CNI—causing intermittent connectivity loss. To avoid that, this procedure never reloads or restarts firewalld.
+
+Instead, a oneshot systemd unit adds the ports to the running firewalld with `firewall-cmd --add-port`. This is purely additive and flushes nothing. The unit is ordered after firewalld and declared `PartOf=firewalld.service`, so if firewalld is ever restarted the unit runs again and re-adds the ports (a runtime `--add-port` does not survive a firewalld restart on its own).
+
+## Opening Additional Ports
+
+The following example opens TCP ports `9141` (ZooKeeper) and `9308` (cpaas-kafka), two ports commonly needed by the logging stack. Change the `--add-port` list to the ports your workload requires.
+
+1. Create a `MachineConfig` that installs a oneshot unit which opens the ports at runtime:
+
+   ```yaml
+   apiVersion: machineconfiguration.alauda.io/v1alpha1
+   kind: MachineConfig
+   metadata:
+     name: 99-worker-firewall-ports
+     labels:
+       machineconfiguration.alauda.io/role: worker
+   spec:
+     config:
+       ignition:
+         version: 3.4.0
+       systemd:
+         units:
+           - name: open-app-ports.service
+             enabled: true
+             contents: |
+               [Unit]
+               Description=Open firewalld ports for workloads (runtime add-port, no reload)
+               After=firewalld.service
+               Requires=firewalld.service
+               PartOf=firewalld.service
+
+               [Service]
+               Type=oneshot
+               RemainAfterExit=yes
+               ExecStart=/usr/bin/firewall-cmd --add-port=9141/tcp --add-port=9308/tcp
+
+               [Install]
+               WantedBy=multi-user.target
+   ```
+
+2. Configure a node disruption policy so that changes to this unit restart the unit—re-running `firewall-cmd`—instead of rebooting the node. Add the `open-app-ports.service` entry to the `nodeDisruptionPolicy.units` list of the cluster-scoped `MachineConfiguration` singleton named `cluster`, and confirm it is reflected in `status.nodeDisruptionPolicyStatus` **before** applying the `MachineConfig`:
+
+   ```yaml
+   apiVersion: machineconfiguration.alauda.io/v1alpha1
+   kind: MachineConfiguration
+   metadata:
+     name: cluster
+   spec:
+     nodeDisruptionPolicy:
+       units:
+         - name: open-app-ports.service
+           actions:
+             - type: DaemonReload
+             - type: Restart
+               restart:
+                 serviceName: open-app-ports.service
+       sshkey:
+         actions:
+           - type: None
+   ```
+
+After both objects are applied, the unit opens the ports on each targeted node with no firewalld reload and no node reboot; the platform's preconfigured ports and other components' rules are left intact.
+
+:::warning
+The `cluster` object is a singleton and may already carry other unit or file policies. Add `open-app-ports.service` to the existing `nodeDisruptionPolicy.units` list rather than replacing the whole policy. A managed unit that is **not** listed here falls back to the default action for units, which reboots the node when the unit changes.
+:::
+
+## Changing or Removing Ports
+
+- **To add ports**, extend the `--add-port` list in the unit and re-apply the `MachineConfig`. The node disruption policy restarts the unit and the new ports are added at runtime.
+- **To remove a port**, deleting it from the `--add-port` list is not sufficient by itself: `firewall-cmd --add-port` only adds, so a port that is already open at runtime stays open until firewalld is restarted. Remove the port from the unit, then restart firewalld on the affected nodes—or reboot them—to drop it.
+
+## Notes
+
+- Ports are added to firewalld's default zone. If the relevant interface is bound to a non-default zone, add `--zone=<zone>` to the `firewall-cmd` command.
+- `firewall-cmd --add-port` is idempotent: re-adding an already-open port returns a warning and still succeeds, so the oneshot unit is safe to re-run.
+- The unit requires firewalld to be running. On a node that does not run host firewalld, the unit does not start and no ports are opened.
+- A runtime `--add-port` is not written to firewalld's permanent configuration. If firewalld is reloaded out of band (`firewall-cmd --reload`), these ports are dropped and are re-added only the next time firewalld or the node restarts.
