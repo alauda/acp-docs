@@ -21,7 +21,7 @@ That deployment procedure is the authoritative source for the installation-time 
 
 - Each side is installed from its own bootstrap node: two bootstrap nodes in total, on every provider.
 - Primary and standby clusters use the same Kubernetes API server encryption provider configuration.
-- The `KubeadmControlPlane` etcd server certificate SAN list includes both the primary and standby control plane VIPs and the Platform Access Address. This list is separate from the platform `console.cert` SAN list.
+- Each cluster's `KubeadmControlPlane` etcd server certificate SAN list includes that cluster's own control plane VIP, the Platform Access Address, and `etcd.kube-system`; the primary and standby lists differ (see [Add DR etcd Server Certificate SANs to KubeadmControlPlane](./installing.mdx#dr-etcd-server-cert-sans)). This list is separate from the platform `console.cert` SAN list.
 - Huawei DCS deployments reference the shared encryption provider Secret from `DCSCluster.spec.encryptionProviderConfigRef`. The Secret must exist in each final `global` cluster, not only in the bootstrap cluster that installed it.
 - VMware vSphere deployments write the same `/etc/kubernetes/encryption-provider.conf` file through `KubeadmControlPlane.spec.kubeadmConfigSpec.files`.
 - Huawei Cloud Stack deployments write the same `/etc/kubernetes/encryption-provider.conf` file through `KubeadmControlPlane.spec.kubeadmConfigSpec.files`.
@@ -86,11 +86,11 @@ synchronization sources and post-failover checks are in
 [Bare Metal DR Model](#bare-metal-dr-model) section.
 
 1. Fence the primary so it cannot write workload resources.
-2. Wait for the monitor to show no differences, then **uninstall** `etcd-sync` from the old standby. Removing its `ModuleInfo` is what uninstalls the plugin; scaling the Deployments to zero is not enough (see the warning below).
+2. Wait for the monitor to show no differences, then **uninstall** `etcd-sync` from the old standby. Removing its `ModuleInfo` is what uninstalls the plugin; scaling the Deployments to zero is not enough (see the warning below). On Bare Metal, then set `elemental.systemAgent.sharedAuthReadOnly: false` in the [Bare Metal provider's `ModuleInfo`](../../workload_clusters/alauda_os/bare-metal/install_provider.mdx#install-the-cluster-plugins) on the old standby, which becomes the active cluster, and wait until the `elemental-operator` Deployment no longer has the `--system-agent-shared-auth-read-only` argument (check with `kubectl -n cpaas-system get deploy elemental-operator -o yaml | grep -- --system-agent-shared-auth-read-only`). Until then, new worker nodes cannot obtain their plans.
 3. Switch the platform domain to the standby control-plane entrance.
 4. Verify the standby API and platform endpoint.
 5. Confirm workload hosts reconnect through the platform domain and can update plan feedback.
-6. Install the `etcd-sync` plugin on the new standby (the fenced former primary) with the reverse active/standby values and, on Bare Metal, the same `baremetal-dr-rules` ConfigMap. Remember that the active-cluster token must now come from the new active cluster, and that pushing the plugin package uses the Registry credential of the cluster the platform domain now points to.
+6. On Bare Metal, first set `elemental.systemAgent.sharedAuthReadOnly: true` in the provider's `ModuleInfo` on the new standby and confirm with the same command that the `elemental-operator` Deployment has the `--system-agent-shared-auth-read-only` argument. Then install the `etcd-sync` plugin on the new standby (the fenced former primary) with the reverse active/standby values and, on Bare Metal, the same `baremetal-dr-rules` ConfigMap. Remember that the active-cluster token must now come from the new active cluster, and that pushing the plugin package uses the Registry credential of the cluster the platform domain now points to.
 
 <Directive type="warning" title="Uninstall the mirror, do not just scale it down">
   On startup `etcd-sync` resolves the platform domain and checks that the cluster the domain points to does not have `etcd-sync` installed. This is what prevents the mirror from running on both sides at once. If step 2 only scaled the Deployments to zero, the `ModuleInfo` still exists and the new standby refuses to start with:
@@ -122,7 +122,7 @@ Bare Metal keeps physical hosts and their plan Secrets in MachineInventory objec
 
 The Global row is specific to DR and to the post-handoff Global registration described below. The workload row is the standard Bare Metal registration path; for the stage-by-stage network requirements of the workload-cluster path — including DNS, NTP, the registry, and cluster-internal traffic — see [Network Connectivity](../../workload_clusters/alauda_os/bare-metal/create_cluster.mdx#network-connectivity).
 
-Set `elemental.systemAgent.splitAuthEnabled: true` on both Bare Metal provider releases. The active Global uses `sharedAuthReadOnly: false`; the standby uses `sharedAuthReadOnly: true` while it receives data. Keep the standard ServiceAccount, Secret, Role, and RoleBinding names. Never grant namespace-wide Secret access.
+Set `elemental.systemAgent.splitAuthEnabled: true` on the Bare Metal provider of both sides. The active Global uses `sharedAuthReadOnly: false`; the standby uses `sharedAuthReadOnly: true` while it receives data. Set these values on each side's bootstrap release as described in [Add Provider-Specific DR Fields](./installing.mdx#add-provider-specific-dr-fields), and again on each final `global` cluster in the provider's `ModuleInfo`, together with `elemental.tls.caCertSecretKey`; see [Install the cluster plugins](../../workload_clusters/alauda_os/bare-metal/install_provider.mdx#install-the-cluster-plugins). Keep the standard ServiceAccount, Secret, Role, and RoleBinding names. Never grant namespace-wide Secret access.
 
 After handoff, every Global registration must use the local API server:
 
@@ -229,12 +229,12 @@ For a planned switch, run the [failover sequence](#failover-procedure). The `bar
   </Tab>
   <Tab label="VMware vSphere">
 
-Follow the VMware vSphere steps in [Optional Disaster Recovery Deployment](./installing.mdx#optional-disaster-recovery-deployment). The VMware vSphere installation uses the same `KubeadmControlPlane` encryption file entry and etcd SAN configuration as the primary installation. No `VSphereCluster` encryption Secret reference is required. Create the VMware vSphere `dcs-import-extra-resources` ConfigMap so the installer imports vSphere infrastructure resources and the `global-vsphere-credentials` Secret referenced by `VSphereCluster.spec.identityRef.name`.
+Follow the VMware vSphere steps in [Optional Disaster Recovery Deployment](./installing.mdx#optional-disaster-recovery-deployment). The VMware vSphere installation uses the same `KubeadmControlPlane` encryption file entry as the primary installation, and its own etcd SAN list. No `VSphereCluster` encryption Secret reference is required. Create the VMware vSphere `dcs-import-extra-resources` ConfigMap so the installer imports vSphere infrastructure resources and the `global-vsphere-credentials` Secret referenced by `VSphereCluster.spec.identityRef.name`.
 
   </Tab>
   <Tab label="Huawei Cloud Stack">
 
-Follow the HCS steps in [Optional Disaster Recovery Deployment](./installing.mdx#optional-disaster-recovery-deployment). The HCS installation uses the same `KubeadmControlPlane` encryption file entry and etcd SAN configuration as the primary installation. No `HCSCluster` encryption Secret reference is required. Create the HCS `dcs-import-extra-resources` ConfigMap so the installer imports HCS infrastructure resources and the Secret referenced by `HCSCluster.spec.identityRef.name`.
+Follow the HCS steps in [Optional Disaster Recovery Deployment](./installing.mdx#optional-disaster-recovery-deployment). The HCS installation uses the same `KubeadmControlPlane` encryption file entry as the primary installation, and its own etcd SAN list. No `HCSCluster` encryption Secret reference is required. Create the HCS `dcs-import-extra-resources` ConfigMap so the installer imports HCS infrastructure resources and the Secret referenced by `HCSCluster.spec.identityRef.name`.
 
   </Tab>
   <Tab label="Bare Metal">
@@ -248,7 +248,7 @@ Bare Metal requires all of the following to be aligned:
 - Same ServiceAccount signing key files and same issuer/audience values on both sides.
 - Same trusted platform HTTPS certificate on both sides, with the stable platform domain in its SAN list. Add a control-plane VIP SAN only when platform HTTPS intentionally uses that VIP; do not add internal Service names to `console.cert`. With the platform built-in Registry, the registry on port `11443` uses an independently managed `global-registry-server` certificate chain.
 - `dcs-import-extra-resources` created before the installer API call on both sides, containing the durable Global Bare Metal and Elemental owner resources plus the referenced encryption-provider Secret. It must exclude Global plan Secrets, `KubeadmConfig` objects, and kubeadm bootstrap data Secrets; fresh handoff creates the initial Global plan Secrets with the live Global `MachineInventory` UID.
-- Bare Metal provider AppRelease values set with the local `handoffHook.controlPlaneVIP`, `handoffHook.directAPIServer: true`, `elemental.systemAgent.authMode: shared`, `elemental.systemAgent.splitAuthEnabled: true`, and `elemental.systemAgent.globalServiceAccountName: baremetal-global-system-agent`. The active side sets `elemental.systemAgent.sharedAuthReadOnly: false`; the inactive side sets it to `true`.
+- Bare Metal provider AppRelease values on each bootstrap cluster set with the local `handoffHook.controlPlaneVIP`, `handoffHook.directAPIServer: true`, `elemental.systemAgent.authMode: shared`, `elemental.systemAgent.splitAuthEnabled: true`, and `elemental.systemAgent.globalServiceAccountName: baremetal-global-system-agent`. The active side sets `elemental.systemAgent.sharedAuthReadOnly: false`; the inactive side sets it to `true`. On each final `global` cluster, set only `elemental.tls.caCertSecretKey`, `elemental.systemAgent.splitAuthEnabled: true`, and that side's `sharedAuthReadOnly` value, in `spec.valuesOverride` of the provider's `ModuleInfo`; see [Install the cluster plugins](../../workload_clusters/alauda_os/bare-metal/install_provider.mdx#install-the-cluster-plugins).
 - The deployed `elemental-operator` image and every newly produced `baremetal-base-image` and `baremetal-base-image-iso` are built from the same pinned elemental commit. Rebuild the installation media whenever that commit changes.
 
 Do not sync `SeedImage` from primary to standby. Sync non-`global` `MachineRegistration` resources when workload ISOs need to remain valid across failover. Do not sync primary Global `MachineRegistration` resources to standby. Create Global registrations locally with `baremetal.cluster.io/system-agent-auth-scope: global`, `baremetal.cluster.io/system-agent-server-url: https://<local-global-control-plane-vip>:6443`, and `baremetal.cluster.io/system-agent-endpoint-mode: direct-apiserver`.
