@@ -1,0 +1,165 @@
+---
+weight: 20
+title: Create the global Cluster
+queries:
+  - install global cluster on huawei cloud stack
+  - ac adm alpha global create --provider hcs
+  - hcs global cluster elb vipAddress flavorName imageName
+---
+
+# Create the global Cluster on Huawei Cloud Stack
+
+## Prerequisites \{#prerequisites}
+
+- You completed the [common prerequisites](../prerequisites.mdx) and the [Huawei Cloud Stack prerequisites](./prerequisites.mdx).
+- The Core Package is extracted on the bootstrap node and its payload is in the external registry; see [Prepare the Core Package and the Registry](../prerequisites.mdx#prepare-core-package).
+- For a disaster recovery pair, write both files as described in [Disaster Recovery](../disaster_recovery.mdx#configure-install-config), then run this procedure on each side.
+
+## Procedure
+
+### 1. Write `install-config.yaml` \{#install-config}
+
+Create an installation directory on the bootstrap node and write `install-config.yaml` in it. Keep the file private (`chmod 600 install-config.yaml`); it holds the passwords. Do not add `cluster.network.loadBalancer`: on Huawei Cloud Stack the control plane endpoint is the ELB under `provider.hcs.elb`, and `ac` rejects a `loadBalancer` block. The fields are described in [Parameters](./reference/install-config-parameters.mdx); additional NICs, raw disks, availability zones, and per-group overrides are optional and listed there.
+
+```yaml title="install-config.yaml"
+global:
+  registry:
+    address: <host>:<port> # [!code callout]
+    username: <user> # [!code callout]
+    password: <password>
+  platform:
+    address: <platform-domain-or-ip> # [!code callout]
+    username: admin@cpaas.io # [!code callout]
+    password: <password> # [!code callout]
+    extraAddresses: [] # [!code callout]
+
+cluster: # [!code callout]
+  sshKeys: # [!code callout]
+    - <ssh-public-key>
+  ntpServers: [] # [!code callout]
+
+provider:
+  hcs:
+    credential: # [!code callout]
+      accessKey: <access-key>
+      secretKey: <secret-key>
+      projectID: <project-id>
+      region: <region>
+      externalGlobalDomain: <domain>
+    imageName: <image-name> # [!code callout]
+    flavorName: <flavor-name> # [!code callout]
+    rootDisk:
+      sizeGiB: 200 # [!code callout]
+    network:
+      vpcName: <vpc-name> # [!code callout]
+      securityGroupName: <security-group>
+      subnetName: <subnet-name> # [!code callout]
+    elb: # [!code callout]
+      vipAddress: <control-plane-vip> # [!code callout]
+      l4:
+        ips: [<l4-ip-1>, <l4-ip-2>] # [!code callout]
+      l7:
+        ips: [<l7-ip-1>, <l7-ip-2>]
+
+controlPlane:
+  replicas: 3 # [!code callout]
+  disks:
+    ephemeral: # [!code callout]
+      - name: var-lib-containerd
+        sizeGiB: 100
+      - name: var-lib-kubelet
+        sizeGiB: 100
+      - name: var-lib-etcd # [!code callout]
+        sizeGiB: 20
+    persistent: # [!code callout]
+      - name: var-cpaas
+        sizeGiB: 100
+  hosts: # [!code callout]
+    - hostname: <cp-0-hostname>
+      ip: <cp-0-ip>
+    - hostname: <cp-1-hostname>
+      ip: <cp-1-ip>
+    - hostname: <cp-2-hostname>
+      ip: <cp-2-ip>
+
+computes: # [!code callout]
+  - name: worker
+    replicas: 3
+    disks:
+      ephemeral: # [!code callout]
+        - name: var-lib-containerd
+          sizeGiB: 100
+        - name: var-lib-kubelet
+          sizeGiB: 100
+      persistent:
+        - name: var-cpaas
+          sizeGiB: 100
+    hosts:
+      - hostname: <worker-0-hostname>
+        ip: <worker-0-ip>
+      - hostname: <worker-1-hostname>
+        ip: <worker-1-ip>
+      - hostname: <worker-2-hostname>
+        ip: <worker-2-ip>
+```
+
+<Callouts>
+
+1. `registry.address`: required. The external registry as `<host>[:<port>]`, without a scheme or `/v2/`.
+2. `registry.username` and `registry.password`: optional. Set both or neither.
+3. `platform.address`: required. The platform access address, without a scheme or port. Disaster recovery requires a domain name.
+4. `platform.username`: defaults to `admin@cpaas.io`.
+5. `platform.password`: required. 8 to 32 characters, mixing letters, digits, and symbols.
+6. `extraAddresses`: optional. List the control plane VIP to open the console on it. Required for disaster recovery, where each side lists its own VIP.
+7. Do not set `clusterName`: `ac` names the cluster `global`.
+8. `sshKeys`: required. The SSH public keys installed on every node.
+9. `ntpServers`: optional. Empty keeps the image's time configuration.
+10. `credential`: required. The HCS API credential; every field shown is required.
+11. `imageName`: required. The image every node is created from.
+12. `flavorName`: required, unless every node group sets `hcs.flavorName`. The flavor sets the instance size.
+13. `rootDisk.sizeGiB`: required. The system disk size.
+14. `vpcName` and `securityGroupName`: required.
+15. `subnetName`: required. The node subnet.
+16. `elb`: the control plane ELB, which the provider creates.
+17. `vipAddress`: required. The control plane VIP, an IPv4 address.
+18. `l4.ips` and `l7.ips`: required. Exactly two IPv4 addresses each.
+19. `replicas`: an odd number, `1` or `3` or more. With fewer than three control plane nodes, contact technical support before you upgrade the cluster.
+20. `ephemeral`: disks recreated with the instance.
+21. `var-lib-etcd`: control plane only.
+22. `persistent`: disks kept when the instance is replaced.
+23. `hosts`: required. At least `replicas` entries.
+24. `computes`: optional. Without workers, the platform runs on the control plane nodes.
+25. Workers have no `var-lib-etcd`.
+
+</Callouts>
+
+### 2. Create the Cluster \{#create}
+
+On the bootstrap node:
+
+```bash
+<extract-dir>/res/<arch>/ac adm alpha global create --dir <install-dir> --provider hcs
+```
+
+`ac` first checks only that the IAM endpoint `<schema>://iam-apigateway-proxy.<externalGlobalDomain>` answers. If the check fails, nothing is changed and the error names the endpoint. `ac` does not sign in or look up the image, flavor, VPC, subnet, or security group: a wrong credential or name stops the installation in stage 4.
+
+`create` returns when the installation is complete. If `create` stops, run the same command again; completed work is skipped. See [The `create` Command](../reference.mdx#create-command).
+
+### 3. Monitor the Installation \{#monitor}
+
+From another terminal on the bootstrap node:
+
+```bash
+<extract-dir>/res/<arch>/ac adm alpha global status
+```
+
+For the stages and common failures, see [Troubleshooting](../troubleshooting.mdx); for Huawei Cloud Stack failures, see [Troubleshooting on Huawei Cloud Stack](./troubleshooting.mdx).
+
+## Verification
+
+When `create` returns, the installation is complete. Verify the platform as described in [Validation](../../validation.mdx), including its [checks for Alauda OS](../../validation.mdx#alauda-os-checks).
+
+## Next Steps
+
+- [Create a Cluster on Huawei Cloud Stack](../../../workload_clusters/alauda_os/huawei-cloud-stack/create_cluster.mdx). The `global` cluster already runs the Huawei Cloud Stack provider.
+- To create workload clusters on other infrastructure, install that provider as described in [Prepare](../../../workload_clusters/alauda_os/prepare/index.mdx).

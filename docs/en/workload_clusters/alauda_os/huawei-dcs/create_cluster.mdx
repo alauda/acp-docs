@@ -7,1360 +7,242 @@ queries:
   - create dcs cluster
   - deploy kubernetes on huawei dcs
   - dcs cluster creation guide
-  - workload cluster naming cluster-name not global
-  - dcs self-built vip control plane endpoint
+  - ac adm alpha cluster create --provider dcs
 ---
 
 # Create a Cluster on Huawei DCS
 
-This document provides instructions for creating Kubernetes clusters on the Huawei DCS platform. YAML-based cluster creation is available through manifests. If Fleet Essentials is installed, you can also create clusters through the web UI. The `persistentDisk` declaration on `DCSIpHostnamePool` is available through YAML only and is not exposed in the web UI. With ACP `v4.4` or later, `Self-built VIP` is also supported through the YAML workflow.
-
-:::info
-The web UI provides a guided workflow with validation, while YAML offers more automation flexibility.
-:::
+ACP CLI (ac) renders the Cluster API and DCS objects from one `install-config.yaml`, applies them to the `global` cluster, and reports the creation stages. Every object lives in the `cpaas-system` namespace of the `global` cluster.
 
 ## Prerequisites
 
-Before creating clusters, ensure all of the following prerequisites are met:
+- You meet the [Huawei DCS prerequisites](./prerequisites.mdx).
+- `ac` is logged in to the platform as a platform administrator (`ac login https://<platform-address>`).
 
-### 1. Infrastructure Resources
+## Procedure
 
-Configure the following infrastructure resources before creating a cluster:
+### 1. Write `install-config.yaml` \{#write-install-config}
 
-- **[Cloud Credential](./infrastructure.mdx#cloud-credentials)** - DCS platform access information
-- **[IP Pool](./infrastructure.mdx#ip-pools)** - Network configuration for cluster nodes, additional NICs, and any IP-slot persistent disks such as `/var/cpaas`
-- **[Machine Template](./infrastructure.mdx#machine-templates)** - VM specifications for control plane and worker nodes, excluding pool-managed persistent disks
+Create an installation directory for the cluster and write `install-config.yaml` in it. `ac` writes `manifests/` and `logs/ac.log` next to it. `ac` renders one `DCSIpHostnamePool` and one `DCSMachineTemplate` per node group from it, so you do not create IP pools or machine templates. The fields, and the optional NICs, raw disks, placement, and Self-built VIP, are described in [Parameters](./reference/install-config-parameters.mdx).
 
-See [Infrastructure Resources for Huawei DCS](./infrastructure.mdx) for detailed configuration instructions.
+```yaml title="install-config.yaml"
+cluster:
+  clusterName: <cluster-name> # [!code callout]
+  sshKeys: # [!code callout]
+    - <ssh-public-key>
+  network:
+    loadBalancer:
+      type: external # [!code callout]
+      address: <control-plane-endpoint> # [!code callout]
+      port: 6443
+      # vrid: <vrid> # [!code callout]
 
-### 2. Required Plugin Installation
+credentialRef: # [!code callout]
+  name: <credential-secret-name>
+  namespace: cpaas-system
 
-Before you create the first workload cluster on Huawei DCS, upload and install the following plugins on the `global` cluster. This applies regardless of the IaaS platform that the `global` cluster itself runs on:
-- **Alauda Container Platform Cluster Bootstrap Provider**
-- **Alauda Container Platform Infrastructure Provider for Huawei DCS**
+provider:
+  dcs:
+    vmTemplateName: <vm-template-name> # [!code callout]
+    controlPlaneHA: true # [!code callout]
+    machineFolder: <folder-name> # [!code callout]
+    network: # [!code callout]
+      dvSwitchName: <dv-switch-name> # [!code callout]
+      portGroupName: <port-group-name> # [!code callout]
+    disks:
+      datastore:
+        type: Datastore # [!code callout]
+        name: <datastore-name> # [!code callout]
 
-For the procedure, see [Install the Provider](./install_provider.mdx).
+controlPlane:
+  replicas: 3 # [!code callout]
+  cpuCore: 8
+  memoryGiB: 16
+  network:
+    gateway: <cp-gateway> # [!code callout]
+    dns: [<dns-ip>] # [!code callout]
+    mask: <prefix-length> # [!code callout]
+  disks: # [!code callout]
+    ephemeral: # [!code callout]
+      - name: var-lib-containerd
+        sizeGiB: 100
+      - name: var-lib-kubelet
+        sizeGiB: 100
+      - name: var-lib-etcd # [!code callout]
+        sizeGiB: 20
+    persistent: # [!code callout]
+      - name: var-cpaas
+        sizeGiB: 100
+  hosts: # [!code callout]
+    - hostname: <cp-0-hostname>
+      ip: <cp-0-ip>
+    - hostname: <cp-1-hostname>
+      ip: <cp-1-ip>
+    - hostname: <cp-2-hostname>
+      ip: <cp-2-ip>
 
-### 3. Virtual Machine Template Preparation
+computes: # [!code callout]
+  - name: worker
+    replicas: 3
+    network:
+      gateway: <worker-gateway>
+      dns: [<dns-ip>]
+      mask: <prefix-length>
+    disks:
+      ephemeral: # [!code callout]
+        - name: var-lib-containerd
+          sizeGiB: 100
+        - name: var-lib-kubelet
+          sizeGiB: 100
+      persistent:
+        - name: var-cpaas
+          sizeGiB: 100
+    hosts:
+      - hostname: <worker-0-hostname>
+        ip: <worker-0-ip>
+      - hostname: <worker-1-hostname>
+        ip: <worker-1-ip>
+      - hostname: <worker-2-hostname>
+        ip: <worker-2-ip>
+```
 
-For Kubernetes installation, you must:
-- Upload the Alauda OS image to the DCS platform. Use the Alauda OS image published for the ACP release installed on the cluster; see [Downloading Alauda OS](../../../overview/alauda_os_support_matrix.mdx#downloading-alauda-os).
-- Create a virtual machine template based on this image
-- Ensure the template includes all necessary Kubernetes components
-- Use DCS VM templates `4.2.1` or later if you plan to use persistent disks, because safe shutdown and disk detach depend on guest tools
-- Use one-by-one replacement for any cluster that will rely on pool-managed persistent disks. Keep `maxSurge: 0` on the control plane and on worker node pools.
+<Callouts>
 
-For details on the Kubernetes components included in each VM image, see [OS Support Matrix](../../../overview/alauda_os_support_matrix.mdx).
+1. `clusterName`: required. It must not be `global` or start with `global-`.
+2. `sshKeys`: required. The SSH public keys installed on every node.
+3. `type`: `external`, the default, or `internal` for a [Self-built VIP](./reference/install-config-parameters.mdx#self-built-vip).
+4. `address`: required. The control plane endpoint, an IPv4 address.
+5. `vrid`: required for `internal`, from 1 to 255 and unique in the control plane Layer 2 domain. Omit it for `external`.
+6. `credentialRef`: required. The credential Secret.
+7. `vmTemplateName`: required. It decides the Kubernetes version.
+8. `controlPlaneHA`: required, `true` or `false`. `true` keeps the control plane VMs on different DCS hosts.
+9. `machineFolder`: required. An existing VM folder.
+10. `network`: the primary NIC of every node.
+11. `dvSwitchName`: required. The distributed virtual switch.
+12. `portGroupName`: required. A port group of that switch.
+13. `datastore.type`: required. `Datastore` or `DatastoreCluster`.
+14. `datastore.name`: required. The datastore or datastore cluster name.
+15. `replicas`: an odd number, `1` or `3` or more. With fewer than three control plane nodes, contact technical support before you upgrade the cluster.
+16. `gateway`: required.
+17. `dns`: DCS uses only the first entry.
+18. `mask`: required. A prefix length from 1 to 32.
+19. `disks`: required. Every standard disk below.
+20. `ephemeral`: disks recreated with the VM.
+21. `var-lib-etcd`: control plane only.
+22. `persistent`: disks kept when the VM is replaced.
+23. `hosts`: required. At least `replicas` entries.
+24. `computes`: optional.
+25. Workers have no `var-lib-etcd`.
 
-### 4. Network Connectivity
+</Callouts>
 
-Global cluster nodes must be able to reach the DCS platform at two distinct destinations:
-
-| From | To | Port | Purpose |
-|---|---|---|---|
-| Global cluster node | DCS VRM virtual IP | TCP/7443 | DCS REST API. Covers cluster lifecycle calls and the first step of file uploads (`applyUpload`). |
-| Global cluster node | DCS physical host MGMT IP (every host that may receive a clone) | DCS-returned port; typically TCP/8443; confirm with the DCS administrator | File-stream upload of the Ignition ISO. The provider streams the file to the URL returned by the `applyUpload` response. |
-
-File upload is a two-step flow: the provider calls `applyUpload` on the VRM virtual IP (TCP/7443); the DCS platform responds with a URL that points to a specific physical host's management IP and port; the provider then streams the file to that URL. Both destinations must be reachable end-to-end before cluster creation.
-
-If global cluster nodes use a multi-NIC layout (for example, one NIC on the ACP cluster network and another NIC on the customer's management network where DCS is deployed), ensure that **both** destinations — the VRM virtual IP and every DCS physical host MGMT IP — are routable from the appropriate NIC.
-
-**Requirement**: Connectivity to both destinations is mandatory for cluster creation and management.
-
-### 5. LoadBalancer Configuration
-
-Configure a stable Kubernetes API endpoint before creating the cluster. The endpoint distributes or directs API server traffic for control plane access.
-
-| Mode | Version | Who manages it | When to use |
-|---|---|---|---|
-| External LoadBalancer | All supported versions | You provision and maintain the load balancer before cluster creation. | Use this when your environment already has a hardware or software load balancer. |
-| `Self-built VIP` | ACP `v4.4+` | The DCS provider creates and reconciles the provider-managed `alive` `ModuleInfo`. | Use this when you need a highly available control plane endpoint but no external load balancer is available. |
-| Single control plane direct endpoint | All supported versions | No load balancer is created. The API endpoint is the single control plane node IP. | Use this only for development or PoC clusters with one control plane replica. |
-
-For external LoadBalancer requirements, follow [Plan the Control Plane Endpoint](../prepare/control-plane-endpoint.mdx). For a single-control-plane deployment that has no load balancer in front of the API server, see [Single-Control-Plane (No External LB) Layout](#single-control-plane-layout).
-
-### 6. Workload Cluster Image Registry
-
-Decide which registry this cluster pulls its platform components from — Kube-OVN and the platform modules that Alauda Container Platform installs on the cluster. This choice does not affect the images kubeadm manages, which come from `KubeadmControlPlane.spec.kubeadmConfigSpec.clusterConfiguration.imageRepository`.
-
-| Option | What you configure | When to use it |
-|---|---|---|
-| Registry of the `global` cluster | Nothing. The cluster inherits it. | Workload nodes reach the registry the `global` cluster uses with acceptable throughput. |
-| Dedicated registry | A RegistryCredential Secret in `cpaas-system`, referenced from the `Cluster` by the `cpaas.io/registry-reference` label. | Workload nodes sit in a different region or network segment and should pull from a registry close to them. |
-
-Either way, the registry must already hold Alauda Container Platform Core for the target version plus the packages for every platform plugin you intend to install on this cluster, and every workload cluster node must reach its address.
-
-For the dedicated-registry procedure and its constraints, see [Choose the Image Registry for a Workload Cluster](../prepare/workload-cluster-image-registry.mdx).
+### 2. Create the Cluster \{#create-with-ac}
 
 :::warning
-The registry binding is read only when the cluster is first created. Changing or removing `cpaas.io/registry-reference` on an existing `Cluster` does not move that cluster to another registry. A dedicated registry is configured through YAML only; the web UI workflow always uses the registry of the `global` cluster.
+Make sure the password in the credential Secret is correct before you run `create`: DCS locks the account after repeated failed sign-ins.
 :::
 
-### 7. Node Labels and Taints
-
-To give the nodes of a pool their own role label and taint — for example to reserve dedicated pools for monitoring, logging, or ingress — declare them on the pool's resources as described in [Infra Nodes](../../../configure/nodes/node_planning.mdx#create-infra-nodes-alauda-os). Plan them before you create the pools. This applies to every node pool, whether the cluster is created through the web UI or with YAML; the web UI node pool steps do not set labels or taints.
-
----
-
-## Using the Web UI
-
-:::info
-**Fleet Essentials upgrade boundary**
-
-Fleet Essentials 1.0.4 and later can request the ACP 4.3-and-later Distribution Version upgrade through CVO. It does not perform the DCS Kubernetes and Alauda OS replacement. Use [Upgrading Kubernetes on Huawei DCS](../../../upgrade/workload/alauda_os/huawei-dcs.mdx) for that Phase 2 YAML procedure. Cluster creation through Fleet Essentials is unaffected by this boundary.
-:::
-
-**Requirement**: This workflow requires Fleet Essentials. If you use pool-managed persistent disks, configure `DCSIpHostnamePool.spec.pool[].persistentDisk` through YAML because the web UI does not expose that field.
-
-If the new cluster will rely on pool-managed persistent disks, create or update the backing `DCSIpHostnamePool` with YAML and then use the web UI for the rest of the cluster workflow.
-
-### Creation Workflow
-
-The cluster creation follows a 5-step wizard:
-
-```
-Step 1: Basic Info
-  ↓
-Step 2: Control Plane Node Pool
-  ↓
-Step 3: Worker Node Pools
-  ↓
-Step 4: Networking
-  ↓
-Step 5: Review
-```
-
-**Navigation**: Clusters → Clusters → Create Cluster → Select Huawei DCS
-
-### Step 1: Basic Info
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| Infrastructure Credential | dropdown | Yes | Select an existing Cloud Credential |
-| Name | text | Yes | Unique cluster identifier (lowercase letters, numbers, hyphens) |
-| Display Name | text | No | Custom description for easy identification |
-| Distribution Version | readonly | - | ACP version (matches the `global` cluster) |
-| Kubernetes Version | readonly | - | Determined by Distribution Version |
-| Cluster API Address | text | Yes | Format: `https://<load-balancer-address>:6443`. For `Self-built VIP`, reserve the VIP and use the YAML path in this document. |
-
-**Prerequisites Check**:
-
-Before creating a cluster, ensure:
-- DCS VM Templates exist in the DCS platform, and the Alauda OS version matches the Kubernetes version
-- The Kubernetes API endpoint is ready. For an external LoadBalancer, create it before cluster creation. For `Self-built VIP`, reserve the VIP and use the YAML path.
-
-**Version Constraint**: Only the latest Kubernetes version supported by the platform can be created.
-
-### Step 2: Control Plane Node Pool
-
-The control plane node pool is fixed at 3 replicas for high availability.
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| Machine Template | dropdown | Yes | Filter templates by Type: Control Plane and compatible Kubernetes version |
-| Replicas | readonly | - | Fixed at 3 |
-| SSH Authorized Keys | text | No | Add multiple SSH public keys for node access |
-
-**Validation**: The associated IP Pool must have sufficient available IP addresses (≥ 3).
-
-### Step 3: Worker Node Pools
-
-You can add multiple worker node pools. Each pool has the following configuration:
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| Pool Name | text | Yes | Unique identifier for this node pool |
-| Machine Template | dropdown | Yes | Filter templates by Type: Worker Node and compatible Kubernetes version |
-| Replicas | number | Yes | Default: 3 |
-| Max Surge | number | No | Default: 0, must be ≥ 0. Keep this value at `0` if the node pool will use pool-managed persistent disks |
-| Max Unavailable | number | No | Default: 1, must be ≥ 0. When maxSurge = 0, maxUnavailable must be > 0 and ≤ Replicas |
-| SSH Authorized Keys | text | No | Add multiple SSH public keys |
-
-**Validation Rules**:
-- Pool names must be unique within the cluster
-- IP Pool must have sufficient available IP addresses (≥ Replicas)
-- maxSurge and maxUnavailable must satisfy the constraint: if maxSurge = 0, then maxUnavailable > 0
-- If the cluster will rely on pool-managed persistent disks, keep `maxSurge = 0` so nodes are replaced one by one during future upgrades
-
-**Tip**: Prefix the pool name with the cluster name followed by a hyphen (e.g., `mycluster-worker-1`) to avoid naming conflicts across different clusters.
-
-### Step 4: Networking
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| Pods CIDR | CIDR | Yes | Pod network address range |
-| Services CIDR | CIDR | Yes | Service network address range |
-| Join CIDR | CIDR | Yes | Kube-OVN join CIDR parameter |
-
-**Validation**: Pods CIDR and Services CIDR must not overlap.
-
-### Step 5: Review
-
-Review all configuration settings before creating the cluster:
-
-**Basic Info**:
-- Name, Display Name, Infrastructure Credential
-- Distribution Version, Kubernetes Version
-- Cluster API Address
-
-**Control Plane Node Pool**:
-- Machine Template with VM Template Name, OS Version, Kubernetes Version
-- CPU, Memory, Replicas, SSH Keys
-
-**Worker Node Pools** (list view):
-- Pool Name, Machine Template, Replicas
-- Max Surge, Max Unavailable, SSH Keys
-
-If the cluster will rely on pool-managed persistent disks, keep **Max Surge** set to `0` for worker node pools.
-
-**Networking**:
-- Pods CIDR, Services CIDR, Join CIDR
-
-Click **Create** to start the cluster creation process.
-
----
-
-## Using YAML
-
-### Cluster Creation Workflow
-
-When using YAML, you create Cluster API resources in the `global` cluster to provision infrastructure and bootstrap a functional Kubernetes cluster.
-
-:::warning
-**Important Namespace Requirement**
-
-To ensure proper integration as workload clusters, all resources must be deployed in the `cpaas-system` namespace. Deploying resources in other namespaces may result in integration issues.
-:::
-
-<a id="workload-cluster-naming"></a>
-
-:::warning
-**Workload Cluster Naming**
-
-The workload `cluster-name` **must not** be `global`. That name is reserved for the `global` cluster, and reusing it causes the workload cluster's resources to collide with `global` cluster resources in `cpaas-system`. The `global-` prefix is reserved for resources owned by the `global` cluster's DR workflow; see [Common Prerequisites](../../../install/alauda_os/installing.mdx#common-prerequisites). Do not use `global-` for workload-cluster resources, because failover operations can select those resources as if they belonged to the `global` cluster.
-
-As a convention, keep the CAPI `Cluster` and provider cluster resource (`DCSCluster`) named exactly `<cluster-name>`, and prefix non-root CAPI and provider resources (`KubeadmControlPlane`, `KubeadmConfigTemplate`, `MachineDeployment`, machine templates, IP/hostname pools, etc.) with `<cluster-name>-` — for example, the example manifests use `<cluster-name>-kcp`. This is a recommendation rather than a controller-enforced rule, but it prevents same-namespace collisions when multiple workload clusters live in `cpaas-system` and makes resource ownership obvious during operations.
-:::
-
-### Configuration Workflow
-
-Follow these steps in order to provision a functional cluster (control plane **and** worker nodes):
-
-1. Configure `KubeadmControlPlane` (control-plane spec and kubeadm bootstrap).
-2. Configure `DCSCluster` (infrastructure binding and load balancer reference).
-3. Create the `Cluster` resource (top-level CAPI object that links the two above).
-4. Configure worker resources: `KubeadmConfigTemplate` (worker bootstrap), worker `DCSMachineTemplate`, worker `DCSIpHostnamePool`, and `MachineDeployment`. **The control plane alone is not a usable cluster.** See [Deploy Worker Nodes](#worker-node-deployment) for the four worker YAML resources.
-
-**Note**: Infrastructure resources (Secret, control-plane `DCSIpHostnamePool`, control-plane `DCSMachineTemplate`) should be configured separately. See [Infrastructure Resources for Huawei DCS](./infrastructure.mdx) for instructions.
-
-If you need any disk to survive rolling replacement, declare it in the matching `DCSIpHostnamePool.spec.pool[].persistentDisk` entry. This includes the platform-required `/var/cpaas` disk. The provider creates new persistent volumes as independent persistent normal volumes. When the DCS environment requires an explicit thin-provisioning setting, set `persistentDisk[].isThin`; if you omit it, the provider does not send `isThin` and DCS uses the platform default.
-
-If the cluster needs additional NICs, declare them in `DCSIpHostnamePool.spec.pool[].additionNic[]` before the corresponding Machines are created. The provider applies additional NICs only during new VM creation. Existing VMs do not receive hot-added NICs when the Pool is edited later.
-
-### Resolving Placeholder Values \{#resolving-placeholders}
-
-The example manifests below use `<placeholder>` syntax for values that are environment-specific. Several of these have a canonical source of truth that you should query rather than hand-pick:
-
-| Placeholder | Source of truth | How to retrieve |
-|---|---|---|
-| `<control-plane-kubernetes-version>` / `<worker-kubernetes-version>` | A `cpaas.io/dcs-vm-template` ConfigMap in the `cpaas-system` namespace, one per distribution version. | `kubectl -n cpaas-system get cm -l cpaas.io/dcs-vm-template -o yaml` — read `data.kubernetesVersion`. |
-| `<dns-image-tag>` | Same ConfigMap, `data.corednsTag`. | Same `kubectl get cm` query as above. |
-| `<etcd-image-tag>` | Same ConfigMap, `data.etcdTag`. | Same `kubectl get cm` query as above. |
-| `<vm-template-name>` (in `DCSMachineTemplate.spec.template.spec.vmTemplateName`) | The ConfigMap's `cpaas.io/dcs-vm-template` label value (must match the VM template name registered in the DCS platform). | Same `kubectl get cm` query — read the label. |
-| `<ssh-authorized-keys>` | Operator-supplied. Each entry is a single-line OpenSSH-format public key (`ssh-ed25519 AAAA…` / `ssh-rsa AAAA…`). The field is required by the ignition validator and must be non-empty. For test or PoC clusters that do not need interactive SSH, supply any syntactically valid public key (you do not need to hold the matching private key); for production, use the operator team's signing key. | n/a — generated or sourced from the operator. |
-| `<auth-secret-name>` | The Secret you authored in [Infrastructure → Cloud Credentials](./infrastructure.mdx#cloud-credentials). | `kubectl -n cpaas-system get secret <name>` |
-| `<cluster-name>` | Operator-chosen; must satisfy DNS-1123 and **must not** be `global` (that name is reserved for the `global` cluster). Reused across `Cluster`, `DCSCluster`, and the `cluster.x-k8s.io/cluster-name` label on every `Machine`. The `KubeadmControlPlane` uses the prefixed form `<cluster-name>-kcp`. See [Workload Cluster Naming](#workload-cluster-naming) for the full convention. | n/a |
-| `<load-balancer-ip>` | Operator-supplied endpoint clients use to reach the cluster API server. For `type: external`, this is the external load balancer VIP (an IP address — domain names are not supported for the cluster endpoint). For single-control-plane clusters with no external LB, this is the IP of the sole control plane node (see [Single-control-plane layout](#single-control-plane-layout)). | n/a |
-| `<self-built-vip>` | Operator-supplied IPv4 VIP for `Self-built VIP`. Reserve this address before cluster creation. It must not be assigned to a node primary IP or `DCSIpHostnamePool.spec.pool[].additionNic[].ip`. | n/a |
-| `<pods-cidr>` / `<services-cidr>` / `<kube-ovn-join-cidr>` | Operator-supplied. Must not overlap with the host network, the `global` cluster's CIDRs, or any other CAPI cluster's CIDRs you intend to interconnect. Leaving them empty falls back to the kube-ovn defaults shipped with the `global` cluster, which is **not recommended** for production: explicit CIDRs avoid silent collisions when multiple workload clusters live on the same `global` cluster. | n/a |
-
-### Magic-Token Placeholders \{#magic-tokens}
-
-A few values in the example manifests look like placeholders but are **actually literal tokens** substituted by the DCS Provider at machine-join time. Leave them exactly as written:
-
-| Literal token | Meaning | Substituted by |
-|---|---|---|
-| `PROVIDER_ID` | The per-Machine provider ID (e.g. `dcs://<dcsmachine-name>`). | DCS Provider — overwritten in the generated kubelet config before `kubeadm init` / `kubeadm join` runs. |
-| `NODE_IP` | The node IP allocated from the `DCSIpHostnamePool` entry attached to this Machine. | DCS Provider — overwritten with the value of `DCSIpHostnamePool.spec.pool[].ip`. |
-
-Replacing or quoting these tokens manually breaks the join flow and produces nodes that never register with the control plane.
-
-### Network Planning and Load Balancer
-
-Before creating control plane resources, plan the network architecture and choose the control plane endpoint mode.
-
-**Requirements**:
-- **Network segmentation**: Plan IP address ranges for control plane nodes
-- **Additional NICs**: If nodes require storage, management, or isolated application networks, plan `DCSIpHostnamePool.spec.pool[].additionNic[]` values for each IP slot, including DVS and Port Group names
-- **API endpoint mode**: Use an external LoadBalancer, or use `Self-built VIP` with ACP `v4.4+`
-- **API server address**: Prepare a stable VIP or load balancer address for the Kubernetes API server
-- **Connectivity**: Ensure network connectivity between all components
-
-For `Self-built VIP`, validate that the target DCS port group allows VIP ownership, GARP or ARP updates, and VRRP traffic between the control plane VMs. The VIP must be in the same Layer 2 network as the NIC that will hold it.
-For an external LoadBalancer, validate the Layer 4 listener, TCP `6443` backends, HTTPS `/healthz` checks, backend ownership, and endpoint reachability in [Plan the Control Plane Endpoint](../prepare/control-plane-endpoint.mdx).
-
-### Configure KubeadmControlPlane
-
-The KubeadmControlPlane resource defines the control plane configuration including Kubernetes version, node specifications, and bootstrap settings.
-
-<Directive type="warning" title="Kubernetes 1.35 kubelet settings">
-  `imagePullCredentialsVerificationPolicy: NeverVerify` is required only starting with Kubernetes 1.35. Omit this parameter when creating a cluster with Kubernetes 1.34 or earlier. If `contentFrom.secret` supplies the patch, verify that the referenced Secret key contains this parameter for Kubernetes 1.35.
-</Directive>
-
-:::tip
-**Full Configuration Reference**
-
-The example below truncates long configuration files for readability. For the complete configuration (including default audit policies, admission controls, and file contents), refer to the [Complete KubeadmControlPlane Configuration](#complete-kubeadmcontrolplane-configuration) in the Appendix.
-:::
-
-```yaml title="kubeadmcontrolplane.yaml"
-apiVersion: controlplane.cluster.x-k8s.io/v1beta1
-kind: KubeadmControlPlane
-metadata:
-  name: <cluster-name>-kcp
-  namespace: cpaas-system
-  annotations:
-    controlplane.cluster.x-k8s.io/skip-coredns: ""
-    controlplane.cluster.x-k8s.io/skip-kube-proxy: ""
-spec:
-  rolloutStrategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 0 # Required when the cluster relies on pool-managed persistent disks
-  kubeadmConfigSpec:
-    users:
-    - name: boot
-      sshAuthorizedKeys:
-      - "<ssh-authorized-keys>"
-    format: ignition
-    files:
-    - path: /etc/kubernetes/admission/psa-config.yaml
-      owner: "root:root"
-      permissions: "0644"
-      content: |
-        # ... (Admission Configuration Content) ...
-    - path: /etc/kubernetes/patches/kubeletconfiguration0+strategic.json
-      owner: "root:root"
-      permissions: "0644"
-      content: |
-        {
-          "apiVersion": "kubelet.config.k8s.io/v1beta1",
-          "kind": "KubeletConfiguration",
-          "imagePullCredentialsVerificationPolicy": "NeverVerify",
-          "_comment": "... (Kubelet Configuration Content) ..."
-        }
-    # ... (other files) ...
-    clusterConfiguration:
-      imageRepository: cloud.alauda.io/alauda
-      dns:
-        imageTag: <dns-image-tag>
-      etcd:
-        local:
-          imageTag: <etcd-image-tag>
-      # ... (apiServer, controllerManager, scheduler) ...
-    initConfiguration:
-      patches:
-        directory: /etc/kubernetes/patches
-      nodeRegistration:
-        kubeletExtraArgs:
-          node-labels: "kube-ovn/role=master"
-          provider-id: PROVIDER_ID
-          volume-plugin-dir: "/opt/libexec/kubernetes/kubelet-plugins/volume/exec/"
-          protect-kernel-defaults: "true"
-    joinConfiguration:
-      patches:
-        directory: /etc/kubernetes/patches
-      nodeRegistration:
-        kubeletExtraArgs:
-          node-ip: NODE_IP
-          node-labels: "kube-ovn/role=master"
-          provider-id: PROVIDER_ID
-          volume-plugin-dir: "/opt/libexec/kubernetes/kubelet-plugins/volume/exec/"
-          protect-kernel-defaults: "true"
-  machineTemplate:
-    nodeDrainTimeout: 1m
-    nodeDeletionTimeout: 5m
-    infrastructureRef:
-      apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-      kind: DCSMachineTemplate
-      name: <cp-dcs-machine-template-name>
-  replicas: 3
-  version: <control-plane-kubernetes-version>
-```
-
-**Parameter Descriptions**:
-
-| Parameter | Type | Description | Required |
-|-----------|------|-------------|----------|
-| `.spec.kubeadmConfigSpec` | object | kubeadm bootstrap provider startup parameters | Yes |
-| `.spec.machineTemplate.infrastructureRef` | object | DCSMachineTemplate reference | Yes |
-| `.spec.replicas` | int | Control plane replica count. Must satisfy `1 ≤ replicas ≤ IP Pool size`. Set to `1` for development / PoC single-control-plane deployments (see [Single-control-plane layout](#single-control-plane-layout)). Production usually uses `3` for HA. | Yes |
-| `.spec.version` | string | Kubernetes version (must match VM template — see [Resolving Placeholder Values](#resolving-placeholders)) | Yes |
-
-For component versions (e.g., `<dns-image-tag>`, `<etcd-image-tag>`), refer to [OS Support Matrix](../../../overview/alauda_os_support_matrix.mdx).
-
-### Configure DCSCluster \{#configure-dcscluster}
-
-DCSCluster is the infrastructure cluster declaration that references the load balancer and DCS platform credentials.
-
-Use `type: external` when you manage the load balancer outside the cluster.
-
-```yaml title="dcscluster.yaml"
-apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: DCSCluster
-metadata:
-  name: "<cluster-name>"
-  namespace: cpaas-system
-spec:
-  controlPlaneLoadBalancer:
-    host: <load-balancer-ip>
-    port: 6443
-    type: external
-  credentialSecretRef:
-    name: <auth-secret-name>
-  controlPlaneEndpoint:
-    host: <load-balancer-ip>
-    port: 6443
-  # Optional. Enable only when the target DCS compute cluster has DRS enabled.
-  controlPlaneHA:
-    enabled: true
-  networkType: kube-ovn
-  site: <site>
-```
-
-With ACP `v4.4+`, use `type: internal` to enable `Self-built VIP`:
-
-```yaml title="dcscluster-self-built-vip.yaml"
-apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: DCSCluster
-metadata:
-  name: "<cluster-name>"
-  namespace: cpaas-system
-spec:
-  controlPlaneLoadBalancer:
-    host: <self-built-vip>
-    port: 6443
-    type: internal
-    vrid: 42
-    interface: eth0
-  credentialSecretRef:
-    name: <auth-secret-name>
-  controlPlaneEndpoint:
-    host: <self-built-vip>
-    port: 6443
-  networkType: kube-ovn
-  site: <site>
-```
-
-**Parameter Descriptions**:
-
-| Parameter | Type | Description | Required |
-|-----------|------|-------------|----------|
-| `.spec.controlPlaneLoadBalancer` | object | Control plane API server exposure method | Yes |
-| `.spec.controlPlaneLoadBalancer.type` | string | `external` uses an operator-managed load balancer. `internal` enables `Self-built VIP` and requires ACP `v4.4+`. | Yes |
-| `.spec.controlPlaneLoadBalancer.host` | string | For `external`, the external load balancer VIP (an IP address). For `internal`, the reserved IPv4 VIP. | Yes |
-| `.spec.controlPlaneLoadBalancer.port` | int | Kubernetes API server port. The valid range is `1-65535`. | Yes |
-| `.spec.controlPlaneLoadBalancer.vrid` | int | Keepalived VRID used by `Self-built VIP`. Set a value from `1` to `255` when `type` is `internal`. This field is ignored when `type` is `external`. | Conditional |
-| `.spec.controlPlaneLoadBalancer.interface` | string | Optional NIC name used by the bootstrap VIP and `alive`. Leave it empty to detect the NIC by node IP. Set it explicitly for multi-NIC clusters when the VIP must be held by a specific interface. | No |
-| `.spec.credentialSecretRef.name` | string | DCS authentication Secret name. The Secret defines whether DCS Provider authenticates as an interface interconnection user (default) or a domain user — see [Credential User Types](./infrastructure.mdx#user-types). | Yes |
-| `.spec.controlPlaneEndpoint` | object | Kubernetes API endpoint that CAPI and kubeadm use. Set it to the same host and port as `controlPlaneLoadBalancer`. | Yes |
-| `.spec.controlPlaneHA.enabled` | bool | Enables a provider-managed DCS DRS mutual-exclusion rule for control-plane VMs. Set it to `true` only when the target DCS compute cluster has DRS enabled and has enough hosts and capacity for cross-host placement. | No |
-| `.spec.networkType` | string | Currently only supports "kube-ovn" | Yes |
-| `.spec.site` | string | DCS platform site ID | Yes |
-
-`controlPlaneHA` is optional. When enabled, the provider creates and maintains one DRS `ruleType=2` mutual-exclusion rule for the current control-plane VMs in this workload cluster. DCS performs the actual placement and runtime migration. The provider does not run DRS or apply DRS recommendations. If the rule is maintained but placement has not converged, wait for the DCS scheduling mechanism or trigger/apply DRS from the DCS platform side. For infrastructure prerequisites, see [Cross-Host High Availability for Control Plane](./infrastructure.mdx#cross-host-ha).
-
-#### Self-built VIP behavior and limitations \{#self-built-vip}
-
-`Self-built VIP` requires ACP `v4.4` or later. Plan this mode before cluster creation.
-
-**Recommendation**: Use `type: internal` only for new highly available clusters with three control plane replicas. For existing clusters that use `type: external`, keep the external load balancer unless you have a tested migration plan. `controlPlaneHA.enabled` is an independent DRS placement feature and is not required for Self-built VIP.
-
-The DCS provider handles `Self-built VIP` in two phases:
-
-1. During bootstrap, the provider injects `dcs-bootstrap-vip.service` only on the first `kubeadm init` control plane node. This service adds `<self-built-vip>/32` before `kubeadm` starts.
-2. After the control plane nodes register, the provider creates or updates the provider-managed `alive` `ModuleInfo`. The platform plugin flow renders the workload `AppRelease`, and `alive` installs the VIP runtime on the control plane nodes.
-
-Important constraints:
-
-- Both modes accept only an IP address: `type: external` takes the external load balancer VIP, `type: internal` the reserved IPv4 VIP. Domain names are not supported for the cluster endpoint in either mode.
-- The VIP must be excluded from `DCSIpHostnamePool` primary IPs and additional NIC IPs.
-- The target DCS port group must allow VIP ownership, GARP or ARP updates, and VRRP traffic.
-- `interface` must be a Linux interface name of 15 characters or fewer. Use it when the VIP must be bound to a specific NIC, such as `eth0` or `eth1`.
-- `type`, `host`, `port`, `vrid`, and `interface` are not intended to be changed after the cluster control plane is initialized.
-- The DCS provider creates or patches the `alive` `ModuleInfo`; the platform plugin flow creates the workload `AppRelease` and runtime resources.
-- The DCS provider does not inject or persist IPVS kernel modules or sysctl parameters. Use the VM template and plugin package delivered with the supported ACP release.
-
-#### Verify Self-built VIP \{#verify-self-built-vip}
-
-If you set `DCSCluster.spec.controlPlaneLoadBalancer.type` to `internal`, verify the provider-managed VIP path after the cluster is created.
+Run the following command from a machine where `ac` is logged in to the platform:
 
 ```bash
-kubectl -n cpaas-system get dcscluster <cluster-name> \
+ac config use-cluster global
+ac adm alpha cluster create --dir <install-dir> --provider dcs
+```
+
+`ac` first checks the credential Secret, the DCS objects named in `install-config.yaml`, the Kubernetes version of the VM template, and the registry. If a check fails, nothing is changed and the error names the item.
+
+`create` returns once the objects are applied, and the cluster keeps building. Add `--wait` to wait until all stages are ready; `--timeout` (default `2h`) limits only the wait. To render without applying, run `ac adm alpha cluster manifests` with the same flags.
+
+### 3. Monitor the Creation \{#monitor-creation}
+
+```bash
+ac config use-cluster global
+ac adm alpha cluster status --cluster <cluster-name>                      # prints the four stages once
+ac adm alpha cluster wait-for install-complete --cluster <cluster-name>   # waits until all four are ready
+```
+
+Continue when all four stages are ready; otherwise see [Troubleshooting](./troubleshooting.mdx).
+
+### 4. Verify the Cluster \{#verify-the-cluster}
+
+Run the following commands from a machine where `ac` is logged in to the platform:
+
+```bash
+ac config sync
+ac config use-cluster <cluster-name>
+ac get nodes
+ac config use-cluster global
+```
+
+Continue when every node is `Ready`; otherwise see [Troubleshooting](./troubleshooting.mdx).
+
+#### Self-built VIP \{#verify-self-built-vip}
+
+**Applies to**: `cluster.network.loadBalancer.type: internal`. Skip it for an external load balancer.
+
+```bash
+ac config use-cluster global
+ac -n cpaas-system get dcscluster <cluster-name> \
   -o jsonpath='{.spec.controlPlaneLoadBalancer.type}{" "}{.spec.controlPlaneEndpoint.host}{":"}{.spec.controlPlaneEndpoint.port}{"\n"}'
-kubectl -n cpaas-system get cluster <cluster-name> \
-  -o jsonpath='{.spec.controlPlaneEndpoint.host}{":"}{.spec.controlPlaneEndpoint.port}{"\n"}'
-kubectl -n cpaas-system get moduleinfo \
+ac -n cpaas-system get moduleinfo \
   -l cpaas.io/cluster-name=<cluster-name>,cpaas.io/module-name=alive
-kubectl --kubeconfig <workload-kubeconfig> -n cpaas-system get apprelease alive
-kubectl --kubeconfig <workload-kubeconfig> -n kube-system get pods -l app=alive -o wide
-kubectl --kubeconfig <vip-kubeconfig> get --raw=/version
+ac config sync
+ac config use-cluster <cluster-name>
+ac -n cpaas-system get apprelease alive
+ac -n kube-system get pods -l app=alive -o wide
+ac config use-cluster global
 ```
 
-Expected results are the configured VIP endpoint, a provider-created `alive` `ModuleInfo`, a synced and healthy `alive` `AppRelease`, Ready `alive` pods on every control plane node, and a successful `/version` request through the VIP.
+Continue when the output shows `internal` with your VIP and port, an `alive` `ModuleInfo`, a synced and healthy `alive` `AppRelease`, and a Ready `alive` Pod on every control plane node; otherwise see [Self-built VIP](./troubleshooting.mdx#self-built-vip) in Troubleshooting.
 
-#### Single-Control-Plane (No External LB) Layout \{#single-control-plane-layout}
-
-For development, PoC, or any deployment where the control plane has only **one** replica (`KubeadmControlPlane.spec.replicas: 1`), you do not have a real load balancer in front of the API server. Two fields nevertheless still require a value:
-
-- `.spec.controlPlaneLoadBalancer.host` and `.spec.controlPlaneEndpoint.host` — set both to **the IP of the sole control plane node** (the same IP allocated to that node in the control-plane `DCSIpHostnamePool`).
-- `.spec.controlPlaneLoadBalancer.type` — keep the schema-compatible value `external`; no load-balancing component is created in this layout.
-
-Concretely:
-
-```yaml
-spec:
-  controlPlaneLoadBalancer:
-    host: 10.226.82.150     # same IP as the control plane node from the IP pool
-    port: 6443
-    type: external
-  controlPlaneEndpoint:
-    host: 10.226.82.150     # same as above
-    port: 6443
-```
-
-This layout has no HA — losing the single control plane node makes the cluster API unreachable until the node is recovered. Do not use `Self-built VIP` for this layout. For production, use `replicas: 3` with an external LoadBalancer or `Self-built VIP`.
-
-### Configure Cluster
-
-The Cluster resource declares the cluster and references the control plane and infrastructure resources.
-
-```yaml title="cluster.yaml"
-apiVersion: cluster.x-k8s.io/v1beta1
-kind: Cluster
-metadata:
-  annotations:
-    capi.cpaas.io/resource-group-version: infrastructure.cluster.x-k8s.io/v1beta1
-    capi.cpaas.io/resource-kind: DCSCluster
-    cpaas.io/kube-ovn-join-cidr: <kube-ovn-join-cidr>
-  labels:
-    cluster-type: DCS
-    # Optional. Bind this cluster to a dedicated image registry instead of the
-    # registry of the `global` cluster. Read only at cluster creation.
-    # cpaas.io/registry-reference: <registry-credential-name>
-  name: <cluster-name>
-  namespace: cpaas-system
-spec:
-  clusterNetwork:
-    pods:
-      cidrBlocks:
-      - <pods-cidr>
-    services:
-      cidrBlocks:
-      - <services-cidr>
-  controlPlaneRef:
-    apiVersion: controlplane.cluster.x-k8s.io/v1beta1
-    kind: KubeadmControlPlane
-    name: <cluster-name>-kcp
-  infrastructureRef:
-    apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-    kind: DCSCluster
-    name: <cluster-name>
-```
-
-**Parameter Descriptions**:
-
-| Parameter | Type | Description | Required |
-|-----------|------|-------------|----------|
-| `.spec.clusterNetwork.pods.cidrBlocks` | []string | Pod CIDR. Optional in the CAPI schema but **recommended to set explicitly** so multiple CAPI clusters can co-exist without overlap. If unset, kube-ovn falls back to a default that may conflict with another cluster on the same global. | Recommended |
-| `.spec.clusterNetwork.services.cidrBlocks` | []string | Service CIDR. Same recommendation as the pod CIDR — set explicitly to avoid collisions across clusters. | Recommended |
-| `.spec.controlPlaneRef` | object | Control plane reference | Yes |
-| `.spec.infrastructureRef` | object | Infrastructure cluster reference | Yes |
-
-**Cluster Annotations**:
-
-The example above shows three annotations, but a complete `Cluster` resource carries a few more. The table below lists the annotations the **operator authors** (some others are written by ACP controllers and you should not pre-set them):
-
-{/* lint disable no-legacy-os-names */}
-
-| Annotation | Required | Value source | Purpose |
-|---|---|---|---|
-| `capi.cpaas.io/resource-group-version` | Yes | Literal `infrastructure.cluster.x-k8s.io/v1beta1` | Tells the CAPI infrastructure binding which API group to use. |
-| `capi.cpaas.io/resource-kind` | Yes | Literal `DCSCluster` | Tells the CAPI infrastructure binding which kind to bind to. |
-| `capi.cpaas.io/kubernetes` | Yes | Same value as `KubeadmControlPlane.spec.version` and `MachineDeployment.spec.template.spec.version`. | Display label, also consumed by some upgrade and inventory tooling. Source-of-truth is the `cpaas.io/dcs-vm-template` ConfigMap's `kubernetesVersion`. |
-| `cpaas.io/kube-ovn-join-cidr` | Yes | Operator-chosen `/16` CIDR, must not overlap with pod / service CIDRs or any other cluster's join CIDR. | Kube-OVN inter-node tunnel network. |
-| `cpaas.io/kube-ovn-version` | Yes | The kube-ovn release the `global` cluster ships with. Read it from the `cpaas.io/kube-ovn-version` annotation on the `global` CAPI `Cluster` (`kubectl get cluster global -n cpaas-system -o jsonpath='{.metadata.annotations.cpaas\.io/kube-ovn-version}'`). The same value lives on every healthy workload cluster on the same `global` cluster, so you can also read it from any of those if they exist. | Pin the kube-ovn version installed into the workload cluster. |
-| `cpaas.io/registry-address` | Yes | The image registry the `global` cluster uses (typically `<registry-host>:11443`). Read it from the `cpaas.io/registry-address` annotation on the `global` CAPI `Cluster` (`kubectl get cluster global -n cpaas-system -o jsonpath='{.metadata.annotations.cpaas\.io/registry-address}'`). | Lets day-2 reconcilers resolve images while the cluster is being provisioned. This annotation does not select a registry credential: to pull platform images from a dedicated registry, use the `cpaas.io/registry-reference` label described below. |
-| `cpaas.io/nodes-mode` | Yes | Literal `self-managed` for clusters that DCS Provider provisions. | Marks the cluster as having its node lifecycle managed by CAPI + this provider. |
-| `cpaas.io/os-family` | KubeOS only | Literal `kubeos` when the cluster's DCS VM template is built from a KubeOS image. Omit it for Alauda OS: DCS Provider handles an unset value, or any value other than `kubeos`, as `slemicro`. | Tells DCS Provider not to render the `/home` mount into the node Ignition config. A KubeOS node that receives that mount fails early in Ignition and does not boot. Set it when you create the `Cluster`, before any machine is provisioned. |
-
-{/* lint enable no-legacy-os-names */}
-
-ACP controllers may write additional read-only annotations (`cpaas.io/cpu-cores-number`, `cpaas.io/memories`, `cpaas.io/nodes-number`, and so on) after the cluster is up — these are computed and **must not** be pre-set in the YAML you apply.
-
-**Cluster Labels**:
-
-| Label | Required | Value source | Purpose |
-|---|---|---|---|
-| `cluster-type` | Yes | Literal `DCS`. | Marks the cluster as provisioned by DCS Provider. |
-| `cpaas.io/registry-reference` | No | Name of a RegistryCredential Secret in `cpaas-system`. | Binds this cluster to a dedicated image registry. Omit it to inherit the registry of the `global` cluster. Read only at cluster creation — see [Choose the Image Registry for a Workload Cluster](../prepare/workload-cluster-image-registry.mdx). |
-
-### Deploy Worker Nodes \{#worker-node-deployment}
-
-The control plane alone is not a usable cluster. Create the worker resources in the following order:
-
-1. **IP-Hostname Pool Configuration** - Network settings for worker nodes
-2. **Machine Template Setup** - VM specifications
-3. **Bootstrap Configuration** - Node initialization and join settings
-4. **Machine Deployment** - Orchestration of node creation and management
-
-#### Step 1: Configure IP-Hostname Pool \{#worker-step-1-ip-hostname-pool}
-
-The IP-Hostname Pool defines the network configuration for worker node virtual machines. You must plan and configure the IP addresses, hostnames, DNS servers, additional NICs, and other network parameters before deployment.
-
-On Huawei DCS, the IP pool is also where you declare persistent disks that must survive VM replacement. Use `persistentDisk` for the platform-required `/var/cpaas` disk and for any other worker-node disk that must be preserved during delete-recreate operations.
-
-When a node template declares a dedicated data disk at `/var/lib/containerd`, the DCS provider's bootstrap configuration stores pod logs under `/var/lib/containerd/pods` and links `/var/log/pods` to that path. Keep the disk mounted at `/var/lib/containerd` when replacing the node if you need the pod-log data to remain on the containerd data disk.
-
-:::warning
-**Pool Size Requirement**
-The pool must include at least as many entries as the number of worker nodes you plan to deploy. Insufficient entries will prevent node deployment.
-:::
-
-**Example:**
-
-Create a `DCSIpHostnamePool` named `<cluster-name>-worker-pool`:
-
-```yaml
-apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: DCSIpHostnamePool
-metadata:
-  name: <cluster-name>-worker-pool
-  namespace: cpaas-system
-spec:
-  pool:
-  - ip: "<worker-ip-1>"
-    mask: "<worker-cidr-prefix-length>"
-    gateway: "<worker-gateway>"
-    dns: "<worker-dns>"
-    hostname: "<worker-hostname-1>"
-    machineName: "<worker-machine-name-1>"
-    additionNic:
-    - ip: "<worker-additional-ip-1>"
-      mask: "<worker-additional-cidr-prefix-length>"
-      gateway: "<worker-additional-gateway>"
-      dns: "<worker-additional-dns>"
-      dvSwitchName: "<additional-dvs>"
-      portGroupName: "<additional-port-group>"
-    persistentDisk:
-    - slot: 0
-      quantityGB: 40
-      datastoreClusterName: <datastore-cluster-name>
-      path: /var/cpaas
-      format: xfs
-  - ip: "<worker-ip-2>"
-    mask: "<worker-cidr-prefix-length>"
-    gateway: "<worker-gateway>"
-    dns: "<worker-dns>"
-    hostname: "<worker-hostname-2>"
-    machineName: "<worker-machine-name-2>"
-    persistentDisk:
-    - slot: 0
-      quantityGB: 40
-      datastoreClusterName: <datastore-cluster-name>
-      path: /var/cpaas
-      format: xfs
-  - ip: "<worker-ip-3>"
-    mask: "<worker-cidr-prefix-length>"
-    gateway: "<worker-gateway>"
-    dns: "<worker-dns>"
-    hostname: "<worker-hostname-3>"
-    machineName: "<worker-machine-name-3>"
-    persistentDisk:
-    - slot: 0
-      quantityGB: 40
-      datastoreClusterName: <datastore-cluster-name>
-      path: /var/cpaas
-      format: xfs
-```
-
-**Key parameters:**
-
-| Parameter | Type | Description | Required |
-|-----------|------|-------------|----------|
-| `.spec.pool[].ip` | string | IP address for the worker virtual machine | Yes |
-| `.spec.pool[].mask` | string | Subnet mask in CIDR prefix-length format without `/`, for example `24` | Yes |
-| `.spec.pool[].gateway` | string | Gateway IP address | Yes |
-| `.spec.pool[].dns` | string | DNS server IP addresses (semicolon-separated for multiple) | No |
-| `.spec.pool[].machineName` | string | Virtual machine name in the DCS platform | No |
-| `.spec.pool[].hostname` | string | Hostname for the virtual machine | No |
-| `.spec.pool[].additionNic[]` | []object | Additional NICs bound to this IP slot. Use this for storage, management, or isolated application networks. | No |
-| `.spec.pool[].additionNic[].ip` | string | Additional NIC IP address for the generated guest network configuration. | Recommended* |
-| `.spec.pool[].additionNic[].mask` | string | Additional NIC subnet mask in CIDR prefix-length format without `/`, for example `24`. | Recommended* |
-| `.spec.pool[].additionNic[].gateway` | string | Gateway for the additional NIC network. Confirm route behavior before setting this value. | No |
-| `.spec.pool[].additionNic[].dns` | string | DNS server IPs for the additional NIC network, separated by semicolons when multiple values are required. | No |
-| `.spec.pool[].additionNic[].dvSwitchName` | string | DCS distributed virtual switch used to resolve the Port Group for the additional NIC. | Yes* |
-| `.spec.pool[].additionNic[].portGroupName` | string | DCS Port Group used to attach the additional NIC. | Yes* |
-| `.spec.pool[].persistentDisk[]` | []object | Persistent disks bound to this IP slot. Use this for `/var/cpaas` and any disk that must survive node replacement. | No |
-
-\*Fields marked `Yes*` are required for the provider to resolve the target network and attach the additional NIC. Fields marked `Recommended*` are needed for the generated static guest network configuration. The CRD does not enforce these fields.
-
-#### Step 2: Configure Machine Template \{#worker-step-2-machine-template}
-
-The DCSMachineTemplate defines the specifications for worker node virtual machines, including VM templates, compute resources, storage configuration, and network settings.
-
-The fields in this resource reference several Huawei DCS platform concepts (DCS VM Template, DCS VM Folder, DCS Datastore, and related items). For the definitions of those concepts and how they map to Cluster API resources, see [Huawei DCS Concepts and Terminology](./overview.mdx#concepts-and-terminology).
-
-:::warning
-**Required Disk Configurations**
-The following disk mount points are mandatory. Do not remove them:
-- System volume (`systemVolume: true`)
-- `/var/lib/kubelet` - Kubelet data directory
-- `/var/lib/containerd` - Container runtime data
-
-Configure `/var/cpaas` in the IP pool as a persistent disk, not in `DCSMachineTemplate`.
-
-You may add additional template disks, but these essential template disks must be preserved.
-:::
-
-**Example:**
-
-Create a `DCSMachineTemplate` named `<cluster-name>-worker-template`:
-
-```yaml
-apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: DCSMachineTemplate
-metadata:
-  name: <cluster-name>-worker-template
-  namespace: cpaas-system
-spec:
-  template:
-    spec:
-      vmTemplateName: <vm-template-name>
-      location:
-        type: folder
-        name: <folder-name>
-      vmConfig:
-        dvSwitchName: <dv-switch-name> # Optional
-        portGroupName: <port-group-name> # Optional
-        dcsMachineCpuSpec:
-          quantity: <worker-cpu>
-        dcsMachineMemorySpec: # MB
-          quantity: <worker-memory>
-        dcsMachineDiskSpec: # GB
-        - quantity: 0
-          datastoreClusterName: <datastore-cluster-name>
-          systemVolume: true
-        - quantity: 100
-          datastoreClusterName: <datastore-cluster-name>
-          path: /var/lib/kubelet
-          format: xfs
-        - quantity: 100
-          datastoreClusterName: <datastore-cluster-name>
-          path: /var/lib/containerd
-          format: xfs
-      ipHostPoolRef:
-        name: <cluster-name>-worker-pool
-```
-
-**Key parameters:**
-
-| Parameter | Type | Description | Required |
-|-----------|------|-------------|----------|
-| `.spec.template.spec.vmTemplateName` | string | DCS VM Template name as registered on the DCS platform. | Yes |
-| `.spec.template.spec.location` | object | Places the cloned virtual machine under a DCS VM Folder for organizational grouping. If omitted, the virtual machine is not placed in any folder. See [Huawei DCS Concepts and Terminology](./overview.mdx#concepts-and-terminology) for the VM Folder definition and [Infrastructure → Advanced: Multi-Cluster Deployment](./infrastructure.mdx#advanced-multi-cluster) for the multi-cluster use of this field. | No |
-| `.spec.template.spec.location.type` | string | Set to `folder` for the standard workflow. The folder must already exist on the DCS platform. | Yes* |
-| `.spec.template.spec.location.name` | string | Name of the existing DCS VM Folder. | Yes* |
-| `.spec.template.spec.vmConfig` | object | Virtual machine configuration | Yes |
-| `.spec.template.spec.vmConfig.dvSwitchName` | string | Virtual switch name (uses template default if not specified) | No |
-| `.spec.template.spec.vmConfig.portGroupName` | string | Port group name (must belong to the specified switch) | No |
-| `.spec.template.spec.vmConfig.dcsMachineCpuSpec.quantity` | int | CPU cores for worker VM | Yes |
-| `.spec.template.spec.vmConfig.dcsMachineMemorySpec.quantity` | int | Memory size in MB | Yes |
-| `.spec.template.spec.vmConfig.dcsMachineDiskSpec` | []object | Disk configuration array | Yes |
-| `.spec.template.spec.vmConfig.dcsMachineDiskSpec[].quantity` | int | Disk size in GB (0 for system disk uses template size) | Yes |
-| `.spec.template.spec.vmConfig.dcsMachineDiskSpec[].datastoreClusterName` | string | Datastore cluster name | Yes |
-| `.spec.template.spec.vmConfig.dcsMachineDiskSpec[].systemVolume` | bool | System disk flag (only one disk can be true) | No |
-| `.spec.template.spec.vmConfig.dcsMachineDiskSpec[].path` | string | Mount path (disk not mounted if omitted) | No |
-| `.spec.template.spec.vmConfig.dcsMachineDiskSpec[].format` | string | Filesystem format (e.g., xfs, ext4) | No |
-| `.spec.template.spec.ipHostPoolRef.name` | string | Referenced DCSIpHostnamePool name | Yes |
-
-*Required when parent object is specified
-
-#### Persistent Disks Managed by the IP Pool \{#worker-persistent-disks}
-
-Declare any upgrade-preserved disk in the matching `DCSIpHostnamePool.spec.pool[].persistentDisk` entry.
-
-- Use this for `/var/cpaas`, which is required by the platform.
-- Keep `DCSMachineTemplate` for the system disk and template-local disks that may be recreated with the VM.
-- Choose a unique `slot` per IP entry. The controller uses `(ip, slot)` as the persistent-disk identity.
-- On replacement nodes, the guest disk setup logic checks for an existing filesystem. If the disk is already formatted, it skips `mkfs` and mounts the disk directly.
-- Persistent-disk workflows require one-by-one replacement, so keep `MachineDeployment.spec.strategy.rollingUpdate.maxSurge = 0`.
-- You can append new `persistentDisk` entries, but deleting existing entries is not supported. The controller attaches the newly added disk to the running VM on the DCS side, but it does not format or mount the disk inside the guest OS. Guest formatting and mounting take effect only after the VM is replaced and the replacement VM runs the generated disk setup during bootstrap.
-- The controller creates new persistent volumes as independent persistent normal volumes. When it reuses an existing volume, it only requires the volume to be independent and persistent; it does not require a specific DCS volume type.
-- Treat `format`, `options`, and `pciType` as immutable after creation.
-- Use `isThin` only when the DCS environment requires an explicit thin-provisioning value for newly created persistent volumes. If omitted, the provider does not send `isThin` and DCS uses the platform default.
-- Treat `quantityGB` and datastore changes as rollout-sensitive changes. The webhook performs best-effort validation against the DCS platform when it has enough cluster context. `isThin` is creation-only: changing it does not validate, reconcile, or convert existing volumes, and affects only persistent volumes created later.
-
-To inspect the runtime state of persistent disks during node operations, check `status.persistentDiskStatus` on the pool:
+Then, on a control plane node of the cluster:
 
 ```bash
-kubectl get dcsiphostnamepool <cluster-name>-worker-pool -n cpaas-system -o yaml
+curl --cacert /etc/kubernetes/pki/ca.crt https://<vip>:6443/healthz
 ```
 
-#### Additional NICs Managed by the IP Pool \{#worker-additional-nics}
+Continue when it prints `ok`; otherwise see [Self-built VIP](./troubleshooting.mdx#self-built-vip) in Troubleshooting.
 
-Declare worker additional NICs in `DCSIpHostnamePool.spec.pool[].additionNic[]`.
+#### Control Plane HA \{#verify-control-plane-ha}
 
-- The provider applies `additionNic[]` only when it creates a new VM.
-- Existing worker VMs are not hot-updated when you edit the Pool.
-- New worker Machines use the `additionNic[]` values from the Pool slot they claim.
-- Each additional NIC should include both `dvSwitchName` and `portGroupName` so the provider can resolve the target DCS Port Group before VM clone.
-- If you also use `persistentDisk[]`, keep `MachineDeployment.spec.strategy.rollingUpdate.maxSurge = 0` so fixed IP slots and preserved disks move one node at a time.
-- If an additional NIC has a gateway, verify that the guest OS route table still prefers the intended primary network for the default route.
-
-To inspect the runtime state of additional NICs, check `DCSMachine.status.additionalNic`:
+**Applies to**: `provider.dcs.controlPlaneHA: true`. Skip it when it is `false`.
 
 ```bash
-kubectl -n cpaas-system get dcsmachine -l cluster.x-k8s.io/cluster-name=<cluster-name> \
-  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.networkConfig.ip}{"\t"}{.status.additionalNic}{"\n"}{end}'
-```
-
-#### Step 3: Configure Bootstrap Template \{#worker-step-3-bootstrap-template}
-
-The KubeadmConfigTemplate defines the bootstrap configuration for worker nodes, including user accounts, SSH keys, system files, and kubeadm join settings.
-
-`imagePullCredentialsVerificationPolicy: NeverVerify` is required only starting with Kubernetes 1.35. Omit this parameter when creating workers with Kubernetes 1.34 or earlier. If `contentFrom.secret` supplies the patch, verify that the referenced `worker-kubelet-patch.json` contains this parameter for Kubernetes 1.35.
-
-:::info
-**Template Optimization**
-The template includes pre-optimized configurations for security and performance. Modify only the parameters that require customization for your environment.
-:::
-
-**Example:**
-
-```yaml
-apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
-kind: KubeadmConfigTemplate
-metadata:
-  name: <cluster-name>-worker-kct
-  namespace: cpaas-system
-spec:
-  template:
-    spec:
-      format: ignition
-      users:
-      - name: boot
-        sshAuthorizedKeys:
-        - "<ssh-authorized-keys>"
-      files:
-      - path: /etc/kubernetes/patches/kubeletconfiguration0+strategic.json
-        owner: "root:root"
-        permissions: "0644"
-        content: |
-          {
-            "apiVersion": "kubelet.config.k8s.io/v1beta1",
-            "kind": "KubeletConfiguration",
-            "imagePullCredentialsVerificationPolicy": "NeverVerify",
-            "protectKernelDefaults": true,
-            "staticPodPath": null,
-            "tlsCertFile": "/etc/kubernetes/pki/kubelet.crt",
-            "tlsPrivateKeyFile": "/etc/kubernetes/pki/kubelet.key",
-            "streamingConnectionIdleTimeout": "5m",
-            "clientCAFile": "/etc/kubernetes/pki/ca.crt"
-          }
-      preKubeadmCommands:
-      - while ! ip route | grep -q "default via"; do sleep 1; done; echo "NetworkManager started"
-      - mkdir -p /run/cluster-api && restorecon -Rv /run/cluster-api
-      - if [ -f /etc/disk-setup.sh ]; then bash /etc/disk-setup.sh; fi
-      postKubeadmCommands:
-      - chmod 600 /var/lib/kubelet/config.yaml
-      joinConfiguration:
-        patches:
-          directory: /etc/kubernetes/patches
-        nodeRegistration:
-          kubeletExtraArgs:
-            node-ip: NODE_IP
-            provider-id: PROVIDER_ID
-            volume-plugin-dir: "/opt/libexec/kubernetes/kubelet-plugins/volume/exec/"
-            protect-kernel-defaults: "true"
-```
-
-`PROVIDER_ID` and `NODE_IP` are literal magic tokens that DCS Provider substitutes at machine-join time — keep them exactly as written. See [Magic-Token Placeholders](#magic-tokens) for the full list.
-
-:::tip
-**Alternative: reference a centrally managed Secret for the worker kubelet patch**
-
-The DCS Provider plugin ships a Secret named `dcs-kubernetes-<kubernetes-major-minor>-files` in the `cpaas-system` namespace (for example, `dcs-kubernetes-1.33-files` for Kubernetes 1.33). In addition to the control-plane files it serves to `KubeadmControlPlane` (see [Complete KubeadmControlPlane Configuration](#complete-kubeadmcontrolplane-configuration)), this Secret also contains a `worker-kubelet-patch.json` key suitable for the worker `KubeadmConfigTemplate`. When that Secret is present, you can replace the inline `files` entry above with a `contentFrom.secret` reference — this keeps the worker kubelet patch in sync with the installed plugin version and avoids manual updates on cluster upgrades.
-
-```yaml
-files:
-- contentFrom:
-    secret:
-      key: worker-kubelet-patch.json
-      name: dcs-kubernetes-1.33-files
-  owner: "root:root"
-  path: /etc/kubernetes/patches/kubeletconfiguration0+strategic.json
-  permissions: "0644"
-```
-
-The inline and Secret-referenced forms are functionally equivalent; the Secret form is the recommended path when the plugin Secret is available in the target cluster.
-:::
-
-#### Step 4: Configure Machine Deployment \{#worker-step-4-machine-deployment}
-
-The MachineDeployment orchestrates the creation and management of worker nodes by referencing the previously configured DCSMachineTemplate and KubeadmConfigTemplate resources. It manages the desired number of nodes and handles rolling updates.
-
-**Example:**
-
-```yaml
-apiVersion: cluster.x-k8s.io/v1beta1
-kind: MachineDeployment
-metadata:
-  name: <cluster-name>-md-0
-  namespace: cpaas-system
-spec:
-  strategy:
-    rollingUpdate:
-      maxSurge: 0 # Required when this node pool relies on persistent disks
-      maxUnavailable: 1
-    type: RollingUpdate
-  clusterName: <cluster-name>
-  replicas: 3
-  selector:
-    matchLabels: null
-  template:
-    metadata:
-      labels:
-        cluster.x-k8s.io/cluster-name: <cluster-name>
-        pool.name: <cluster-name>-md-0
-    spec:
-      nodeDrainTimeout: 1m
-      nodeDeletionTimeout: 5m
-      bootstrap:
-        configRef:
-          apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
-          kind: KubeadmConfigTemplate
-          name: <cluster-name>-worker-kct
-          namespace: cpaas-system
-      clusterName: <cluster-name>
-      infrastructureRef:
-        apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-        kind: DCSMachineTemplate
-        name: <cluster-name>-worker-template
-        namespace: cpaas-system
-      version: <worker-kubernetes-version>
-```
-
-**Key parameters:**
-
-| Parameter | Type | Description | Required |
-|-----------|------|-------------|----------|
-| `.spec.clusterName` | string | Target cluster name for node deployment | Yes |
-| `.spec.replicas` | int | Number of worker nodes (must not exceed IP pool size) | Yes |
-| `.spec.template.spec.bootstrap.configRef` | object | Reference to KubeadmConfigTemplate | Yes |
-| `.spec.template.spec.infrastructureRef` | object | Reference to DCSMachineTemplate | Yes |
-| `.spec.template.spec.version` | string | Kubernetes version (must match VM template) | Yes |
-| `.spec.strategy.rollingUpdate.maxSurge` | int | Maximum nodes above desired during update. Keep this at `0` when the node pool relies on persistent disks | No |
-| `.spec.strategy.rollingUpdate.maxUnavailable` | int | Maximum unavailable nodes during update. When persistent disks are used with `maxSurge = 0`, keep this value greater than `0` and within the replica count | No |
-
----
-
-## Cluster Verification
-
-After deploying all cluster resources, verify that the cluster has been created successfully and is operational.
-
-### Using the Console
-
-1. Navigate to **Clusters** → **Clusters**
-2. Locate your newly created cluster in the cluster list
-3. Verify that the cluster status shows as **Running**
-4. Check that all control plane and worker nodes are **Ready**
-
-### Using kubectl
-
-Alternatively, verify the cluster using kubectl commands:
-
-```bash
-# Check cluster status
-kubectl get cluster -n cpaas-system <cluster-name>
-
-# Verify control plane
-kubectl get kubeadmcontrolplane -n cpaas-system <cluster-name>-kcp
-
-# Check machine status
-kubectl get machines -n cpaas-system
-
-# Verify cluster deployment
-kubectl get clustermodule <cluster-name> -o jsonpath='{.status.base.deployStatus}'
-```
-
-For clusters that use additional NICs, also verify that the provider recorded them on the matching `DCSMachine` objects:
-
-```bash
-kubectl -n cpaas-system get dcsmachine -l cluster.x-k8s.io/cluster-name=<cluster-name> \
-  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.networkConfig.ip}{"\t"}{.status.additionalNic}{"\n"}{end}'
-```
-
-### Verify Control Plane HA \{#verify-control-plane-ha}
-
-If you enabled `DCSCluster.spec.controlPlaneHA.enabled`, inspect the `DCSCluster` condition first:
-
-```bash
-kubectl get dcscluster <cluster-name> -n cpaas-system \
+ac config use-cluster global
+ac -n cpaas-system get dcscluster <cluster-name> \
   -o jsonpath='{range .status.conditions[?(@.type=="ControlPlaneHAReady")]}{.status}{" "}{.reason}{" "}{.message}{"\n"}{end}'
 ```
 
-Interpret the condition as follows:
+Continue when the status is `True`; otherwise see [Control Plane HA](./troubleshooting.mdx#control-plane-ha) in Troubleshooting.
 
-| Status and reason | Meaning | Next step |
-|-------------------|---------|-----------|
-| `True ControlPlaneHAReady` | The provider-managed DRS rule exists and the provider has observed the current control-plane VMs on different DCS hosts. | No action is required. |
-| `False ControlPlaneHAPending` | The provider is waiting for a recoverable state, such as enough VM URNs, enough members, or DCS-side placement. | Read the message. If it mentions placement, check DCS host capacity, DRS status, and whether runtime migration is blocked. |
-| `False ControlPlaneHAFailed` | The provider could not query, validate, create, update, delete, or check the DRS rule. | Read the message, then check the DCS credential, DRS settings, rule-name conflicts, and controller logs if needed. |
+#### Additional NICs \{#verify-additional-nics}
 
-Inspect the observed rule and membership snapshot:
+**Applies to**: node groups with `network.additions`. Skip it otherwise.
 
 ```bash
-kubectl get dcscluster <cluster-name> -n cpaas-system \
-  -o jsonpath='rule={.status.controlPlaneHA.ruleName}{" index="}{.status.controlPlaneHA.ruleIndex}{" cluster="}{.status.controlPlaneHA.clusterUrn}{"\n"}{range .status.controlPlaneHA.members[*]}{.machineName}{" "}{.vmUrn}{"\n"}{end}'
+ac config use-cluster global
+ac -n cpaas-system get dcsmachine -l cluster.x-k8s.io/cluster-name=<cluster-name> \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.networkConfig.ip}{"\t"}{.status.additionalNic}{"\n"}{end}'
 ```
 
-The `members[]` list contains the CAPI Machine name and DCS VM URN for each control-plane VM in the rule. The current DCS status snapshot does not include the DCS host name. If you need to confirm the exact host placement, query the VM details from the DCS platform or DCS API and compare the VM `hostName` or `hostUrn` values.
+Continue when each `DCSMachine` lists one additional NIC per address in its host's `additionalIps`; otherwise contact technical support.
 
-### Expected Results
+## Run `create` Again \{#rerun-create}
 
-A successfully created cluster should show:
-- Cluster status: **Running** or **Provisioned**
-- All control plane machines: **Running**
-- All worker nodes (if deployed): **Running**
-- Kubernetes nodes: **Ready**
-- Cluster Module Status: **Completed**
-- For multi-NIC clusters, each created VM has the expected additional NICs in `DCSMachine.status.additionalNic`, and the guest OS shows the corresponding `ethN` interfaces.
+If `create` stops, run the same command again; completed work is skipped. Running `create` again on the same directory puts back anything that has drifted, except Secrets, which `ac` creates once and then leaves as they are. When `manifests/` already exists, `create` asks whether to reuse it: press Enter to reuse it, or answer `n` to render again after you change `install-config.yaml`. When standard input is not a terminal, pass `--reuse-manifests=true` or `--reuse-manifests=false`. Reusing `manifests/` ignores `install-config.yaml` and skips every check.
 
----
+Do not edit the files in `manifests/`.
 
-## Appendix
-
-### Complete KubeadmControlPlane Configuration \{#complete-kubeadmcontrolplane-configuration}
-
-Below is the complete `KubeadmControlPlane` configuration, including all default audit policies, admission controls, and file contents.
-
-The embedded kubelet patch includes `imagePullCredentialsVerificationPolicy: NeverVerify`, which is required only starting with Kubernetes 1.35. Remove this parameter for Kubernetes 1.34 or earlier.
-
-```yaml
-apiVersion: controlplane.cluster.x-k8s.io/v1beta1
-kind: KubeadmControlPlane
-metadata:
-  name: <cluster-name>-kcp
-  namespace: cpaas-system
-  annotations:
-    controlplane.cluster.x-k8s.io/skip-coredns: ""
-    controlplane.cluster.x-k8s.io/skip-kube-proxy: ""
-spec:
-  rolloutStrategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 0 # Required when the cluster relies on pool-managed persistent disks
-  kubeadmConfigSpec:
-    users:
-    - name: boot
-      sshAuthorizedKeys:
-      - "<ssh-authorized-keys>"
-    format: ignition
-    files:
-    - path: /etc/kubernetes/admission/psa-config.yaml
-      owner: "root:root"
-      permissions: "0644"
-      content: |
-        apiVersion: apiserver.config.k8s.io/v1
-        kind: AdmissionConfiguration
-        plugins:
-        - name: PodSecurity
-          configuration:
-            apiVersion: pod-security.admission.config.k8s.io/v1
-            kind: PodSecurityConfiguration
-            defaults:
-              enforce: "privileged"
-              enforce-version: "latest"
-              audit: "baseline"
-              audit-version: "latest"
-              warn: "baseline"
-              warn-version: "latest"
-            exemptions:
-              usernames: []
-              runtimeClasses: []
-              namespaces:
-              - kube-system
-              - cpaas-system
-    - path: /etc/kubernetes/patches/kubeletconfiguration0+strategic.json
-      owner: "root:root"
-      permissions: "0644"
-      content: |
-        {
-          "apiVersion": "kubelet.config.k8s.io/v1beta1",
-          "kind": "KubeletConfiguration",
-          "imagePullCredentialsVerificationPolicy": "NeverVerify",
-          "protectKernelDefaults": true,
-          "tlsCertFile": "/etc/kubernetes/pki/kubelet.crt",
-          "tlsPrivateKeyFile": "/etc/kubernetes/pki/kubelet.key",
-          "streamingConnectionIdleTimeout": "5m",
-          "clientCAFile": "/etc/kubernetes/pki/ca.crt"
-        }
-    - path: /etc/kubernetes/audit/policy.yaml
-      owner: "root:root"
-      append: false
-      permissions: "0644"
-      content: |
-        apiVersion: audit.k8s.io/v1
-        kind: Policy
-        omitStages:
-        - "RequestReceived"
-        rules:
-        - level: None
-          users:
-          - system:kube-controller-manager
-          - system:kube-scheduler
-          - system:serviceaccount:kube-system:endpoint-controller
-          verbs: ["get", "update"]
-          namespaces: ["kube-system"]
-          resources:
-          - group: ""
-            resources: ["endpoints"]
-        - level: None
-          nonResourceURLs:
-          - /healthz*
-          - /version
-          - /swagger*
-        - level: None
-          resources:
-          - group: ""
-            resources: ["events"]
-        - level: None
-          resources:
-          - group: "devops.alauda.io"
-        - level: None
-          verbs: ["get", "list", "watch"]
-        - level: None
-          resources:
-          - group: "coordination.k8s.io"
-            resources: ["leases"]
-        - level: None
-          resources:
-          - group: "authorization.k8s.io"
-            resources: ["subjectaccessreviews", "selfsubjectaccessreviews"]
-          - group: "authentication.k8s.io"
-            resources: ["tokenreviews"]
-        - level: None
-          resources:
-          - group: "app.alauda.io"
-            resources: ["imagewhitelists"]
-          - group: "k8s.io"
-            resources: ["namespaceoverviews"]
-        - level: Metadata
-          resources:
-          - group: ""
-            resources: ["secrets", "configmaps"]
-        - level: Metadata
-          resources:
-          - group: "operator.connectors.alauda.io"
-            resources: ["installmanifests"]
-          - group: "operators.katanomi.dev"
-            resources: ["katanomis"]
-        - level: RequestResponse
-          resources:
-          - group: ""
-          - group: "aiops.alauda.io"
-          - group: "apps"
-          - group: "app.k8s.io"
-          - group: "authentication.istio.io"
-          - group: "auth.alauda.io"
-          - group: "autoscaling"
-          - group: "asm.alauda.io"
-          - group: "clusterregistry.k8s.io"
-          - group: "crd.alauda.io"
-          - group: "infrastructure.alauda.io"
-          - group: "monitoring.coreos.com"
-          - group: "operators.coreos.com"
-          - group: "networking.istio.io"
-          - group: "extensions.istio.io"
-          - group: "install.istio.io"
-          - group: "security.istio.io"
-          - group: "telemetry.istio.io"
-          - group: "opentelemetry.io"
-          - group: "networking.k8s.io"
-          - group: "portal.alauda.io"
-          - group: "rbac.authorization.k8s.io"
-          - group: "storage.k8s.io"
-          - group: "tke.cloud.tencent.com"
-          - group: "devopsx.alauda.io"
-          - group: "core.katanomi.dev"
-          - group: "deliveries.katanomi.dev"
-          - group: "integrations.katanomi.dev"
-          - group: "artifacts.katanomi.dev"
-          - group: "builds.katanomi.dev"
-          - group: "versioning.katanomi.dev"
-          - group: "sources.katanomi.dev"
-          - group: "tekton.dev"
-          - group: "operator.tekton.dev"
-          - group: "eventing.knative.dev"
-          - group: "flows.knative.dev"
-          - group: "messaging.knative.dev"
-          - group: "operator.knative.dev"
-          - group: "sources.knative.dev"
-          - group: "operator.devops.alauda.io"
-          - group: "flagger.app"
-          - group: "jaegertracing.io"
-          - group: "velero.io"
-            resources: ["deletebackuprequests"]
-          - group: "connectors.alauda.io"
-          - group: "operator.connectors.alauda.io"
-            resources: ["connectorscores", "connectorsgits", "connectorsocis"]
-        - level: Metadata
-    preKubeadmCommands:
-    - while ! ip route | grep -q "default via"; do sleep 1; done; echo "NetworkManager started"
-    - mkdir -p /run/cluster-api && restorecon -Rv /run/cluster-api
-    - if [ -f /etc/disk-setup.sh ]; then bash /etc/disk-setup.sh; fi
-    postKubeadmCommands:
-    - chmod 600 /var/lib/kubelet/config.yaml
-    clusterConfiguration:
-      imageRepository: cloud.alauda.io/alauda
-      dns:
-        imageTag: <dns-image-tag>
-      etcd:
-        local:
-          imageTag: <etcd-image-tag>
-      apiServer:
-        extraArgs:
-          audit-log-format: json
-          audit-log-maxage: "30"
-          audit-log-maxbackup: "10"
-          audit-log-maxsize: "200"
-          profiling: "false"
-          audit-log-mode: batch
-          audit-log-path: /etc/kubernetes/audit/audit.log
-          audit-policy-file: /etc/kubernetes/audit/policy.yaml
-          tls-cipher-suites: "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"
-          encryption-provider-config: /etc/kubernetes/encryption-provider.conf
-          admission-control-config-file: /etc/kubernetes/admission/psa-config.yaml
-          tls-min-version: VersionTLS12
-          kubelet-certificate-authority: /etc/kubernetes/pki/ca.crt
-        extraVolumes:
-        - name: vol-dir-0
-          hostPath: /etc/kubernetes
-          mountPath: /etc/kubernetes
-          pathType: Directory
-      controllerManager:
-        extraArgs:
-          bind-address: "::"
-          profiling: "false"
-          tls-min-version: VersionTLS12
-          flex-volume-plugin-dir: "/opt/libexec/kubernetes/kubelet-plugins/volume/exec/"
-      scheduler:
-        extraArgs:
-          bind-address: "::"
-          tls-min-version: VersionTLS12
-          profiling: "false"
-    initConfiguration:
-      patches:
-        directory: /etc/kubernetes/patches
-      nodeRegistration:
-        kubeletExtraArgs:
-          node-labels: "kube-ovn/role=master"
-          provider-id: PROVIDER_ID
-          volume-plugin-dir: "/opt/libexec/kubernetes/kubelet-plugins/volume/exec/"
-          protect-kernel-defaults: "true"
-    joinConfiguration:
-      patches:
-        directory: /etc/kubernetes/patches
-      nodeRegistration:
-        kubeletExtraArgs:
-          node-ip: NODE_IP
-          node-labels: "kube-ovn/role=master"
-          provider-id: PROVIDER_ID
-          volume-plugin-dir: "/opt/libexec/kubernetes/kubelet-plugins/volume/exec/"
-          protect-kernel-defaults: "true"
-  machineTemplate:
-    nodeDrainTimeout: 1m
-    nodeDeletionTimeout: 5m
-    infrastructureRef:
-      apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-      kind: DCSMachineTemplate
-      name: <cp-dcs-machine-template-name>
-  replicas: 3
-  version: <control-plane-kubernetes-version>
-```
-
-:::tip
-**Alternative: reference a centrally managed Secret instead of inline content**
-
-The Alauda Container Platform Infrastructure Provider for Huawei DCS plugin ships a Secret named `dcs-kubernetes-<kubernetes-major-minor>-files` in the `cpaas-system` namespace (for example, `dcs-kubernetes-1.33-files` for Kubernetes 1.33). It contains the canonical content of `psa-config.yaml`, `control-plane-kubelet-patch.json`, and `audit-policy.yaml`, and is updated together with each release.
-
-When that Secret is present, you can replace the three inline `files` entries with `contentFrom.secret` references. Inline and Secret-referenced forms are functionally equivalent; using the Secret keeps file content aligned with the installed plugin version and avoids manual updates on cluster upgrades.
-
-```yaml
-files:
-- contentFrom:
-    secret:
-      key: psa-config.yaml
-      name: dcs-kubernetes-1.33-files
-  owner: "root:root"
-  path: /etc/kubernetes/admission/psa-config.yaml
-  permissions: "0644"
-- contentFrom:
-    secret:
-      key: control-plane-kubelet-patch.json
-      name: dcs-kubernetes-1.33-files
-  owner: "root:root"
-  path: /etc/kubernetes/patches/kubeletconfiguration0+strategic.json
-  permissions: "0644"
-- contentFrom:
-    secret:
-      key: audit-policy.yaml
-      name: dcs-kubernetes-1.33-files
-  owner: "root:root"
-  path: /etc/kubernetes/audit/policy.yaml
-  permissions: "0644"
-```
-
-`encryption-provider.conf` is not part of this Secret, and it is not part of `files` at all — the DCS provider delivers it. See [How the Encryption Provider Configuration Is Delivered](#encryption-provider-delivery).
-
-To check whether the Secret is present on the target cluster before deciding which form to use:
-
-```bash
-# Replace <kubernetes-major-minor> with the value matching this cluster
-# (for example, 1.33 for Kubernetes v1.33.x).
-K8S_MM=<kubernetes-major-minor>
-kubectl -n cpaas-system get secret "dcs-kubernetes-${K8S_MM}-files" >/dev/null 2>&1 \
-  && echo "Secret present — contentFrom.secret form is supported" \
-  || echo "Secret missing — use inline content form"
-```
+:::warning
+Keep `<install-dir>/manifests/`, or set `cluster.encryptionProviderConfig`: a generated encryption key is kept only in `manifests/`. Rendering again without either generates a new key, and `manifests/` then no longer records the key the cluster uses.
 :::
 
-### How the Encryption Provider Configuration Is Delivered \{#encryption-provider-delivery}
+## Add or Change Node Groups \{#worker-node-deployment}
 
-`/etc/kubernetes/encryption-provider.conf` is owned by the DCS provider, not by `KubeadmControlPlane`. When the provider builds a control-plane machine's Ignition config it writes the file itself, and it removes any entry for that path that arrives from `kubeadmConfigSpec.files`. An entry you add there has no effect — it is neither merged nor applied, so a key written into it is silently unused.
-
-What the provider writes depends on the cluster:
-
-| Condition | File content |
-| :--- | :--- |
-| `DCSCluster.spec.encryptionProviderConfigRef` is set | The `encryption-provider.conf` key of the referenced Secret. Used for disaster recovery, where both sides must hold the same key. The Secret must exist in the cluster the provider runs in; see [Optional Disaster Recovery Deployment](../../../install/alauda_os/installing.mdx#optional-disaster-recovery-deployment) |
-| Not set, and the control plane is not yet initialized (the first control-plane machine) | A freshly generated random AES-CBC key |
-| Not set, and the control plane is already running (every later control-plane machine) | The file read back from the running `kube-apiserver`, so all control-plane nodes share one key |
-
-Worker nodes never receive the file.
-
-`clusterConfiguration.apiServer.extraVolumes` mounts `/etc/kubernetes` into the API server container, so `apiServer.extraArgs.encryption-provider-config: /etc/kubernetes/encryption-provider.conf` resolves on every control-plane node. Keep that argument — as the appendix has it — to run with etcd secret encryption-at-rest. Removing it turns encryption-at-rest off; the provider still writes the file, the API server just stops using it.
-
----
+To add a worker node group, add it to `computes` with its own `hosts`, then run `create --reuse-manifests=false` on the same directory. `ac` renders a new `DCSIpHostnamePool`, `DCSMachineTemplate`, `KubeadmConfigTemplate`, and `MachineDeployment` for it. Changing `replicas` works the same way; keep at least `replicas` entries in `hosts`. For other changes to a running cluster, see [Manage Nodes on Huawei DCS](../../../configure/nodes/alauda_os/huawei-dcs.mdx).
 
 ## Next Steps
 
-After creating a cluster:
-
 - [Manage Nodes](../../../configure/nodes/alauda_os/huawei-dcs.mdx)
 - [Upgrade Cluster](../../../upgrade/workload/alauda_os/huawei-dcs.mdx)
-
-## Troubleshooting
-
-If the cluster reaches `Provisioned` but never becomes Ready — for example, workload nodes stay `NotReady` because the CNI is not deployed — see [Troubleshoot a Workload Cluster Stuck in Provisioned](../troubleshooting/troubleshoot-cluster-not-ready.mdx).
+- [Delete the Cluster](./deleting.mdx)

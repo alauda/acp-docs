@@ -6,1980 +6,250 @@ category: howto
 queries:
   - create vsphere workload cluster
   - deploy capv cluster from global cluster
-  - vsphere self-built vip control plane endpoint
-  - vsphere pool slot immutable error
-  - vsphere persistent disk phase
+  - ac adm alpha cluster create --provider vsphere
 ---
 
 # Create a Cluster on VMware vSphere
 
-This document explains how to create a VMware vSphere workload cluster by applying Cluster API manifests to the ACP `global` management cluster. The procedure does not create the `global` cluster itself. It covers a minimum supported topology with one datacenter, one NIC per node, and static IP allocation through `VSphereMachineConfigPool`.
-
-## Provider Requirements \{#provider-requirements}
-
-Read the installed provider version from the provider `AppRelease` on the management cluster; do not infer it from the ACP release. See [Identify the Installed Provider Version](../../../upgrade/workload/alauda_os/index.mdx#identify-the-installed-provider-version).
-
-The following rules apply when the `VSphereMachineTemplate` referenced by a controller sets `machineConfigPoolRef` — the fixed-IP topology this page teaches. The provider's admission webhooks enforce the `KubeadmControlPlane` and pool rules on `CREATE` and `UPDATE`, and the last rule on `DELETE`.
-
-- `KubeadmControlPlane.spec.rolloutStrategy.rollingUpdate.maxSurge` is the integer `0`, and `spec.replicas` is `3` or more. An unset `maxSurge` means the Cluster API default `1`, which is not accepted.
-- `MachineDeployment.spec.strategy.rollingUpdate.maxSurge` is `0`. With the default `maxSurge` of `1`, a rollout needs an extra slot that a full pool does not have, and it stalls. `strategy.type: OnDelete` needs no surge setting.
-- `VSphereMachineConfigPool.spec.configs` declares at least one slot, and every slot declares `network`. Hostnames and primary IP addresses are unique across every pool bound to the same `Cluster`, and one pool serves one controller.
-- A slot that is already `InUse` or `Released` rejects some changes. See [Allocated slot restrictions](#create-the-machine-config-pools).
-- A pool that still owns `InUse` slots cannot be deleted.
-
-Confirm the webhooks are registered in your environment with the webhook check in [Verify the installation](./install_provider.mdx#verify-the-installation). Where a webhook is not registered, the same values are still required: the fixed-IP slot model has no free slot for a surge machine, so a non-compliant rollout stalls instead of being rejected up front.
-
-## Scenarios
-
-Use this document in the following scenarios:
-
-- You want to create the first baseline VMware vSphere workload cluster in your environment.
-- You use one datacenter and one NIC per node for the initial validation.
-- You want to keep the first deployment simple before enabling advanced placement or networking features.
-
-This document applies to the following deployment model:
-
-- CAPV connects directly to vCenter.
-- Control plane and worker nodes both use `VSphereMachineConfigPool` for static IP allocation and data disks.
-- `ClusterResourceSet` delivers the vSphere CPI component automatically.
-- The first validation uses one datacenter and one NIC per node.
-
-This document does not apply to the following scenarios:
-
-- A deployment that depends on vSphere Supervisor or `vm-operator`.
-- A deployment that does not use `VSphereMachineConfigPool`.
-
-This document is written for the current platform environment. The `kube-ovn` delivery path depends on platform controllers that consume annotations on the `Cluster` resource, so this workflow is not intended to be a generic standalone CAPV deployment guide outside the platform context.
-
-## How to Use This Page
-
-1. Complete the infrastructure and parameter checklist.
-2. Prepare the baseline manifest files in the procedure below.
-3. Before applying them, add only the required [creation-time topology variants](#creation-time-topology-variants).
-4. Apply the complete manifest set and finish the verification checks.
-5. After the cluster is running, use [Manage Nodes on VMware vSphere](../../../configure/nodes/alauda_os/vmware-vsphere.mdx) for scale-out, machine template changes, and runtime topology changes.
-
-The baseline is the validation reference. If the target cluster needs several optional topology features, introduce and validate one manifest change at a time before combining them.
-
-## Prerequisites
-
-Before you begin, ensure the following conditions are met:
-
-1. The Cluster Bootstrap Provider and the Infrastructure Provider for Virtualization Platform are uploaded and installed on the `global` cluster. This applies regardless of the IaaS platform that the `global` cluster itself runs on. See [Install the Provider](./install_provider.mdx).
-2. You completed [VMware vSphere Infrastructure Preparation](./infrastructure.mdx).
-3. The `global` cluster can reach vCenter.
-4. The target template, networks, datastores, and vCenter resource pool are available.
-5. The control plane endpoint mode is selected. For an external LoadBalancer, it satisfies [the endpoint contract](../prepare/control-plane-endpoint.mdx). For a Self-built VIP, the [Self-built VIP prerequisites](#self-built-vip-prerequisites) are met. The mode cannot be changed once the cluster exists, so decide it now: see [Control Plane Endpoint Modes](#control-plane-endpoint-modes).
-6. All required static IP addresses are allocated, are not in use, and are not already declared by a slot in another `VSphereMachineConfigPool` bound to the same `Cluster`.
-7. `ClusterResourceSet=true` is enabled.
-8. The image registry for this cluster is decided. By default the cluster inherits the registry of the `global` cluster, which requires a valid `public-registry-credential` Secret when that registry is authenticated. To pull platform images from a dedicated registry instead, follow [Choose the Image Registry for a Workload Cluster](../prepare/workload-cluster-image-registry.mdx) before you create the cluster; the binding cannot be changed afterwards.
-9. The registry chosen above is reachable from workload nodes and contains the required Kube-OVN, CoreDNS, and vSphere CPI tags.
-10. The platform can process the cluster annotations required to install the network plugin.
-11. The vCenter account referenced by `VSphereCluster.spec.identityRef` satisfies the Custom Fields privilege requirement in [Install the VMware vSphere Provider](./install_provider.mdx#prerequisites).
-12. The `global` cluster is the active management cluster, not a disaster-recovery standby. See [Standby Management Clusters](./install_provider.mdx#standby-management-cluster).
-13. Role labels and taints for any dedicated node pools are planned. They are declared on the pool's resources, as described in [Infra Nodes](../../../configure/nodes/node_planning.mdx#create-infra-nodes-alauda-os).
-
-## Control Plane Endpoint Modes \{#control-plane-endpoint-modes}
-
-Every cluster reaches its API server through a stable endpoint. Select the mode before you write `10-cluster.yaml`, because it cannot be corrected afterwards. The choice is recorded in `VSphereCluster.spec.controlPlaneLoadBalancer`, and leaving the field out is itself a choice: an absent field means an external LoadBalancer.
-
-<Directive type="warning" title="The Self-built VIP is a creation-time choice only">
-The Self-built VIP exists from provider `v1.0.17`, requires ACP `v4.4` or later, and is available only to clusters **created** with it. An existing cluster cannot adopt it, and neither can a cluster whose provider was upgraded to `v1.0.17` from an earlier release: the VIP is injected while the first control-plane node bootstraps, and Alive then takes it over, so there is no in-place migration path. Those clusters keep their external LoadBalancer, and moving one onto a Self-built VIP means creating a new cluster. See [Upgrading the Provider](./install_provider.mdx#upgrade-the-provider).
-</Directive>
-
-| `spec.controlPlaneLoadBalancer` | Who owns the endpoint |
-|---|---|
-| Absent (the baseline on this page) | You do. Provision an external Layer 4 TCP LoadBalancer and write `spec.controlPlaneEndpoint` yourself. |
-| `type: external` | You do. The provider checks the value against `spec.controlPlaneEndpoint` and deploys no VIP component. |
-| `type: internal` | The provider does. It injects a bootstrap VIP on the first control-plane node, then installs Alive (keepalived and IPVS) into the workload cluster and holds the VIP on the control-plane nodes. |
-
-None of the three can be changed once the cluster exists. The field is write-once; see [`controlPlaneLoadBalancer` fields](#control-plane-load-balancer-fields).
-
-**Recommendation**: for an external LoadBalancer, leave the field out rather than writing `type: external`. An absent field already means an external LoadBalancer, and writing it only to record that intent pins the endpoint to a frozen second copy of the same address.
-
-For `type: internal`, the prerequisites, the field reference, the manifest block, and the verification commands are in [Use a Self-built VIP](#use-self-built-vip).
-
-## Key Objects
-
-![VMware vSphere Cluster API resource dependencies](./assets/vsphere-resource-dependency.svg)
-
-The top-level `Cluster` references `VSphereCluster` and the control-plane or worker controllers. Those controllers reference `VSphereMachineTemplate` objects. Each template references one `VSphereMachineConfigPool`, whose slots provide hostnames, static network configuration, and persistent disks to the runtime `Machine`, `VSphereMachine`, and `VSphereVM` objects.
-
-| Stage | Input | Apply | Expected result | Diagnose first |
-|---|---|---|---|---|
-| Endpoint and Registry | LoadBalancer, permanent Registry, version set | Validate external dependencies. | Endpoint and Registry are reachable from the required networks. | LoadBalancer health, DNS, Registry API, and ACP port rules. |
-| Cluster root | Network CIDRs, vCenter identity, endpoint | Apply `Cluster` and `VSphereCluster`. | Both resources exist and report progressing conditions. | `Cluster` and `VSphereCluster` conditions. |
-| CPI delivery | vCenter CPI config and credentials | Apply the `ClusterResourceSet` resources. | The workload cluster receives the vSphere CPI after its API is reachable. | `ClusterResourceSetBinding` and CPI Pods. |
-| Node slots | Hostnames, static IPs, datastores, persistent disks | Apply both `VSphereMachineConfigPool` objects. | Each pool is Ready and exposes the expected slots. | Pool conditions and `status.configStatuses`. |
-| Control plane | VM template, kubeadm config, Kubernetes versions | Apply `VSphereMachineTemplate` and `KubeadmControlPlane`. | Three control-plane Machines become Ready. | KCP, Machine, `VSphereMachine`, `VSphereVM`, and endpoint health. |
-| Workers | Worker template and bootstrap config | Apply `KubeadmConfigTemplate` and `MachineDeployment`. | Worker Machines and Nodes become Ready. | MachineDeployment rollout, VM status, CPI, and CNI. |
-
-### `ClusterResourceSet`
-
-`ClusterResourceSet` is a Cluster API resource in the `global` cluster. After the workload API server becomes reachable, it applies the referenced `ConfigMap` and `Secret` resources to the workload cluster.
-
-In this workflow, `ClusterResourceSet` is used to deliver the vSphere CPI resources automatically.
-
-### vSphere CPI component
-
-The vSphere CPI component is delivered to the workload cluster through `ClusterResourceSet`. It connects workload nodes to the vSphere infrastructure so the cluster can report infrastructure identities and complete cloud-provider initialization.
-
-### Provider-managed fields on your manifests \{#provider-managed-fields}
-
-Some fields on the objects you apply are owned by the provider after creation. Knowing which ones prevents a repository fight during upgrades.
-
-- The provider patches your `KubeadmControlPlane` after you apply it. Expect the CoreDNS and kube-proxy skip annotations set to `"true"`, and `spec.kubeadmConfigSpec.clusterConfiguration.dns.imageRepository` set by the controller.
-- **Set `dns.imageTag` yourself and leave `dns.imageRepository` unset.** Provide the CoreDNS tag published for the target ACP release: at ACP `v4.4` and later, the tag staged under `acp/coredns`; below `v4.4`, the one under `tkestack/coredns`. The provider reads the `-v<acp>` suffix in the tag to select that repository, so a tag without the suffix resolves to `tkestack/coredns` — on ACP `v4.4` or later that repository does not carry the tag, and the CoreDNS pods stay in `ImagePullBackOff`.
-- The kube-proxy repository is derived from the Kubernetes version: `acp/k8s` at `v1.35` and later, `tkestack` below it. The Kube-OVN chart is `acp/chart-kube-ovn` at chart `v4.4` and later, `acp/chart-cpaas-kube-ovn` below it.
-- The registry prefix for all three comes from the `Cluster` annotation `cpaas.io/registry-address`.
-- The workload cluster's `kube-system/kube-proxy` DaemonSet and `kube-system/coredns` Deployment image repositories are reconciled as well, but **only after the control-plane rollout completes**. A lag between the `KubeadmControlPlane` reaching the target version and those workloads changing repository is expected.
-- Image pull credentials for these managed components come from the workload cluster's `cpaas-system/sentry` ServiceAccount.
-
-<Directive type="warning">
-Do not remove the CoreDNS and kube-proxy skip annotations, and do not re-apply a stored `KubeadmControlPlane` manifest that omits them. Returning CoreDNS or kube-proxy to kubeadm's management while the provider also manages them produces a repository conflict that flips the images back and forth.
-</Directive>
-
-### machine config pool
-
-The machine config pool is the `VSphereMachineConfigPool` custom resource. In the baseline workflow:
-
-- One machine config pool is used for control plane nodes.
-- One machine config pool is used for worker nodes.
-
-Each node slot includes the hostname, datacenter, static IP assignment, and optional data disk definitions.
-
-For network configuration, distinguish the following fields:
-
-- `networkName` is the vCenter network or port group name.
-- `deviceName` is the NIC name inside the guest operating system.
-
-If `deviceName` is set, CAPV writes that value into the generated guest-network metadata. If it is omitted, the current implementation typically uses NIC names such as `eth0`, `eth1`, and `eth2` by NIC order.
-
-Also distinguish the following value formats:
-
-- A node IP address is used together with a prefix length, for example `10.10.10.11/24`.
-- The gateway field contains only the gateway IP address, for example `10.10.10.1`.
-
-`spec.configs` must declare at least one slot, and every slot must declare `network` with a non-empty `network.primary.networkName`.
-
-Each slot can declare two disk lists. `persistentDisks[]` survive VM replacement and are reattached to the machine that replaces the previous one; `ephemeralDisks[]` are deleted with the VM and recreated empty. The standard set declares `/var/cpaas` as a persistent disk and `/var/lib/kubelet`, `/var/lib/containerd`, and `/var/lib/etcd` as ephemeral disks. Disk names and mount paths share one namespace across both lists within a slot. `ephemeralDisks[]` is new in provider `v1.0.17`, so this split is available only to a cluster created on `v1.0.17` or later. See [Choose persistent or ephemeral](#choose-persistent-or-ephemeral).
-
-**One pool serves exactly one controller.** When a machine allocates a slot, the provider records the owning `KubeadmControlPlane` or `MachineDeployment` in `status.consumerRef`. A second controller whose template references the same pool is not accepted. Use one pool for the control plane and one pool per `MachineDeployment`.
-
-### VM template requirements
-
-The VM template used by this workflow should meet the following minimum requirements:
-
-1. It uses the required operating system for the target platform environment.
-2. It includes `cloud-init`.
-3. It includes VMware Tools or `open-vm-tools`.
-4. It includes `containerd`.
-5. It includes the baseline components required by kubeadm bootstrap.
-6. It includes pre-exported container image tar files under `/root/images/`. These files are imported into containerd by `capv-load-local-images.sh` before kubeadm runs, so that node bootstrap does not depend on pulling images from a remote registry.
-7. The tar files include the kubeadm control-plane images supplied with the OS template, including etcd and kube-apiserver, under the exact image references generated from `clusterConfiguration.imageRepository`, the Kubernetes version, and the component image tags. Although etcd and kube-apiserver run as static Pods, they still require container images. A missing or mismatched local reference causes the runtime to try the configured Registry instead.
-8. The `/root/images/*.tar` files **must** include the sandbox (pause) image whose reference exactly matches the `sandbox_image` value (containerd v1) or `sandbox` value (containerd v2) configured in `/etc/containerd/config.toml`. For example, if containerd is configured with `sandbox_image = "registry.example.com/tkestack/pause:3.10"`, one of the tar files must contain that exact image reference. A mismatch causes containerd to pull the sandbox image from the network, which defeats the purpose of local preloading and fails in air-gapped environments.
-
-Static IP configuration, hostname injection, and other initialization settings depend on `cloud-init`. Node IP reporting depends on guest tools.
-
-## Local File Layout
-
-<Directive type="warning" title="Workload Cluster Naming">
-The workload `cluster_name` **must not** be `global`. That name is reserved for the `global` cluster, and reusing it causes the workload cluster's resources to collide with `global` cluster resources in `cpaas-system`. The `global-` prefix is reserved for resources owned by the `global` cluster's DR workflow; see [Common Prerequisites](../../../install/alauda_os/installing.mdx#common-prerequisites). Do not use `global-` for workload-cluster resources, because failover operations can select those resources as if they belonged to the `global` cluster.
-
-As a convention, keep the CAPI `Cluster` and provider cluster resource (`VSphereCluster`) named exactly `<cluster_name>`, and prefix non-root CAPI and provider resources (`KubeadmControlPlane`, `KubeadmConfigTemplate`, `MachineDeployment`, `VSphereMachineTemplate`, `VSphereMachineConfigPool`, etc.) with `<cluster_name>-` — for example, the example manifests use `<cluster_name>-kcp` and `<cluster_name>-md-0`. This is a recommendation rather than a controller-enforced rule, but it prevents same-namespace collisions when multiple workload clusters live in `cpaas-system` and makes resource ownership obvious during operations.
-</Directive>
-
-Create a local working directory and store the manifests with the following layout:
-
-```text
-capv-cluster/
-├── 00-namespace.yaml
-├── 10-cluster.yaml
-├── 15-vsphere-cpi-clusterresourceset.yaml
-├── 16-vspheremachineconfigpool-control-plane.yaml
-├── 17-vspheremachineconfigpool-worker.yaml
-├── 18-failure-domains.yaml  # only when failure domains are enabled
-├── 20-control-plane.yaml
-└── 30-workers-md-0.yaml
-```
-
-Use the following commands to create the directory:
-
-```bash
-mkdir -p ./capv-cluster
-cd ./capv-cluster
-```
-
-## Steps
-
-<Steps>
-### Validate the environment
-
-Run the following commands from the `global` cluster to verify the minimum prerequisites:
-
-```bash
-kubectl get ns
-kubectl get minfo -l cpaas.io/module-name=cluster-api-provider-vsphere
-kubectl get minfo -l cpaas.io/module-name=cluster-api-provider-kubeadm
-kubectl -n cpaas-system get deploy capi-controller-manager -o jsonpath='{.spec.template.spec.containers[0].args}'
-kubectl -n cpaas-system get secret public-registry-credential -o name
-kubectl -n cpaas-system get cluster global \
-  -o jsonpath='{.metadata.annotations.cpaas\.io/registry-address}{"\n"}'
-kubectl -n kube-public get configmap etcd-sync -o name 2>/dev/null || echo "not standby"
-```
-
-Export the permanent platform Registry address returned by the `Cluster` annotation and the image Registry used by the CPI and kubeadm manifests. If both placeholders identify the same Registry, use the same value for both variables.
-
-```bash
-export CLUSTER_REGISTRY_ADDRESS="<registry_address>"
-export IMAGE_REGISTRY_ADDRESS="<image_registry>"
-# Repository names depend on the target version. The values below are the
-# ACP v4.4 and later ones; for an earlier target, change them to:
-#   Kube-OVN chart -> acp/chart-cpaas-kube-ovn
-#   CoreDNS        -> tkestack/coredns
-export KUBE_OVN_CHART_REPO="acp/chart-kube-ovn"
-export COREDNS_REPO="acp/coredns"
-
-curl -sk "https://${CLUSTER_REGISTRY_ADDRESS}/v2/${KUBE_OVN_CHART_REPO}/tags/list"
-curl -sk "https://${IMAGE_REGISTRY_ADDRESS}/v2/${COREDNS_REPO}/tags/list"
-curl -sk "https://${IMAGE_REGISTRY_ADDRESS}/v2/acp/cloud-provider-vsphere/tags/list"
-```
-
-A `NAME_UNKNOWN` response means the repository name does not match the target version; correct `KUBE_OVN_CHART_REPO` or `COREDNS_REPO` from the mapping above and retry, rather than reading it as a missing tag.
-
-The repository boundaries above are the same ones the provider applies at runtime; see [Provider-managed fields on your manifests](#provider-managed-fields) for the selection rules, and [Upgrade Kube-OVN Before the Control Plane](../../../upgrade/workload/alauda_os/index.mdx#upgrade-kube-ovn-before-the-control-plane) for the authoritative chart-name table.
-
-The `/v2/` segment is part of the Registry HTTP API URL only. In the workload `Cluster` manifest, set the Registry annotation to `<registry_address>` without a scheme or path.
-
-Confirm the following results:
-
-- The `global` cluster is reachable.
-- Alauda Container Platform Cluster Bootstrap Provider and Alauda Container Platform Infrastructure Provider for Virtualization Platform are running.
-- The controller arguments include `ClusterResourceSet=true`.
-- The `public-registry-credential` Secret exists; its contents are not printed by this procedure.
-- The `global` cluster is not a disaster-recovery standby. The `kube-public/etcd-sync` ConfigMap must not exist. See [Standby Management Clusters](./install_provider.mdx#standby-management-cluster).
-- The permanent platform Registry contains the required Kube-OVN, CoreDNS, and vSphere CPI tags.
-- The VM template passed [the executable local-image validation](./infrastructure.mdx#validate-the-locally-preloaded-images), including exact etcd, kube-apiserver, and sandbox image references. Their static-Pod deployment does not remove the image requirement.
-
-Before you continue, also verify the following items:
-
-- The vCenter server address is reachable.
-- The vCenter username and password are valid.
-- The thumbprint is correct.
-- The template name is correct.
-- The template is resolvable in the target datacenter.
-- If the VM is cloned as a `fullClone`, the template system disk is not larger than the `diskGiB` value used later in the manifests. If CAPV completes a `linkedClone`, the system disk size stays at the template's size and `diskGiB` is ignored.
-- VMware Tools or `open-vm-tools` is installed in the template.
-- The external LoadBalancer follows the Layer 4 listener, backend, health-check, reachability, and ownership requirements in [Plan the Control Plane Endpoint](../prepare/control-plane-endpoint.mdx).
-- If you selected `type: internal`, the [Self-built VIP prerequisites](#self-built-vip-prerequisites) are satisfied instead: the VIP is unclaimed, VRRP and gratuitous ARP are not blocked by the dvPortGroup security policy or an NSX-T distributed firewall rule, the template can load `ip_vs`, and the `alive` plugin is deployable on the `global` cluster.
-
-### Create the namespace and vCenter credential secret
-
-Create the namespace that stores the workload cluster objects.
-
-This workflow stores workload cluster objects in the `cpaas-system` namespace. In the manifests and commands below, replace every `<namespace>` placeholder with `cpaas-system`.
-
-```yaml title="00-namespace.yaml"
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: <namespace>
-```
-
-Apply the namespace:
-
-```bash
-kubectl apply -f 00-namespace.yaml
-```
-
-Create the vCenter credential secret referenced by `VSphereCluster.spec.identityRef`.
-
-Author the credential file with an editor rather than typing the values at a shell prompt. A shell records the whole command, password included, in its history; a file written by an editor leaves no such copy. Keep it outside `capv-cluster/` so it is never mistaken for a manifest.
-
-```text title="vsphere-credentials.env"
-username=<vsphere_username>
-password=<vsphere_password>
-```
-
-Each line is `key=value`. Do not quote the values — `kubectl` takes quote characters literally. A value may contain `=`; only the first `=` on a line separates the key from the value.
-
-Restrict the file, create the Secret from it, then remove it:
-
-```bash
-chmod 600 ../vsphere-credentials.env
-
-VSPHERE_SECRET_NAME="<credentials_secret_name>"
-VSPHERE_NAMESPACE="<namespace>"
-
-kubectl create secret generic "${VSPHERE_SECRET_NAME}" \
-  --namespace "${VSPHERE_NAMESPACE}" \
-  --from-env-file=../vsphere-credentials.env
-
-rm -f ../vsphere-credentials.env
-```
-
-<Directive type="warning" title="Do not create credential Secrets with kubectl apply">
-  Client-side apply stores the manifest it applied — including the vCenter password — in the `kubectl.kubernetes.io/last-applied-configuration` annotation on the Secret itself. `kubectl create` writes no such annotation. This applies whether the values were written as `stringData` or as base64 `data`; base64 is an encoding, not protection. The same applies to the CPI credential later on this page.
-</Directive>
-
-### Create the `Cluster` and `VSphereCluster` objects \{#create-cluster-objects}
-
-Create the base cluster manifest with the workload cluster network settings, the control plane endpoint, and the vCenter connection settings. Set `cpaas.io/registry-address` to the permanent platform Registry in the form `<registry_address>` (`<host>:<port>` only).
-
-The manifest below uses an external LoadBalancer, which is the baseline on this page. For a Self-built VIP, add the `spec.controlPlaneLoadBalancer` block from [Enable the Self-built VIP in `10-cluster.yaml`](#enable-self-built-vip) to the `VSphereCluster` object.
-
-```yaml title="10-cluster.yaml"
-apiVersion: cluster.x-k8s.io/v1beta1
-kind: Cluster
-metadata:
-  name: <cluster_name>
-  namespace: <namespace>
-  labels:
-    cluster.x-k8s.io/cluster-name: <cluster_name>
-    cluster-type: VSphere
-    addons.cluster.x-k8s.io/vsphere-cpi: "enabled"
-    # Optional. Bind this cluster to a dedicated image registry instead of the
-    # registry of the `global` cluster. Read only at cluster creation.
-    # cpaas.io/registry-reference: <registry_credential_name>
-  annotations:
-    capi.cpaas.io/resource-group-version: infrastructure.cluster.x-k8s.io/v1beta1
-    capi.cpaas.io/resource-kind: VSphereCluster
-    cpaas.io/sentry-deploy-type: Baremetal
-    cpaas.io/alb-address-type: ClusterAddress
-    cpaas.io/network-type: kube-ovn
-    cpaas.io/kube-ovn-version: <kube_ovn_version>
-    cpaas.io/kube-ovn-join-cidr: <kube_ovn_join_cidr>
-    cpaas.io/registry-address: <registry_address>
-spec:
-  clusterNetwork:
-    pods:
-      cidrBlocks:
-      - <pod_cidr>
-    services:
-      cidrBlocks:
-      - <service_cidr>
-  controlPlaneRef:
-    apiVersion: controlplane.cluster.x-k8s.io/v1beta1
-    kind: KubeadmControlPlane
-    name: <cluster_name>-kcp
-  infrastructureRef:
-    apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-    kind: VSphereCluster
-    name: <cluster_name>
----
-apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: VSphereCluster
-metadata:
-  name: <cluster_name>
-  namespace: <namespace>
-spec:
-  controlPlaneEndpoint:
-    host: "<vip>"
-    port: <api_server_port>
-  identityRef:
-    kind: Secret
-    name: <credentials_secret_name>
-  server: "<vsphere_server>"
-  thumbprint: "<thumbprint>"
-```
-
-Apply the manifest:
-
-```bash
-kubectl apply -f 10-cluster.yaml
-```
-
-### Create the vSphere CPI delivery resources
-
-Create a `ClusterResourceSet` so the workload cluster receives the vSphere CPI configuration and manifests automatically after the workload API server becomes reachable.
-
-<Directive type="info">
-In the baseline workflow `VSphereCluster.spec.failureDomainSelector` is intentionally not set and the CPI `vsphere.conf` does not include a `[Labels]` block. Both are required only after you enable failure domains; configure them together as described in [Multiple datacenters and failure domains](#multiple-datacenters-and-failure-domains). Adding `[Labels]` to `vsphere.conf` without matching `VSphereFailureDomain` objects causes the CPI to look up zone and region tags that do not exist.
-</Directive>
-
-<Directive type="info">
-The vSphere CPI TLS bypass option is `insecure-flag`. Keep `insecure-flag = "1"` in the `[Global]` section of `<cluster_name>-vsphere-cpi-config` so the CPI can connect when the vCenter certificate is self-signed or not trusted by the workload cluster nodes. The CPI applies the global value to vCenter entries that do not set their own `insecure-flag`.
-</Directive>
-
-<Directive type="warning">
-The CPI `ConfigMap`, `Secret`, and `ClusterResourceSet` resources **must** be created in the same namespace as the `Cluster` resource. In this guide that namespace is `cpaas-system`. A `ClusterResourceSet` can only match clusters within its own namespace; deploying it in a different namespace will silently prevent resource delivery.
-</Directive>
-
-<Directive type="info">
-The `kube-ovn` configuration in the `Cluster` annotations is consumed by platform controllers. This document does not install the network plugin directly.
-</Directive>
-
-<Directive type="tip">
-This manifest is long and contains nested YAML inside `data` fields. Validate the manifest before applying: `kubectl apply --dry-run=client -f 15-vsphere-cpi-clusterresourceset.yaml`.
-
-The manifest declares the two ConfigMaps and the `ClusterResourceSet`. It does not declare the CPI credential Secret that the `ClusterResourceSet` also references — that Secret carries the vCenter password and is created separately in the next step.
-</Directive>
-
-```yaml title="15-vsphere-cpi-clusterresourceset.yaml"
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: <cluster_name>-vsphere-cpi-config
-  namespace: <namespace>
-data:
-  data: |
-    apiVersion: v1
-    kind: ConfigMap
-    metadata:
-      name: cloud-config
-      namespace: kube-system
-    data:
-      vsphere.conf: |
-        [Global]
-        secret-name = "vsphere-cloud-secret"
-        secret-namespace = "kube-system"
-        service-account = "cloud-controller-manager"
-        port = "443"
-        insecure-flag = "1"
-        datacenters = "<cpi_datacenters>"
-
-        [VirtualCenter "<vsphere_server>"]
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: <cluster_name>-vsphere-cpi-manifests
-  namespace: <namespace>
-data:
-  data: |
-    apiVersion: v1
-    kind: ServiceAccount
-    metadata:
-      name: cloud-controller-manager
-      namespace: kube-system
-    automountServiceAccountToken: false
-    ---
-    apiVersion: rbac.authorization.k8s.io/v1
-    kind: ClusterRole
-    metadata:
-      name: system:cloud-controller-manager
-    rules:
-    - apiGroups: [""]
-      resources: ["events"]
-      verbs: ["create", "patch", "update"]
-    - apiGroups: [""]
-      resources: ["nodes"]
-      verbs: ["*"]
-    - apiGroups: [""]
-      resources: ["nodes/status"]
-      verbs: ["patch"]
-    - apiGroups: [""]
-      resources: ["services"]
-      verbs: ["list", "patch", "update", "watch"]
-    - apiGroups: [""]
-      resources: ["services/status"]
-      verbs: ["patch"]
-    - apiGroups: [""]
-      resources: ["serviceaccounts"]
-      verbs: ["create", "get", "list", "watch", "update"]
-    - apiGroups: [""]
-      resources: ["persistentvolumes"]
-      verbs: ["get", "list", "update", "watch"]
-    - apiGroups: [""]
-      resources: ["endpoints"]
-      verbs: ["create", "get", "list", "watch", "update"]
-    - apiGroups: [""]
-      resources: ["secrets"]
-      verbs: ["get", "list", "watch"]
-    - apiGroups: ["coordination.k8s.io"]
-      resources: ["leases"]
-      verbs: ["get", "list", "watch", "create", "update"]
-    ---
-    apiVersion: rbac.authorization.k8s.io/v1
-    kind: RoleBinding
-    metadata:
-      name: servicecatalog.k8s.io:apiserver-authentication-reader
-      namespace: kube-system
-    roleRef:
-      apiGroup: rbac.authorization.k8s.io
-      kind: Role
-      name: extension-apiserver-authentication-reader
-    subjects:
-    - apiGroup: ""
-      kind: ServiceAccount
-      name: cloud-controller-manager
-      namespace: kube-system
-    - apiGroup: ""
-      kind: User
-      name: cloud-controller-manager
-    ---
-    apiVersion: rbac.authorization.k8s.io/v1
-    kind: ClusterRoleBinding
-    metadata:
-      name: system:cloud-controller-manager
-    roleRef:
-      apiGroup: rbac.authorization.k8s.io
-      kind: ClusterRole
-      name: system:cloud-controller-manager
-    subjects:
-    - kind: ServiceAccount
-      name: cloud-controller-manager
-      namespace: kube-system
-    - kind: User
-      name: cloud-controller-manager
-    ---
-    apiVersion: apps/v1
-    kind: DaemonSet
-    metadata:
-      annotations:
-        scheduler.alpha.kubernetes.io/critical-pod: ""
-      labels:
-        component: cloud-controller-manager
-        tier: control-plane
-        k8s-app: vsphere-cloud-controller-manager
-      name: vsphere-cloud-controller-manager
-      namespace: kube-system
-    spec:
-      selector:
-        matchLabels:
-          k8s-app: vsphere-cloud-controller-manager
-      updateStrategy:
-        type: RollingUpdate
-      template:
-        metadata:
-          labels:
-            component: cloud-controller-manager
-            k8s-app: vsphere-cloud-controller-manager
-        spec:
-          securityContext:
-            runAsUser: 1001
-          automountServiceAccountToken: true
-          # Optional: required when the CPI image is stored in a private
-          # registry that needs authentication. The platform automatically
-          # syncs a dockerconfigjson secret named "global-registry-auth"
-          # into every namespace of the workload cluster when the
-          # `global` cluster secret "public-registry-credential"
-          # (data.content) is configured. If your environment does not
-          # use a private registry, remove the imagePullSecrets block.
-          imagePullSecrets:
-          - name: global-registry-auth
-          serviceAccountName: cloud-controller-manager
-          hostNetwork: true
-          tolerations:
-          - operator: Exists
-          - key: node.cloudprovider.kubernetes.io/uninitialized
-            value: "true"
-            effect: NoSchedule
-          - key: node-role.kubernetes.io/master
-            effect: NoSchedule
-          - key: node.kubernetes.io/not-ready
-            effect: NoSchedule
-            operator: Exists
-          containers:
-          - name: vsphere-cloud-controller-manager
-            image: <image_registry>/acp/cloud-provider-vsphere:<cpi_image_tag>
-            args:
-            - --v=2
-            - --cloud-provider=vsphere
-            - --cloud-config=/etc/cloud/vsphere.conf
-            volumeMounts:
-            - mountPath: /etc/cloud
-              name: vsphere-config-volume
-              readOnly: true
-            resources:
-              requests:
-                cpu: 200m
-          volumes:
-          - name: vsphere-config-volume
-            configMap:
-              name: cloud-config
-    ---
-    apiVersion: v1
-    kind: Service
-    metadata:
-      labels:
-        component: cloud-controller-manager
-      name: vsphere-cloud-controller-manager
-      namespace: kube-system
-    spec:
-      type: NodePort
-      ports:
-      - port: 43001
-        protocol: TCP
-        targetPort: 43001
-      selector:
-        component: cloud-controller-manager
----
-apiVersion: addons.cluster.x-k8s.io/v1beta1
-kind: ClusterResourceSet
-metadata:
-  name: <cluster_name>-vsphere-cpi
-  namespace: <namespace>
-spec:
-  strategy: Reconcile
-  clusterSelector:
-    matchLabels:
-      addons.cluster.x-k8s.io/vsphere-cpi: "enabled"
-  resources:
-  - name: <cluster_name>-vsphere-cpi-config
-    kind: ConfigMap
-  - name: <cluster_name>-vsphere-cpi-secret
-    kind: Secret
-  - name: <cluster_name>-vsphere-cpi-manifests
-    kind: ConfigMap
-```
-
-Create the CPI credential Secret. It wraps the `vsphere-cloud-secret` that the vSphere CPI reads on the workload cluster, so its payload carries the vCenter password. Author the payload with an editor, for the reason given earlier on this page, and keep it outside `capv-cluster/` so it is not mistaken for a manifest:
-
-```text title="vsphere-cpi-secret-payload.txt"
-apiVersion: v1
-kind: Secret
-metadata:
-  name: vsphere-cloud-secret
-  namespace: kube-system
-type: Opaque
-stringData:
-  <vsphere_server>.username: <vsphere_username>
-  <vsphere_server>.password: <vsphere_password>
-```
-
-Restrict the file, create the Secret from it, then remove it:
-
-```bash
-chmod 600 ../vsphere-cpi-secret-payload.txt
-
-CLUSTER_NAME="<cluster_name>"
-
-kubectl create secret generic "${CLUSTER_NAME}-vsphere-cpi-secret" \
-  --namespace "${VSPHERE_NAMESPACE}" \
-  --type=addons.cluster.x-k8s.io/resource-set \
-  --from-file=data=../vsphere-cpi-secret-payload.txt
-
-rm -f ../vsphere-cpi-secret-payload.txt
-```
-
-Use the same `<cluster_name>` as everywhere else on this page. `VSPHERE_NAMESPACE` was set when you created the vCenter credential; set it again if you are in a new shell. The Secret's only key must be `data`, which `--from-file=data=` produces.
-
-Then apply the manifest:
-
-```bash
-kubectl apply -f 15-vsphere-cpi-clusterresourceset.yaml
-```
-
-### Create the machine config pools \{#create-the-machine-config-pools}
-
-Create the control plane machine config pool.
-
-<Directive type="info">
-Each node slot declares its NIC layout under `network.primary` (required) and `network.additional` (optional list). The primary NIC's `networkName` is required, and the provider derives the Kubernetes node name, the kubelet serving certificate DNS SAN, and the kubelet `node-ip` from `hostname` and the resolved primary NIC addresses. The `hostname` must be a valid DNS-1123 subdomain.
-</Directive>
-
-<Directive type="info">
-`deviceName` is optional. If you do not need to force the guest NIC name, remove the `deviceName` line from every node slot. The provider assigns NIC names such as `eth0`, `eth1` by NIC order.
-</Directive>
-
-<Directive type="warning">
-The `dns` entries in `VSphereMachineConfigPool` are kept in the static network configuration, but they might not update the guest operating system's `/etc/resolv.conf` reliably in affected VMware deployments. The control plane and worker bootstrap manifests below therefore also write `/etc/resolv.conf` explicitly through kubeadm `files`.
-</Directive>
-
-<Directive type="warning" title="Slot validation rules">
-The provider validates the following:
-
-- `spec.configs` declares at least one slot, and every slot declares `network` with a non-empty `network.primary.networkName`.
-- Every disk declares a `sizeGiB` of `1` or more.
-- A persistent disk's `unitNumber`, when set, is between `0` and `15` and is **never `7`**, which is reserved for the SCSI controller.
-- Disk names and mount paths are unique across `persistentDisks` and `ephemeralDisks` within a slot.
-- Hostnames and primary IP addresses are unique within the pool **and** across every other pool bound to the same `Cluster` in the namespace.
-</Directive>
-
-<Directive type="warning" title="Allocated slot restrictions">
-Once a slot's `status.configStatuses[].state` is `InUse` or `Released`, you cannot remove the slot, change its `network.primary.ip` or `.ipv6`, remove a disk from `persistentDisks[]`, or change a persistent disk's `sizeGiB` or `mountPath`.
-
-Do not add a disk to a slot that is `InUse` or `Released`: the provider cannot attach it to the running node and reports errors for that node, and an added persistent disk cannot be removed again until the node is replaced. Plan all disks of a slot before the first Machine takes it.
-
-Plan hostnames and addresses before the first Machine allocates the slot. For scale-out and runtime changes, see [Manage Nodes on VMware vSphere](../../../configure/nodes/alauda_os/vmware-vsphere.mdx).
-</Directive>
-
-```yaml title="16-vspheremachineconfigpool-control-plane.yaml"
-apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: VSphereMachineConfigPool
-metadata:
-  name: <cluster_name>-cp-pool
-  namespace: <namespace>
-spec:
-  clusterRef:
-    apiVersion: cluster.x-k8s.io/v1beta1
-    kind: Cluster
-    name: <cluster_name>
-  datacenter: "<default_datacenter>"
-  releaseDelayHours: <release_delay_hours>
-  configs:
-  - hostname: "<cp_node_name_1>"
-    datacenter: "<master_01_datacenter>"
+ACP CLI (ac) renders the Cluster API, vSphere, and CPI objects from one `install-config.yaml`, applies them to the `global` cluster, and reports the creation stages. Every object lives in the `cpaas-system` namespace of the `global` cluster. For how the provider objects fit together, see [How It Works](./overview.mdx#how-it-works).
+
+## Prerequisites \{#prerequisites}
+
+- You meet the [VMware vSphere prerequisites](./prerequisites.mdx).
+- `ac` is logged in to the platform as a platform administrator (`ac login https://<platform-address>`).
+- You work against the primary `global` cluster, not a disaster recovery standby; see [Standby Management Clusters](./reference/install_provider.mdx#standby-management-cluster).
+
+## Procedure
+
+### 1. Write `install-config.yaml` \{#write-install-config}
+
+Create an installation directory for the cluster and write `install-config.yaml` in it. `ac` writes `manifests/` and `logs/ac.log` next to it. The template holds the required fields. The optional fields, such as the Self-built VIP, a second NIC, and data disks, are in [Parameters](./reference/install-config-parameters.mdx#optional-fields).
+
+```yaml title="install-config.yaml"
+cluster:
+  clusterName: <cluster-name> # [!code callout]
+  sshKeys: # [!code callout]
+    - <ssh-public-key>
+  network:
+    loadBalancer:
+      type: external # [!code callout]
+      address: <control-plane-endpoint> # [!code callout]
+      port: 6443
+
+credentialRef: # [!code callout]
+  name: <cluster-name>-credential
+  namespace: cpaas-system
+
+provider:
+  vsphere:
+    server: <vcenter-address> # [!code callout]
+    datacenter: <datacenter> # [!code callout]
+    template: <template-name-or-path> # [!code callout]
+    datastore: <datastore> # [!code callout]
+    computeResource: <cluster-or-host> # [!code callout]
+    releaseDelayHours: 24 # [!code callout]
     network:
-      primary:
-        networkName: "<nic1_network_name>"
-        deviceName: "<nic1_device_name>"
-        ip: "<master_01_nic1_ip>/<nic1_prefix>"
-        gateway: "<nic1_gateway>"
-        dns:
-        - "<nic1_dns_1>"
-    persistentDisks:
-    - name: var-cpaas
-      sizeGiB: <cp_var_cpaas_size_gib>
-      mountPath: /var/cpaas
-      fsFormat: ext4
-    ephemeralDisks:
-    - name: var-lib-kubelet
-      sizeGiB: <cp_var_lib_kubelet_size_gib>
-      mountPath: /var/lib/kubelet
-      fsFormat: ext4
-    - name: var-lib-containerd
-      sizeGiB: <cp_var_lib_containerd_size_gib>
-      mountPath: /var/lib/containerd
-      fsFormat: ext4
-    - name: var-lib-etcd
-      sizeGiB: <cp_var_lib_etcd_size_gib>
-      mountPath: /var/lib/etcd
-      fsFormat: ext4
-  - hostname: "<cp_node_name_2>"
-    datacenter: "<master_02_datacenter>"
+      name: <portgroup-name> # [!code callout]
+
+controlPlane:
+  replicas: 3 # [!code callout]
+  network:
+    gateway: <cp-gateway> # [!code callout]
+    dns: [<dns-ip>] # [!code callout]
+    mask: <prefix-length> # [!code callout]
+  disks:
+    ephemeral: # [!code callout]
+      - name: var-lib-containerd
+        sizeGiB: 100
+      - name: var-lib-kubelet
+        sizeGiB: 100
+      - name: var-lib-etcd # [!code callout]
+        sizeGiB: 20
+    persistent: # [!code callout]
+      - name: var-cpaas
+        sizeGiB: 100
+  hosts: # [!code callout]
+    - hostname: <cp-0-hostname>
+      ip: <cp-0-ip>
+    - hostname: <cp-1-hostname>
+      ip: <cp-1-ip>
+    - hostname: <cp-2-hostname>
+      ip: <cp-2-ip>
+
+computes: # [!code callout]
+  - name: worker
+    replicas: 3
     network:
-      primary:
-        networkName: "<nic1_network_name>"
-        deviceName: "<nic1_device_name>"
-        ip: "<master_02_nic1_ip>/<nic1_prefix>"
-        gateway: "<nic1_gateway>"
-        dns:
-        - "<nic1_dns_1>"
-    persistentDisks:
-    - name: var-cpaas
-      sizeGiB: <cp_var_cpaas_size_gib>
-      mountPath: /var/cpaas
-      fsFormat: ext4
-    ephemeralDisks:
-    - name: var-lib-kubelet
-      sizeGiB: <cp_var_lib_kubelet_size_gib>
-      mountPath: /var/lib/kubelet
-      fsFormat: ext4
-    - name: var-lib-containerd
-      sizeGiB: <cp_var_lib_containerd_size_gib>
-      mountPath: /var/lib/containerd
-      fsFormat: ext4
-    - name: var-lib-etcd
-      sizeGiB: <cp_var_lib_etcd_size_gib>
-      mountPath: /var/lib/etcd
-      fsFormat: ext4
-  - hostname: "<cp_node_name_3>"
-    datacenter: "<master_03_datacenter>"
-    network:
-      primary:
-        networkName: "<nic1_network_name>"
-        deviceName: "<nic1_device_name>"
-        ip: "<master_03_nic1_ip>/<nic1_prefix>"
-        gateway: "<nic1_gateway>"
-        dns:
-        - "<nic1_dns_1>"
-    persistentDisks:
-    - name: var-cpaas
-      sizeGiB: <cp_var_cpaas_size_gib>
-      mountPath: /var/cpaas
-      fsFormat: ext4
-    ephemeralDisks:
-    - name: var-lib-kubelet
-      sizeGiB: <cp_var_lib_kubelet_size_gib>
-      mountPath: /var/lib/kubelet
-      fsFormat: ext4
-    - name: var-lib-containerd
-      sizeGiB: <cp_var_lib_containerd_size_gib>
-      mountPath: /var/lib/containerd
-      fsFormat: ext4
-    - name: var-lib-etcd
-      sizeGiB: <cp_var_lib_etcd_size_gib>
-      mountPath: /var/lib/etcd
-      fsFormat: ext4
+      gateway: <worker-gateway>
+      dns: [<dns-ip>]
+      mask: <prefix-length>
+    disks:
+      ephemeral: # [!code callout]
+        - name: var-lib-containerd
+          sizeGiB: 100
+        - name: var-lib-kubelet
+          sizeGiB: 100
+      persistent:
+        - name: var-cpaas
+          sizeGiB: 100
+    hosts:
+      - hostname: <worker-0-hostname>
+        ip: <worker-0-ip>
+      - hostname: <worker-1-hostname>
+        ip: <worker-1-ip>
+      - hostname: <worker-2-hostname>
+        ip: <worker-2-ip>
 ```
 
-Create the worker machine config pool.
 
-```yaml title="17-vspheremachineconfigpool-worker.yaml"
-apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: VSphereMachineConfigPool
-metadata:
-  name: <cluster_name>-worker-pool
-  namespace: <namespace>
-spec:
-  clusterRef:
-    apiVersion: cluster.x-k8s.io/v1beta1
-    kind: Cluster
-    name: <cluster_name>
-  datacenter: "<default_datacenter>"
-  releaseDelayHours: <release_delay_hours>
-  configs:
-  - hostname: "<worker_node_name_1>"
-    datacenter: "<worker_01_datacenter>"
-    network:
-      primary:
-        networkName: "<nic1_network_name>"
-        deviceName: "<nic1_device_name>"
-        ip: "<worker_01_nic1_ip>/<nic1_prefix>"
-        gateway: "<nic1_gateway>"
-        dns:
-        - "<nic1_dns_1>"
-    persistentDisks:
-    - name: var-cpaas
-      sizeGiB: <worker_var_cpaas_size_gib>
-      mountPath: /var/cpaas
-      fsFormat: ext4
-    ephemeralDisks:
-    - name: var-lib-kubelet
-      sizeGiB: <worker_var_lib_kubelet_size_gib>
-      mountPath: /var/lib/kubelet
-      fsFormat: ext4
-    - name: var-lib-containerd
-      sizeGiB: <worker_var_lib_containerd_size_gib>
-      mountPath: /var/lib/containerd
-      fsFormat: ext4
-```
+<Callouts>
 
-Apply both manifests:
+1. `clusterName`: required. It must not be `global` or start with `global-`.
+2. `sshKeys`: required. The SSH public keys installed on every node.
+3. `type`: `external`, the default, or `internal`. It cannot be changed later. `internal` also needs `vrid`; see [Optional Fields](./reference/install-config-parameters.mdx#optional-fields).
+4. `address`: required. The control plane endpoint, an IPv4 address.
+5. `credentialRef`: required. The credential Secret.
+6. `server`: required. The vCenter address.
+7. `datacenter`: required. The datacenter name. Use an inventory path, such as `/folder/dc`, only when you do not set `computeResource`.
+8. `template`: required. The VM template every node is cloned from.
+9. `datastore`: required.
+10. `computeResource`: the name of the DRS cluster or host, not a path. Set it when the datacenter has more than one.
+11. `releaseDelayHours`: how long a released slot keeps its persistent disks before the provider deletes them.
+12. `network.name`: required. The port group of the primary NIC.
+13. `replicas`: an odd number, `1` or `3` or more. With fewer than three control plane nodes, contact technical support before you upgrade the cluster.
+14. `gateway`: required.
+15. `dns`: required.
+16. `mask`: required. A prefix length from 1 to 32.
+17. `ephemeral`: disks recreated with the VM.
+18. `var-lib-etcd`: control plane only.
+19. `persistent`: disks kept when the VM is replaced.
+20. `hosts`: required. At least `replicas` entries.
+21. `computes`: optional.
+22. Workers have no `var-lib-etcd`.
+
+</Callouts>
+
+### 2. Create the Cluster \{#create-with-ac}
+
+Run the following command from a machine where `ac` is logged in to the platform:
 
 ```bash
-kubectl apply -f 16-vspheremachineconfigpool-control-plane.yaml
-kubectl apply -f 17-vspheremachineconfigpool-worker.yaml
+ac config use-cluster global
+ac adm alpha cluster create --dir <install-dir> --provider vsphere
 ```
 
-Verify the pool binding and slot state before you create Machines:
+`ac` first checks the provider CRDs on the `global` cluster, the credential and the vCenter sign-in, the vCenter objects named in `install-config.yaml`, and the registry. If a check fails, nothing is changed and the error names the item.
+
+`create` returns once the objects are applied, and the cluster keeps building. Add `--wait` to wait until all stages are ready; `--timeout` (default `2h`) limits only the wait. To render without applying, run `ac adm alpha cluster manifests` with the same flags.
+
+### 3. Monitor the Creation \{#monitor-creation}
 
 ```bash
-kubectl -n <namespace> get vspheremachineconfigpool
-kubectl -n <namespace> get vspheremachineconfigpool <cluster_name>-cp-pool \
-  -o jsonpath='{range .status.conditions[*]}{.type}={.status} ({.reason}){"\n"}{end}'
-kubectl -n <namespace> get vspheremachineconfigpool <cluster_name>-cp-pool -o yaml
-kubectl -n <namespace> get vspheremachineconfigpool <cluster_name>-worker-pool -o yaml
+ac config use-cluster global
+ac adm alpha cluster status --cluster <cluster-name>                      # prints the four stages once
+ac adm alpha cluster wait-for install-complete --cluster <cluster-name>   # waits until all four are ready
 ```
 
-The list output carries `TOTAL`, `AVAILABLE`, and `ALLOCATED` columns, taken from `status.total`, `status.available`, and `status.allocated`. Before you create Machines, expect `ClusterRefReady=True`, `VCenterAvailable=True`, `MembersValid=True`, `MembersUnique=True`, and `Ready=True`.
+Continue when all four stages are ready; otherwise see [Troubleshooting](./troubleshooting.mdx).
 
-`SlotAvailable` is deliberately not part of the `Ready` summary. A pool whose slots are all allocated still reports `Ready=True` with `SlotAvailable=False`, and that combination is normal during a `maxSurge: 0` rollout rather than a contradiction.
+### 4. Verify the Cluster \{#verify-the-cluster}
 
-The pool is also the authority for persistent-disk replacement state. When a VM is replaced, its slot changes from `InUse` to `Released`; a replacement Machine that references the same existing pool can reuse that slot and its VMDKs immediately. `releaseDelayHours` controls reclaim when the slot remains unused; it is not a reuse delay.
-
-Do not create a new pool name as a routine retry for Machine replacement. A different `VSphereMachineConfigPool.metadata.name` creates independent slots and VMDKs, so repeated teardown and redeployment can temporarily consume multiple complete disk sets. Before another deployment on a capacity-constrained datastore, wait for earlier pools and their VMDKs to finish provider-managed deletion. See [Persistent disk lifecycle](./infrastructure.mdx#persistent-disk-lifecycle) for the teardown checks. The live signal is `status.persistentDiskStatuses[].phase`, whose values are `Creating`, `Attached`, `Available`, `Reclaiming`, `Reclaimed`, and `Error`. The `status.configStatuses[].reclaimStatus` subtree and the `spec.configs[].persistentDisks[].volumePath` and `.diskUUID` fields are deprecated, frozen, and scheduled for removal.
-
-### Apply the optional failure-domain objects
-
-Skip this step for the baseline single-datacenter topology.
-
-If failure domains are enabled, complete [Multiple datacenters and failure domains](#multiple-datacenters-and-failure-domains), then apply the failure-domain objects before creating the control plane:
+Run the following commands from a machine where `ac` is logged in to the platform:
 
 ```bash
-kubectl apply -f 18-failure-domains.yaml
-kubectl get vspherefailuredomain,vspheredeploymentzone
+ac config sync
+ac config use-cluster <cluster-name>
+ac get nodes
+ac config use-cluster global
 ```
 
-Verify that every `VSphereFailureDomain` and `VSphereDeploymentZone` referenced by the cluster exists. Do not proceed until the deployment zones are available. Treat the following as one configuration set:
+Continue when every node is `Ready`; otherwise see [Troubleshooting](./troubleshooting.mdx).
 
-- The `VSphereFailureDomain` and `VSphereDeploymentZone` objects in `18-failure-domains.yaml`
-- `VSphereCluster.spec.failureDomainSelector` in `10-cluster.yaml`
-- The CPI `[Labels]` block in `15-vsphere-cpi-clusterresourceset.yaml`
-
-Do not add `failureDomainSelector` or the CPI `[Labels]` block to the baseline manifests when failure domains are not enabled.
-
-### Create the control plane objects
-
-Create the `VSphereMachineTemplate` and `KubeadmControlPlane` objects. Replace the placeholders in the following full template with the values collected in the checklist document.
-
-<Directive type="warning" title="Kubernetes 1.35 kubelet settings">
-The baseline control-plane and worker manifests omit `imagePullCredentialsVerificationPolicy` and are valid for Kubernetes 1.34 or earlier.
-
-For Kubernetes 1.35 or later, add the following field to the `KubeletConfiguration` JSON in both `20-control-plane.yaml` and `30-workers-md-0.yaml` before applying either manifest:
-
-```json
-"imagePullCredentialsVerificationPolicy": "NeverVerify",
-```
-</Directive>
-
-`cloneMode` and `diskGiB` both remain present in the template because CAPV accepts both fields. In practice, `diskGiB` only affects the system disk when the actual clone operation is `fullClone`. If `cloneMode` is `linkedClone` and the template has a usable snapshot, CAPV completes a linked clone and the system disk size remains equal to the source template. If no usable snapshot exists, CAPV falls back to `fullClone`, and `diskGiB` applies again.
-
-<Directive type="warning" title="System disk and persistent disks are separate">
-`VSphereMachineTemplate.spec.template.spec.diskGiB` sets only the VM system disk size. It is not the total capacity of all disks on the node.
-
-Data disks are declared separately under `VSphereMachineConfigPool.spec.configs[].persistentDisks[]` and `.ephemeralDisks[]`. Do not add the data disk sizes to `diskGiB`; otherwise the VM can receive a larger system disk plus the separate data disks, which doubles the intended capacity.
-
-For `fullClone`, `diskGiB` must be greater than or equal to the system disk size in the OS image template. For `linkedClone`, the system disk remains at the template size and `diskGiB` is ignored.
-</Directive>
-
-```yaml title="20-control-plane.yaml"
-apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: VSphereMachineTemplate
-metadata:
-  name: <cluster_name>-control-plane
-  namespace: <namespace>
-spec:
-  template:
-    spec:
-      server: "<vsphere_server>"
-      template: "<template_name>"
-      cloneMode: <clone_mode>
-      folder: "<vm_folder>"
-      datastore: "<cp_system_datastore>"
-      diskGiB: <cp_system_disk_gib>
-      memoryMiB: <cp_memory_mib>
-      numCPUs: <cp_num_cpus>
-      os: Linux
-      powerOffMode: <power_off_mode>
-      network:
-        devices:
-        - networkName: "<nic1_network_name>"
-      machineConfigPoolRef:
-        apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-        kind: VSphereMachineConfigPool
-        name: <cluster_name>-cp-pool
-        namespace: <namespace>
----
-apiVersion: controlplane.cluster.x-k8s.io/v1beta1
-kind: KubeadmControlPlane
-metadata:
-  name: <cluster_name>-kcp
-  namespace: <namespace>
-spec:
-  rolloutStrategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 0
-  version: "<k8s_version>"
-  replicas: <cp_replicas>
-  machineTemplate:
-    nodeDrainTimeout: 1m
-    nodeDeletionTimeout: 5m
-    metadata:
-      labels:
-        node-role.kubernetes.io/control-plane: ""
-    infrastructureRef:
-      apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-      kind: VSphereMachineTemplate
-      name: <cluster_name>-control-plane
-  kubeadmConfigSpec:
-    users:
-    - name: boot
-      sudo: ALL=(ALL) NOPASSWD:ALL
-      sshAuthorizedKeys:
-      - "<ssh_public_key>"
-    files:
-    - path: /etc/resolv.conf
-      owner: "root:root"
-      append: false
-      permissions: "0644"
-      content: |
-        nameserver <nic1_dns_1>
-    - path: /etc/kubernetes/admission/psa-config.yaml
-      owner: "root:root"
-      permissions: "0644"
-      content: |
-        apiVersion: apiserver.config.k8s.io/v1
-        kind: AdmissionConfiguration
-        plugins:
-        - name: PodSecurity
-          configuration:
-            apiVersion: pod-security.admission.config.k8s.io/v1
-            kind: PodSecurityConfiguration
-            defaults:
-              enforce: "privileged"
-              enforce-version: "latest"
-              audit: "baseline"
-              audit-version: "latest"
-              warn: "baseline"
-              warn-version: "latest"
-            exemptions:
-              usernames: []
-              runtimeClasses: []
-              namespaces:
-              - kube-system
-              - <namespace>
-    - path: /etc/kubernetes/patches/kubeletconfiguration0+strategic.json
-      owner: "root:root"
-      permissions: "0644"
-      content: |
-        {
-          "apiVersion": "kubelet.config.k8s.io/v1beta1",
-          "kind": "KubeletConfiguration",
-          "protectKernelDefaults": true,
-          "streamingConnectionIdleTimeout": "5m",
-          "tlsCertFile": "/etc/kubernetes/pki/kubelet.crt",
-          "tlsPrivateKeyFile": "/etc/kubernetes/pki/kubelet.key"
-        }
-    # Generate the encryption key with: head -c 32 /dev/urandom | base64
-    - path: /etc/kubernetes/encryption-provider.conf
-      owner: "root:root"
-      append: false
-      permissions: "0644"
-      content: |
-        apiVersion: apiserver.config.k8s.io/v1
-        kind: EncryptionConfiguration
-        resources:
-        - resources:
-          - secrets
-          providers:
-          - aescbc:
-              keys:
-              - name: key1
-                secret: <encryption_provider_secret>
-    - path: /etc/kubernetes/audit/policy.yaml
-      owner: "root:root"
-      append: false
-      permissions: "0644"
-      content: |
-        apiVersion: audit.k8s.io/v1
-        kind: Policy
-        omitStages:
-        - "RequestReceived"
-        rules:
-        - level: None
-          users:
-          - system:kube-controller-manager
-          - system:kube-scheduler
-          - system:serviceaccount:kube-system:endpoint-controller
-          verbs: ["get", "update"]
-          namespaces: ["kube-system"]
-          resources:
-          - group: ""
-            resources: ["endpoints"]
-        - level: None
-          nonResourceURLs:
-          - /healthz*
-          - /version
-          - /swagger*
-        - level: None
-          resources:
-          - group: ""
-            resources: ["events"]
-        - level: None
-          resources:
-          - group: "devops.alauda.io"
-        - level: None
-          verbs: ["get", "list", "watch"]
-        - level: None
-          resources:
-          - group: "coordination.k8s.io"
-            resources: ["leases"]
-        - level: None
-          resources:
-          - group: "authorization.k8s.io"
-            resources: ["subjectaccessreviews", "selfsubjectaccessreviews"]
-          - group: "authentication.k8s.io"
-            resources: ["tokenreviews"]
-        - level: None
-          resources:
-          - group: "app.alauda.io"
-            resources: ["imagewhitelists"]
-          - group: "k8s.io"
-            resources: ["namespaceoverviews"]
-        - level: Metadata
-          resources:
-          - group: ""
-            resources: ["secrets", "configmaps"]
-        - level: Metadata
-          resources:
-          - group: "operator.connectors.alauda.io"
-            resources: ["installmanifests"]
-          - group: "operators.katanomi.dev"
-            resources: ["katanomis"]
-        - level: RequestResponse
-          resources:
-          - group: ""
-          - group: "aiops.alauda.io"
-          - group: "apps"
-          - group: "app.k8s.io"
-          - group: "authentication.istio.io"
-          - group: "auth.alauda.io"
-          - group: "autoscaling"
-          - group: "asm.alauda.io"
-          - group: "clusterregistry.k8s.io"
-          - group: "crd.alauda.io"
-          - group: "infrastructure.alauda.io"
-          - group: "monitoring.coreos.com"
-          - group: "operators.coreos.com"
-          - group: "networking.istio.io"
-          - group: "extensions.istio.io"
-          - group: "install.istio.io"
-          - group: "security.istio.io"
-          - group: "telemetry.istio.io"
-          - group: "opentelemetry.io"
-          - group: "networking.k8s.io"
-          - group: "portal.alauda.io"
-          - group: "rbac.authorization.k8s.io"
-          - group: "storage.k8s.io"
-          - group: "tke.cloud.tencent.com"
-          - group: "devopsx.alauda.io"
-          - group: "core.katanomi.dev"
-          - group: "deliveries.katanomi.dev"
-          - group: "integrations.katanomi.dev"
-          - group: "artifacts.katanomi.dev"
-          - group: "builds.katanomi.dev"
-          - group: "versioning.katanomi.dev"
-          - group: "sources.katanomi.dev"
-          - group: "tekton.dev"
-          - group: "operator.tekton.dev"
-          - group: "eventing.knative.dev"
-          - group: "flows.knative.dev"
-          - group: "messaging.knative.dev"
-          - group: "operator.knative.dev"
-          - group: "sources.knative.dev"
-          - group: "operator.devops.alauda.io"
-          - group: "flagger.app"
-          - group: "jaegertracing.io"
-          - group: "velero.io"
-            resources: ["deletebackuprequests"]
-          - group: "connectors.alauda.io"
-          - group: "operator.connectors.alauda.io"
-            resources: ["connectorscores", "connectorsgits", "connectorsocis"]
-        - level: Metadata
-    - path: /usr/local/bin/capv-load-local-images.sh
-      owner: "root:root"
-      permissions: "0755"
-      content: |
-        #!/bin/bash
-        set -euo pipefail
-        until mountpoint -q /var/lib/containerd; do
-          echo "waiting for /var/lib/containerd mount"
-          sleep 1
-        done
-        systemctl restart containerd
-        until systemctl is-active --quiet containerd; do
-          echo "waiting for containerd"
-          sleep 1
-        done
-        if [ ! -d "/root/images" ]; then
-          echo "ERROR: /root/images directory not found" >&2
-          exit 1
-        fi
-        image_count=0
-        for image_file in /root/images/*.tar; do
-          if [ -f "$image_file" ]; then
-            echo "importing image: $image_file"
-            ctr -n k8s.io images import "$image_file"
-            image_count=$((image_count + 1))
-          fi
-        done
-        if [ "$image_count" -eq 0 ]; then
-          echo "ERROR: no tar files found in /root/images" >&2
-          exit 1
-        fi
-        echo "imported $image_count images"
-    preKubeadmCommands:
-    - hostnamectl set-hostname "{{ ds.meta_data.hostname }}"
-    - echo "::1         ipv6-localhost ipv6-loopback localhost6 localhost6.localdomain6" >/etc/hosts
-    - echo "127.0.0.1   {{ ds.meta_data.hostname }} {{ local_hostname }} localhost localhost.localdomain localhost4 localhost4.localdomain4" >>/etc/hosts
-    - while ! ip route | grep -q "default via"; do sleep 1; done; echo "NetworkManager started"
-    - /usr/local/bin/capv-load-local-images.sh
-    postKubeadmCommands:
-    - chmod 600 /var/lib/kubelet/config.yaml
-    clusterConfiguration:
-      imageRepository: <image_registry>/tkestack
-      dns:
-        imageTag: <dns_image_tag>
-      etcd:
-        local:
-          imageTag: <etcd_image_tag>
-      apiServer:
-        extraArgs:
-          admission-control-config-file: /etc/kubernetes/admission/psa-config.yaml
-          audit-log-format: json
-          audit-log-maxage: "30"
-          audit-log-maxbackup: "10"
-          audit-log-maxsize: "200"
-          audit-log-mode: batch
-          audit-log-path: /etc/kubernetes/audit/audit.log
-          audit-policy-file: /etc/kubernetes/audit/policy.yaml
-          encryption-provider-config: /etc/kubernetes/encryption-provider.conf
-          kubelet-certificate-authority: /etc/kubernetes/pki/ca.crt
-          profiling: "false"
-          tls-cipher-suites: TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
-          tls-min-version: VersionTLS12
-        extraVolumes:
-        - hostPath: /etc/kubernetes
-          mountPath: /etc/kubernetes
-          name: vol-dir-0
-          pathType: Directory
-      controllerManager:
-        extraArgs:
-          bind-address: "::"
-          cloud-provider: external
-          flex-volume-plugin-dir: "/opt/libexec/kubernetes/kubelet-plugins/volume/exec/"
-          profiling: "false"
-          tls-min-version: VersionTLS12
-      scheduler:
-        extraArgs:
-          bind-address: "::"
-          profiling: "false"
-          tls-min-version: VersionTLS12
-    initConfiguration:
-      nodeRegistration:
-        criSocket: /var/run/containerd/containerd.sock
-        ignorePreflightErrors:
-        - ImagePull
-        kubeletExtraArgs:
-          cloud-provider: external
-          node-labels: kube-ovn/role=master
-          volume-plugin-dir: "/opt/libexec/kubernetes/kubelet-plugins/volume/exec/"
-        name: '{{ local_hostname }}'
-      patches:
-        directory: /etc/kubernetes/patches
-    joinConfiguration:
-      nodeRegistration:
-        criSocket: /var/run/containerd/containerd.sock
-        ignorePreflightErrors:
-        - ImagePull
-        kubeletExtraArgs:
-          cloud-provider: external
-          node-labels: kube-ovn/role=master
-          volume-plugin-dir: "/opt/libexec/kubernetes/kubelet-plugins/volume/exec/"
-        name: '{{ local_hostname }}'
-      patches:
-        directory: /etc/kubernetes/patches
-```
-
-`rolloutStrategy.rollingUpdate.maxSurge: 0` and a `replicas` value of `3` or more are not stylistic choices. A `KubeadmControlPlane` whose infrastructure template sets `machineConfigPoolRef` requires both. See [Provider Requirements](#provider-requirements).
-
-Apply the manifest:
+#### CPI and Pools \{#verify-cpi-and-pools}
 
 ```bash
-kubectl apply -f 20-control-plane.yaml
+ac config use-cluster global
+ac -n cpaas-system get clusterresourceset,clusterresourcesetbinding
+ac -n cpaas-system get vspheremachineconfigpool
+ac config sync
+ac config use-cluster <cluster-name>
+ac -n kube-system get daemonset
+ac config use-cluster global
 ```
 
-### Create the worker objects \{#create-the-worker-objects}
+Continue when a `ClusterResourceSetBinding` exists for the cluster, `vsphere-cloud-controller-manager` is listed in `kube-system`, and each pool reports `Ready=True` with `ALLOCATED` equal to the number of its machines; otherwise see [Troubleshooting](./troubleshooting.mdx#common-causes).
 
-Create the worker machine template, bootstrap template, and `MachineDeployment`.
+#### Persistent Disks \{#verify-persistent-disks}
 
-The baseline worker kubelet patch omits the Kubernetes 1.35-only field. If the selected version is Kubernetes 1.35 or later, add `imagePullCredentialsVerificationPolicy: NeverVerify` here as well as in `20-control-plane.yaml`, as described in the control-plane step.
-
-```yaml title="30-workers-md-0.yaml"
-apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: VSphereMachineTemplate
-metadata:
-  name: <cluster_name>-worker
-  namespace: <namespace>
-spec:
-  template:
-    spec:
-      server: "<vsphere_server>"
-      template: "<template_name>"
-      cloneMode: <clone_mode>
-      folder: "<vm_folder>"
-      datastore: "<worker_system_datastore>"
-      diskGiB: <worker_system_disk_gib>
-      memoryMiB: <worker_memory_mib>
-      numCPUs: <worker_num_cpus>
-      os: Linux
-      powerOffMode: <power_off_mode>
-      network:
-        devices:
-        - networkName: "<nic1_network_name>"
-      machineConfigPoolRef:
-        apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-        kind: VSphereMachineConfigPool
-        name: <cluster_name>-worker-pool
-        namespace: <namespace>
----
-apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
-kind: KubeadmConfigTemplate
-metadata:
-  name: <cluster_name>-worker-bootstrap
-  namespace: <namespace>
-spec:
-  template:
-    spec:
-      files:
-      - path: /etc/resolv.conf
-        owner: "root:root"
-        append: false
-        permissions: "0644"
-        content: |
-          nameserver <nic1_dns_1>
-      - path: /etc/kubernetes/patches/kubeletconfiguration0+strategic.json
-        owner: "root:root"
-        permissions: "0644"
-        content: |
-          {
-            "apiVersion": "kubelet.config.k8s.io/v1beta1",
-            "kind": "KubeletConfiguration",
-            "protectKernelDefaults": true,
-            "staticPodPath": null,
-            "streamingConnectionIdleTimeout": "5m",
-            "tlsCertFile": "/etc/kubernetes/pki/kubelet.crt",
-            "tlsPrivateKeyFile": "/etc/kubernetes/pki/kubelet.key"
-          }
-      - path: /usr/local/bin/capv-load-local-images.sh
-        owner: "root:root"
-        permissions: "0755"
-        content: |
-          #!/bin/bash
-          set -euo pipefail
-          until mountpoint -q /var/lib/containerd; do
-            echo "waiting for /var/lib/containerd mount"
-            sleep 1
-          done
-          systemctl restart containerd
-          until systemctl is-active --quiet containerd; do
-            echo "waiting for containerd"
-            sleep 1
-          done
-          if [ ! -d "/root/images" ]; then
-            echo "ERROR: /root/images directory not found" >&2
-            exit 1
-          fi
-          image_count=0
-          for image_file in /root/images/*.tar; do
-            if [ -f "$image_file" ]; then
-              echo "importing image: $image_file"
-              ctr -n k8s.io images import "$image_file"
-              image_count=$((image_count + 1))
-            fi
-          done
-          if [ "$image_count" -eq 0 ]; then
-            echo "ERROR: no tar files found in /root/images" >&2
-            exit 1
-          fi
-          echo "imported $image_count images"
-      joinConfiguration:
-        nodeRegistration:
-          criSocket: /var/run/containerd/containerd.sock
-          ignorePreflightErrors:
-          - ImagePull
-          kubeletExtraArgs:
-            cloud-provider: external
-            volume-plugin-dir: "/opt/libexec/kubernetes/kubelet-plugins/volume/exec/"
-          name: '{{ local_hostname }}'
-        patches:
-          directory: /etc/kubernetes/patches
-      preKubeadmCommands:
-      - hostnamectl set-hostname "{{ ds.meta_data.hostname }}"
-      - echo "::1         ipv6-localhost ipv6-loopback localhost6 localhost6.localdomain6" >/etc/hosts
-      - echo "127.0.0.1   {{ ds.meta_data.hostname }} {{ local_hostname }} localhost localhost.localdomain localhost4 localhost4.localdomain4" >>/etc/hosts
-      - while ! ip route | grep -q "default via"; do sleep 1; done; echo "NetworkManager started"
-      - /usr/local/bin/capv-load-local-images.sh
-      postKubeadmCommands:
-      - chmod 600 /var/lib/kubelet/config.yaml
-      users:
-      - name: boot
-        sudo: ALL=(ALL) NOPASSWD:ALL
-        sshAuthorizedKeys:
-        - "<ssh_public_key>"
----
-apiVersion: cluster.x-k8s.io/v1beta1
-kind: MachineDeployment
-metadata:
-  name: <cluster_name>-md-0
-  namespace: <namespace>
-spec:
-  clusterName: <cluster_name>
-  replicas: <worker_replicas>
-  strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 0
-      maxUnavailable: 1
-  selector:
-    matchLabels:
-      nodepool: md-0
-  template:
-    metadata:
-      labels:
-        cluster.x-k8s.io/cluster-name: <cluster_name>
-        nodepool: md-0
-    spec:
-      clusterName: <cluster_name>
-      version: "<k8s_version>"
-      bootstrap:
-        configRef:
-          apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
-          kind: KubeadmConfigTemplate
-          name: <cluster_name>-worker-bootstrap
-      infrastructureRef:
-        apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-        kind: VSphereMachineTemplate
-        name: <cluster_name>-worker
-```
-
-`strategy.rollingUpdate.maxSurge: 0` is likewise required for a `MachineDeployment` whose infrastructure template sets `machineConfigPoolRef`. With the default `maxSurge` of `1`, a rollout needs an extra slot that a full pool does not have, and it stalls. The example uses `maxUnavailable: 1`.
-
-Apply the manifest:
+Run it for each pool, `<cluster-name>-control-plane` and `<cluster-name>-<group>`:
 
 ```bash
-kubectl apply -f 30-workers-md-0.yaml
+ac config use-cluster global
+ac -n cpaas-system get vspheremachineconfigpool <pool-name> \
+  -o jsonpath='{range .status.persistentDiskStatuses[*]}{.hostname}{" "}{.name}{" "}{.phase}{"\n"}{end}'
 ```
 
-In the baseline workflow, note the following worker-specific rules:
+Continue when every persistent disk of an allocated slot reports `Attached`; otherwise see [Troubleshooting](./troubleshooting.mdx#common-causes).
 
-- `failureDomain` is not set by default in the main worker manifest because the baseline workflow assumes a single datacenter. If you need a worker `MachineDeployment` to land in a specific `VSphereDeploymentZone`, add `failureDomain` as described in [Multiple datacenters and failure domains](#multiple-datacenters-and-failure-domains).
-- Some environments add extra runtime-image replacement commands or service-restart commands to `KubeadmConfigTemplate`. Those commands are intentionally not included in the baseline sample. Add them only when the platform requirements in your environment explicitly require them.
+#### Optional Topology \{#verify-creation-time-variants}
 
-### Wait for the cluster to become ready
-
-After all manifests are applied, the cluster creation is asynchronous. Monitor the progress with:
+**Applies to**: node groups with `network.additions` or `rawDisks`. Skip it when you use neither.
 
 ```bash
-kubectl -n <namespace> get cluster,kubeadmcontrolplane,machinedeployment,machine -w
+ac config use-cluster global
+ac -n cpaas-system get vspheremachineconfigpool <pool-name> -o yaml
 ```
 
-Wait until `KubeadmControlPlane` reports the expected number of ready replicas and all `Machine` objects reach the `Running` phase before proceeding to verification.
-
-</Steps>
-
-## Verification
-
-Use the following commands to verify the cluster creation workflow.
-
-1. Check the CPI delivery resources in the `global` cluster:
-   ```bash
-   kubectl -n <namespace> get clusterresourceset
-   kubectl -n <namespace> get clusterresourcesetbinding
-   ```
-2. Export the workload kubeconfig:
-   ```bash
-   kubectl -n <namespace> get secret <cluster_name>-kubeconfig -o jsonpath='{.data.value}' | base64 -d > /tmp/<cluster_name>.kubeconfig
-   ```
-3. Check whether the vSphere CPI daemonset is created in the workload cluster:
-   ```bash
-   kubectl --kubeconfig=/tmp/<cluster_name>.kubeconfig -n kube-system get daemonset
-   ```
-4. Check the `global` cluster objects:
-   ```bash
-   kubectl -n <namespace> get cluster,vspherecluster,kubeadmcontrolplane,machinedeployment,machine,vspheremachine,vspherevm
-   ```
-5. Check the workload nodes:
-   ```bash
-   kubectl --kubeconfig=/tmp/<cluster_name>.kubeconfig get nodes -o wide
-   ```
-6. Check the pool slot counters and the per-disk state of both lists:
-   ```bash
-   kubectl -n <namespace> get vspheremachineconfigpool
-   kubectl -n <namespace> get vspheremachineconfigpool <cluster_name>-cp-pool \
-     -o jsonpath='{range .status.persistentDiskStatuses[*]}{.hostname}{" "}{.name}{" "}{.phase}{" unit="}{.unitNumber}{"\n"}{end}'
-   kubectl -n <namespace> get vspheremachineconfigpool <cluster_name>-cp-pool \
-     -o jsonpath='{range .status.ephemeralDiskStatuses[*]}{.hostname}{" "}{.name}{" unit="}{.unitNumber}{"\n"}{end}'
-   ```
-
-Confirm the following results:
-
-- `vsphere-cloud-controller-manager` appears in the workload cluster.
-- Control plane and worker nodes are created.
-- The nodes eventually become `Ready`.
-- Each pool reports `Ready=True`, and its `ALLOCATED` count equals the number of running Machines drawn from that pool.
-- Every persistent disk on an allocated slot reports `phase: Attached`.
-- Every ephemeral disk on an allocated slot appears in `status.ephemeralDiskStatuses[]` with an assigned unit number. Ephemeral disks carry no phase; they are created with the VM.
-
-## Troubleshooting \{#troubleshooting}
-
-Use the following commands first when the workflow fails:
+On a node of that group:
 
 ```bash
-kubectl -n <namespace> describe cluster <cluster_name>
-kubectl -n <namespace> describe vspherecluster <cluster_name>
-kubectl -n <namespace> describe kubeadmcontrolplane <cluster_name>-kcp
-kubectl -n <namespace> describe machinedeployment <cluster_name>-md-0
-kubectl -n <namespace> get cluster,vspherecluster,kubeadmcontrolplane,machinedeployment,machine,vspheremachine,vspherevm
-kubectl -n cpaas-system logs deploy/capi-controller-manager
+ls -l /dev/disk/by-capv/
 ```
 
-Prioritize the following checks:
+Continue when each slot lists the declared additional NICs and disks, and every raw disk appears in `/dev/disk/by-capv/`; otherwise contact technical support.
 
-- If the CPI resources are not delivered, verify `ClusterResourceSet=true`, `ClusterResourceSet`, and `ClusterResourceSetBinding`.
-- If `ClusterResourceSet` exists but no `ClusterResourceSetBinding` is created, check whether the controller has the required delete permission on the referenced `ConfigMap` and `Secret` resources.
-- If the network plugin is not installed, verify that the required cluster annotations are present and that the platform controllers processed them.
-- If the `cpaas.io/registry-address` annotation is missing or incorrect, verify that it is set to the permanent `<registry_address>` without a scheme or `/v2/`. Then verify the credential that backs it: `public-registry-credential` when the cluster inherits the registry of the `global` cluster, or the Secret named by `cpaas.io/registry-reference` when the cluster uses a dedicated registry.
-- If a machine is stuck in `Provisioning`, check `VSphereMachine` conditions for `MachineConfigPoolReady` — it shows whether slot allocation failed due to pool binding or datacenter mismatch. Then read the pool's own conditions: `MembersValid`, `MembersUnique`, `PersistentDisksReady`, `ClusterRefReady`, and `VCenterAvailable`.
-- If a machine never bootstraps, check the `BootstrapReady` condition on `VSphereVM` and `VSphereMachine`. The reason `BootstrapSecretGetFailed` means the bootstrap Secret is missing or unreadable; `BootstrapSecretContentInvalid` means it exists but cannot be used. Inspect the `KubeadmConfig` for that Machine and its bootstrap data Secret before looking at vCenter.
-- If a node was powered off in vCenter and stays off, that is expected behavior. `VSphereVM` latches `InitialPowerOnCompleted=True` after its first successful power-on and never clears it; from then on a powered-off VM is treated as a deliberate out-of-band action and is not powered back on. `PoweredOn=False` propagates into `VSphereVM.Ready` and then into `VSphereMachine.Ready`, so reporting not-ready is correct. Power the VM on in vCenter to recover; a rollout is not required. A replacement VM created by a rollout has an unset latch, so its first boot is unaffected.
-- If `VSphereMachine` clears `Ready` without an obvious cause, note that `Ready` is cleared while the backing `VSphereVM`, its `providerID`, or its network information is unavailable, and that out-of-band power changes are now observed. Read the `VSphereVM` conditions before treating it as a controller fault.
-- If nothing reconciles at all and no condition changes, check whether the management cluster is a disaster-recovery standby. See [Standby Management Clusters](./install_provider.mdx#standby-management-cluster).
-- If a VM is waiting for IP allocation, verify VMware Tools, the static IP settings, and `VSphereVM.status.addresses`.
-- If workload `Node` objects remain without `spec.providerID`, first verify the CPI delivery resources and then check for duplicate vCenter guest hostnames. When an old VM in the same datacenter still reports the same guest hostname as a new node, `cloud-provider-vsphere` can fall back to node-name lookup, cache the old VM, and reject the new node because the VM IP does not match the kubelet node IP. Check the leader `vsphere-cloud-controller-manager` logs, the node `SystemUUID`, the real VM UUID, and vCenter guest hostname/IP values. After you fix or remove the duplicate hostname or old VM conflict, restart the workload cluster's `vsphere-cloud-controller-manager` Pods to clear the bad in-memory cache:
-  ```bash
-  kubectl --kubeconfig=/tmp/<cluster_name>.kubeconfig -n kube-system delete pod \
-    -l k8s-app=vsphere-cloud-controller-manager
-  ```
-- If datastore space is exhausted, first list all current and terminating `VSphereMachineConfigPool` objects and compare their names with every `VSphereMachineTemplate.spec.template.spec.machineConfigPoolRef.name`. Different pool names own independent slots and VMDKs; repeated deployments can therefore accumulate multiple disk sets. Then inspect `status.configStatuses[]` for `state` and `lastReleasedTime`, and `status.persistentDiskStatuses[]` for `phase`, `lastError`, `retryAfter`, and `taskRef`, together with related Events and the vCenter attachment state. `insufficient disk available` confirms a datastore capacity failure but does not by itself prove that reclaim failed. Do not manually delete a VMDK or remove a pool finalizer while reuse or provider-managed reclaim is pending.
-- Do not delete a `phase: Reclaimed` entry from `status.persistentDiskStatuses[]`. It is a deliberate tombstone: the backing VMDK is already gone, and the record is what stops the controller from re-seeding the disk from the frozen `spec` `volumePath`. Deleting it produces a seed, delete, and re-seed loop that prevents the pool finalizer from ever clearing.
-- If the template system disk size does not match the manifest values, first check the actual clone mode. When the VM was created as `linkedClone`, the system disk stays at the template's size and `diskGiB` is ignored. Only `fullClone` uses `diskGiB`, and in that case `diskGiB` must not be smaller than the template disk size.
-- If the control plane endpoint does not come up, verify TCP `6443` passthrough, all control-plane backends, HTTPS `/healthz` results, DNS and certificate SANs, and reachability from the `global` cluster and control-plane nodes.
-- If the TLS connection to vCenter fails, verify the thumbprint, the vCenter address, and whether proxy settings interfere with the connection.
+#### Self-built VIP \{#verify-self-built-vip}
 
-When you review controller logs, use the following rules:
-
-- `deploy/capi-controller-manager` runs in the `cpaas-system` namespace of the `global` cluster.
-- Do not use the workload-cluster kubeconfig to inspect `capi-controller-manager` logs.
-- If platform controllers process the cluster network annotations, also inspect the platform network-controller logs and the platform cluster-lifecycle-controller logs.
-
-### Admission rejections \{#admission-rejections}
-
-An `apply` or `edit` can be rejected before anything is created. Match a fragment of the rejection message against the following table.
-
-| Rejection contains | Cause and fix |
-|---|---|
-| `maxSurge must be 0 when the infrastructure template references a machineConfigPoolRef` | Set `maxSurge` to the integer `0` on the `KubeadmControlPlane`. Leaving it unset means the Cluster API default `1`. |
-| `must have at least 3 replicas` | Set `KubeadmControlPlane.spec.replicas` to `3` or more. A fixed-IP rollout uses `maxSurge: 0`, which Cluster API permits only for control planes with three or more replicas. |
-| `unit number 7 is reserved for the SCSI controller` | Choose another `unitNumber` between `0` and `15`. |
-| `also used by pool` | A hostname or primary IP collides with a slot in another pool bound to the same `Cluster` in this namespace. |
-| `allocated slot` | The slot is `InUse` or `Released`. The message names what is frozen — the primary IP or IPv6, or a persistent disk's `sizeGiB` or `mountPath` — or reports that the slot, or one of its persistent disks, cannot be removed. See [Allocated slot restrictions](#create-the-machine-config-pools). |
-| `cannot delete pool while` | The pool still owns `InUse` slots. Delete the Machines that hold them first. |
-| `is already referenced by` or `is bound to` | Two controllers reference one pool. Give each `KubeadmControlPlane` and `MachineDeployment` its own pool. |
-| `cannot change clusterRef while consumerRef is set` | The pool is already bound to a controller. Create a new pool instead of retargeting this one. |
-| `VSphereMachineTemplate spec.template.spec field is immutable` | Create a new template under a new name instead of editing the existing one. See [Roll out updated worker node configuration](../../../configure/nodes/alauda_os/vmware-vsphere.mdx#roll-out-updated-worker-node-configuration). |
-| `is immutable once controlPlaneLoadBalancer is set` | `spec.controlPlaneLoadBalancer` is write-once. See [`controlPlaneLoadBalancer` fields](#control-plane-load-balancer-fields). |
-| `cannot be set after the cluster is created` | The cluster was created without `spec.controlPlaneLoadBalancer`, which already means an external LoadBalancer. The endpoint is fixed at creation and cannot be filled in later. |
-
-## Creation-Time Topology Variants \{#creation-time-topology-variants}
-
-The baseline manifest intentionally starts with one datacenter and one NIC. Before you create the cluster, use the following variants when the initial topology requires a Self-built control plane VIP, additional NICs, multiple datacenters, failure domains, or extra data disks. Apply one variant at a time and validate the complete manifest set before combining them.
-
-### Use a Self-built VIP \{#use-self-built-vip}
-
-Use this variant when the cluster is created with `VSphereCluster.spec.controlPlaneLoadBalancer.type: internal` instead of an external LoadBalancer. Decide the mode first in [Control Plane Endpoint Modes](#control-plane-endpoint-modes); it cannot be changed after the cluster exists.
-
-#### Self-built VIP prerequisites \{#self-built-vip-prerequisites}
-
-Complete all of the following before you select `type: internal`.
-
-- The platform is ACP `v4.4` or later. An earlier platform release does not support the Self-built VIP, whatever the provider version.
-- The VIP is IPv4, is currently unclaimed, and lives in the same Layer-2 broadcast domain as the control-plane node IPs. IPv6 and dual-stack endpoints are not accepted.
-- The VIP is not one of the slot addresses (`network.primary.ip` or `network.additional[].ip`) declared in this cluster's `VSphereMachineConfigPool` objects, and it falls outside every external IPAM pool range. The provider checks the slot addresses; it cannot read external IPAM pools and will not detect that conflict.
-- The `vrid` is unique in that Layer-2 domain.
-- The network path allows VRRP (IP protocol `112`, multicast `224.0.0.18`) and gratuitous ARP between the control-plane nodes. Confirm that the dvPortGroup security policy and any NSX-T distributed firewall rule do not block them.
-- The VM template exposes the Linux IPVS subsystem (the `ip_vs` module family is loadable) and allows Alive to set `net.ipv4.conf.all.arp_accept=1` and `net.ipv4.vs.conntrack=1`.
-- The `alive` cluster plugin is present and deployable on the `global` cluster.
-
-The provider does not carry Alive itself. It creates a `ModuleInfo` on the `global` cluster, and the platform renders the workload `cpaas-system/alive` `AppRelease` from it. Confirm the plugin on the `global` cluster:
+**Applies to**: `type: internal`. Skip it for an external load balancer.
 
 ```bash
-kubectl get clustermodule global -o jsonpath='{.spec.version}{"\n"}'
-kubectl get moduleplugin alive -o jsonpath='{.status.targetClusterVersions}{"\n"}'
-kubectl get moduleplugin alive -o jsonpath='{.status.latestVersion}{"\n"}'
-kubectl get moduleconfig alive-<alive_version> -o jsonpath='{.status.readyForDeploy}{"\n"}'
+ac config use-cluster global
+ac -n cpaas-system get vspherecluster <cluster-name> \
+  -o jsonpath='{.status.conditions[?(@.type=="SelfBuiltLoadBalancerReady")].status}{"\n"}'
+ac config sync
+ac config use-cluster <cluster-name>
+ac -n kube-system get pods -l app=alive -o wide
+ac config use-cluster global
 ```
 
-The provider resolves `<alive_version>` in this order: the `--plugin-alive-version` override on the provider deployment when it is set, then the `ModulePlugin/alive` entry `status.targetClusterVersions[<ClusterModule spec.version>].version`, and only then `status.latestVersion`. Read the `targetClusterVersions` entry that matches the version printed by the first command first; `latestVersion` applies only when the map has no entry for it.
+Continue when the condition is `True` and one Alive Pod runs on each control plane node; otherwise see [Troubleshooting](./troubleshooting.mdx#self-built-vip).
 
-The workload cluster's own `ClusterModule` does not exist until the cluster is created, so at planning time read the `global` cluster's version as the planning value. It is the closest available proxy, not a guarantee: once the cluster exists, read its own version with `kubectl get clustermodule <cluster_name>` and repeat the `readyForDeploy` check against the `alive` version that this version resolves to. Do that before the control plane finishes bootstrapping, because `type: internal` cannot be changed afterwards. When you are creating the `global` cluster itself, confirm the component version and the presence of the `alive` plugin from the installation package instead.
-
-The last command must print `true` for the version that resolution selects. If `ModulePlugin/alive` is absent, or the matching `ModuleConfig` is missing or reports `false`, the Self-built VIP cannot be installed in this environment. Create the cluster with an external LoadBalancer instead, and leave `spec.controlPlaneLoadBalancer` absent. Contact Alauda technical support for the plugin package that matches your platform release.
-
-#### `controlPlaneLoadBalancer` fields \{#control-plane-load-balancer-fields}
-
-| Parameter | Type | Description | Required |
-|---|---|---|---|
-| `.spec.controlPlaneLoadBalancer.type` | string (`internal` / `external`) | `internal` installs Alive and manages the VIP. `external` skips Alive and requires a pre-provisioned Layer 4 TCP LoadBalancer. The values are lowercase; other providers use different spelling. | No (defaults to `external`) |
-| `.spec.controlPlaneLoadBalancer.host` | string | Control plane endpoint address. For `internal`, the Self-built VIP, which must be IPv4. For `external`, the load balancer frontend address. | Yes |
-| `.spec.controlPlaneLoadBalancer.port` | int (1–65535) | Control plane port. Typically `6443`. | Yes |
-| `.spec.controlPlaneLoadBalancer.vrid` | int | Keepalived `virtual_router_id`, `1`–`255`, unique in the control-plane Layer-2 domain. | When `type: internal` |
-| `.spec.controlPlaneLoadBalancer.interface` | string (max 15 characters) | Host interface that carries the VIP. Leave empty to let the provider match the interface holding the node's primary IP. | No, but see the warning below |
-
-<Directive type="warning" title="controlPlaneLoadBalancer is write-once">
-The provider accepts `spec.controlPlaneLoadBalancer` only when the cluster is created. After that, `type`, `host`, `port`, `vrid`, and `interface` are all frozen, the field cannot be cleared, and a cluster created without it cannot have it added. Correcting a mistake requires rebuilding the cluster.
-
-Two consequences follow. On multi-NIC nodes, set `interface` explicitly at creation — a wrong auto-detected interface cannot be patched afterwards. And `host` and `port` must describe the same address as `spec.controlPlaneEndpoint`; a mismatch is not accepted.
-
-The `vrid` range is enforced by the provider's admission webhook rather than by the CRD schema. A client-side dry run contacts no server, so it catches neither this nor the schema rules; use `kubectl apply --dry-run=server` to see the rejection without creating the object.
-</Directive>
-
-#### Enable the Self-built VIP in `10-cluster.yaml` \{#enable-self-built-vip}
-
-For `type: internal`, add the following block to the `VSphereCluster` object in [Create the `Cluster` and `VSphereCluster` objects](#create-cluster-objects). Everything else in the baseline manifest is unchanged.
-
-```yaml
-spec:
-  controlPlaneLoadBalancer:
-    type: internal
-    host: "<vip>"           # must equal spec.controlPlaneEndpoint.host
-    port: <api_server_port> # must equal spec.controlPlaneEndpoint.port
-    vrid: <vrid>
-    interface: "<vip_interface>" # set explicitly on multi-NIC nodes
-```
-
-The provider also reconciles the workload cluster's `kube-system/kube-proxy` configuration for you, setting `ipvs.strictARP: true` and adding `<vip>/32` to `ipvs.excludeCIDRs`, then rolling the kube-proxy DaemonSet. Do not revert those values by hand; the provider reapplies them and rolls the DaemonSet again.
-
-#### Verify the Self-built VIP \{#verify-self-built-vip}
+On a control plane node of the cluster:
 
 ```bash
-kubectl -n <namespace> get vspherecluster <cluster_name> \
-  -o jsonpath='{range .status.conditions[*]}{.type}={.status} ({.reason}){"\n"}{end}'
-kubectl --kubeconfig=/tmp/<cluster_name>.kubeconfig -n kube-system get pods -l app=alive -o wide
-kubectl --kubeconfig=/tmp/<cluster_name>.kubeconfig -n cpaas-system get apprelease alive
-kubectl --kubeconfig=/tmp/<cluster_name>.kubeconfig get --raw='/version'
+curl --cacert /etc/kubernetes/pki/ca.crt https://<vip>:6443/healthz
 ```
 
-Expect `SelfBuiltLoadBalancerReady=True`, one Alive pod per control-plane node, and a successful API response through the VIP without disabling TLS verification.
+Continue when it prints `ok`; otherwise see [Troubleshooting](./troubleshooting.mdx#self-built-vip).
 
-The Alive pods run in `kube-system`, not in `cpaas-system`; `cpaas-system` holds the `alive` `AppRelease` the platform renders from the provider's `ModuleInfo`. `SelfBuiltLoadBalancerReady` covers the whole chain, the `AppRelease` and the pods, so check both namespaces when it is `False`.
+## Run `create` Again \{#rerun-create}
 
-<Directive type="info">
-`SelfBuiltLoadBalancerReady` reports the VIP chain only. It does not gate `VSphereCluster.status.ready`, so the infrastructure cluster can report ready while the VIP is still converging. The condition reasons are `SelfBuiltLoadBalancerReady`, `SelfBuiltLoadBalancerReconciling`, `SelfBuiltLoadBalancerNotReady`, and `InvalidSelfBuiltLoadBalancerConfiguration`.
+If `create` stops, run the same command again; completed work is skipped. Running `create` again on the same directory puts back anything that has drifted, except the credential Secret, which `ac` does not render. When `manifests/` already exists, `create` asks whether to reuse it: press Enter to reuse it, or answer `n` to render again after you change `install-config.yaml`. When standard input is not a terminal, pass `--reuse-manifests=true` or `--reuse-manifests=false`. Reusing `manifests/` ignores `install-config.yaml` and skips every check.
 
-While the VIP is not ready, the provider also defers the workload-cluster CoreDNS and kube-proxy repository reconciliation described in [Provider-managed fields on your manifests](#provider-managed-fields).
-</Directive>
+Do not edit the files in `manifests/`.
 
-### Add a second NIC
+:::warning
+Keep `<install-dir>/manifests/`, or set `cluster.encryptionProviderConfig`: a generated encryption key is kept only in `manifests/`. Rendering again without either generates a new key, and `manifests/` then no longer records the key the cluster uses.
+:::
 
-When nodes require an additional management, storage, or service network, extend the manifests in the following resources:
+## Add or Change Node Groups \{#create-the-worker-objects}
 
-- `16-vspheremachineconfigpool-control-plane.yaml`
-- `17-vspheremachineconfigpool-worker.yaml`
-- `20-control-plane.yaml`
-- `30-workers-md-0.yaml`
-- `18-failure-domains.yaml` if failure domains are enabled
+To add a worker node group, add it to `computes` with its own `hosts`, then run `create --reuse-manifests=false` on the same directory. `ac` renders a new pool, template, bootstrap template, and `MachineDeployment` for it. To scale a group, change `replicas` and keep at least `replicas` entries in `hosts`. Slots that machines already hold are frozen; see [Allocated slot restrictions](./reference/install-config-parameters.mdx#create-the-machine-config-pools).
 
-Each node slot declares its NIC layout under `network.primary` and `network.additional`. The primary NIC is used to derive the kubelet `node-ip` and remains the node's primary identity; additional NICs are merged after it in the order listed.
-
-Add the second NIC to each control plane node slot in the machine config pools:
-
-```yaml
-network:
-  primary:
-    networkName: "<nic1_network_name>"
-    deviceName: "<nic1_device_name>"
-    ip: "<master_01_nic1_ip>/<nic1_prefix>"
-    gateway: "<nic1_gateway>"
-    dns:
-    - "<nic1_dns_1>"
-  additional:
-  - networkName: "<nic2_network_name>"
-    deviceName: "<nic2_device_name>"
-    ip: "<master_01_nic2_ip>/<nic2_prefix>"
-    gateway: "<nic2_gateway>"
-    dns:
-    - "<nic2_dns_1>"
-```
-
-Apply the same pattern to the worker node slots:
-
-```yaml
-network:
-  primary:
-    networkName: "<nic1_network_name>"
-    deviceName: "<nic1_device_name>"
-    ip: "<worker_01_nic1_ip>/<nic1_prefix>"
-    gateway: "<nic1_gateway>"
-    dns:
-    - "<nic1_dns_1>"
-  additional:
-  - networkName: "<nic2_network_name>"
-    deviceName: "<nic2_device_name>"
-    ip: "<worker_01_nic2_ip>/<nic2_prefix>"
-    gateway: "<nic2_gateway>"
-    dns:
-    - "<nic2_dns_1>"
-```
-
-Add the second NIC to the machine templates:
-
-```yaml
-network:
-  devices:
-  - networkName: "<nic1_network_name>"
-  - networkName: "<nic2_network_name>"
-```
-
-If the DNS server used by the node changes when you add the second NIC, update the `/etc/resolv.conf` file entries in both `20-control-plane.yaml` and `30-workers-md-0.yaml`. The `dns` values in the machine config pool network blocks do not replace the explicit `/etc/resolv.conf` bootstrap file entries.
-
-If failure domains are enabled, update the network list in `VSphereFailureDomain.spec.topology.networks`:
-
-```yaml
-topology:
-  networks:
-  - <nic1_network_name>
-  - <nic2_network_name>
-```
-
-When you define the second NIC values, prepare the following placeholders in the infrastructure checklist and manifests:
-
-- `<master_01_nic2_ip>`
-- `<master_02_nic2_ip>`
-- `<master_03_nic2_ip>`
-- `<worker_01_nic2_ip>`
-- `<worker_02_nic2_ip>` when you also expand the worker pool
-
-For a running cluster, change all three network definitions together when you replace the machines. See [Runtime Topology Changes](../../../configure/nodes/alauda_os/vmware-vsphere.mdx#runtime-topology-changes).
-
-### Multiple datacenters and failure domains \{#multiple-datacenters-and-failure-domains}
-
-Use multiple datacenters and failure domains when you need node placement across different vCenter datacenters or compute clusters.
-
-The following principles apply:
-
-- One cluster can define multiple `VSphereFailureDomain` objects.
-- Each `VSphereDeploymentZone` references one `VSphereFailureDomain`.
-- The control plane uses `VSphereCluster.spec.failureDomainSelector`.
-- A worker `MachineDeployment` uses `spec.template.spec.failureDomain` when it must target a specific deployment zone.
-
-Prepare the following placeholders for the first datacenter:
-
-- `<compute_cluster_1>`
-- `<default_datastore_1>`
-- `<resource_pool_path_1>`
-- `<fd_name_1>`
-- `<dz_name_1>`
-
-Prepare the following placeholders for the second datacenter:
-
-- `<dc_name_2>`
-- `<fd_name_2>`
-- `<dz_name_2>`
-- `<compute_cluster_2>`
-- `<default_datastore_2>`
-- `<resource_pool_path_2>`
-
-If you add a third datacenter, continue with the same placeholder pattern:
-
-- `<dc_name_3>`
-- `<fd_name_3>`
-- `<dz_name_3>`
-- `<compute_cluster_3>`
-- `<default_datastore_3>`
-- `<resource_pool_path_3>`
-
-Create the failure-domain objects in `18-failure-domains.yaml`. The first datacenter also needs a `VSphereFailureDomain` and `VSphereDeploymentZone` when failure domains are enabled:
-
-```yaml
-apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: VSphereFailureDomain
-metadata:
-  name: <fd_name_1>
-spec:
-  region:
-    name: region-a
-    type: Datacenter
-    tagCategory: k8s-region
-    autoConfigure: true
-  zone:
-    name: zone-1
-    type: ComputeCluster
-    tagCategory: k8s-zone
-    autoConfigure: true
-  topology:
-    datacenter: <default_datacenter>
-    computeCluster: <compute_cluster_1>
-    datastore: <default_datastore_1>
-    networks:
-    - <nic1_network_name>
----
-apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: VSphereDeploymentZone
-metadata:
-  name: <dz_name_1>
-spec:
-  server: <vsphere_server>
-  failureDomain: <fd_name_1>
-  controlPlane: true
-  placementConstraint:
-    resourcePool: <resource_pool_path_1>
----
-apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: VSphereFailureDomain
-metadata:
-  name: <fd_name_2>
-spec:
-  region:
-    name: region-a
-    type: Datacenter
-    tagCategory: k8s-region
-    autoConfigure: true
-  zone:
-    name: zone-2
-    type: ComputeCluster
-    tagCategory: k8s-zone
-    autoConfigure: true
-  topology:
-    datacenter: <dc_name_2>
-    computeCluster: <compute_cluster_2>
-    datastore: <default_datastore_2>
-    networks:
-    - <nic1_network_name>
----
-apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: VSphereDeploymentZone
-metadata:
-  name: <dz_name_2>
-spec:
-  server: <vsphere_server>
-  failureDomain: <fd_name_2>
-  controlPlane: true
-  placementConstraint:
-    resourcePool: <resource_pool_path_2>
-```
-
-Enable control plane selection across the available failure domains by adding `failureDomainSelector` to the `VSphereCluster` spec in `10-cluster.yaml`:
-
-```yaml
-apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-kind: VSphereCluster
-metadata:
-  name: <cluster_name>
-  namespace: <namespace>
-spec:
-  controlPlaneEndpoint:
-    host: "<vip>"
-    port: <api_server_port>
-  identityRef:
-    kind: Secret
-    name: <credentials_secret_name>
-  server: "<vsphere_server>"
-  thumbprint: "<thumbprint>"
-  failureDomainSelector: {}
-```
-
-An empty selector `{}` matches every `VSphereDeploymentZone` that has `controlPlane: true`. Use match labels to restrict the control plane to a subset of zones.
-
-Also add the `[Labels]` block to the CPI `ConfigMap` so the vSphere CPI publishes the matching zone and region labels on workload nodes. The keys must match the `tagCategory` values used in `VSphereFailureDomain.spec.zone.tagCategory` and `VSphereFailureDomain.spec.region.tagCategory`. Update the `vsphere.conf` data in `15-vsphere-cpi-clusterresourceset.yaml`:
-
-```yaml
-      vsphere.conf: |
-        [Global]
-        secret-name = "vsphere-cloud-secret"
-        secret-namespace = "kube-system"
-        service-account = "cloud-controller-manager"
-        port = "443"
-        insecure-flag = "1"
-        datacenters = "<cpi_datacenters>"
-
-        [Labels]
-        zone = "k8s-zone"
-        region = "k8s-region"
-
-        [VirtualCenter "<vsphere_server>"]
-```
-
-`failureDomainSelector` and the CPI `[Labels]` block must be enabled together. Adding either one alone leaves the cluster in an inconsistent state: nodes get unresolved zone or region labels, or the control plane cannot select a deployment target.
-
-Set a worker deployment zone when a worker `MachineDeployment` must be pinned to one deployment target. Add `failureDomain` to `spec.template.spec` in `30-workers-md-0.yaml`:
-
-```yaml
-apiVersion: cluster.x-k8s.io/v1beta1
-kind: MachineDeployment
-metadata:
-  name: <cluster_name>-md-0
-  namespace: <namespace>
-spec:
-  clusterName: <cluster_name>
-  replicas: <worker_replicas>
-  template:
-    spec:
-      clusterName: <cluster_name>
-      failureDomain: <worker_failure_domain>
-      version: "<k8s_version>"
-      # ... rest of spec
-```
-
-Use a `VSphereDeploymentZone` name for `<worker_failure_domain>`, not a `VSphereFailureDomain` name.
-
-Before you enable multiple datacenters, confirm all of the following prerequisites:
-
-1. The template is already synchronized to every target datacenter.
-2. The network names are resolvable in every target datacenter.
-3. The datastore names are resolvable in every target datacenter.
-4. The vSphere CPI datacenter list covers every target datacenter.
-
-### Add data disks \{#add-data-disks}
-
-The baseline deployment includes the following required data disks:
-
-- **Control plane nodes** (4 disks per node): `var-cpaas` in `persistentDisks[]`, plus `var-lib-kubelet`, `var-lib-containerd`, and `var-lib-etcd` in `ephemeralDisks[]`. Do not remove any of these disks.
-- **Worker nodes** (3 disks per node): `var-cpaas` in `persistentDisks[]`, plus `var-lib-kubelet` and `var-lib-containerd` in `ephemeralDisks[]`. Do not remove any of these disks.
-
-`VSphereMachineTemplate.spec.template.spec.diskGiB` is the system disk size, not the total disk capacity of the VM. Keep the data disks under `VSphereMachineConfigPool.spec.configs[].persistentDisks[]` and `.ephemeralDisks[]`. Do not add the data disk sizes to `diskGiB` unless you intentionally want a larger system disk.
-
-If a node needs additional data disks beyond the required set, append more entries to the matching list in the corresponding `VSphereMachineConfigPool` node slot: `persistentDisks` when the data must survive VM replacement, `ephemeralDisks` when it is rebuildable. The following optional fields are especially relevant here:
-
-- **`mountPath`**: If set, the disk is formatted and mounted at the specified path. If omitted, the disk is attached as a raw device with a symlink at `/dev/disk/by-capv/<name>`, allowing an external process to manage it at runtime.
-- **`wipeFilesystem`**: Persistent disks only. When `true`, disk content is wiped on the first boot of a new VM. Normal reboots and manual service restarts are not affected. Defaults to `false`.
-
-To attach a raw disk without formatting or mounting, omit `mountPath` and `fsFormat`:
-
-```yaml
-persistentDisks:
-# ...standard persistent disks...
-- name: app-data
-  sizeGiB: 50
-```
-
-The disk is accessible inside the guest OS at `/dev/disk/by-capv/app-data`. On rolling updates, the same VMDK is re-attached to the new VM and the symlink is recreated. The disk is never formatted or mounted automatically; the application is responsible for managing it at runtime.
-
-#### Choose persistent or ephemeral \{#choose-persistent-or-ephemeral}
-
-A slot declares two disk lists: `spec.configs[].persistentDisks[]` and `spec.configs[].ephemeralDisks[]`.
-
-| | `persistentDisks[]` | `ephemeralDisks[]` |
-|---|---|---|
-| Spec fields | `name`, `sizeGiB`, `datastore`, `storagePolicy`, `unitNumber`, `mountPath`, `mountOptions`, `fsFormat`, `wipeFilesystem` | `name`, `sizeGiB`, `datastore`, `storagePolicy`, `mountPath`, `mountOptions`, `fsFormat` |
-| When the VM is deleted | Detached and kept, then reattached to the replacement VM at the same slot | Deleted with the VM |
-| When the VM is recreated | Same VMDK and same content, unless `wipeFilesystem: true` | Always a new empty disk, formatted from scratch |
-| Reclaim and slot-release gating | Participates. Blocks slot release and pool reclaim while still attached | Does not participate |
-| Observed state | `status.persistentDiskStatuses[]`, with path, UUID, unit, phase, and owning machine | `status.ephemeralDiskStatuses[]`, with hostname, name, and unit only |
-| SCSI unit | Pin it with `unitNumber`, or let the controller assign one and read it back from status | Controller-assigned only; there is no spec field |
-| Guest addressing | `/dev/disk/by-capv/<name>`. The guest script locates the device by VMDK `diskUUID`, then by SCSI unit | `/dev/disk/by-capv/<name>`. The guest script locates the device by SCSI unit only |
-
-Use `ephemeralDisks` for rebuildable node-local data that should not sit on the system disk — the standard `/var/lib/kubelet`, `/var/lib/containerd`, and `/var/lib/etcd` disks, plus any scratch space. Use `persistentDisks` for anything whose loss is a data loss.
-
-<Directive type="warning" title="Keep the standard disks in their declared list">
-`/var/cpaas` must stay in `persistentDisks[]`: it holds platform state that has to survive VM replacement. `/var/lib/kubelet`, `/var/lib/containerd`, and `/var/lib/etcd` belong in `ephemeralDisks[]`; they are rebuilt on every new VM, and declaring them as persistent disks carries stale kubelet, runtime, and etcd member data onto the replacement node.
-
-This split is a creation-time choice. `ephemeralDisks[]` is new in provider `v1.0.17`, so a cluster created on an earlier provider cannot use the standard ephemeral set at all: it declares `/var/cpaas`, `/var/lib/containerd`, and `/var/lib/etcd` as persistent disks, with `wipeFilesystem: true` on the etcd disk. That cluster keeps its layout: a provider upgrade migrates no disk. See [Upgrading the Provider](./install_provider.mdx#upgrade-the-provider).
-</Directive>
-
-The following example adds one ephemeral scratch disk alongside the standard worker set:
-
-```yaml
-persistentDisks:
-- name: var-cpaas
-  sizeGiB: <worker_var_cpaas_size_gib>
-  mountPath: /var/cpaas
-  fsFormat: ext4
-ephemeralDisks:
-- name: var-lib-kubelet
-  sizeGiB: <worker_var_lib_kubelet_size_gib>
-  mountPath: /var/lib/kubelet
-  fsFormat: ext4
-- name: var-lib-containerd
-  sizeGiB: <worker_var_lib_containerd_size_gib>
-  mountPath: /var/lib/containerd
-  fsFormat: ext4
-- name: scratch
-  sizeGiB: 50
-  mountPath: /var/scratch
-  fsFormat: ext4
-```
-
-Disk names and mount paths must be unique across both lists within one slot.
-
-#### Pin a SCSI unit number \{#pin-a-scsi-unit-number}
-
-`unitNumber` on a persistent disk keeps guest device ordering stable across VM recreations. Valid values are `0` through `15`, excluding `7`, which is reserved for the SCSI controller, and each value must be unique within the slot.
-
-If you omit `unitNumber`, the controller assigns one at clone time, records it in `status.persistentDiskStatuses[].unitNumber`, and reuses that value when the VM is recreated.
-
-Ephemeral disks have no `unitNumber` field at all. The controller assigns their unit at every clone and reports it in `status.ephemeralDiskStatuses[].unitNumber`, so the standard `/var/lib/kubelet`, `/var/lib/containerd`, and `/var/lib/etcd` disks cannot be pinned.
-
-#### Relocating the pod log directory \{#pod-log-relocation}
-
-When any disk in a slot mounts at `/var/lib/containerd`, the guest disk-reconcile script points `/var/log/pods` at a directory on that disk, so pod logs land on the data disk instead of the root filesystem. In the standard layout that disk is ephemeral, so relocated pod logs are destroyed with the VM they belong to; ship anything you need to keep to the platform log store.
-
-<Directive type="warning">
-This relocation is written into the guest through `guestinfo` user data **before first boot only**. Upgrading the provider does not retrofit it onto existing machines; the change is picked up when nodes are rolled and replaced. See [OS Image Update Without a Kubernetes Version Change](../../../upgrade/workload/alauda_os/vmware-vsphere.mdx#os-image-only-rollout). Remediating a running node in place requires an out-of-band script and is not part of this workflow.
-</Directive>
-
-### Verify creation-time variants
-
-After you apply a topology variant, validate the cluster state with the following commands:
-
-```bash
-kubectl -n <namespace> get cluster,vspherecluster,kubeadmcontrolplane,machinedeployment,machine,vspheremachine,vspherevm
-kubectl --kubeconfig=/tmp/<cluster_name>.kubeconfig get nodes -o wide
-kubectl -n <namespace> get vspheremachineconfigpool <pool_name> \
-  -o jsonpath='{range .status.ephemeralDiskStatuses[*]}{.hostname}{" "}{.name}{" unit="}{.unitNumber}{"\n"}{end}'
-```
-
-Confirm the following results:
-
-- The placement, NIC, or disk definitions are reflected in the target resources.
-- New nodes reach the `Ready` state.
-- Existing nodes remain healthy after the change.
-- Every declared ephemeral disk has an assigned unit number and is addressable in the guest at `/dev/disk/by-capv/<name>`.
+For worker scale-out and later template or runtime-topology changes, see [Manage Nodes on VMware vSphere](../../../configure/nodes/alauda_os/vmware-vsphere.mdx). Apply one change at a time and validate the result before you combine changes.
 
 ## Next Steps
 
-For worker scale-out and later template or runtime-topology changes, see [Manage Nodes on VMware vSphere](../../../configure/nodes/alauda_os/vmware-vsphere.mdx). Apply one change at a time and validate the result before you combine multiple changes in the same cluster.
+- [Manage Nodes](../../../configure/nodes/alauda_os/vmware-vsphere.mdx)
+- [Upgrade Cluster](../../../upgrade/workload/alauda_os/vmware-vsphere.mdx)
+- [Delete the Cluster](./deleting.mdx)

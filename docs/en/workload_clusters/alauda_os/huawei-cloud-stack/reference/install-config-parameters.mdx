@@ -1,0 +1,298 @@
+---
+weight: 10
+title: Parameters
+author: chaozhou@alauda.io
+category: reference
+queries:
+  - hcs workload cluster install-config.yaml fields
+  - hcs install-config.yaml elb vipAddress flavorName
+  - hcs availability zone cluster node pool
+  - hcs rendered manifests hcsmachineconfigpool
+---
+
+# install-config.yaml Parameters for Huawei Cloud Stack
+
+This page lists the fields of a Huawei Cloud Stack workload cluster's `install-config.yaml`, how they map to the rendered objects, and the optional topology.
+
+## Fields \{#fields}
+
+The `provider.hcs` and node group fields are the same as for the `global` cluster; see [Huawei Cloud Stack Fields](../../../../install/alauda_os/huawei-cloud-stack/reference/install-config-parameters.mdx#fields). As there, `cluster.network.loadBalancer` is rejected. A workload cluster differs in the following fields:
+
+| Field | Required | Description |
+|---|---|---|
+| `cluster.clusterName` | Yes | A DNS-1123 subdomain of at most 63 characters. It must not be `global` or start with `global-`. `Cluster` and `HCSCluster` are named `<cluster-name>`, and the other objects are prefixed with `<cluster-name>-`. |
+| `credentialRef` | Yes | The [credential Secret](../prerequisites.mdx#credential-secret). `namespace` is `cpaas-system`. |
+| `cluster.registrySecretRef` | No | A Secret in `cpaas-system` labelled `capi.cpaas.io/provider=registry-credential`, with a required `registry` key and optional `username` and `password`, set together. Empty uses the registry of the `global` cluster. See [Workload Cluster Image Registry](../prerequisites.mdx#workload-cluster-image-registry). |
+
+## Optional Fields \{#optional-fields}
+
+The template in [Create a Cluster](../create_cluster.mdx#write-install-config) holds the required fields. Add the following where you need them:
+
+```yaml
+cluster:
+  registrySecretRef: # [!code callout]
+    name: <registry-secret-name>
+    namespace: cpaas-system
+  encryptionProviderConfig: <key> # [!code callout]
+  network:
+    podCIDR: 10.199.0.0/16 # [!code callout]
+    serviceCIDR: 10.96.0.0/12
+    kubeOVN:
+      joinCIDR: 100.64.0.0/16
+provider:
+  hcs:
+    availabilityZone: <az> # [!code callout]
+    rootDisk:
+      type: SSD # [!code callout]
+    diskType: SSD # [!code callout]
+    controlPlaneHA: # [!code callout]
+      enabled: true
+      policy: soft-anti-affinity # [!code callout]
+    elb:
+      vipSubnetName: <subnet-name> # [!code callout]
+      l4:
+        subnetName: <subnet-name> # [!code callout]
+      l7:
+        subnetName: <subnet-name>
+controlPlane: # [!code callout]
+  hcs: # [!code callout]
+    flavorName: <flavor-name>
+    availabilityZone: <az>
+    subnetName: <subnet-name>
+    rootDisk: # [!code callout]
+      sizeGiB: <root-disk-gib>
+      type: SSD
+  network:
+    additions: # [!code callout]
+      - hcs:
+          subnetName: <nic2-subnet-name>
+  disks:
+    rawDisks: # [!code callout]
+      - name: data-001
+        sizeGiB: 50
+    hcs:
+      type: SSD # [!code callout]
+  hosts:
+    - hostname: <cp-0-hostname>
+      ip: <cp-0-ip>
+      additionalIps: [<cp-0-nic2-ip>] # [!code callout]
+```
+
+<Callouts>
+
+1. `registrySecretRef`: optional. A registry other than the platform's; see `cluster.registrySecretRef` in [Fields](#fields).
+2. `encryptionProviderConfig`: optional. The base64 of a 16, 24, or 32 byte aescbc key; generated when empty. See [Run `create` Again](../create_cluster.mdx#rerun-create).
+3. `podCIDR`, `serviceCIDR`, `joinCIDR`: optional. The defaults are shown; the ranges must not overlap.
+4. `availabilityZone`: optional. See [Availability Zone Placement](#availability-zone-placement).
+5. `rootDisk.type`: optional. `SSD`, the default, `SAS`, or `SATA`.
+6. `diskType`: optional. The data disk type: `SSD`, the default, `SAS`, or `SATA`.
+7. `controlPlaneHA`: optional. Enabled by default; see [Control Plane HA Placement](#control-plane-ha-placement).
+8. `policy`: `soft-anti-affinity`, the default, or `anti-affinity`.
+9. `vipSubnetName`: optional. Empty takes `network.subnetName`.
+10. `l4.subnetName` and `l7.subnetName`: optional. Empty takes `network.subnetName`.
+11. The same fields apply to each `computes` entry.
+12. `hcs`: overrides `flavorName`, `availabilityZone`, and `subnetName` for this node group; see [Place Node Groups Separately](#node-group-overrides).
+13. `rootDisk`: replaces `provider.hcs.rootDisk`; set both fields.
+14. `additions`: additional NICs, with no `gateway`, `dns`, or `mask`; see [Add a Second NIC](#add-a-second-nic). Empty `subnetName` takes the node group's subnet.
+15. `rawDisks`: raw block volumes for TopoLVM; see [Add Raw Disks](#add-raw-disks).
+16. `disks.hcs.type`: optional. Overrides `provider.hcs.diskType` for this group's data disks.
+17. `additionalIps`: one per `network.additions` entry, in order.
+
+</Callouts>
+
+## Kubernetes Version \{#kubernetes-version}
+
+You do not set the Kubernetes, etcd, or Kube-OVN version. `ac` installs the latest Kubernetes version that the platform supports, the default entry in the `kube-public/base-component-version` ConfigMap, with the etcd tag that matches it, and prints them as `Pinning Kubernetes <version>, etcd <tag>`. It reads the Kube-OVN version from the Kube-OVN plugin of the `global` cluster. The image in `provider.hcs.imageName` must carry that Kubernetes version.
+
+## Control Plane Replicas \{#control-plane-replicas}
+
+`controlPlane.replicas` must be odd: `1`, or `3` or more. With fewer than three control plane nodes, contact technical support before you upgrade the cluster.
+
+## Control Plane Endpoint \{#configure-hcscluster}
+
+The HCS provider creates an Elastic Load Balance (ELB) on the HCS platform for the Kubernetes API server and owns its VIP. The ELB uses Hybrid Load Balancing, with exactly two fixed addresses each for `l4` and `l7`. Do not disable Hybrid Load Balancing on the provider-created ELB after the cluster is created.
+
+The provider sets the control plane endpoint from the ELB. Leave `provider.hcs.elb.vipDomainName` unset.
+
+## Control Plane HA Placement \{#control-plane-ha-placement}
+
+With `provider.hcs.controlPlaneHA` enabled, the default, the provider keeps an HCS server group for the control plane instances; see [Verify Control Plane HA](../create_cluster.mdx#verify-control-plane-ha). It applies to the control plane only, not to worker node groups, and it spreads the instances across physical hosts within one availability zone, not across zones. Set `enabled: false` to let HCS place the control plane freely.
+
+| Policy | Behavior | Operational impact |
+|--------|----------|--------------------|
+| `soft-anti-affinity` (default) | Best-effort anti-affinity. HCS tries to place control-plane ECS instances on different hosts. | Use this when you prefer spread but do not want the rule to block ECS creation. Final placement may still share a host. |
+| `anti-affinity` | Hard anti-affinity. HCS must place control-plane ECS instances on different hosts. | Use this when strict host separation is required. ECS creation can fail if HCS cannot find enough capacity that satisfies the rule. |
+
+Enabling `controlPlaneHA` on an existing cluster does not move the running control plane instances: only instances created afterwards, for example by a rolling replacement, join the server group, and `ControlPlaneHAReady` can stay `False` with `ControlPlaneHAPending` until all of them have been replaced.
+
+## Availability Zone Placement \{#availability-zone-placement}
+
+`ac` renders one `HCSMachineTemplate` for the control plane and one for each worker node group, and an `HCSMachineTemplate` selects one availability zone for every machine created from it. As a result:
+
+- All control plane nodes use one availability zone.
+- All replicas in one worker node group use one availability zone.
+- Different worker node groups can select different availability zones, with `computes[].hcs.availabilityZone`.
+- A single node group does not automatically spread replicas across multiple availability zones.
+
+For predictable placement, select an availability zone explicitly: if the zone is empty, the provider selects the first zone that HCS reports as available. The provider rejects a name that HCS does not return. Make sure a named zone is available before you create the cluster: in an unavailable zone, ECS creation can fail.
+
+:::warning
+An existing pool-managed persistent disk locks its replacement ECS instance to the disk's availability zone. If the template explicitly selects a different zone, the replacement fails with an availability zone conflict.
+:::
+
+## Node Networks \{#node-networks}
+
+Every NIC is a subnet and a fixed IPv4 address. The node subnet is `provider.hcs.network.subnetName`, or `hcs.subnetName` of the node group; the subnet supplies the gateway and DNS, so `network.gateway`, `network.dns`, and `network.mask` are rejected.
+
+To attach more NICs, see [Add a Second NIC](#add-a-second-nic). The provider attaches each NIC with its subnet and static IP only. It does not support declaring the role or purpose of each NIC, a default gateway for a specific NIC, static routes or route metrics, or per-NIC DNS settings.
+
+## Disks \{#disks}
+
+Every node group declares the standard disks, which are all required: `var-lib-containerd`, `var-lib-kubelet`, and `var-cpaas` on every group, and `var-lib-etcd` on the control plane. `ac` formats them as xfs and mounts them at `/var/lib/containerd`, `/var/lib/kubelet`, `/var/cpaas`, and `/var/lib/etcd`. Their EVS type is `provider.hcs.diskType`, or `disks.hcs.type` of the node group.
+
+| List | Rendered as | When the instance is replaced |
+|---|---|---|
+| `ephemeral` | `HCSMachineTemplate.spec.template.spec.dataVolumes[]` | Recreated empty with the new ECS. |
+| `persistent` (`var-cpaas`) | `HCSMachineConfigPool.spec.configs[].persistentDisks[]`, with a mount path | Detached from the old ECS and attached to the replacement. |
+| `rawDisks` | `HCSMachineConfigPool.spec.configs[].persistentDisks[]`, without a mount path or file system | Detached and reattached like `persistent`; see [Add Raw Disks](#add-raw-disks). |
+
+`/var/cpaas` holds platform state and logs that must survive VM replacement; size it for platform monitoring, log, and plug-in data. A newly created EVS data disk takes `10` to `32768` GB.
+
+## Hostname Behavior on the Node \{#hostname-behavior-on-the-node}
+
+A `hosts[].hostname` is a DNS-1123 subdomain: lowercase letters, numbers, hyphens (`-`), and dots (`.`), starting and ending with a lowercase letter or number, at most 253 characters, and unique across the cluster. `ac` rejects other values.
+
+The provider derives the node's POSIX hostname and FQDN from the value as follows:
+
+| `hostname` value | Node `hostname` | Node `hostname -f` | `/etc/hosts` entry written |
+|---|---|---|---|
+| `master-1` (no dot) | `master-1` | `master-1` (resolver returns the short name) | none added by the provider |
+| `master-1.example.org` (dotted) | `master-1` (short label, dot and everything after it stripped) | `master-1.example.org` | `<node-ip> master-1.example.org master-1` |
+
+Use the dotted form for applications that depend on FQDN resolution, such as `hostname -f`, certificates with SAN entries, or log labels.
+
+## Rendered Manifests \{#render-manifests}
+
+`ac` writes the objects it applies to `<install-dir>/manifests/`, one file per object, all in `cpaas-system`:
+
+| Object | Name | Notes |
+|---|---|---|
+| `Secret` | `<cluster-name>-encryption-provider-config` | The encryption configuration, referenced by `HCSCluster`. |
+| `Cluster` | `<cluster-name>` | Labelled `cluster-type: HCS`. |
+| `HCSCluster` | `<cluster-name>` | The VPC, the subnet inventory, the security group, the control plane ELB, `controlPlaneHA`, and `identityRef`. No `controlPlaneEndpoint`. |
+| `HCSMachineConfigPool`, `HCSMachineTemplate`, `KubeadmControlPlane` | `<cluster-name>-control-plane` | |
+| `HCSMachineConfigPool`, `HCSMachineTemplate`, `MachineDeployment` | `<cluster-name>-<group>` | |
+| `KubeadmConfigTemplate` | `<cluster-name>-<group>-config` | |
+
+The credential Secret and a registry Secret are yours; `ac` neither renders nor deletes them. Every node group, and a control plane of `3` or more replicas, is replaced one node at a time (`maxSurge: 0`), so a replacement needs no extra IP addresses.
+
+For the API fields of these objects, see [Provider APIs](../../../../apis/kubernetes_apis/infrastructure_providers/huawei-cloud-stack/index.mdx).
+
+### Machine Config Pools \{#machine-config-pools}
+
+`hosts`, the NICs, and the persistent and raw disks go to the `HCSMachineConfigPool`; the image, the flavor, the availability zone, the system disk, and the ephemeral disks go to the `HCSMachineTemplate`. For one worker host with the defaults, the two objects render as follows:
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: HCSMachineConfigPool
+metadata:
+  name: <cluster-name>-worker
+  namespace: cpaas-system
+spec:
+  configs:
+  - hostname: <worker-0-hostname>
+    networks:
+    - subnetName: <subnet-name>
+      ipAddress: <worker-0-ip>
+    persistentDisks:             # Kept when the instance is replaced
+    - slot: 0
+      size: 100
+      type: SSD
+      mountPath: /var/cpaas
+      format: xfs
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: HCSMachineTemplate
+metadata:
+  name: <cluster-name>-worker
+  namespace: cpaas-system
+spec:
+  template:
+    spec:
+      imageName: <image-name>
+      flavorName: <flavor-name>
+      rootVolume:
+        type: SSD
+        size: 200
+      configPoolRef:
+        name: <cluster-name>-worker
+      dataVolumes:               # Recreated with the instance
+      - size: 100
+        type: SSD
+        mountPath: /var/lib/containerd
+        format: xfs
+      - size: 100
+        type: SSD
+        mountPath: /var/lib/kubelet
+        format: xfs
+```
+
+`ac` numbers the persistent disks of each host from slot `0`, `var-cpaas` first and then the raw disks in declaration order.
+
+### Change Rendered Objects Later \{#change-rendered-objects}
+
+The following provider rules apply when you change these objects after the cluster exists, whether by rendering again or by editing them as described in [Manage Nodes on Huawei Cloud Stack](../../../../configure/nodes/alauda_os/huawei-cloud-stack.mdx).
+
+- Do not change `slot`, `size`, `type`, `format`, or `mountPath` of a persistent disk after the provider accepts the entry, and do not remove the entry.
+- You can append a `persistentDisks[]` entry to an existing host. The provider creates the EVS disk, but the disk is formatted and mounted only when the node is replaced.
+- You can update `mountOptions`, which defaults to `defaults,noatime`. The change takes effect when the node is replaced and the replacement VM renders its disk mounts.
+- Do not declare the same mount path in both `HCSMachineConfigPool.spec.configs[].persistentDisks[]` and `HCSMachineTemplate.spec.template.spec.dataVolumes[]`.
+- Keep `maxSurge: 0` on the `KubeadmControlPlane` and every `MachineDeployment` whose pool uses persistent disks.
+- In a hand-written `networks[]` entry, set either `subnetName` or `subnetId`, not both. If an older entry keeps the deprecated `subenetName` and you add `subnetName`, use the same value.
+
+To inspect the persistent-disk runtime state of a pool:
+
+```bash
+ac config use-cluster global
+ac get hcsmachineconfigpool <cluster-name>-<group> -n cpaas-system -o yaml
+```
+
+## Optional Topology \{#optional-topology}
+
+The template in [Write `install-config.yaml`](../create_cluster.mdx#write-install-config) uses one subnet and one NIC per node. Add the following variants in `install-config.yaml` before you create the cluster, and render the manifests to check the result.
+
+### Add a Second NIC \{#add-a-second-nic}
+
+Declare the NIC in `network.additions` of each node group, and give every host one address per NIC in `additionalIps`, in the same order:
+
+```yaml
+controlPlane:
+  network:
+    additions:
+      - hcs:
+          subnetName: <nic2-subnet-name>   # Optional: empty takes the node group's subnet
+  hosts:
+    - hostname: <cp-0-hostname>
+      ip: <cp-0-ip>
+      additionalIps: [<cp-0-nic2-ip>]
+```
+
+Each addition becomes another `networks[]` entry of the host in the `HCSMachineConfigPool`. An addition takes no `mask`; see [Node Networks](#node-networks) for what the provider does not configure on a NIC.
+
+### Add Raw Disks \{#add-raw-disks}
+
+For more storage, add `rawDisks`. Each one becomes a persistent disk with no mount path and no file system, for TopoLVM or another consumer:
+
+```yaml
+disks:
+  rawDisks:
+    - name: data-001
+      sizeGiB: 50
+```
+
+On a rolling replacement, the same EVS disk is reattached to the new instance. The disk is never formatted or mounted automatically.
+
+### Place Node Groups Separately \{#node-group-overrides}
+
+A node group's `hcs` block overrides `flavorName`, `availabilityZone`, `subnetName`, and `rootDisk` for that group; its `rootDisk` replaces the cluster-level one, so set both `sizeGiB` and `type`, and its `disks.hcs.type` overrides the EVS type of its data disks. Use it to place worker node groups in different availability zones or subnets; see [Availability Zone Placement](#availability-zone-placement).
+

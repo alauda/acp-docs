@@ -1,0 +1,123 @@
+---
+weight: 20
+title: Install the Provider
+author: dev@alauda.io
+category: howto
+queries:
+  - install vmware vsphere provider
+  - install capv provider on global cluster
+  - verify vmware provider installation
+  - verify vsphere provider webhooks
+  - vsphere provider standby global cluster
+  - upgrade vsphere provider disk status migration
+---
+
+# Install the VMware vSphere Provider
+
+This document explains how to install the Infrastructure Provider for Virtualization Platform and the Cluster Bootstrap Provider, and how to verify that the required Cluster API components are available on the `global` cluster.
+
+## When You Need This
+
+Complete this page before you create the first workload cluster on VMware vSphere when the `global` cluster runs on other infrastructure: `ac` installs only that infrastructure's provider. A `global` cluster installed on VMware vSphere with ACP CLI (ac) already runs both providers, and you can skip this page. In a disaster recovery (DR) pair, complete it on **both** `global` clusters, so that the standby can reconcile the same workload clusters after a failover. Upload the packages to each `global` cluster.
+
+## Prerequisites \{#prerequisites}
+
+Before installing the provider, ensure the following conditions are met:
+
+- You can access the <Term name="product" textCase="capitalize" /> `global` cluster.
+- You can access Customer Portal to download provider packages.
+- The vCenter account that clusters will reference through `VSphereCluster.spec.identityRef` can list, create, and set VM custom attributes. Grant the **Global → Manage custom attributes** and **Global → Set custom attribute** privileges. The provider requires them whenever a `VSphereCluster` or its CAPI `Cluster` carries any `vsphere.cluster.x-k8s.io/*` annotation, and a missing privilege fails VM reconciliation rather than skipping the metadata write.
+- To create or upgrade workload clusters, you work against the primary `global` cluster, not a disaster recovery standby. See [Standby Management Clusters](#standby-management-cluster).
+
+## Steps
+
+<Steps>
+### Download the required packages
+
+To create clusters on VMware vSphere, you need two cluster plugins. Download both from the Customer Portal. For <Term name="productShort" /> 4.5, they are listed under **Common ACP Extensions**; see [Download](../../../../install/prepare/download.mdx).
+
+1. **Alauda Container Platform Cluster Bootstrap Provider**
+2. **Alauda Container Platform Infrastructure Provider for Virtualization Platform**
+
+### Upload the packages
+
+Upload both packages to the platform with `violet push`. For the command and its parameters, refer to [Upload Packages](../../../../extend/upload_package.mdx#violet_push_usage).
+
+### Install the cluster plugins
+
+Install both cluster plugins on the `global` cluster. For the procedure, refer to [Cluster Plugin](../../../../extend/cluster_plugin.mdx).
+
+### Verify the installation \{#verify-the-installation}
+
+Run the following commands from a machine where `ac` is logged in to the platform:
+
+```bash
+ac config use-cluster global
+ac get minfo -l cpaas.io/module-name=cluster-api-provider-vsphere
+ac get minfo -l cpaas.io/module-name=cluster-api-provider-kubeadm
+ac get crd | grep -E '^vsphere[a-z]+\.infrastructure\.cluster\.x-k8s\.io\b'
+ac get validatingwebhookconfiguration \
+  -o jsonpath='{range .items[*]}{range .webhooks[*]}{.name}{"\n"}{end}{end}' \
+  | grep -E 'vsphere|capv'
+```
+
+Continue when:
+
+- Both plugins are listed and `Running`.
+- The CRD list holds nine CRDs: `vsphereclusters`, `vsphereclusteridentities`, `vsphereclustertemplates`, `vspheredeploymentzones`, `vspherefailuredomains`, `vspheremachines`, `vspheremachineconfigpools`, `vspheremachinetemplates`, and `vspherevms`, each in `infrastructure.cluster.x-k8s.io`.
+- The webhook list includes `validation.vspherecluster.infrastructure.cluster.x-k8s.io`, `validation.vspheremachineconfigpool.infrastructure.cluster.x-k8s.io`, `validation.vspheremachinetemplate.infrastructure.cluster.x-k8s.io`, and `validation.kubeadmcontrolplane.capv.cluster.x-k8s.io`.
+
+Otherwise, install the missing plugin again as in [Cluster Plugin](../../../../extend/cluster_plugin.mdx), or contact technical support.
+
+</Steps>
+
+## Upgrading the Provider \{#upgrade-the-provider}
+
+The provider is an Aligned extension and is upgraded together with the Distribution Version upgrade of the `global` cluster. Publish the target-version provider package with `violet` as described in [Pre-Upgrade Preparation](../../../../upgrade/pre-upgrade.mdx); CVO then upgrades the installed cluster plugin as part of the cluster upgrade. See [Upgrade the Distribution Version of the `global` Cluster](../../../../upgrade/global/upgrade_global_cluster.mdx).
+
+The upgrade also updates the provider CRDs. Some fields move between releases, but **existing resources are migrated for you** — do not hand-edit `VSphereMachineConfigPool` or any other provider object to match a new schema, and do not delete and recreate one. On its first reconcile after the upgrade the controller brings each object up to the current layout:
+
+- The control plane endpoint is not touched. An existing cluster leaves `spec.controlPlaneLoadBalancer` unset, which is what an external LoadBalancer looks like, and it stays that way: the API server address does not change and nothing is deployed into the workload cluster.
+- Per-disk state that used to be recorded on `spec.configs[].persistentDisks[].volumePath` and `.diskUUID`, and per-slot reclaim state under `status.configStatuses[].reclaimStatus`, are folded into `status.persistentDiskStatuses[]`. A reclaim that was in flight keeps its phase and task reference and continues, and `reclaimStatus` is then cleared so status has a single source of truth.
+- The deprecated `spec` fields are left in the object. Treat them as history and read `status.persistentDiskStatuses[]` instead.
+- The migration never overwrites a value that is already set, so it is safe to repeat. The disk part is status-only bookkeeping and runs before vCenter is contacted, so it completes even while vCenter is unreachable.
+- It covers the provider's own resources only. The rollout values required on the Cluster API objects — `maxSurge` and `replicas` — are never rewritten, so an existing `KubeadmControlPlane` or `MachineDeployment` that does not carry them still has to be corrected by hand. See [Check the manifests against the admission rules](../../../../upgrade/workload/alauda_os/vmware-vsphere.mdx#preflight-admission-rules).
+
+Nothing in the workload cluster is touched, and no VM is replaced. Three consequences are worth knowing before you upgrade:
+
+- A cluster created on an earlier provider keeps its external LoadBalancer; see [Control Plane Endpoint](../prerequisites.mdx#control-plane-endpoint-modes).
+- A pool keeps the disk lists it was created with. The upgrade moves no existing disk into `spec.configs[].ephemeralDisks[]`: a cluster created on an earlier ACP version keeps `/var/cpaas`, `/var/lib/containerd`, and `/var/lib/etcd` as persistent disks. The persistent-plus-ephemeral split documented for new clusters is a creation-time layout. See [Add Data Disks](./install-config-parameters.mdx#add-data-disks).
+- Guest-side changes delivered through `guestinfo` user data, such as the pod-log relocation, reach a node only when it is replaced. See [Pod Log Directory](./install-config-parameters.mdx#pod-log-relocation).
+
+Confirm the result with the checks in [Verify the installation](#verify-the-installation), then read one pool back:
+
+```bash
+ac config use-cluster global
+ac -n cpaas-system get vspheremachineconfigpool <pool-name> \
+  -o jsonpath='{range .status.persistentDiskStatuses[*]}{.hostname}{" "}{.name}{" "}{.phase}{"\n"}{end}'
+```
+
+Each disk that was already provisioned before the upgrade appears with a phase, and `status.configStatuses[].reclaimStatus` is gone. A disk on a slot that no Machine has ever allocated has no VMDK yet, so it has no record; that is expected rather than an incomplete migration.
+
+## Standby Management Clusters \{#standby-management-cluster}
+
+Do not create or upgrade a workload cluster against a standby `global` cluster: the provider skips the workload cluster's objects there, so nothing changes and no error appears.
+
+**Applies to**: a `global` cluster in a Global Cluster Disaster Recovery pair. Skip it for a single `global` cluster.
+
+```bash
+ac config use-cluster global
+ac -n kube-public get configmap etcd-sync -o name 2>/dev/null || echo "not standby"
+```
+
+Continue when it prints `not standby`; otherwise you are on the standby: work on the primary `global` cluster.
+
+For the disaster recovery workflow itself, see [Global Cluster Disaster Recovery](../../../../install/alauda_os/disaster_recovery.mdx).
+
+## Next Steps
+
+After the provider is installed, continue with:
+
+- [Create a Cluster on VMware vSphere](../create_cluster.mdx)
+- [Upgrade Kubernetes on VMware vSphere](../../../../upgrade/workload/alauda_os/vmware-vsphere.mdx)
+- [VMware vSphere Provider](../overview.mdx)

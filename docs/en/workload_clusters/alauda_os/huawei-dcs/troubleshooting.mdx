@@ -1,0 +1,139 @@
+---
+weight: 70
+title: Troubleshooting
+author: dev@alauda.io
+category: howto
+queries:
+  - dcs cluster creation stuck
+  - dcs preflight credential sign in failed
+  - dcsmachine provisioning stuck
+  - dcsmachine stuck deleting
+  - VMStopPending condition huawei dcs
+  - machine deletion stuck FC site policy
+  - errorCode 102212808 ait
+---
+
+# Troubleshooting Huawei DCS Workload Clusters
+
+Start from the preflight error or the stage that `ac adm alpha cluster status` reports. For failures that every provider shares, see [Troubleshooting](../troubleshooting/index.mdx). Run the `ac` commands on this page from a machine where `ac` is logged in to the platform, after `ac config use-cluster global`.
+
+| Symptom | Action |
+|---|---|
+| Preflight reports that the DCS infrastructure provider or the kubeadm control plane provider is not installed | Install them; see [Providers](./prerequisites.mdx#providers). |
+| Preflight reports that the credential cannot sign in | Check that `authKey` is the plain-text password and `site` the bare site ID; see [DCS Credential Secret](./prerequisites.mdx#credential-secret). Correct the Secret before you run `create` again: repeated failed sign-ins lock the DCS account. |
+| Preflight reports a missing template, folder, switch, port group, datastore, or compute resource | Correct the name in `install-config.yaml`; for a port group, check that it belongs to the named switch. |
+| `[1/4] CAPI Cluster` stays `NotFound` | Check the cluster name: `ac get clusters.cluster.x-k8s.io -n cpaas-system`. |
+| `[2/4] KubeadmControlPlane` does not become ready | Run `ac -n cpaas-system describe machine <name>` and `ac -n cpaas-system describe dcsmachine <name>`, and check the credential, the template name, the capacity, the folder, and the port group. |
+| A `DCSMachine` stays in `Provisioning` while the DCS VM stays in `creating` | See [VM Stuck in `creating`](#stuck-creating). |
+| The control plane does not come up | For `external`, check that the load balancer forwards `6443` to the control plane nodes; for `internal`, see [Self-built VIP](#self-built-vip). |
+| `ControlPlaneHAReady` is not `True` | See [Control Plane HA](#control-plane-ha). |
+| `[3/4] MachineDeployment` shows the wrong node groups | Check `computes[].name` and the `hosts` of each group. |
+| `[4/4] ClusterView` does not become ready | Check the provider log: `ac -n cpaas-system logs deployment/cluster-api-provider-dcs-manager --tail=50`. |
+| The cluster reaches `Provisioned` but never becomes Ready, for example nodes stay `NotReady` because the CNI is not deployed | See [Troubleshoot a Workload Cluster Stuck in Provisioned](../troubleshooting/troubleshoot-cluster-not-ready.mdx). |
+| A `DCSMachine` stays in `Deleting` | See [DCSMachine Stuck in Deleting](#dcsmachine-stuck-deleting). |
+| The `Cluster` stays in `Deleting` after its machines are gone | See [Troubleshoot a Cluster Stuck in Deleting](../troubleshooting/troubleshoot-cluster-stuck-deleting.mdx). |
+
+## Self-built VIP \{#self-built-vip}
+
+| Result | Action |
+|---|---|
+| `type` is not `internal`, or the address is not your VIP | Contact technical support. |
+| No `alive` `ModuleInfo`, or the `alive` `AppRelease` is not synced and healthy | Contact technical support. |
+| `alive` Pods are not Ready, or the cluster cannot be reached through the VIP | Check that the DCS port group allows VIP ownership, gratuitous ARP, and VRRP traffic, that the VIP is not a node address, and that `vrid` is unique in the Layer 2 domain; see [Self-built VIP](./reference/install-config-parameters.mdx#self-built-vip). If they are, contact technical support. |
+
+## Control Plane HA \{#control-plane-ha}
+
+The [Control Plane HA check](./create_cluster.mdx#verify-control-plane-ha) prints the status, the reason, and a message:
+
+| Result | Action |
+|---|---|
+| `True ControlPlaneHAReady` | None. |
+| `False ControlPlaneHAPending` | Read the message. For placement, check DCS host capacity, DRS status, and whether anything blocks migration, such as an attached CD-ROM; the provider does not run DRS, so run it on the DCS side if the placement does not converge. To find the VMs on DCS, list the members: `ac -n cpaas-system get dcscluster <cluster-name> -o jsonpath='{range .status.controlPlaneHA.members[*]}{.machineName}{" "}{.vmUrn}{"\n"}{end}'`. |
+| `False ControlPlaneHAFailed` | Read the message, then check the DCS credential, the DRS settings, and rule-name conflicts on DCS. If they are correct, contact technical support. |
+
+## VM Stuck in `creating` \{#stuck-creating}
+
+A `DCSMachine` stays in `Provisioning` with `status.cdRomFile` set, so the sign-in and the ISO upload succeeded, while the DCS VM stays in `creating` with no host and its deploy task does not progress. The DCS scheduler cannot place the VM.
+
+1. In the DCS portal, check the free space of the datastores that the node group uses and the load of the hosts. A nearly full datastore, or hosts that are all heavily overcommitted, block placement; see [DCS Objects, Capacity, and Addresses](./prerequisites.mdx#dcs-objects).
+2. Ask the DCS platform team to free space or rebalance the hosts. Unless the node group is pinned through `resource`, DCS picks the host.
+3. If the deploy task does not respond to cancellation or to the VM deletion that the provider issues, a DCS administrator cancels it in the portal. Where DCS serializes VM deployment, one stuck task stalls every later one, so clear the first one.
+
+## DCSMachine Stuck in Deleting \{#dcsmachine-stuck-deleting}
+
+Use this section when a `DCSMachine` stays in `Deleting` and blocks a scale-down, a rolling upgrade, or the deletion of the cluster. Before it deletes a VM, the provider stops it and detaches its persistent disks, and DCS must complete each step.
+
+Read the `VMStopPending` condition of the `DCSMachine`:
+
+```bash
+ac config use-cluster global
+ac -n cpaas-system describe dcsmachine <name>
+```
+
+| Result | Action |
+|---|---|
+| `VMStopPending` with reason `WaitingForStop` | Wait. If the VM stays in `stopping`, see [VM Stuck in `stopping`](#vm-stuck-in-stopping). |
+| `VMStopPending` with reason `VMMidTransition` | Read the VM status in the message; see [VM Stuck in Mid-Transition](#vm-stuck-in-mid-transition). |
+| No `VMStopPending` condition, and the VM is still listed in the DCS portal | See [Controller Cannot Reach DCS API](#controller-cannot-reach-dcs-api). |
+| No `VMStopPending` condition, and the VM is gone from DCS | The stop is complete; the deletion is held elsewhere, for example by a Cluster API drain. See the [Cluster API troubleshooting documentation](https://cluster-api.sigs.k8s.io/user/troubleshooting.html) or contact technical support. |
+
+### VM Stuck in `stopping` \{#vm-stuck-in-stopping}
+
+The provider issued a safe stop, and the VM does not reach `stopped`. In the DCS portal, open the VM detail page:
+
+| Result | Action |
+|---|---|
+| `pvDriverStatus` is not `running`, or the guest OS is hung | Stop the VM with **Force** from the DCS portal (VM detail → **Operations** → **Stop** → **Force**). The provider then continues the deletion. |
+| The VM was cloned from a template older than `4.2.1`, whose guest tools cannot take a safe stop | Contact technical support. |
+
+### VM Stuck in Mid-Transition \{#vm-stuck-in-mid-transition}
+
+The provider waits until the VM is `running` or `stopped`:
+
+| Status in the message | Action |
+|---|---|
+| `migrating` | Wait; the deletion continues when the migration ends. |
+| `starting` | Wait until `running`; the deletion then continues. |
+| `paused` or `hibernated` | Resume the VM from the DCS portal (**Operations** → **Resume**). If it cannot be resumed, contact technical support. |
+
+### Controller Cannot Reach DCS API \{#controller-cannot-reach-dcs-api}
+
+Read the provider log:
+
+```bash
+ac config use-cluster global
+ac -n cpaas-system logs deployment/cluster-api-provider-dcs-manager --tail=50
+```
+
+| Result | Action |
+|---|---|
+| `connection refused` or `timeout` | Check the paths from the `global` cluster nodes to DCS; see [Network Connectivity](./prerequisites.mdx#network-connectivity). |
+| `errorCode: 10100116` | The DCS account is locked; see [DCS Account Lockout](#dcs-account-lockout). |
+| `401 Unauthorized` | Update the credential Secret as described in [DCS Credential Secret](./prerequisites.mdx#credential-secret). |
+
+### DCS Account Lockout \{#dcs-account-lockout}
+
+`errorCode: 10100116` means that DCS has locked the account of the credential Secret.
+
+1. If the password changed, update the credential Secret as described in [DCS Credential Secret](./prerequisites.mdx#credential-secret): while it is wrong, the provider's sign-ins keep the account locked.
+2. Contact technical support to recover from the lockout.
+
+Do not use the DCS portal `admin` account in the credential Secret: a lockout then locks everyone out. Use a dedicated account, as described in [DCS Credential Secret](./prerequisites.mdx#credential-secret).
+
+### FC Site Policy: errorCode `102212808` \{#fc-site-policy-stopped-only}
+
+On a DCS site whose FusionCompute platform deletes only stopped VMs, the provider log can show `DeleteVm rejected by FC site policy` with `errorCode=102212808`. The provider stops the VM again and retries on its own.
+
+| Result | Action |
+|---|---|
+| The error appears once, and the `Machine` is then deleted | None. |
+| The error repeats | Something restarts the VM on DCS, such as an operator or another automation. Stop it. If the error still repeats, contact technical support. |
+
+### Verify Recovery
+
+```bash
+ac config use-cluster global
+ac -n cpaas-system get machines -l cluster.x-k8s.io/cluster-name=<cluster-name>
+```
+
+Continue when the `Machine` is no longer listed and the VM is gone from the DCS portal; otherwise contact technical support.

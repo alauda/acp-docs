@@ -1,0 +1,110 @@
+---
+weight: 10
+title: Parameters
+author: gangwang@alauda.io
+category: reference
+queries:
+  - bare metal workload cluster install-config.yaml fields
+  - bare metal rendered manifests
+---
+
+# install-config.yaml Parameters for Bare Metal
+
+This page lists the fields of a Bare Metal workload cluster's `install-config.yaml` and the objects that `ac` renders from them.
+
+## Fields \{#fields}
+
+| Field | Required | Default | Description |
+|---|---|---|---|
+| `cluster.clusterName` | Yes | — | The cluster name, a DNS-1123 subdomain of at most 63 characters. It must not be `global` or start with `global-`. `Cluster` and `BaremetalCluster` take this name, and every other object is prefixed with `<cluster-name>-`. |
+| `cluster.sshKeys` | Yes | — | SSH public keys of the `boot` user on every node. |
+| `cluster.registrySecretRef` | No | The platform registry | A Secret in `cpaas-system` labelled `capi.cpaas.io/provider=registry-credential`, with a required `registry` key and optional `username` and `password`, set together. See [Image Registry](../prerequisites.mdx#image-registry). |
+| `cluster.encryptionProviderConfig` | No | Generated | The aescbc key for encrypting Secrets at rest: the base64 of a 16, 24, or 32 byte key. A generated key is kept only in `manifests/`; see [Run `create` Again](../create_cluster.mdx#rerun-create). |
+| `cluster.network.podCIDR`, `serviceCIDR`, `kubeOVN.joinCIDR` | No | `10.199.0.0/16`, `10.96.0.0/12`, `100.64.0.0/16` | They must not overlap each other, the host network, or the CIDRs of other clusters on the same `global` cluster. |
+| `cluster.network.loadBalancer.type` | No | `internal` | `internal` runs a VIP on the control plane nodes; `external` uses your load balancer, which forwards `TCP/6443`. |
+| `cluster.network.loadBalancer.address`, `port` | `address`: Yes | `port`: `6443` | The control plane endpoint. For `internal`, an unused IPv4 address in the control plane Layer 2 domain; for `external`, the load balancer frontend. See [Network Connectivity](../prerequisites.mdx#network-connectivity) and [Plan the Control Plane Endpoint](../../prepare/control-plane-endpoint.mdx). |
+| `cluster.network.loadBalancer.vrid` | For `internal` | — | 0-255, unique in the control plane Layer 2 domain. |
+| `cluster.network.loadBalancer.interface`, `vipMode` | Not supported | — | The provider binds the VIP to the interface that carries the node address. |
+| `controlPlane.replicas` | Yes | — | An odd number: `1`, or `3` or more. The control plane runs stacked etcd. With fewer than three control plane nodes, contact technical support before you upgrade the cluster. |
+| `*.baremetal.machineInventoryPool` | Yes | — | The pool each node group draws from. Two node groups cannot share a pool. |
+| `computes[].name` | Yes | — | Unique per group. `control-plane` is reserved. |
+
+The node groups take no `cpuCore`, `memoryGiB`, `network`, `disks`, or `hosts` fields, and the file takes no `credentialRef`, `provider.baremetal`, `global`, `ntpServers`, or `deployMode`. Writing one is an error that names the field. Node sizing and addresses come from the host, and data disks are declared on the `MachineInventory`; see [Prepare Managed Data Disks](../create_cluster.mdx#optional-prepare-managed-storage).
+
+## Rendered Manifests \{#render-manifests}
+
+`ac` writes the objects it applies to `<install-dir>/manifests/`, one file per object, all in `cpaas-system`. For their API fields, see [API Reference](../../../../apis/kubernetes_apis/infrastructure_providers/bare-metal/index.mdx).
+
+| Object | Name | Notes |
+|---|---|---|
+| `Secret` | `<cluster-name>-encryption-provider-config` | The encryption configuration, referenced by `BaremetalCluster`. |
+| `Cluster` | `<cluster-name>` | Labelled `cluster-type: ProviderBaremetal`; annotated with the registry address in `cpaas.io/registry-address`. |
+| `BaremetalCluster` | `<cluster-name>` | `controlPlaneLoadBalancer` from `cluster.network.loadBalancer`, with the type written as `Internal` or `External`. |
+| `BaremetalMachineTemplate`, `KubeadmControlPlane` | `<cluster-name>-control-plane` | The template references the control plane pool. `rolloutStrategy.rollingUpdate.maxSurge: 0` with `3` or more replicas; a single replica gets no rollout strategy. |
+| `BaremetalMachineTemplate`, `MachineDeployment` | `<cluster-name>-<group>` | The template references the group's pool. `maxSurge: 0`, `maxUnavailable: 1`. |
+| `KubeadmConfigTemplate` | `<cluster-name>-<group>-config` | |
+
+The `MachineRegistration`, the `SeedImage`, and the pools are yours; `ac` does not render or delete them.
+
+### Worker Objects \{#worker-machine-template}
+
+The worker objects of the template in [Create a Cluster](../create_cluster.mdx#write-install-config) render as follows. The bootstrap template's `files` and `users` are abbreviated.
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: BaremetalMachineTemplate
+metadata:
+  name: <cluster-name>-worker
+  namespace: cpaas-system
+spec:
+  template:
+    spec:
+      machineInventoryPoolRef:
+        name: <cluster-name>-worker-pool
+---
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+kind: KubeadmConfigTemplate
+metadata:
+  name: <cluster-name>-worker-config
+  namespace: cpaas-system
+spec:
+  template:
+    spec:
+      joinConfiguration:
+        nodeRegistration:
+          kubeletExtraArgs:
+            volume-plugin-dir: /opt/libexec/kubernetes/kubelet-plugins/volume/exec/
+        patches:
+          directory: /etc/kubernetes/patches
+      postKubeadmCommands:
+      - chmod 600 /var/lib/kubelet/config.yaml
+      # files: the kubelet configuration patch; users: the boot user with cluster.sshKeys
+---
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineDeployment
+metadata:
+  name: <cluster-name>-worker
+  namespace: cpaas-system
+spec:
+  clusterName: <cluster-name>
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0            # A pool cannot over-provision physical hosts
+      maxUnavailable: 1
+  template:
+    spec:
+      clusterName: <cluster-name>
+      bootstrap:
+        configRef:
+          apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+          kind: KubeadmConfigTemplate
+          name: <cluster-name>-worker-config
+      infrastructureRef:
+        apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+        kind: BaremetalMachineTemplate
+        name: <cluster-name>-worker
+      nodeDrainTimeout: 5m
+      version: <kubernetes-version>
+```
