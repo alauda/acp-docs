@@ -13,7 +13,7 @@ Do not start another `global` upgrade while a workload cluster upgrade is runnin
 
 ## Before You Upgrade the Clusters \{#before-the-window}
 
-Complete these steps for every cluster that you plan to upgrade, and confirm that each of these clusters has a recent successful etcd backup, as described in [Check the etcd Backup](../pre-upgrade.mdx#etcd-backup).
+Complete these steps for each cluster that you plan to upgrade, before you request its upgrade.
 
 <Steps>
 
@@ -50,6 +50,26 @@ violet push <operator-package>.tgz --platform-address "https://<platform-address
   --platform-token "${PLATFORM_TOKEN}" --clusters "<cluster-name>"
 ```
 
+### Check the etcd Backup \{#check-etcd-backup}
+
+**Applies to**: workload clusters created by ACP. Skip it for imported and registered clusters.
+
+On the workload cluster, list its backup records:
+
+```bash
+ac config use-cluster <cluster-name>
+ac whoami --show-server
+ac get etcdbackupconfiguration etcd-backup-default \
+  -o jsonpath='{range .status.records[*]}{.backupTimestamp}{"\t"}{.result}{"\n"}{end}'
+ac config use-cluster global
+```
+
+| Result | Action |
+|---|---|
+| The record with the latest time shows `Success` | Continue. |
+| The command reports `NotFound` or `the server doesn't have a resource type` | Install Alauda Container Platform Cluster Enhancement on the cluster, as described in [etcd Backup and Restore](../../configure/backup/etcd.mdx), and run the command again after its first backup. If you cannot install it, contact technical support. |
+| The record with the latest time does not show `Success`, or there is no record | Contact technical support. |
+
 ### Run Preflight Checks for the Cluster \{#run-preflight}
 
 Run this block on the `global` cluster, the primary in a DR environment, in the `installer/` directory of the extracted target Core Package; `ac whoami --show-server` prints an address that ends with `/kubernetes/global/`:
@@ -64,83 +84,338 @@ bash upgrade.sh --preflight --cluster=<cluster-name>
 |---|---|
 | `Summary` shows `Passed` or `PassedWithWarnings` | Continue. |
 | `GlobalVersionReady` reports `Retry` with the reason `GlobalVersionPending` | Finish the upgrade of the `global` clusters, then run the check again. |
-| `InfraClusterVersionPreflight` reports `PreflightPending` (Huawei DCS and Bare Metal) | Run the check again after 5 minutes; if it does not change, contact technical support. |
-| `InfraClusterVersionPreflight` reports `PreflightUnconsumed` | Contact technical support. |
-| `InfraClusterVersionPreflight` fails for another reason | Run the commands below, fix each failed check as described in [Kubernetes Upgrade Checks](../troubleshooting.mdx#infra-preflight-checks), and run the check again. |
-| Another check fails | Fix it as described in [Handle Preflight Blocks](../troubleshooting.mdx#handle-preflight-blocks-when-needed), and run the check again. For `ResourcePatchUpgradeable`, use the workload cluster as `<cluster-name>`. |
+| `InfraClusterVersionPreflight` does not pass (Huawei DCS and Bare Metal) | Take the action in the Huawei DCS or Bare Metal tab of [Check the Cluster by Type](#check-by-type). |
+| `ResourcePatchUpgradeable` fails | Review each listed patch with technical support, then run the commands below on the workload cluster, and run the check again. |
+| Another check fails | Follow [Resolve Other Preflight Blocks](../troubleshooting.mdx#resolve-other-preflight-blocks), and run the check again. If the check is not listed there, contact technical support. |
 
-On the `global` cluster:
+On the workload cluster, list the patches, review each of them, then exempt it with the target version as the value; do not use `*`:
+
+```bash
+ac config use-cluster <cluster-name>
+ac whoami --show-server
+ac get resourcepatches \
+  -o custom-columns='NAME:.metadata.name,EXEMPT:.metadata.annotations.config\.cpaas\.io/exempt-for-ver'
+ac get resourcepatches <rp-name> -o yaml
+ac annotate resourcepatches <rp-name> config.cpaas.io/exempt-for-ver=<target-version> --overwrite
+ac config use-cluster global
+```
+
+### Check the Cluster by Type \{#check-by-type}
+
+**Applies to**: every cluster that you upgrade, except imported clusters. Use the Non-Alauda OS tab for a cluster that ACP created on nodes without Alauda OS, and the tab of the infrastructure provider for an Alauda OS cluster.
+
+Run each block on the execution host unless it says that it runs on a node or a host. Each table has a Continue row for each part of the output: continue when every part matches its Continue row; otherwise, take the action of each row that matches.
+
+<Tabs>
+  <Tab label="Non-Alauda OS">
+
+On each node of the cluster:
+
+```bash
+uname -r
+stat -fc %T /sys/fs/cgroup/
+```
+
+Continue when the kernel is `5.8` or later and within [Supported OS and Kernel Versions](../../install/non_alauda_os/node_preprocessing.mdx#supported_os_and_kernels), and the second command prints `cgroup2fs`; otherwise, update the OS of the node before you upgrade the cluster, and if you cannot, contact technical support. The update restarts the node.
+
+  </Tab>
+  <Tab label="Huawei DCS">
+
+Read `InfraClusterVersionPreflight` in the output of [Run Preflight Checks for the Cluster](#run-preflight):
+
+| Result | Action |
+|---|---|
+| `InfraClusterVersionPreflight` passes | Continue. |
+| `InfraClusterVersionPreflight` reports only warnings | Run the first block below, take the action of each check whose state is `Failed` in [Kubernetes Upgrade Checks](../troubleshooting.mdx#infra-preflight-checks), then continue. |
+| `InfraClusterVersionPreflight` reports `PreflightPending` | Run the preflight check again after 5 minutes; if it does not change, contact technical support. |
+| `InfraClusterVersionPreflight` reports `PreflightUnconsumed` | Contact technical support. |
+| `InfraClusterVersionPreflight` fails for another reason | Run the first block below, fix each check whose state is `Failed` as described in [Kubernetes Upgrade Checks](../troubleshooting.mdx#infra-preflight-checks), and run the preflight check again. If no check is `Failed`, contact technical support. |
+
+On the `global` cluster; replace `<preflight-name>` with the `NAME` that the third line prints:
 
 ```bash
 ac config use-cluster global
+ac whoami --show-server
 ac -n cpaas-system get infraclusterversionpreflight -l upgrade.alauda.io/cluster=<cluster-name>
 ac -n cpaas-system get infraclusterversionpreflight <preflight-name> \
   -o jsonpath='{range .status.checks[*]}{.name}{"\t"}{.severity}{"\t"}{.state}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
 ```
 
-### Check Huawei Cloud Stack and VMware vSphere Clusters \{#check-vsphere}
+Then, also on the `global` cluster, set `CLUSTER` on the first line to the cluster and run this block once. It only reads; the last command prints the type and the address of the control-plane load balancer of the cluster:
 
-**Applies to**: clusters created with Huawei Cloud Stack or VMware vSphere. Skip it for other clusters.
+```bash
+CLUSTER="<cluster-name>"
+ac config use-cluster global
+ac whoami --show-server
+echo "== MachineDeployments"
+ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name="${CLUSTER}" \
+  -o custom-columns='NAME:.metadata.name,UNAVAILABLE:.spec.strategy.rollingUpdate.maxUnavailable'
+echo "== Machines, IP pools, and the type and address of the control-plane load balancer"
+ac -n cpaas-system get dcsmachine -l cluster.x-k8s.io/cluster-name="${CLUSTER}" \
+  -o custom-columns='NAME:.metadata.name,POOL:.spec.ipHostPoolRef.name,IP:.status.networkConfig.ip'
+ac -n cpaas-system get dcsiphostnamepool \
+  -o custom-columns='NAME:.metadata.name,IPS:.spec.pool[*].ip,DISKS:.spec.pool[*].persistentDisk[*].slot,KEPT_DISKS:.status.persistentDiskStatus[*].ip'
+ac -n cpaas-system get dcscluster "${CLUSTER}" -o jsonpath='{.spec.controlPlaneLoadBalancer.type}{" "}{.spec.controlPlaneLoadBalancer.host}{"\n"}'
+```
 
-On the `global` cluster, for each such cluster, read the rollout settings:
+A free entry is an IP address of a pool in `POOL` whose `DISKS` lists slot numbers, that no machine uses, and that is not the load balancer address when the type is `internal`.
+
+| Result | Action |
+|---|---|
+| Every MachineDeployment shows `UNAVAILABLE` `1` | Continue. |
+| A MachineDeployment shows `UNAVAILABLE` empty, `<none>`, or not `1` | Run the command below for it. |
+| The pools in `POOL` whose `DISKS` lists slot numbers have no free entry | Continue. |
+| A free entry is not in `KEPT_DISKS` | Remove it from `spec.pool` with `ac -n cpaas-system edit dcsiphostnamepool <pool-name>`. Keep the entry of the internal load balancer address. |
+| A free entry is in `KEPT_DISKS` | Contact technical support. Do not remove the entry. |
+
+On the `global` cluster, for each MachineDeployment that the table names:
 
 ```bash
 ac config use-cluster global
-KCP=$(ac -n cpaas-system get clusters.cluster.x-k8s.io <cluster-name> -o jsonpath='{.spec.controlPlaneRef.name}')
-ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='replicas={.spec.replicas} maxSurge={.spec.rolloutStrategy.rollingUpdate.maxSurge}{"\n"}'
-ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=<cluster-name> \
-  -o custom-columns='NAME:.metadata.name,SURGE:.spec.strategy.rollingUpdate.maxSurge,UNAVAILABLE:.spec.strategy.rollingUpdate.maxUnavailable'
+ac whoami --show-server
+ac -n cpaas-system patch machinedeployment <md-name> --type merge \
+  -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":0,"maxUnavailable":1}}}}'
 ```
 
-Then read the pools and the provider:
+  </Tab>
+  <Tab label="Bare Metal">
 
-<Tabs>
-  <Tab label="Huawei Cloud Stack">
+Read `InfraClusterVersionPreflight` in the output of [Run Preflight Checks for the Cluster](#run-preflight):
 
-The first two commands print the machine templates of the cluster. Run the third command for each of these templates, and the fourth for each pool in `POOL`:
+| Result | Action |
+|---|---|
+| `InfraClusterVersionPreflight` passes | Continue. |
+| `InfraClusterVersionPreflight` reports only warnings | Run the first block below, take the action of each check whose state is `Failed` in [Kubernetes Upgrade Checks](../troubleshooting.mdx#infra-preflight-checks), then continue. |
+| `InfraClusterVersionPreflight` reports `PreflightPending` | Run the preflight check again after 5 minutes; if it does not change, contact technical support. |
+| `InfraClusterVersionPreflight` reports `PreflightUnconsumed` | Contact technical support. |
+| `InfraClusterVersionPreflight` fails for another reason | Run the first block below, fix each check whose state is `Failed` as described in [Kubernetes Upgrade Checks](../troubleshooting.mdx#infra-preflight-checks), and run the preflight check again. If no check is `Failed`, contact technical support. |
+
+On the `global` cluster; replace `<preflight-name>` with the `NAME` that the third line prints:
 
 ```bash
-ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{.spec.machineTemplate.infrastructureRef.name}{"\n"}'
-ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=<cluster-name> -o custom-columns='NAME:.metadata.name,TEMPLATE:.spec.template.spec.infrastructureRef.name'
-ac -n cpaas-system get hcsmachinetemplate <template-name> -o custom-columns='NAME:.metadata.name,POOL:.spec.template.spec.configPoolRef.name'
-ac -n cpaas-system get hcsmachineconfigpool <pool-name> \
-  -o custom-columns='NAME:.metadata.name,TOTAL:.status.totalCount,AVAILABLE:.status.availableCount,DISKS:.spec.configs[*].persistentDisks[*].mountPath'
+ac config use-cluster global
+ac whoami --show-server
+ac -n cpaas-system get infraclusterversionpreflight -l upgrade.alauda.io/cluster=<cluster-name>
+ac -n cpaas-system get infraclusterversionpreflight <preflight-name> \
+  -o jsonpath='{range .status.checks[*]}{.name}{"\t"}{.severity}{"\t"}{.state}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
+```
+
+:::warning
+A node pool with a single host has no worker while that host is reinstalled. Make sure its workloads can run on other nodes, or accept the interruption.
+:::
+
+Then, also on the `global` cluster, set `CLUSTER` on the first line to the cluster and run this block once. It only reads. Keep the output; after the upgrade, [Upgrade Validation](../validation.mdx#check-provider-resources) compares the `INVENTORY` values with it.
+
+```bash
+CLUSTER="<cluster-name>"
+ac config use-cluster global
+ac whoami --show-server
+KCP=$(ac -n cpaas-system get clusters.cluster.x-k8s.io "${CLUSTER}" -o jsonpath='{.spec.controlPlaneRef.name}')
+echo "== Control plane and MachineDeployments"
+ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='replicas={.spec.replicas}{"\n"}'
+ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name="${CLUSTER}" \
+  -o custom-columns='NAME:.metadata.name,UNAVAILABLE:.spec.strategy.rollingUpdate.maxUnavailable'
+echo "== Machines, host pools, and hosts"
+ac -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io -l cluster.x-k8s.io/cluster-name="${CLUSTER}" \
+  -o custom-columns='NAME:.metadata.name,INVENTORY:.status.machineInventoryRef.name'
+ac -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io \
+  -o custom-columns='NAME:.metadata.name,CLUSTER:.spec.clusterName,TOTAL:.status.total,ALLOCATED:.status.allocated,HOSTS:.spec.machineInventories[*].name'
+ac -n cpaas-system get machineinventories.elemental.cattle.io \
+  -o custom-columns='NAME:.metadata.name,OS:.metadata.labels.os\.baremetal\.alauda\.io/id,STORAGE:.status.storage.phase'
+```
+
+The hosts of the cluster are the ones in `HOSTS` of the pools whose `CLUSTER` is the cluster, spare hosts included.
+
+| Result | Action |
+|---|---|
+| Every MachineDeployment shows `UNAVAILABLE` `1` | Continue. |
+| A MachineDeployment shows `UNAVAILABLE` empty, `<none>`, or not `1` | Run the command below for it. |
+| A host declares data volumes when its `STORAGE` is not `Unmanaged`, empty, or `<none>`. Each such host of the cluster shows `Prepared`, or `Active` once it is allocated | Continue. |
+| A host that declares data volumes shows another `STORAGE` | Contact technical support. |
+| Each pool of the cluster with a host that declares data volumes shows `TOTAL` equal to `ALLOCATED` | Continue. |
+| `replicas` is 3 or more, and such a pool shows `TOTAL` greater than `ALLOCATED` | Remove the free hosts, the ones in `HOSTS` that no machine uses as its `INVENTORY`, from `spec.machineInventories` with `ac -n cpaas-system edit machineinventorypools.infrastructure.cluster.x-k8s.io <pool-name>`. Removing a free host from the pool does not change the host. |
+| `replicas` is less than 3 | Contact technical support. Do not remove any host. |
+
+On the `global` cluster, for each MachineDeployment that the table names:
+
+```bash
+ac config use-cluster global
+ac whoami --show-server
+ac -n cpaas-system patch machinedeployment <md-name> --type merge \
+  -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":0,"maxUnavailable":1}}}}'
+```
+
+On each host of the cluster whose `OS` is `alaudaos.m.55`, empty, or `<none>` (Alauda OS M55), check the `COS_STATE` partition. For a host whose `OS` starts with `alaudaos.k.` (Alauda OS KU), ask technical support instead how much free space its `/persist` needs.
+
+```bash
+lsblk -o NAME,SIZE,LABEL | grep COS_STATE
+btrfs filesystem usage -h /
+snapper --no-dbus --csvout list --columns number,default,active,userdata
+```
+
+| Result | Action |
+|---|---|
+| `COS_STATE` is larger than 8 GiB, `Free (estimated)` is at least 4 GiB, and no snapshot shows `no` in `default` and `active` and `update-in-progress=yes` in `userdata` | Continue. |
+| `Free (estimated)` is less than 4 GiB, or a snapshot shows `no` in `default` and `active` and `update-in-progress=yes` in `userdata` | Run the steps in [Free Space on COS_STATE](../troubleshooting.mdx#check-cos-state-free-space). |
+| `COS_STATE` is 8 GiB or smaller | Reinstall the host with a larger partition, as described in [Size COS_STATE before the first install](../../workload_clusters/alauda_os/bare-metal/create_cluster.mdx#size-cos-state), before you upgrade the cluster. The reinstall replaces the node. |
+
+  </Tab>
+  <Tab label="Huawei Cloud Stack">
+
+On the `global` cluster, set `CLUSTER` on the first line to the cluster and run this block once. It only reads, and prints each part under its own `==` title:
+
+```bash
+CLUSTER="<cluster-name>"
+ac config use-cluster global
+ac whoami --show-server
+KCP=$(ac -n cpaas-system get clusters.cluster.x-k8s.io "${CLUSTER}" -o jsonpath='{.spec.controlPlaneRef.name}')
+echo "== Rollout settings"
+ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='replicas={.spec.replicas} maxSurge={.spec.rolloutStrategy.rollingUpdate.maxSurge}{"\n"}'
+ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name="${CLUSTER}" \
+  -o custom-columns='NAME:.metadata.name,SURGE:.spec.strategy.rollingUpdate.maxSurge,UNAVAILABLE:.spec.strategy.rollingUpdate.maxUnavailable'
+echo "== Machine templates in use, and the pools"
+ac -n cpaas-system get hcsmachinetemplate \
+  $(ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{.spec.machineTemplate.infrastructureRef.name}') \
+  $(ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name="${CLUSTER}" -o jsonpath='{.items[*].spec.template.spec.infrastructureRef.name}') \
+  -o custom-columns='NAME:.metadata.name,DATA_VOLUMES:.spec.template.spec.dataVolumes[*].mountPath,POOL:.spec.template.spec.configPoolRef.name'
+ac -n cpaas-system get hcsmachineconfigpool \
+  -o custom-columns='NAME:.metadata.name,AVAILABLE:.status.availableCount,DISKS:.spec.configs[*].persistentDisks[*].slot,HOSTNAMES:.spec.configs[*].hostname,USED:.status.usedConfigs[*].hostname'
+echo "== Kubelet patch files: the content, or a Secret name and key"
+echo "${KCP}:"
+ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{range .spec.kubeadmConfigSpec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
+for t in $(ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name="${CLUSTER}" -o jsonpath='{.items[*].spec.template.spec.bootstrap.configRef.name}'); do
+  echo "${t}:"
+  ac -n cpaas-system get kubeadmconfigtemplate "${t}" -o jsonpath='{range .spec.template.spec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
+done
+echo "== Provider"
 ac -n cpaas-system get apprelease \
   -o custom-columns='NAME:.metadata.name,CHART:.spec.source.charts[*].name,REQUESTED:.spec.source.charts[*].targetRevision,INSTALLED:.status.charts.*.installedRevision,SYNC:.status.conditions[?(@.type=="Sync")].status,HEALTH:.status.conditions[?(@.type=="Health")].status' \
   | grep -E '^NAME|chart-cluster-api-provider-hcs'
 ```
 
+When a kubelet patch file shows a Secret name and a key instead of the content, print the content from the Secret. Escape each `.` in `<secret-key>` as `\.`:
+
+```bash
+ac -n cpaas-system get secret <secret-name> -o jsonpath='{.data.<secret-key>}' | base64 -d
+```
+
+Also, in the HCS console, confirm that the image that you recorded for the target version and for each intermediate Kubernetes version exists in the region and project of the cluster.
+
+| Result | Action |
+|---|---|
+| `replicas` is 3 or more and `maxSurge` is `0`, and every MachineDeployment shows `SURGE` `0` and `UNAVAILABLE` `1` | Continue. |
+| `replicas` is less than 3 | Contact technical support. |
+| `replicas` is 3 or more and `maxSurge` is empty or not `0` | Run the `kubeadmcontrolplane` block below. |
+| A MachineDeployment shows `SURGE` empty, `<none>`, or not `0`, or `UNAVAILABLE` empty, `<none>`, or not `1` | Run the `machinedeployment` block below for it. |
+| No machine template lists `/var/cpaas` in `DATA_VOLUMES` | Continue. |
+| A machine template lists `/var/cpaas` in `DATA_VOLUMES` | [Migrate to pool-managed persistent disks](../persistent_disk_migration.mdx) before you upgrade the cluster. The migration replaces nodes. |
+| Every pool in `POOL` whose `DISKS` lists slot numbers shows `AVAILABLE` empty, `<none>`, or `0` | Continue. |
+| Such a pool shows `AVAILABLE` greater than `0` | Remove its free configurations, the ones in `HOSTNAMES` that are not in `USED`, from `spec.configs` with `ac -n cpaas-system edit hcsmachineconfigpool <pool-name>`. |
+| The edit is rejected for a free configuration that was used before | Contact technical support. |
+| Each kubelet patch file shows its content, or a Secret name and a key for which the Secret command above prints the content | Continue. |
+| A kubelet patch file shows nothing, or its Secret or key does not exist | Contact technical support. |
+| A kubelet patch file lacks `"imagePullCredentialsVerificationPolicy": "NeverVerify"` | Continue. You add it in [Upgrade Kubernetes on Huawei Cloud Stack or VMware vSphere](#upgrade-kubernetes-hcs-vsphere), for each version 1.35 or later. |
+| The provider shows `REQUESTED` equal to `INSTALLED`, with `SYNC` and `HEALTH` `True` | Continue. |
+| The provider shows `REQUESTED` different from `INSTALLED`, or `SYNC` or `HEALTH` is not `True` | Contact technical support. |
+| The image of each version exists in the region and project of the cluster | Continue. |
+| An image is missing | Upload the `qcow2` image of that version to the HCS image service in that region and project before you upgrade the cluster. |
+
+On the `global` cluster, with `CLUSTER` on the first line set to the cluster, for the `KubeadmControlPlane`:
+
+```bash
+CLUSTER="<cluster-name>"
+ac config use-cluster global
+ac whoami --show-server
+KCP=$(ac -n cpaas-system get clusters.cluster.x-k8s.io "${CLUSTER}" -o jsonpath='{.spec.controlPlaneRef.name}')
+ac -n cpaas-system patch kubeadmcontrolplane "${KCP}" --type merge \
+  -p '{"spec":{"rolloutStrategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":0}}}}'
+```
+
+On the `global` cluster, for each MachineDeployment that the table names:
+
+```bash
+ac config use-cluster global
+ac whoami --show-server
+ac -n cpaas-system patch machinedeployment <md-name> --type merge \
+  -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":0,"maxUnavailable":1}}}}'
+```
+
   </Tab>
   <Tab label="VMware vSphere">
 
+On the `global` cluster, set `CLUSTER` on the first line to the cluster and run this block once. It only reads, and prints each part under its own `==` title:
+
 ```bash
-ac -n cpaas-system get vspheremachineconfigpool -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status'
+CLUSTER="<cluster-name>"
+ac config use-cluster global
+ac whoami --show-server
+KCP=$(ac -n cpaas-system get clusters.cluster.x-k8s.io "${CLUSTER}" -o jsonpath='{.spec.controlPlaneRef.name}')
+echo "== Rollout settings"
+ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='replicas={.spec.replicas} maxSurge={.spec.rolloutStrategy.rollingUpdate.maxSurge}{"\n"}'
+ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name="${CLUSTER}" \
+  -o custom-columns='NAME:.metadata.name,SURGE:.spec.strategy.rollingUpdate.maxSurge,UNAVAILABLE:.spec.strategy.rollingUpdate.maxUnavailable'
+echo "== Machine config pools"
+ac -n cpaas-system get vspheremachineconfigpool \
+  -o custom-columns='NAME:.metadata.name,CLUSTER:.spec.clusterRef.name,READY:.status.conditions[?(@.type=="Ready")].status'
+echo "== Kubelet patch files: the content, or a Secret name and key"
+echo "${KCP}:"
+ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{range .spec.kubeadmConfigSpec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
+for t in $(ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name="${CLUSTER}" -o jsonpath='{.items[*].spec.template.spec.bootstrap.configRef.name}'); do
+  echo "${t}:"
+  ac -n cpaas-system get kubeadmconfigtemplate "${t}" -o jsonpath='{range .spec.template.spec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
+done
+echo "== Provider"
 ac -n cpaas-system get apprelease \
   -o custom-columns='NAME:.metadata.name,CHART:.spec.source.charts[*].name,REQUESTED:.spec.source.charts[*].targetRevision,INSTALLED:.status.charts.*.installedRevision,SYNC:.status.conditions[?(@.type=="Sync")].status,HEALTH:.status.conditions[?(@.type=="Health")].status' \
   | grep -E '^NAME|chart-cluster-api-provider-vsphere'
 ```
 
-  </Tab>
-</Tabs>
+When a kubelet patch file shows a Secret name and a key instead of the content, print the content from the Secret. Escape each `.` in `<secret-key>` as `\.`:
+
+```bash
+ac -n cpaas-system get secret <secret-name> -o jsonpath='{.data.<secret-key>}' | base64 -d
+```
+
+Also, in vCenter, confirm that the VM template that you recorded for the target version and for each intermediate Kubernetes version exists in each datacenter that the cluster uses.
 
 | Result | Action |
 |---|---|
-| `replicas` is 3 or more and `maxSurge` is `0`, and every MachineDeployment shows `SURGE` `0` and `UNAVAILABLE` `1`; on Huawei Cloud Stack, every pool in `POOL` that lists `DISKS` shows `AVAILABLE` empty or `0`; on VMware vSphere, every pool of the cluster reports `True`; the provider shows `REQUESTED` equal to `INSTALLED`, with `SYNC` and `HEALTH` `True` | Continue. |
+| `replicas` is 3 or more and `maxSurge` is `0`, and every MachineDeployment shows `SURGE` `0` and `UNAVAILABLE` `1` | Continue. |
 | `replicas` is less than 3 | Contact technical support. |
-| `replicas` is 3 or more and `maxSurge` is empty or not `0` | Run the `kubeadmcontrolplane` command below. |
-| A MachineDeployment shows `SURGE` empty or not `0`, or `UNAVAILABLE` empty or not `1` | Run the `machinedeployment` command below for it. |
-| Huawei Cloud Stack: a pool in `POOL` that lists `DISKS` shows `AVAILABLE` greater than `0` | Remove the free configurations from the pool as described in [Check the Free Pool Entries](../pre-upgrade.mdx#persistent-disk-layout). |
-| VMware vSphere: a pool of the cluster does not report `True` | Contact technical support. |
+| `replicas` is 3 or more and `maxSurge` is empty or not `0` | Run the `kubeadmcontrolplane` block below. |
+| A MachineDeployment shows `SURGE` empty, `<none>`, or not `0`, or `UNAVAILABLE` empty, `<none>`, or not `1` | Run the `machinedeployment` block below for it. |
+| Every pool whose `CLUSTER` is the cluster shows `READY` `True` | Continue. |
+| Such a pool does not show `True` | Contact technical support. |
+| Each kubelet patch file shows its content, or a Secret name and a key for which the Secret command above prints the content | Continue. |
+| A kubelet patch file shows nothing, or its Secret or key does not exist | Contact technical support. |
+| A kubelet patch file lacks `"imagePullCredentialsVerificationPolicy": "NeverVerify"` | Continue. You add it in [Upgrade Kubernetes on Huawei Cloud Stack or VMware vSphere](#upgrade-kubernetes-hcs-vsphere), for each version 1.35 or later. |
+| The provider shows `REQUESTED` equal to `INSTALLED`, with `SYNC` and `HEALTH` `True` | Continue. |
 | The provider shows `REQUESTED` different from `INSTALLED`, or `SYNC` or `HEALTH` is not `True` | Contact technical support. |
+| The VM template of each version exists in each datacenter that the cluster uses | Continue. |
+| A VM template is missing | Deploy the `ova` of that version in that datacenter and convert it to a VM template with the recorded name before you upgrade the cluster. |
 
-On the `global` cluster, with `KCP` from the first block:
+On the `global` cluster, with `CLUSTER` on the first line set to the cluster, for the `KubeadmControlPlane`:
 
 ```bash
+CLUSTER="<cluster-name>"
+ac config use-cluster global
+ac whoami --show-server
+KCP=$(ac -n cpaas-system get clusters.cluster.x-k8s.io "${CLUSTER}" -o jsonpath='{.spec.controlPlaneRef.name}')
 ac -n cpaas-system patch kubeadmcontrolplane "${KCP}" --type merge \
   -p '{"spec":{"rolloutStrategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":0}}}}'
+```
+
+On the `global` cluster, for each MachineDeployment that the table names:
+
+```bash
+ac config use-cluster global
+ac whoami --show-server
 ac -n cpaas-system patch machinedeployment <md-name> --type merge \
   -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":0,"maxUnavailable":1}}}}'
 ```
+
+  </Tab>
+</Tabs>
 
 ### Check DR Synchronization \{#check-dr-sync}
 
