@@ -16,10 +16,6 @@ queries:
 
 This document explains how to install the Infrastructure Provider for Virtualization Platform and the Cluster Bootstrap Provider, and how to verify that the required Cluster API components are available on the `global` cluster.
 
-:::info
-The provider package bundles the CAPV controller, the vSphere CPI image, the provider chart, and the admission webhooks that enforce the fixed-IP rollout rules. For those rules, see [Provider Requirements](./install-config-parameters.mdx#provider-requirements).
-:::
-
 ## When You Need This
 
 Complete this page before you create the first workload cluster on VMware vSphere when the `global` cluster runs on other infrastructure: `ac` installs only that infrastructure's provider. A `global` cluster installed on VMware vSphere with ACP CLI (ac) already runs both providers, and you can skip this page. In a disaster recovery (DR) pair, complete it on **both** `global` clusters, so that the standby can reconcile the same workload clusters after a failover. Upload the packages to each `global` cluster.
@@ -31,7 +27,7 @@ Before installing the provider, ensure the following conditions are met:
 - You can access the <Term name="product" textCase="capitalize" /> `global` cluster.
 - You can access Customer Portal to download provider packages.
 - The vCenter account that clusters will reference through `VSphereCluster.spec.identityRef` can list, create, and set VM custom attributes. Grant the **Global → Manage custom attributes** and **Global → Set custom attribute** privileges. The provider requires them whenever a `VSphereCluster` or its CAPI `Cluster` carries any `vsphere.cluster.x-k8s.io/*` annotation, and a missing privilege fails VM reconciliation rather than skipping the metadata write.
-- To create or upgrade workload clusters, you work against the active management cluster, not a disaster-recovery standby. See [Standby Management Clusters](#standby-management-cluster).
+- To create or upgrade workload clusters, you work against the primary `global` cluster, not a disaster recovery standby. See [Standby Management Clusters](#standby-management-cluster).
 
 ## Steps
 
@@ -53,60 +49,25 @@ Install both cluster plugins on the `global` cluster. For the procedure, refer t
 
 ### Verify the installation \{#verify-the-installation}
 
-Check the module state:
+Run the following commands from a machine where `ac` is logged in to the platform:
 
 ```bash
-kubectl get minfo -l cpaas.io/module-name=cluster-api-provider-vsphere
-kubectl get minfo -l cpaas.io/module-name=cluster-api-provider-kubeadm
-```
-
-Both plugins must be present and in the `Running` state.
-
-Check the registered CRDs:
-
-```bash
-kubectl get crd | grep -E '^vsphere[a-z]+\.infrastructure\.cluster\.x-k8s\.io\b'
-```
-
-Expected output includes all nine CRDs:
-
-1. `vsphereclusters.infrastructure.cluster.x-k8s.io`
-2. `vsphereclusteridentities.infrastructure.cluster.x-k8s.io`
-3. `vsphereclustertemplates.infrastructure.cluster.x-k8s.io`
-4. `vspheredeploymentzones.infrastructure.cluster.x-k8s.io`
-5. `vspherefailuredomains.infrastructure.cluster.x-k8s.io`
-6. `vspheremachines.infrastructure.cluster.x-k8s.io`
-7. `vspheremachineconfigpools.infrastructure.cluster.x-k8s.io`
-8. `vspheremachinetemplates.infrastructure.cluster.x-k8s.io`
-9. `vspherevms.infrastructure.cluster.x-k8s.io`
-
-Check the registered admission webhooks. The `ValidatingWebhookConfiguration` object name varies by packaging, so match on the webhook names instead:
-
-```bash
-kubectl get validatingwebhookconfiguration \
+ac config use-cluster global
+ac get minfo -l cpaas.io/module-name=cluster-api-provider-vsphere
+ac get minfo -l cpaas.io/module-name=cluster-api-provider-kubeadm
+ac get crd | grep -E '^vsphere[a-z]+\.infrastructure\.cluster\.x-k8s\.io\b'
+ac get validatingwebhookconfiguration \
   -o jsonpath='{range .items[*]}{range .webhooks[*]}{.name}{"\n"}{end}{end}' \
   | grep -E 'vsphere|capv'
 ```
 
-Expected output includes:
+Continue when:
 
-- `validation.vspherecluster.infrastructure.cluster.x-k8s.io`
-- `validation.vspheremachineconfigpool.infrastructure.cluster.x-k8s.io`
-- `validation.vspheremachinetemplate.infrastructure.cluster.x-k8s.io`
-- `validation.kubeadmcontrolplane.capv.cluster.x-k8s.io`
-- `validation.machinedeployment.capv.cluster.x-k8s.io`
+- Both plugins are listed and `Running`.
+- The CRD list holds nine CRDs: `vsphereclusters`, `vsphereclusteridentities`, `vsphereclustertemplates`, `vspheredeploymentzones`, `vspherefailuredomains`, `vspheremachines`, `vspheremachineconfigpools`, `vspheremachinetemplates`, and `vspherevms`, each in `infrastructure.cluster.x-k8s.io`.
+- The webhook list includes `validation.vspherecluster.infrastructure.cluster.x-k8s.io`, `validation.vspheremachineconfigpool.infrastructure.cluster.x-k8s.io`, `validation.vspheremachinetemplate.infrastructure.cluster.x-k8s.io`, `validation.kubeadmcontrolplane.capv.cluster.x-k8s.io`, and `validation.machinedeployment.capv.cluster.x-k8s.io`.
 
-The last two enforce the fixed-IP rollout rules described in [Provider Requirements](./install-config-parameters.mdx#provider-requirements). The `vspheremachineconfigpool` webhook also intercepts `DELETE`, which is what turns the deletion of a pool that still owns `InUse` slots into an immediate rejection rather than a resource held in `Terminating`.
-
-Check the management-cluster permissions if your platform restricts ClusterRoles. Beyond the upstream set, the provider chart grants `capv-manager-role` the following:
-
-- Read access to `clustermodules`, `moduleconfigs`, and `moduleplugins` in `cluster.alauda.io`.
-- Write access to `moduleinfoes` and read access to `moduleinfoes/status`.
-- Read access to `clusters` in `clusterregistry.k8s.io` and `platform.tkestack.io`.
-- `patch` and `update` on `controlplane.cluster.x-k8s.io/kubeadmcontrolplanes`.
-- Access to `vspheremachineconfigpools`.
-
-The `kubeadmcontrolplanes` patch permission is what lets the provider set the CoreDNS and kube-proxy skip annotations described in [Provider-managed Fields](./install-config-parameters.mdx#provider-managed-fields).
+Otherwise, install the missing plugin again as in [Cluster Plugin](../../../../extend/cluster_plugin.mdx), or contact technical support.
 
 </Steps>
 
@@ -131,7 +92,8 @@ Nothing in the workload cluster is touched, and no VM is replaced. Three consequ
 Confirm the result with the checks in [Verify the installation](#verify-the-installation), then read one pool back:
 
 ```bash
-kubectl -n <namespace> get vspheremachineconfigpool <pool_name> \
+ac config use-cluster global
+ac -n cpaas-system get vspheremachineconfigpool <pool-name> \
   -o jsonpath='{range .status.persistentDiskStatuses[*]}{.hostname}{" "}{.name}{" "}{.phase}{"\n"}{end}'
 ```
 
@@ -139,23 +101,18 @@ Each disk that was already provisioned before the upgrade appears with a phase, 
 
 ## Standby Management Clusters \{#standby-management-cluster}
 
-While the `etcd-sync` ConfigMap exists in the **`kube-public`** namespace, the provider treats the management cluster as a disaster-recovery standby:
+Do not create or upgrade a workload cluster against a standby `global` cluster: the provider skips the workload cluster's objects there, so nothing changes and no error appears.
 
-- Objects owned by the reserved `global` cluster are still reconciled.
-- Every other object is skipped and requeued every 30 seconds.
-- An object whose cluster name cannot be determined is skipped as well.
-
-**Do not create or upgrade a workload cluster against a standby management cluster.** The reconcilers no-op silently — no condition changes and no error appears on the resource, so the workflow looks stalled rather than blocked.
-
-Check before you start:
+**Applies to**: a `global` cluster in a Global Cluster Disaster Recovery pair. Skip it for a single `global` cluster.
 
 ```bash
-kubectl -n kube-public get configmap etcd-sync -o name 2>/dev/null || echo "not standby"
+ac config use-cluster global
+ac -n kube-public get configmap etcd-sync -o name 2>/dev/null || echo "not standby"
 ```
 
-A common mistake is to look in `kube-system`. The ConfigMap is in `kube-public`.
+Continue when it prints `not standby`; otherwise you are on the standby: work on the primary `global` cluster.
 
-For the disaster-recovery workflow itself, see [Global Cluster Disaster Recovery](../../../../install/alauda_os/disaster_recovery.mdx).
+For the disaster recovery workflow itself, see [Global Cluster Disaster Recovery](../../../../install/alauda_os/disaster_recovery.mdx).
 
 ## Next Steps
 

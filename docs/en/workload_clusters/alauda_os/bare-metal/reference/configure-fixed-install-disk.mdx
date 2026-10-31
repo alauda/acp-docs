@@ -15,16 +15,9 @@ Use this guide when one `SeedImage` ISO must be reused across multiple bare-meta
 
 ## Why a Manual Disk Gate Is Required
 
-Do not leave `MachineRegistration.spec.config.elemental.install.device` empty on a multi-disk host. An empty device and an empty `device-selector` do not make Elemental wait for an operator to choose a disk. Multiple discovered disks can match, and one of them is selected without a uniqueness check.
+Do not leave `MachineRegistration.spec.config.elemental.install.device` empty on a multi-disk host: Elemental then picks one of the disks without a uniqueness check. Do not use `/dev/sda` either: the same disk can have a different kernel name in the live ISO and in the installed system.
 
-Do not use `/dev/sda` as a persistent disk identity either. Storage-controller discovery order can change between the Live ISO and the installed system, so the same logical disk can appear as `/dev/sda` during one boot and `/dev/sdb` during another.
-
-This guide uses a fail-closed manual gate:
-
-1. Every reusable ISO contains the same, initially nonexistent install path: `/dev/elemental-install-target`.
-2. The install service cannot proceed while that path does not exist, and it does not fall back to automatic disk selection.
-3. On each host, an operator identifies the intended whole disk by `/dev/disk/by-id/wwn-*` and creates the gate as a symbolic link to that disk.
-4. The operator starts the install service only after the disk, network, mount, and stale-label checks pass.
+Instead, every ISO points `install.device` at `/dev/elemental-install-target`, a path that does not exist when the live ISO starts, so installation cannot proceed on its own. On each host, you link that path to the system disk by its `/dev/disk/by-id/wwn-*` entry, and then start the installation.
 
 :::warning
 The cleanup procedure in this guide permanently destroys data. Run it only from the Live ISO console, only on disks approved for reinstallation, and only after verifying that none of those disks is mounted.
@@ -37,45 +30,28 @@ The cleanup procedure in this guide permanently destroys data. Run it only from 
 - You have console access to each host through BMC, iDRAC, iLO, or an equivalent interface.
 - Each intended system disk has a stable `/dev/disk/by-id/wwn-*` entry.
 - You know which disks may be erased. If the host contains data disks that must be preserved, exclude them from every cleanup command.
-- If the Live ISO network has no DHCP service, you have the host IP address, prefix, gateway, DNS server, and Global registration URL.
+- If the Live ISO network has no DHCP service, you have the host IP address, prefix, gateway, DNS server, and the registration URL.
 
-See [Create a Cluster on Bare Metal](../create_cluster.mdx) for the complete provider and cluster creation workflow.
+For multi-disk hosts, follow this page instead of the host boot in [Build the ISO and Boot the Hosts](../create_cluster.mdx#build-iso). When every host is registered, return to [Confirm the Registration](../create_cluster.mdx#confirm-registration).
 
 ## Configure the Shared MachineRegistration
 
-Set the install device to `/dev/elemental-install-target`. Do not configure a `device-selector` for this workflow.
+In the `MachineRegistration` of [Create the Registration and the ISO](../create_cluster.mdx#step-1-machineregistration-seedimage), set `install.device` to `/dev/elemental-install-target`, and keep every other field as shown there. Do not configure a `device-selector`.
 
 ```yaml title="MachineRegistration install settings"
-apiVersion: elemental.cattle.io/v1beta1
-kind: MachineRegistration
-metadata:
-  name: <cluster-name>-registration
-  namespace: cpaas-system
 spec:
-  machineName: "<cluster-name>-${System Information/UUID}"
   config:
     elemental:
       install:
         device: /dev/elemental-install-target
-        eject-cd: true
-        reboot: true
-        snapshotter:
-          type: btrfs
-          maxSnaps: 4
-      registration:
-        auth: tpm
-        # Use hardware TPM when available. For hosts without TPM, enable
-        # emulation and derive a unique identity for every host.
-        emulate-tpm: true
-        emulated-tpm-seed: -1
 ```
 
-The path is intentionally absent when the Live ISO starts. A filesystem label, GPT `PARTLABEL`, or `/dev/disk/by-label/*` path is not an alternative: these identify partitions, while Elemental requires a whole-disk install target.
+Do not use a filesystem label, GPT `PARTLABEL`, or `/dev/disk/by-label/*` path instead: these identify partitions, and Elemental needs a whole disk.
 
-Create a `SeedImage` that references this MachineRegistration, or rebuild the existing SeedImage after changing the install device. That `SeedImage` must also carry the `state` partition sizing described in [Size COS_STATE before the first install](../create_cluster.mdx#size-cos-state) — the Elemental default of 8 GiB is too small once a host is upgraded to a different image, and the size cannot be changed without reinstalling the host.
+Create a `SeedImage` that references this `MachineRegistration`, or rebuild the existing `SeedImage` after you change the install device. Keep the `state` partition sizing of [Size COS_STATE](../create_cluster.mdx#size-cos-state) in it.
 
-:::warning
-The MachineRegistration settings are embedded in the generated ISO. Patching the MachineRegistration does not change an ISO that was already built and downloaded. Rebuild the SeedImage, wait until it is ready, download the new ISO, and verify its checksum before booting hosts from it.
+:::note
+Patching the `MachineRegistration` does not change an ISO that was already built. Rebuild the `SeedImage`, wait until it is ready, download the new ISO, and verify its checksum before you boot hosts from it.
 :::
 
 ## Prepare Each Host
@@ -143,9 +119,9 @@ Configure the selected connection with the values assigned to this host:
 ```bash
 nmcli connection modify "Wired connection 1" \
   ipv4.method manual \
-  ipv4.addresses 192.168.254.76/24 \
-  ipv4.gateway 192.168.254.1 \
-  ipv4.dns 192.168.16.19 \
+  ipv4.addresses <host-ip>/<prefix-length> \
+  ipv4.gateway <gateway-ip> \
+  ipv4.dns <dns-ip> \
   ipv4.ignore-auto-dns yes
 
 nmcli connection up "Wired connection 1"
@@ -157,16 +133,14 @@ Verify the address, default route, DNS resolution, and the complete registration
 ip -br addr
 ip route
 cat /etc/resolv.conf
-ping -c 2 -W 2 192.168.254.1
+ping -c 2 -W 2 <gateway-ip>
 getent hosts <global-domain>
 curl -ksS --connect-timeout 10 \
   -o /dev/null -w 'REG_HTTP=%{http_code}\n' \
   'https://<global-domain>/<registration-path-and-token>'
 ```
 
-Use the site-specific network values instead of copying the example addresses. Keep the full registration URL and token out of source control and shared logs.
-
-This network configuration only connects the Live ISO for registration and initial installation. It does not replace the persistent networking applied to the installed system during Cluster API reprovisioning.
+Keep the full registration URL and token out of source control and shared logs. This network configuration applies to the Live ISO only.
 
 ### 4. Identify All Disks and the Intended System Disk
 
@@ -286,8 +260,6 @@ lsblk -d -o NAME,PATH,SIZE,MODEL,SERIAL,WWN,HCTL \
 
 If the alias already exists or is a dangling link, do not overwrite it. Inspect it with `readlink`, determine why it exists, and remove it only after confirming it is stale.
 
-The link exists only in the current Live ISO session. It is expected to disappear after reboot; the installed system does not require it for normal startup.
-
 ### 7. Run the Final Gate and Start Installation
 
 Verify the Live root, mounts, target link, network, and DNS one final time:
@@ -320,18 +292,19 @@ After installation triggers a reboot:
 
 1. Eject the BMC virtual media and restore normal disk-first boot order.
 2. Confirm that the host does not return to the Live ISO.
-3. Verify the new `MachineInventory` on the Global cluster:
+3. From a machine where `ac` is logged in to the platform, read the new `MachineInventory` on the `global` cluster:
 
    ```bash
-   kubectl -n cpaas-system get machineinventories.elemental.cattle.io -o wide
-   kubectl -n cpaas-system describe machineinventory <inventory-name>
+   ac config use-cluster global
+   ac -n cpaas-system get machineinventories.elemental.cattle.io -o wide
+   ac -n cpaas-system describe machineinventory <inventory-name>
    ```
 
-4. Confirm that the inventory is `Ready=True`, reports the expected network, and has only one current Elemental disk layout.
+4. Continue when the inventory is `Ready=True`, reports the expected network, and has only one current Elemental disk layout; otherwise see [Troubleshooting](#troubleshooting).
 5. Add the inventory to a `MachineInventoryPool` only after it is ready.
 6. After Cluster API allocates the host, verify the `BaremetalMachine`, workload Node, control-plane components, and CNI as described in [Create a Cluster on Bare Metal](../create_cluster.mdx).
 
-## Troubleshooting
+## Troubleshooting \{#troubleshooting}
 
 | Symptom | Cause and action |
 |---|---|
@@ -344,7 +317,6 @@ After installation triggers a reboot:
 
 ## Limitations
 
-- This workflow intentionally requires one console action per host. It prevents automatic selection; it does not provide fully unattended heterogeneous disk selection.
-- MachineRegistration metadata labels are not interpolated into `install.device`.
+- This workflow requires one console action per host.
 - A `device-selector` based only on disk size is safe only if exactly one disk can match, and current selection does not enforce uniqueness. The WWN gate is preferred for hosts with multiple equal-sized disks.
 - The target must be a whole disk. Do not point the gate at a partition.

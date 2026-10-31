@@ -17,13 +17,13 @@ ACP CLI (ac) renders the Cluster API and DCS objects from one `install-config.ya
 ## Prerequisites
 
 - You meet the [Huawei DCS prerequisites](./prerequisites.mdx).
-- `ac` is logged in to the `global` cluster with `ac login`, and the `global` cluster is the current context.
+- `ac` is logged in to the platform as a platform administrator (`ac login https://<platform-address>`).
 
 ## Procedure
 
 ### 1. Write `install-config.yaml` \{#write-install-config}
 
-Create an installation directory for the cluster and write `install-config.yaml` in it. `ac` renders one `DCSIpHostnamePool` and one `DCSMachineTemplate` per node group from it, so you do not create IP pools or machine templates. The fields, and the optional NICs, raw disks, placement, and Self-built VIP, are described in [Parameters](./reference/install-config-parameters.mdx).
+Create an installation directory for the cluster and write `install-config.yaml` in it. `ac` writes `manifests/` and `logs/ac.log` next to it. `ac` renders one `DCSIpHostnamePool` and one `DCSMachineTemplate` per node group from it, so you do not create IP pools or machine templates. The fields, and the optional NICs, raw disks, placement, and Self-built VIP, are described in [Parameters](./reference/install-config-parameters.mdx).
 
 ```yaml title="install-config.yaml"
 cluster:
@@ -55,8 +55,8 @@ provider:
 
 controlPlane:
   replicas: 3 # [!code callout]
-  cpuCore: 8 # [!code callout]
-  memoryGiB: 16 # [!code callout]
+  cpuCore: 8
+  memoryGiB: 16
   network:
     gateway: <cp-gateway> # [!code callout]
     dns: [<dns-ip>] # [!code callout]
@@ -109,7 +109,7 @@ computes: # [!code callout]
 
 1. `clusterName`: required. It must not be `global` or start with `global-`.
 2. `sshKeys`: required. The SSH public keys installed on every node.
-3. `type`: `external`, the default, or `internal`.
+3. `type`: `external`, the default, or `internal`. `internal` also needs `vrid`; see [Self-built VIP](./reference/install-config-parameters.mdx#self-built-vip).
 4. `address`: required. The control plane endpoint, an IPv4 address.
 5. `credentialRef`: required. The credential Secret.
 6. `vmTemplateName`: required. It decides the Kubernetes version.
@@ -120,48 +120,44 @@ computes: # [!code callout]
 11. `portGroupName`: required. A port group of that switch.
 12. `datastore.type`: required. `Datastore` or `DatastoreCluster`.
 13. `datastore.name`: required. The datastore or datastore cluster name.
-14. `replicas`: an odd number, `1` or `3` or more. A single control plane node cannot be upgraded.
-15. `cpuCore`: defaults to `8`.
-16. `memoryGiB`: defaults to `16`.
-17. `gateway`: required.
-18. `dns`: DCS uses only the first entry.
-19. `mask`: required. A prefix length from 1 to 32.
-20. `disks`: required. Every standard disk below.
-21. `ephemeral`: disks recreated with the VM.
-22. `var-lib-etcd`: control plane only.
-23. `persistent`: disks kept when the VM is replaced.
-24. `hosts`: required. At least `replicas` entries.
-25. `computes`: optional.
-26. Workers have no `var-lib-etcd`.
+14. `replicas`: an odd number, `1` or `3` or more. With fewer than three control plane nodes, contact technical support before you upgrade the cluster.
+15. `gateway`: required.
+16. `dns`: DCS uses only the first entry.
+17. `mask`: required. A prefix length from 1 to 32.
+18. `disks`: required. Every standard disk below.
+19. `ephemeral`: disks recreated with the VM.
+20. `var-lib-etcd`: control plane only.
+21. `persistent`: disks kept when the VM is replaced.
+22. `hosts`: required. At least `replicas` entries.
+23. `computes`: optional.
+24. Workers have no `var-lib-etcd`.
 
 </Callouts>
 
 ### 2. Create the Cluster \{#create-with-ac}
 
+Run the following command from a machine where `ac` is logged in to the platform:
+
 ```bash
+ac config use-cluster global
 ac adm alpha cluster create --dir <install-dir> --provider dcs
 ```
 
-Before it applies anything, `ac` checks the following:
+`ac` first checks the credential Secret, the DCS objects named in `install-config.yaml`, the Kubernetes version of the VM template, and the registry. If a check fails, nothing is changed and the error names the item.
 
-- The provider CRDs are served on the `global` cluster.
-- The credential Secret exists, signs in to DCS, and the site exists. Preflight signs in once and does not retry, because DCS locks an account after repeated failed sign-ins.
-- The Kubernetes and etcd versions resolve; see [VM Template and Kubernetes Version](./prerequisites.mdx#resolving-placeholders).
-- The VM template, the folders, the switches and port groups, the datastores, and any configured compute resource exist on the site, and each port group belongs to the switch named with it. Only names are checked, not capacity.
-- For an `internal` VIP, the platform version supports it. An `external` load balancer is not probed.
-- The registry resolves: the Secret of `cluster.registrySecretRef`, or the `registry` key of `cpaas-system/public-registry-credential`.
-- Every rendered object passes a server-side dry run on the `global` cluster. `ac` names any object it could not dry-run yet.
+:::warning
+Make sure the password in the credential Secret is correct before you run `create`: DCS locks the account after repeated failed sign-ins.
+:::
 
-`create` returns once the objects are applied, and the cluster keeps building. Add `--wait` to wait until all stages are ready; `--timeout` limits the wait, defaults to `2h`, and ends only the wait, not the creation. To render without applying, run `ac adm alpha cluster manifests` with the same flags.
+`create` returns once the objects are applied, and the cluster keeps building. Add `--wait` to wait until all stages are ready; `--timeout` (default `2h`) limits only the wait. To render without applying, run `ac adm alpha cluster manifests` with the same flags.
 
 ### 3. Monitor the Creation \{#monitor-creation}
 
 ```bash
+ac config use-cluster global
 ac adm alpha cluster status --cluster <cluster-name>                      # prints the four stages once
 ac adm alpha cluster wait-for install-complete --cluster <cluster-name>   # waits until all four are ready
 ```
-
-Both commands change nothing and need no installation directory. `--namespace` defaults to `cpaas-system`.
 
 | # | Stage | Done when |
 |---:|---|---|
@@ -170,77 +166,75 @@ Both commands change nothing and need no installation directory. `--namespace` d
 | 3 | `MachineDeployment` | Every node group is ready. |
 | 4 | `ClusterView` | The platform's view of the cluster reports `status.phase: Running`. `status` also shows the control plane endpoint and the ready node counts. |
 
-When a stage does not advance, see [Troubleshooting](./troubleshooting.mdx).
+Continue when all four stages are ready; otherwise see [Troubleshooting](./troubleshooting.mdx).
 
 ### 4. Verify the Cluster \{#verify-the-cluster}
 
-In the console, open **Clusters** → **Clusters**, and check that the cluster is **Running** and its nodes are **Ready**.
-
-#### Using kubectl \{#verify-with-kubectl}
+Run the following commands from a machine where `ac` is logged in to the platform:
 
 ```bash
-kubectl get cluster -n cpaas-system <cluster-name>
-kubectl get kubeadmcontrolplane -n cpaas-system <cluster-name>-control-plane
-kubectl get machines -n cpaas-system
-kubectl get clustermodule <cluster-name> -o jsonpath='{.status.base.deployStatus}'
+ac config use-cluster global
+ac adm alpha cluster status --cluster <cluster-name>
+ac config sync
+ac config use-cluster <cluster-name>
+ac get nodes
+ac config use-cluster global
 ```
 
-Expect the cluster **Running** or **Provisioned**, every control plane machine and worker **Running**, every Kubernetes node **Ready**, and the cluster module status **Completed**.
-
-With additional NICs, check that each `DCSMachine` records them, and that the guest OS shows the matching `ethN` interfaces:
-
-```bash
-kubectl -n cpaas-system get dcsmachine -l cluster.x-k8s.io/cluster-name=<cluster-name> \
-  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.networkConfig.ip}{"\t"}{.status.additionalNic}{"\n"}{end}'
-```
+Continue when `status` reports all four stages ready and every node is `Ready`; otherwise see [Troubleshooting](./troubleshooting.mdx).
 
 #### Self-built VIP \{#verify-self-built-vip}
 
-With `type: internal`:
+**Applies to**: `cluster.network.loadBalancer.type: internal`. Skip it for an external load balancer.
 
 ```bash
-kubectl -n cpaas-system get dcscluster <cluster-name> \
+ac config use-cluster global
+ac -n cpaas-system get dcscluster <cluster-name> \
   -o jsonpath='{.spec.controlPlaneLoadBalancer.type}{" "}{.spec.controlPlaneEndpoint.host}{":"}{.spec.controlPlaneEndpoint.port}{"\n"}'
-kubectl -n cpaas-system get moduleinfo \
+ac -n cpaas-system get moduleinfo \
   -l cpaas.io/cluster-name=<cluster-name>,cpaas.io/module-name=alive
-kubectl --kubeconfig <workload-kubeconfig> -n cpaas-system get apprelease alive
-kubectl --kubeconfig <workload-kubeconfig> -n kube-system get pods -l app=alive -o wide
-kubectl --kubeconfig <vip-kubeconfig> get --raw=/version
+ac config sync
+ac config use-cluster <cluster-name>
+ac -n cpaas-system get apprelease alive
+ac -n kube-system get pods -l app=alive -o wide
+ac config use-cluster global
 ```
 
-Expect the configured VIP endpoint, a provider-created `alive` `ModuleInfo`, a synced and healthy `alive` `AppRelease`, Ready `alive` Pods on every control plane node, and a successful `/version` request through the VIP.
+Continue when the output shows `internal` with your VIP and port, an `alive` `ModuleInfo`, a synced and healthy `alive` `AppRelease`, and a Ready `alive` Pod on every control plane node; otherwise see [Self-built VIP](./troubleshooting.mdx#self-built-vip) in Troubleshooting.
 
 #### Control Plane HA \{#verify-control-plane-ha}
 
-With `controlPlaneHA: true`:
+**Applies to**: `provider.dcs.controlPlaneHA: true`. Skip it when it is `false`.
 
 ```bash
-kubectl get dcscluster <cluster-name> -n cpaas-system \
+ac config use-cluster global
+ac -n cpaas-system get dcscluster <cluster-name> \
   -o jsonpath='{range .status.conditions[?(@.type=="ControlPlaneHAReady")]}{.status}{" "}{.reason}{" "}{.message}{"\n"}{end}'
 ```
 
-| Status and reason | Meaning | Next step |
-|-------------------|---------|-----------|
-| `True ControlPlaneHAReady` | The DRS rule exists and the provider has observed the control plane VMs on different DCS hosts. | None. |
-| `False ControlPlaneHAPending` | The provider waits for a recoverable state, such as enough VM URNs, enough members, or DCS-side placement. | Read the message. For placement, check DCS host capacity, DRS status, and whether migration is blocked. |
-| `False ControlPlaneHAFailed` | The provider could not query, validate, create, update, delete, or check the DRS rule. | Read the message, then check the DCS credential, DRS settings, rule-name conflicts, and the controller logs. |
+Continue when the status is `True`; otherwise see [Control Plane HA](./troubleshooting.mdx#control-plane-ha) in Troubleshooting.
 
-To see the rule and its members, the Cluster API Machine name and DCS VM URN of each control plane VM:
+#### Additional NICs \{#verify-additional-nics}
+
+**Applies to**: node groups with `network.additions`. Skip it otherwise.
 
 ```bash
-kubectl get dcscluster <cluster-name> -n cpaas-system \
-  -o jsonpath='rule={.status.controlPlaneHA.ruleName}{" index="}{.status.controlPlaneHA.ruleIndex}{" cluster="}{.status.controlPlaneHA.clusterUrn}{"\n"}{range .status.controlPlaneHA.members[*]}{.machineName}{" "}{.vmUrn}{"\n"}{end}'
+ac config use-cluster global
+ac -n cpaas-system get dcsmachine -l cluster.x-k8s.io/cluster-name=<cluster-name> \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.networkConfig.ip}{"\t"}{.status.additionalNic}{"\n"}{end}'
 ```
 
-The status does not include the DCS host name; to confirm the host placement, compare the VMs' `hostName` or `hostUrn` on the DCS platform or API.
+Continue when each `DCSMachine` lists one additional NIC per address in its host's `additionalIps`; otherwise contact technical support.
 
 ## Run `create` Again \{#rerun-create}
 
-Running `create` again on the same directory puts back anything that has drifted, except Secrets, which `ac` creates once and then leaves as they are. When `manifests/` already exists, `create` asks whether to reuse it: press Enter to reuse it, or answer `n` to render again after you change `install-config.yaml`. When standard input is not a terminal, pass `--reuse-manifests=true` or `--reuse-manifests=false`.
+If `create` stops, run the same command again; completed work is skipped. Running `create` again on the same directory puts back anything that has drifted, except Secrets, which `ac` creates once and then leaves as they are. When `manifests/` already exists, `create` asks whether to reuse it: press Enter to reuse it, or answer `n` to render again after you change `install-config.yaml`. When standard input is not a terminal, pass `--reuse-manifests=true` or `--reuse-manifests=false`. Reusing `manifests/` ignores `install-config.yaml` and skips every check.
 
-- Reusing `manifests/` skips `install-config.yaml` and every check, and applies the files as they are.
-- Rendering again discards hand edits in `manifests/`.
-- A generated encryption key is kept only in `manifests/`. Keep that directory, or set `cluster.encryptionProviderConfig`: rendering again without either generates a new key. `create` keeps the existing encryption Secret, so the cluster keeps its key, but `manifests/` then records a different key that cannot restore it.
+Do not edit the files in `manifests/`.
+
+:::warning
+Keep `<install-dir>/manifests/`, or set `cluster.encryptionProviderConfig`: a generated encryption key is kept only in `manifests/`. Rendering again without either generates a new key, and `manifests/` then no longer records the key the cluster uses.
+:::
 
 ## Add or Change Node Groups \{#worker-node-deployment}
 
@@ -254,7 +248,7 @@ The web UI creates the cluster from infrastructure resources that you create fir
 
 Create them in this order; each one references the previous one.
 
-1. **Cloud Credential**: **Clusters** → **Cloud Credentials** → **Create Cloud Credential** → **Huawei DCS**. Enter the name, the DCS endpoint, the user name, the password, and the site, as described in [DCS Credential Secret](./prerequisites.mdx#credential-secret). The form creates only `interconnect` users and cannot change the password later; for a `domain` user or a password change, create or patch the Secret with `kubectl` instead.
+1. **Cloud Credential**: **Clusters** → **Cloud Credentials** → **Create Cloud Credential** → **Huawei DCS**. Enter the name, the DCS endpoint, the user name, the password, and the site, as described in [DCS Credential Secret](./prerequisites.mdx#credential-secret). The form creates only `interconnect` users and cannot change the password later; for a `domain` user or a password change, create or patch the Secret with `ac` instead.
 2. **IP Pool**: **Clusters** → **Virtual Machine** → **IP Pools** → **Create IP Pool**, one per node pool, with at least as many entries as the pool has replicas. Each entry is one node: its IP, subnet mask as a prefix length such as `24`, gateway, and optionally DNS, hostname, machine name, switch, and port group. Additional NICs are optional; each one needs its IP, prefix length, switch, and port group.
 3. **Machine Template**: **Clusters** → **Virtual Machine** → **Machine Templates** → **Create Machine Template**, one of type **Control Plane** and one of type **Worker Node** for each worker pool. Select the VM template, the VM folder, the CPU and memory, the IP Pool, and the disks: the system volume, `/var/lib/kubelet`, and `/var/lib/containerd` on every template, and `/var/lib/etcd` on the control plane.
 
@@ -274,7 +268,8 @@ spec:
 ```
 
 ```bash
-kubectl -n cpaas-system edit dcsiphostnamepool <ip-pool-name>
+ac config use-cluster global
+ac -n cpaas-system edit dcsiphostnamepool <ip-pool-name>
 ```
 
 ### 2. Run the Wizard \{#ui-wizard}
@@ -290,7 +285,7 @@ Open **Clusters** → **Clusters** → **Create Cluster**, select **Huawei DCS**
 | Control Plane Node Pool | Machine Template | A Control Plane template with a compatible Kubernetes version. Replicas are fixed at 3, so its IP Pool has at least 3 free entries. |
 | Worker Node Pools | Pool Name | Unique in the cluster; prefix it with the cluster name, such as `mycluster-worker-1`. |
 | | Machine Template | A Worker Node template with a compatible Kubernetes version, whose IP Pool has at least `Replicas` free entries. |
-| | Replicas, Max Surge, Max Unavailable | Defaults `3`, `0`, and `1`. Keep Max Surge `0` so that nodes with persistent disks are replaced one at a time; Max Unavailable is then at least `1`. |
+| | Replicas, Max Surge, Max Unavailable | Defaults `3`, `0`, and `1`. Keep Max Surge `0`: nodes with persistent disks are replaced one at a time. Max Unavailable is then at least `1`. |
 | Networking | Pods CIDR, Services CIDR, Join CIDR | The Pod, Service, and Kube-OVN join networks. They do not overlap. |
 
 SSH authorized keys are optional on each node pool. Review the settings, click **Create**, then [verify the cluster](#verify-the-cluster).

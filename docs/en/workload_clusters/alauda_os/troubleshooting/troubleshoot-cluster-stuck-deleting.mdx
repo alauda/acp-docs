@@ -6,16 +6,11 @@ queries:
   - cluster phase deleting forever
   - capi.cpaas.io/imported finalizer
   - cluster CR not removed after delete
-  - kubectl patch cluster finalizers null
 ---
 
 # Troubleshoot a Cluster Stuck in Deleting
 
-## Scope
-
-This page covers the case where a workload cluster that was **built by ACP** is being deleted, every child resource (provider-specific `Machine` CRs and the IaaS VMs they represent) is already gone, but the top-level `Cluster` CR remains in `Phase: Deleting` indefinitely.
-
-This page applies to any ACP-built workload cluster, regardless of the underlying IaaS:
+Use this guide when a workload cluster that ACP created is being deleted, its machines and their VMs or hosts are already gone, but the `Cluster` resource on the `global` cluster stays in `Phase: Deleting`. It applies to any ACP-built workload cluster:
 
 - Huawei DCS (DCS Provider)
 - Huawei Cloud Stack (HCS Provider)
@@ -23,97 +18,62 @@ This page applies to any ACP-built workload cluster, regardless of the underlyin
 - Bare Metal (Bare Metal Provider)
 - Clusters created through the SSH UPI path managed by `cluster-manager`
 
-Direct observation evidence comes from DCS; the other providers share the same `global`-cluster control-plane path.
+This page does not cover:
 
-**Not in scope:**
-
-- A provider-specific `Machine` CR (such as `DCSMachine`) stuck in `Deleting` while the IaaS VM still exists — see [Troubleshoot a DCSMachine Stuck in Deleting](../huawei-dcs/troubleshooting.mdx#dcsmachine-stuck-deleting).
-- A workload cluster that was **imported** (onboarded as a Third-party Cluster) and never reached the ready state — see [Troubleshoot a Workload Cluster Stuck in Provisioned](./troubleshoot-cluster-not-ready.mdx).
+- A provider `Machine` resource, such as `DCSMachine`, that stays in `Deleting` while its VM still exists. See [Troubleshoot a DCSMachine Stuck in Deleting](../huawei-dcs/troubleshooting.mdx#dcsmachine-stuck-deleting).
+- A workload cluster that never reached the ready state. See [Troubleshoot a Workload Cluster Stuck in Provisioned](./troubleshoot-cluster-not-ready.mdx).
 
 ## Symptoms
 
-The Cluster CR shows the pattern below.
-
 | Where to look | What you see |
 | --- | --- |
-| `Cluster.status.phase` on the `global` cluster | `Deleting`, persisting far longer than expected — typically from one hour to many hours. |
-| `Cluster.metadata.deletionTimestamp` | Set. |
+| `Cluster.status.phase` on the `global` cluster | `Deleting`, with no progress. |
 | `Cluster.metadata.finalizers` | Still contains `capi.cpaas.io/imported`. |
-| `Cluster.spec.infrastructureRef` and `Cluster.spec.controlPlaneRef` | Both are set (for example `infrastructureRef.kind: DCSCluster`, `controlPlaneRef.kind: KubeadmControlPlane`). This marks an ACP-built cluster — a Third-party Cluster has neither reference. |
-| Provider-specific `Machine` CRs in the same namespace (`DCSMachine` / `HCSMachine` / `VSphereMachine` / etc.), plus the matching infrastructure `Cluster`, `KubeadmControlPlane`, `MachineDeployment`, and `Machine` resources | None remain — cascade deletion has already completed. |
-| The IaaS platform itself (DCS portal, vCenter, HCS portal, bare-metal inventory) | None of the cluster's VMs remain. |
-| Provider controller logs (for example `cluster-api-provider-dcs-manager`) | Show successful machine deletion entries such as `removed DCSMachine finalizer`. |
-
-The `capi.cpaas.io/imported` finalizer (and a `capi.cpaas.io/alauda-cluster: imported` label, if present) does **not** by itself mean the cluster was imported — ACP-built clusters carry these too. Use the `infrastructureRef` / `controlPlaneRef` row above to tell the two apart.
+| `Cluster.spec.infrastructureRef` and `Cluster.spec.controlPlaneRef` | Both are set, for example `DCSCluster` and `KubeadmControlPlane`. A cluster onboarded as a Third-party Cluster has neither. |
+| The provider `Machine` resources, the infrastructure cluster, `KubeadmControlPlane`, `MachineDeployment`, and `Machine` resources of the cluster | None remain. |
+| The IaaS platform (DCS portal, HCS portal, vCenter, or the bare-metal inventory) | None of the VMs of the cluster remain, or, on Bare Metal, the hosts have left the cluster. |
 
 ## Diagnosis
 
-Run the two checks below on the `global` cluster to confirm the pattern.
-
-Confirm the `capi.cpaas.io/imported` finalizer is still present:
+### Check the Finalizer and the Cluster Type
 
 ```shell
-kubectl get cluster <name> -n <ns> -o yaml | grep -A 2 finalizers
+ac config use-cluster global
+ac get cluster <cluster-name> -n <namespace> \
+  -o jsonpath='finalizers={.metadata.finalizers} infrastructureRef={.spec.infrastructureRef.kind} controlPlaneRef={.spec.controlPlaneRef.kind}{"\n"}'
 ```
 
-Confirm the cluster is ACP-built. An ACP-built cluster has both `spec.infrastructureRef` and `spec.controlPlaneRef` set; a Third-party Cluster (onboarded by import) has neither:
+`<namespace>` is the namespace of the cluster objects; for a cluster created with `ac`, it is `cpaas-system`.
+
+| Result | Action |
+| --- | --- |
+| `finalizers` contains `capi.cpaas.io/imported`, and both references are set | Continue with the next check. |
+| Both references are empty | The cluster was onboarded as a Third-party Cluster; this page does not apply. |
+| `finalizers` does not contain `capi.cpaas.io/imported` | This page does not apply. Contact technical support. |
+
+### Check That No Cluster Resources Remain
 
 ```shell
-kubectl get cluster <name> -n <ns> \
-  -o jsonpath='infrastructureRef={.spec.infrastructureRef.kind} controlPlaneRef={.spec.controlPlaneRef.kind}{"\n"}'
+ac config use-cluster global
+ac get machines,machinedeployments,kubeadmcontrolplanes -n <namespace>
+ac get dcsmachines,dcsclusters -n <namespace>          # Huawei DCS
+ac get hcsmachines,hcsclusters -n <namespace>          # Huawei Cloud Stack
+ac get vspheremachines,vsphereclusters -n <namespace>  # VMware vSphere
+ac get baremetalmachines.infrastructure.cluster.x-k8s.io,baremetalclusters.infrastructure.cluster.x-k8s.io -n <namespace>  # Bare Metal
 ```
 
-If both values are non-empty (for example `infrastructureRef=DCSCluster controlPlaneRef=KubeadmControlPlane`), the cluster is ACP-built and the workaround on this page applies. If both are empty, the cluster was onboarded as a Third-party Cluster; this page does not apply and the workaround below must not be used.
+Run the first command and the line of your provider. Then confirm on the IaaS platform that none of the VMs of the cluster remain, or, on Bare Metal, that the hosts have been released from the cluster.
 
-## Why This Happens
+| Result | Action |
+| --- | --- |
+| No resource of this cluster is listed, and no VM of the cluster remains | Contact technical support. Provide the output of both checks. |
+| A resource or VM of the cluster remains | The deletion is still in progress or stopped on that resource. See the Troubleshooting page of your provider. |
 
-The `capi.cpaas.io/imported` finalizer on a `Cluster` CR is managed by a platform controller on the `global` cluster. For a cluster onboarded as a Third-party Cluster, that finalizer is released as part of the platform-side cleanup when the cluster is removed.
-
-An ACP-built cluster carries the same finalizer. When an ACP-built cluster is deleted, its child resources and IaaS VMs are removed correctly, but the `capi.cpaas.io/imported` finalizer on the top-level `Cluster` CR is not released — so the CR stays in `Deleting`.
-
-This is a platform-level behavior, not a fault in any IaaS provider, and it does not affect imported (Third-party) clusters. The exact handling is under investigation by the platform team.
-
-## Workaround
-
-Before clearing the finalizer, verify that nothing depends on the `Cluster` CR's continued presence — every child resource and every IaaS VM must already be gone.
-
-**Step 1 — Confirm all provider-specific `Machine` CRs in the namespace are gone:**
-
-```shell
-# Replace dcsmachines with the resource for your provider (hcsmachines, vspheremachines, ...).
-kubectl get dcsmachines,hcsmachines,vspheremachines -n <ns>
-
-# Also confirm the higher-level CAPI resources are gone:
-kubectl get machines,machinedeployments,kubeadmcontrolplanes,dcsclusters,hcsclusters,vsphereclusters -n <ns>
-```
-
-Each command must return no resources for this cluster.
-
-**Step 2 — Confirm the cluster's VMs are gone on the IaaS platform.** Use the provider-specific verification method:
-
-- DCS: list VMs through the DCS portal or the DCS API and verify that none of the cluster's VMs remain. See [Create a Cluster on Huawei DCS](../huawei-dcs/create_cluster.mdx) for the relevant cluster fields.
-- HCS: list VMs in the HCS portal and verify that none remain.
-- vSphere: list VMs in vCenter under the cluster's folder and verify that none remain.
-- Bare-metal: confirm machine deprovisioning has completed in the bare-metal inventory.
-
-**Step 3 — Only after Step 1 and Step 2 both confirm zero remaining resources**, clear the Cluster CR's finalizers:
-
-```shell
-kubectl patch cluster <name> -n <ns> --type=merge \
-  -p '{"metadata":{"finalizers":null}}'
-```
-
-The Cluster CR disappears immediately. Because every child resource and every IaaS VM was already gone before this step, removing the top-level finalizer cannot leave behind an orphan — it only clears a marker that no longer has any reconciler willing to release it.
-
-## Why Not Just Wait?
-
-The finalizer is not released on a timer, and for an ACP-built cluster it is not released by the normal platform cleanup path. Waiting does not change the state — observations of nine hours or more without progress have been recorded. Apply the workaround once Step 1 and Step 2 are confirmed.
-
-## Permanent Fix
-
-The fix belongs in the `global`-cluster control plane: the `capi.cpaas.io/imported` finalizer must be released for an ACP-built cluster once its child resources are gone. This is tracked outside this documentation set; no release date is committed here. Until the fix lands, the workaround above is the supported recovery path.
+:::warning
+Do not remove the finalizer from the `Cluster` resource yourself. Contact technical support.
+:::
 
 ## See Also
 
-- [Troubleshoot a DCSMachine Stuck in Deleting](../huawei-dcs/troubleshooting.mdx#dcsmachine-stuck-deleting) — node-level deletion stalls; different scope.
-- [Troubleshoot a Workload Cluster Stuck in Provisioned](./troubleshoot-cluster-not-ready.mdx) — covers true Third-party Cluster bring-up issues; different scope.
+- [Troubleshoot a DCSMachine Stuck in Deleting](../huawei-dcs/troubleshooting.mdx#dcsmachine-stuck-deleting)
+- [Troubleshoot a Workload Cluster Stuck in Provisioned](./troubleshoot-cluster-not-ready.mdx)

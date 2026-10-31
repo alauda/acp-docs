@@ -21,7 +21,7 @@ Install these cluster plugins on the `global` cluster:
 - **Alauda Container Platform Cluster Bootstrap Provider**
 - **Alauda Container Platform Infrastructure Provider for Huawei DCS**
 
-A `global` cluster installed on Huawei DCS with `ac` already runs both. Otherwise, download them from **Common ACP Extensions** (see [Download](../../../install/prepare/download.mdx)), upload them with `violet push` (see [Upload Packages](../../../extend/upload_package.mdx#violet_push_usage)), and install them as described in [Cluster Plugin](../../../extend/cluster_plugin.mdx). In a disaster recovery pair, install them on both `global` clusters, so that the standby can reconcile the same workload clusters after a failover.
+A `global` cluster installed on Huawei DCS with `ac` already runs both. Otherwise, download them from **Common ACP Extensions** (see [Download](../../../install/prepare/download.mdx)), upload them with `violet push` (see [Upload Packages](../../../extend/upload_package.mdx#violet_push_usage)), and install them as described in [Cluster Plugin](../../../extend/cluster_plugin.mdx). In a Global Cluster Disaster Recovery pair, install them on both `global` clusters.
 
 ## VM Template and Kubernetes Version \{#resolving-placeholders}
 
@@ -30,10 +30,11 @@ A VM template is created on DCS from the Alauda OS image published for the ACP r
 The Alauda OS release also ships a ConfigMap that records the versions its template carries. Apply it to `cpaas-system` of the `global` cluster, with its `cpaas.io/dcs-vm-template` label set to the VM template name on DCS. `ac` reads the `kubernetesVersion` and `etcdTag` keys from it, and the web UI lists only templates that have one. To list the ConfigMaps that are applied:
 
 ```bash
-kubectl -n cpaas-system get cm -l cpaas.io/dcs-vm-template -L cpaas.io/dcs-vm-template
+ac config use-cluster global
+ac -n cpaas-system get cm -l cpaas.io/dcs-vm-template -L cpaas.io/dcs-vm-template
 ```
 
-You do not set the Kubernetes or etcd version; the template decides them. Without any template ConfigMap, `ac` installs the latest Kubernetes version that the platform supports, the default entry in `kube-public/base-component-version`, with its matching etcd tag; when template ConfigMaps exist but none is for your template, it warns, because the template may not carry that version. A template ConfigMap without `kubernetesVersion` or `etcdTag` is an error. `ac` prints `Pinning Kubernetes <version>, etcd <tag>` before it reads the template ConfigMap, so when one applies, read the version from `spec.version` of the `KubeadmControlPlane` in `manifests/`.
+You do not set the Kubernetes or etcd version; the template decides them. Apply the ConfigMap of your template before you run `create`: without it, `ac` installs the platform's default Kubernetes version, which the template may not carry. A template ConfigMap without `kubernetesVersion` or `etcdTag` is rejected. Do not rely on the `Pinning Kubernetes <version>, etcd <tag>` line that `ac` prints when a template ConfigMap applies; read the version from `spec.version` of the `KubeadmControlPlane` in `manifests/`.
 
 ## Network Connectivity \{#network-connectivity}
 
@@ -41,11 +42,11 @@ The paths from the `global` cluster nodes are needed for creation and for later 
 
 | From | To | Port | Purpose |
 |---|---|---|---|
-| `global` cluster nodes | DCS VRM virtual IP | TCP/7443 | The DCS REST API: lifecycle calls and the first step of a file upload (`applyUpload`). |
-| `global` cluster nodes | The MGMT IP of every DCS physical host that may receive a clone | The port DCS returns, typically TCP/8443; confirm with the DCS administrator | The stream upload of the Ignition ISO. |
-| The machine that runs `ac` | DCS VRM virtual IP | TCP/7443 | Preflight signs in and checks the DCS objects that `install-config.yaml` names. |
+| `global` cluster nodes | DCS VRM virtual IP | TCP/7443 | The DCS REST API. |
+| `global` cluster nodes | The MGMT IP of every DCS physical host that may receive a clone | The port DCS returns, typically TCP/8443; confirm with the DCS administrator | The upload of each node's Ignition ISO. |
+| The machine that runs `ac` | DCS VRM virtual IP | TCP/7443 | The preflight checks of `create`. |
 
-DCS answers `applyUpload` with a URL on one physical host's management IP, and the provider streams the file there. If the `global` nodes have several NICs, for example one on the ACP network and one on the DCS management network, route both the VRM virtual IP and every host MGMT IP through the right NIC.
+If the `global` nodes have several NICs, for example one on the ACP network and one on the DCS management network, route both the VRM virtual IP and every host MGMT IP through the right NIC.
 
 ## Control Plane Endpoint and Image Registry \{#control-plane-endpoint}
 
@@ -82,22 +83,21 @@ userType=interconnect
 | `site` | The bare site ID, not the `urn:sites:` form. |
 | `userType` | Optional. `interconnect` or `domain`, case-insensitive. Other values are rejected. |
 
-Each line is `key=value`, unquoted: `kubectl` keeps quote characters as part of the value. Create the Secret, then remove the file:
+Each line is `key=value`, unquoted: `ac` keeps quote characters as part of the value. Create the Secret, then remove the file:
 
 ```bash
 chmod 600 dcs-credential.env
-kubectl create secret generic <credential-secret-name> -n cpaas-system --from-env-file=dcs-credential.env
+ac config use-cluster global
+ac create secret generic <credential-secret-name> -n cpaas-system --from-env-file=dcs-credential.env
 rm -f dcs-credential.env
 ```
 
-:::warning
-Do not create or update the Secret with `kubectl apply`: client-side apply stores the whole manifest, password included, in the `kubectl.kubernetes.io/last-applied-configuration` annotation. To change a value later, put it under `stringData` in a file and run `kubectl patch secret <credential-secret-name> -n cpaas-system --type=merge --patch-file=<file>`.
-:::
+Do not create or update the Secret with `ac apply`: it stores the password in the `kubectl.kubernetes.io/last-applied-configuration` annotation of the Secret. To change a value later, put it under `stringData` in a file and run `ac patch secret <credential-secret-name> -n cpaas-system --type=merge --patch-file=<file>`.
 
 ## DCS Objects, Capacity, and Addresses \{#dcs-objects}
 
-- The VM folder, the distributed virtual switches and port groups, the datastore or datastore cluster, and any compute cluster or host that `install-config.yaml` names exist on the site. `ac` creates none of them, and preflight checks only their names.
-- The datastores and hosts have room for the planned VMs: each node needs its system disk plus every disk of its node group. A datastore cluster tolerates one full member datastore; a datastore that is nearly full, or hosts that are all heavily overcommitted, leave new VMs stuck in `creating`.
+- The VM folder, the distributed virtual switches and port groups, the datastore or datastore cluster, and any compute cluster or host that `install-config.yaml` names exist on the site. `ac` creates none of them, and preflight checks only their names, not their capacity.
+- The datastores and hosts have room for the planned VMs: each node needs its system disk plus every disk of its node group. A datastore that is nearly full, or hosts that are all heavily overcommitted, leave new VMs stuck in `creating`.
 - To spread the control plane across hosts with `controlPlaneHA: true`, DRS is enabled on the compute cluster, there are at least as many healthy hosts as control plane replicas, a datastore is visible to all of them, nothing blocks DRS migration, such as an attached CD-ROM, and the control plane is not pinned to one host through `resource`.
 - Every node has a static IPv4 address and a hostname, not in use and not equal to the control plane endpoint. Neither `ac` nor the provider reserves addresses on DCS.
 

@@ -10,164 +10,117 @@ queries:
 
 # Troubleshoot a Workload Cluster Stuck in Provisioned
 
-Use this guide when a workload cluster on Alauda OS has reached `Cluster.status.phase = Provisioned` and the Kubernetes control plane reports ready, but the cluster never becomes fully usable.
+Use this guide when a workload cluster on Alauda OS has reached `Cluster.status.phase = Provisioned` and its control plane reports ready, but its nodes stay `NotReady` because the CNI is not deployed. It applies to every provider.
 
-The diagnostic flow assumes the workload cluster was created by applying provider Cluster API manifests to the `global` cluster.
-
-## Scope
-
-The diagnostic flow in this guide targets the **`global` cluster's import controller**, which is shared across all infrastructure providers. The four invariants in [Invariants of a Healthy Imported Cluster](#invariants-of-a-healthy-imported-cluster) — `clusters.platform.tkestack.io` presence, the `capi.cpaas.io/imported` label, the `ClusterCredential` count, and the workload-cluster `sentry` ServiceAccount — apply to every provider.
-
-The log strings in this guide use placeholders for reconciler object names because each infrastructure provider uses its own object types (for example, the provider's own `Cluster` and `Machine` infrastructure CRDs). When you read your provider's logs, substitute the placeholders for the real object names that appear in your provider's reconciler output. The diagnostic pattern itself does not depend on the provider — only the object names in the log strings do.
-
-If your environment is Huawei Cloud Stack and the symptoms below also include a stalled `kubeadm init` on a node whose pool config carries a dotted hostname, see [Troubleshoot HCS Workload Clusters](../huawei-cloud-stack/troubleshooting.mdx) for the provider-specific pattern after you finish the generic diagnostic flow on this page.
+On Huawei Cloud Stack, if `kubeadm init` also stalls on a node whose pool entry has a dotted hostname, finish this page first and then see [Troubleshoot HCS Workload Clusters](../huawei-cloud-stack/troubleshooting.mdx).
 
 ## Symptoms
 
-The cluster reaches a partial-success state and stays there. The following indicators appear together:
-
 | Where to look | What you see |
 |---|---|
-| `Cluster.status.phase` (on the `global` cluster) | `Provisioned` |
+| `Cluster.status.phase` on the `global` cluster | `Provisioned` |
 | `KubeadmControlPlane.status.ready` | `true` |
 | `Machine.status.phase` | `Running` |
-| `Machine.status.conditions[?(@.type=="NodeHealthy")]` | `status: False`, `reason: NodeConditionsFailed`, `message: Node condition Ready is False` |
-| `MachineDeployment.status.conditions[?(@.type=="Available")]` | `status: False`, `reason: NotAvailable`, `message: WorkersAvailable: 0 available replicas` |
-| Inside the workload cluster: `kubectl get nodes` | One or more nodes report `STATUS=NotReady` because the CNI is not running |
+| `Machine` condition `NodeHealthy` | `status: False`, `reason: NodeConditionsFailed` |
+| `MachineDeployment` condition `Available` | `status: False`, `reason: NotAvailable` |
+| Nodes of the workload cluster | One or more nodes are `NotReady` |
+| Logs of the infrastructure provider on the `global` cluster | Repeated `ServiceAccount "sentry" not found` errors while it reconciles the CNI `AppRelease` and the infrastructure cluster object |
 
-A typical secondary signature appears in the infrastructure provider reconciler logs on the `global` cluster:
+## Diagnostic Steps
 
-```text
-ERROR  failed to reconcile <CNI-AppRelease-object>: ServiceAccount "sentry" not found
-ERROR  failed to reconcile <Infra-Cluster-object>: ServiceAccount "sentry" not found
+In the commands, `<namespace>` is the namespace of the cluster objects; for a cluster created with `ac`, it is `cpaas-system`.
+
+### Step 1 — Check the Cluster API Objects
+
+```shell
+ac config use-cluster global
+ac get cluster <cluster-name> -n <namespace> -o wide
+ac get kubeadmcontrolplane -n <namespace>
+ac get machinedeployment -n <namespace>
 ```
 
-`<CNI-AppRelease-object>` and `<Infra-Cluster-object>` are placeholders for the actual object types your provider uses. For example, the CNI AppRelease object is typically named after the CNI being deployed, and the infrastructure cluster object name matches your provider's CRD (your provider's own `*Cluster` CRD).
+| Result | Action |
+|---|---|
+| The cluster is `Provisioned` and the `KubeadmControlPlane` is ready | Continue with Step 2. |
+| Otherwise | This page does not apply. See the Troubleshooting page of your provider. |
 
-The reconciler tries to apply the CNI through an `AppRelease` resource that is executed by the workload cluster's own `sentry` ServiceAccount. If that ServiceAccount is not present, the CNI is never deployed and the workload nodes stay `NotReady`.
+### Step 2 — Check the Machine Conditions
 
-## Invariants of a Healthy Imported Cluster \{#invariants-of-a-healthy-imported-cluster}
+```shell
+ac config use-cluster global
+ac get machine -n <namespace> \
+  -l cluster.x-k8s.io/cluster-name=<cluster-name> \
+  -o jsonpath='{range .items[*]}{.metadata.name}{" phase="}{.status.phase}{" "}{range .status.conditions[*]}{.type}={.status} {end}{"\n"}{end}'
+```
 
-Once a workload cluster reaches a healthy steady state, all of the following must hold. Verify each invariant from the `global` cluster context unless noted otherwise.
+Continue with Step 3 when a machine shows `phase=Running` with `NodeHealthy=False`; otherwise, this page does not apply.
 
-1. A `clusters.platform.tkestack.io/<cluster-name>` object exists.
+### Step 3 — Check the Provider Logs
+
+```shell
+ac config use-cluster global
+ac logs -n cpaas-system <infra-provider-manager-pod> --tail=200 | \
+  grep -E 'ServiceAccount|sentry|<cluster-name>'
+```
+
+Continue with Step 4 when the logs repeat `ServiceAccount "sentry" not found`; otherwise, this page does not apply.
+
+### Step 4 — Check the Import of the Cluster \{#invariants-of-a-healthy-imported-cluster}
+
+Run each check. A healthy cluster passes all four.
+
+1. The platform cluster record exists:
 
    ```shell
-   kubectl get clusters.platform.tkestack.io <cluster-name>
+   ac config use-cluster global
+   ac get clusters.platform.tkestack.io <cluster-name>
    ```
 
-2. The Cluster API `Cluster` resource carries the label `capi.cpaas.io/imported: ""`.
+   Expected: the record is listed, not `NotFound`.
 
-   The label value is the empty string `""` on a healthy import, so a `jsonpath` query alone cannot distinguish "label missing" from "label value is empty". Use `jq` to check label presence explicitly:
+2. The Cluster API `Cluster` carries the `capi.cpaas.io/imported` label:
 
    ```shell
-   kubectl get cluster <cluster-name> -n <namespace> -o json | \
+   ac get cluster <cluster-name> -n <namespace> -o json | \
      jq -r 'if (.metadata.labels | has("capi.cpaas.io/imported"))
             then "present (value=\"\(.metadata.labels["capi.cpaas.io/imported"])\")"
             else "missing"
             end'
    ```
 
-   Expected output: `present (value="")`. `missing` means the import has not completed.
+   Expected: `present (value="")`.
 
-3. Exactly one `clustercredentials.platform.tkestack.io` object is labelled for the cluster.
+3. Exactly one `ClusterCredential` is labelled for the cluster:
 
    ```shell
-   kubectl get clustercredentials.platform.tkestack.io -o json | \
+   ac get clustercredentials.platform.tkestack.io -o json | \
      jq -r --arg c <cluster-name> \
-       '.items[] | select(.metadata.labels["cluster.x-k8s.io/cluster-name"]==$c) | .metadata.name'
+       '.items[] | select(.metadata.labels["cluster.x-k8s.io/cluster-name"]==$c) | "\(.metadata.name) \(.metadata.creationTimestamp)"'
    ```
 
-   Exactly one name should print.
+   Expected: one line.
 
-4. Inside the workload cluster, ServiceAccount `sentry` exists in `cpaas-system`.
+4. The `sentry` ServiceAccount exists in the workload cluster:
 
    ```shell
-   kubectl --kubeconfig <workload-kubeconfig> -n cpaas-system get serviceaccount sentry
+   ac config sync
+   ac config use-cluster <cluster-name>
+   ac -n cpaas-system get serviceaccount sentry
+   ac config use-cluster global
    ```
 
-If any invariant fails, the workload cluster has not been imported by the `global` cluster's import controller, and the symptom pattern above is expected.
+   Expected: the ServiceAccount is listed.
 
-## Diagnostic Steps
-
-### Step 1 — Confirm the Cluster API surface is healthy
-
-```shell
-kubectl get cluster <cluster-name> -n <namespace> -o wide
-kubectl get kubeadmcontrolplane -n <namespace>
-kubectl get machinedeployment -n <namespace>
-```
-
-A failure here is unrelated to the import pattern; investigate the infrastructure provider directly.
-
-### Step 2 — Check Machine and Node conditions
-
-```shell
-kubectl get machine -n <namespace> \
-  -l cluster.x-k8s.io/cluster-name=<cluster-name> \
-  -o jsonpath='{range .items[*]}{.metadata.name}{" phase="}{.status.phase}{" "}{range .status.conditions[*]}{.type}={.status} {end}{"\n"}{end}'
-```
-
-If `phase=Running` but the `NodeHealthy` condition is `False`, the underlying workload node is `NotReady`. Continue to Step 3.
-
-### Step 3 — Inspect the infrastructure provider reconciler logs
-
-```shell
-kubectl logs -n cpaas-system <infra-provider-manager-pod> --tail=200 | \
-  grep -E 'ServiceAccount|sentry|<cluster-name>'
-```
-
-If you see repeated `ServiceAccount "sentry" not found` errors paired with a failure to reconcile the CNI AppRelease object, the workload cluster's CNI is not being deployed because the import flow has not completed. Continue to Step 4.
-
-### Step 4 — Verify the global cluster has imported the workload cluster
-
-Run the invariant checks from the previous section. The combined diagnostic signature for a failed import is:
-
-- `clusters.platform.tkestack.io/<cluster-name>` returns `NotFound`.
-- `Cluster.metadata.labels` does not include `capi.cpaas.io/imported`.
-
-### Step 5 — Verify the ClusterCredential count invariant
-
-```shell
-kubectl get clustercredentials.platform.tkestack.io -o json | \
-  jq -r --arg c <cluster-name> \
-    '[.items[] | select(.metadata.labels["cluster.x-k8s.io/cluster-name"]==$c)] | length'
-```
-
-A healthy cluster prints `1`. A value greater than `1` (for example, `8`) indicates that the import flow tried and failed repeatedly, leaving orphan credentials behind.
-
-## Pattern That Indicates a Failed Import
-
-The diagnostics indicate a failed import when **all** of the following are true at the same time:
-
-- The Cluster API surface is healthy (`Cluster.status.phase=Provisioned`, `KubeadmControlPlane.status.ready=true`).
-- `Machine.condition.NodeHealthy=False` and at least one workload node is `NotReady`.
-- Infrastructure provider logs repeatedly report `ServiceAccount "sentry" not found`.
-- `clusters.platform.tkestack.io/<cluster-name>` does not exist.
-- The Cluster resource does not carry the `capi.cpaas.io/imported` label.
-- More than one `clustercredentials.platform.tkestack.io` object is labelled for the cluster.
-
-When this pattern holds, the workload cluster's initial import on the `global` cluster failed and the import controller does not currently retry from scratch.
-
-## What Does Not Resolve This Pattern
+| Result | Action |
+|---|---|
+| All four checks pass | The import is complete. See the Troubleshooting page of your provider. |
+| Any check fails | Contact technical support. Provide the cluster name and namespace, the output of Steps 1 to 4, and the names and creation timestamps of the `ClusterCredential` objects from check 3. |
 
 :::warning
-Restarting the cluster-transformer pod on the `global` cluster does **not** re-import a workload cluster whose initial import already failed in this pattern. After a manual pod restart no log entries reference the affected cluster and the missing `clusters.platform.tkestack.io` entry is not created.
+Do not delete and recreate the cluster on your own: deleting it deletes its virtual machines on the IaaS platform. Restarting the cluster-transformer Pod on the `global` cluster does not import the cluster again.
 :::
-
-Do not assume the controller will eventually recover on its own when more than one orphan `ClusterCredential` is present for the same cluster.
-
-## Next Step
-
-Engage platform support with the following information:
-
-- The cluster name and namespace.
-- The output of the diagnostic commands in Steps 1 through 5.
-- The names and creation timestamps of every `clustercredentials.platform.tkestack.io` object that shares the same `cluster.x-k8s.io/cluster-name` label as the affected cluster.
-
-Recovery currently requires deleting and recreating the workload cluster after cleaning up the orphan `ClusterCredential` entries. Do not perform this on a production cluster without platform-support guidance: the recreate path triggers deletion of the underlying virtual machines on the IaaS platform, and provider-specific details (for example, DCS IP-pool and hostname planning, or HCS `HCSMachineConfigPool` re-allocation) must be reviewed before the recreate is applied.
 
 ## See Also
 
-- [Troubleshoot a Cluster Stuck in Deleting](./troubleshoot-cluster-stuck-deleting.mdx) — covers ACP-built clusters that stall in `Deleting` rather than failing to import.
-- [Troubleshoot a DCSMachine Stuck in Deleting](../huawei-dcs/troubleshooting.mdx#dcsmachine-stuck-deleting) — node-level deletion stalls; different scope.
+- [Troubleshoot a Cluster Stuck in Deleting](./troubleshoot-cluster-stuck-deleting.mdx)
+- [Troubleshoot a DCSMachine Stuck in Deleting](../huawei-dcs/troubleshooting.mdx#dcsmachine-stuck-deleting)

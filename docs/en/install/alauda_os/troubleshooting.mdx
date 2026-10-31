@@ -17,38 +17,48 @@ This page covers the installation progress and the failures that every provider 
 From another terminal on the bootstrap node, read all eight stages at once:
 
 ```bash
-ac adm alpha global status
+<extract-dir>/res/<arch>/ac adm alpha global status
 ```
 
-`status` changes nothing. It reads only the bootstrap cluster and refuses any other cluster, so it is useful only while the bootstrap cluster exists. It finds the bootstrap cluster through `--kubeconfig` with `--context`, then `/var/cpaas/data/alauda.kubeconfig`, then the current context. It exits non-zero when a stage has `Failed`, so a script can tell a failure from progress. `status` does not read the installation directory, so three stage 8 criteria always show as not checked; only `create` confirms stage 8.
+`status` changes nothing and works only while the bootstrap cluster exists. It exits non-zero when a stage has `Failed`. It cannot confirm stage 8; `create` confirms it.
 
-A typical installation takes 30 to 60 minutes after the machines are available. `logs/ac.log` in the installation directory records every run. To resume after a failure, run the same `create` again; see [The `create` Command](./reference.mdx#create-command).
+`logs/ac.log` in the installation directory records every run. If `create` stops, run the same command again; completed work is skipped. See [The `create` Command](./reference.mdx#create-command).
 
 ## Installation Stages \{#installation-stages}
 
 | # | Stage | What happens | Done when |
 |---:|---|---|---|
-| 1 | `MiniAlaudaReady` | `ac` checks the registry, then runs `setup.sh` to start `minialauda` and `cpaas-installer`. | The node is Ready and the `cpaas-installer` Pod is Running. |
-| 2 | `ProvidersReady` | `ac` installs the Cluster Bootstrap Provider and the infrastructure provider from the charts that `product.yaml` declares. | Both provider `AppRelease` objects are `Synced` and `Ready`. This is the `minialauda-ready` milestone. |
-| 3 | `ClusterAccepted` | `ac` records the registry credential and applies the rendered manifests. | `Cluster`, the infrastructure cluster, and `KubeadmControlPlane` exist, their references resolve, and none reports a failure. |
-| 4 | `MachinesProvisioned` | The infrastructure provider creates the machines. | Every node group has its expected number of `Machine` objects, all Running. |
-| 5 | `ControlPlaneReady` | kubeadm initializes the control plane. | `KubeadmControlPlane` reports `status.initialized` and the control plane endpoint accepts TCP connections. |
-| 6 | `PlatformInstalled` | `ac` sends the installation request to `cpaas-installer`, which installs the platform and imports the provider resources into the `global` cluster. | The installer reports `Success` and `Complete`. This is the `platform-installed` milestone. |
-| 7 | `HandoffVerified` | `ac` connects to the `global` cluster and verifies the handover. | All nodes are Ready, the base modules of `ClusterModule/global` are deployed, the `cpaas-system` workloads have all replicas, and every imported object exists. |
-| 8 | `Finalized` | `ac` installs both providers on the `global` cluster, writes `output/kubeconfig`, collects the installer log, and deletes `minialauda`. | The providers are Ready on the `global` cluster, the kubeconfig works, and `minialauda` and its network are gone. This is the `install-complete` milestone. |
+| 1 | `MiniAlaudaReady` | `ac` checks the registry and starts the bootstrap cluster on the bootstrap node. | The bootstrap cluster and the platform installer are running. |
+| 2 | `ProvidersReady` | `ac` installs the Cluster Bootstrap Provider and the infrastructure provider into the bootstrap cluster. | Both providers are Ready. |
+| 3 | `ClusterAccepted` | `ac` applies the rendered manifests. | The cluster objects exist and none reports a failure. |
+| 4 | `MachinesProvisioned` | The infrastructure provider creates the machines. | Every node group has its expected number of machines, all Running. |
+| 5 | `ControlPlaneReady` | The control plane is initialized. | The control plane endpoint accepts connections. |
+| 6 | `PlatformInstalled` | The platform is installed on the `global` cluster. | The installer reports success. |
+| 7 | `HandoffVerified` | `ac` checks the `global` cluster after the handover. | All nodes are Ready, the platform workloads are running, and the provider resources are on the `global` cluster. |
+| 8 | `Finalized` | `ac` installs both providers on the `global` cluster, writes `output/kubeconfig`, collects the installer log, and removes the bootstrap cluster. | The providers are Ready on the `global` cluster, the kubeconfig works, and the bootstrap cluster is gone. |
 
 Some providers add checks to stages 7 and 8; their installation pages list them.
 
 ## Common Failures \{#common-failures}
 
-| Symptom | Where to look first |
+Run the commands in the table on the bootstrap node unless the row says otherwise. First set `AC` to the `ac` command with the bootstrap cluster's kubeconfig:
+
+```bash
+AC="<extract-dir>/res/<arch>/ac --kubeconfig /var/cpaas/data/alauda.kubeconfig"
+$AC -n cpaas-system get pods
+```
+
+If `/var/cpaas/data/alauda.kubeconfig` is missing while the installation is running, run `create` again: it writes the file again and continues.
+
+| Result | Action |
 |---|---|
-| `setup.sh` exits with an error | Where its output stopped. If it stopped in its preflight checks, the host is unchanged: fix the cause and run `create` again. Otherwise run `bash cleanup.sh -y` in the directory of `setup.sh`, which reboots the host and deletes `/root/.kube`, then run `create` again. |
-| Stage 2 does not advance | The `AppRelease` status, the provider Pods, and whether the registry serves the chart versions in `product.yaml`. |
-| Stage 4 does not advance | `kubectl -n cpaas-system describe machine <name>` and the provider machine object. See the provider's troubleshooting page. |
-| Stage 5 does not advance | The `KubeadmControlPlane` conditions, and etcd and join progress on the first control plane node. |
-| Stage 5 shows `readyReplicas: 0` | Expected. The CNI is installed by the platform installation, and nodes stay NotReady until then. Stage 5 checks `status.initialized`. |
-| Stage 6 stalls | The last lines and the latest error in `/var/cpaas/data/installer.log`. The installer retries failed steps indefinitely, so a stall is more common than an error. Until stage 6 completes, `status` also reports how far the registry credential has got. |
-| Stage 8 reports no running installer Pod | The installer log exists only in `minialauda`, so `ac` does not remove it without the log. Wait until the `cpaas-installer` Pod is Running again, then run `create` again. If the Deployment was scaled to zero, first run `kubectl -n cpaas-system scale deployment cpaas-installer --replicas=1`. |
-| Stage 8 waits for a provider | On the `global` cluster, whether base-operator runs and has created the `ModulePlugin` and `ModuleConfig` of both providers. `ac` creates the `ModuleInfo` only after the `ModuleConfig` appears. |
-| Nodes cannot pull images | Whether the registry is reachable from the node network, and whether the payload is complete. |
+| `setup.sh` exits with an error in its preflight checks | The host is unchanged. Fix the cause it names, then run `create` again. |
+| `setup.sh` exits with an error after its preflight checks | In the directory of `setup.sh`, run `bash cleanup.sh -y`, then run `create` again. `cleanup.sh -y` reboots the host and deletes `/root/.kube`. |
+| Stage 2 does not advance | Check the provider releases and Pods with `$AC get apprelease -A` and `$AC get pods -A`. If an image or chart cannot be pulled, upload the payload again as described in [Prepare the Core Package and the Registry](./prerequisites.mdx#prepare-core-package), then run `create` again. Otherwise, contact technical support. |
+| Stage 4 does not advance | Run `$AC -n cpaas-system describe machine <name>`, then see the provider's troubleshooting page. |
+| Stage 5 does not advance | Run `$AC -n cpaas-system describe kubeadmcontrolplane global-control-plane` and read its conditions. Then see the provider's troubleshooting page, or contact technical support. |
+| Stage 5 shows `readyReplicas: 0` | Expected: the nodes stay NotReady until the platform installs the network plugin in stage 6. Continue. |
+| Stage 6 stalls | Read the last lines and the latest error of `/var/cpaas/data/installer.log` on the bootstrap node, and fix the cause it names; the installer retries by itself. If the error does not name a cause you can fix, contact technical support. |
+| Stage 8 reports no running installer Pod | `ac` removes the bootstrap cluster only after it has copied the installer log. Wait until `$AC -n cpaas-system get pods` shows the `cpaas-installer` Pod Running, then run `create` again. If it does not return to Running, contact technical support. |
+| Stage 8 waits for a provider | On a machine with `ac`, run `ac login https://<platform-address>` as the platform administrator, `ac config use-cluster global`, and `ac get moduleconfigs \| grep cluster-api-provider`. Continue to wait when both providers are listed; otherwise, contact technical support. |
+| Nodes cannot pull images | Check that the registry is reachable from the node network. If the payload is incomplete, upload it again as described in [Prepare the Core Package and the Registry](./prerequisites.mdx#prepare-core-package). |

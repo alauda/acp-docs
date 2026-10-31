@@ -12,17 +12,15 @@ queries:
 
 # Prerequisites for VMware vSphere Workload Clusters
 
-Meet the following before you [create the cluster](./create_cluster.mdx). `ac` creates none of the vCenter objects; it checks them before it applies anything, as listed in [Create the Cluster](./create_cluster.mdx#create-with-ac).
+Meet the following before you [create the cluster](./create_cluster.mdx). `ac` creates none of the vCenter objects; it checks them before it applies anything.
 
 ## Providers \{#providers}
 
 The Cluster Bootstrap Provider and the Infrastructure Provider for Virtualization Platform are installed on the `global` cluster. A `global` cluster installed on VMware vSphere with `ac` already runs both; otherwise see [Install the Provider](./reference/install_provider.mdx).
 
-Some features depend on the provider version, such as the Self-built VIP and ephemeral disks, which require `v1.0.17` or later. Read the installed provider version from the provider `AppRelease` on the management cluster; do not infer it from the ACP release. See [Identify the Installed Provider Version](../../../upgrade/workload/alauda_os/index.mdx#identify-the-installed-provider-version).
-
 ## vCenter Reachability \{#vcenter-reachability}
 
-The `global` cluster and the machine that runs `ac` reach vCenter on `TCP/443`: the provider manages the VMs through it, and `ac` signs in to vCenter to check the names in `install-config.yaml`.
+The `global` cluster and the machine that runs `ac` reach vCenter on `TCP/443`.
 
 ## VM Template \{#vm-template-requirements}
 
@@ -30,24 +28,20 @@ The VM template, the datacenter, the port groups, the datastores, and the comput
 
 ## Control Plane Endpoint \{#control-plane-endpoint-modes}
 
-Every cluster reaches its API server through a stable endpoint. Select the mode before you write `install-config.yaml`; see the warning below. `ac` records it in `VSphereCluster.spec.controlPlaneLoadBalancer`.
+Every cluster reaches its API server through a stable endpoint. Choose the mode before you write `install-config.yaml`: it cannot be changed after the cluster is created, and an existing cluster cannot switch to a Self-built VIP.
 
-| `cluster.network.loadBalancer.type` | What `ac` renders | Who owns the endpoint |
-|---|---|---|
-| `external` (default) | `spec.controlPlaneEndpoint` only; `spec.controlPlaneLoadBalancer` is absent | You do. Provision an external Layer 4 TCP LoadBalancer that forwards `6443` to the control plane nodes and satisfies [the endpoint contract](../prepare/control-plane-endpoint.mdx). |
-| `internal` | `spec.controlPlaneLoadBalancer` with `type: internal` | The provider does. It injects a bootstrap VIP on the first control plane node, then installs Alive (keepalived and IPVS) into the workload cluster and holds the VIP on the control plane nodes. Meet the [Self-built VIP prerequisites](./reference/install-config-parameters.mdx#self-built-vip-prerequisites) first. |
-
-<Directive type="warning" title="The Self-built VIP is a creation-time choice only">
-The Self-built VIP exists from provider `v1.0.17`, requires ACP `v4.4` or later, and is available only to clusters **created** with it. An existing cluster cannot adopt it, and neither can a cluster whose provider was upgraded to `v1.0.17` from an earlier release: the VIP is injected while the first control plane node bootstraps, and Alive then takes it over, so there is no in-place migration path. Those clusters keep their external LoadBalancer, and moving one onto a Self-built VIP means creating a new cluster. See [Upgrading the Provider](./reference/install_provider.mdx#upgrade-the-provider) and [`controlPlaneLoadBalancer` fields](./reference/install-config-parameters.mdx#control-plane-load-balancer-fields).
-</Directive>
+| `cluster.network.loadBalancer.type` | Who provides the endpoint |
+|---|---|
+| `external` (default) | You do. Provision an external Layer 4 TCP load balancer that forwards `6443` to the control plane nodes and satisfies [the endpoint contract](../prepare/control-plane-endpoint.mdx). |
+| `internal` | The provider runs a Self-built VIP on the control plane nodes. Meet the [Self-built VIP prerequisites](./reference/install-config-parameters.mdx#self-built-vip-prerequisites) first. |
 
 ## Static IP Addresses \{#static-ip-addresses}
 
-Every node has a hostname and a static IPv4 address, plus one address for each additional NIC. All required addresses are allocated, are not in use, and are not already declared by a slot in another `VSphereMachineConfigPool` bound to the same `Cluster`. Plan each host's addresses and disks before the cluster is created: once a machine takes a slot, they are frozen; see [Allocated slot restrictions](./reference/install-config-parameters.mdx#create-the-machine-config-pools).
+Every node has a hostname and a static IPv4 address, plus one address for each additional NIC. All required addresses are allocated and not in use. Plan each host's addresses and disks before the cluster is created: once a machine takes a slot, they cannot be changed; see [Allocated slot restrictions](./reference/install-config-parameters.mdx#create-the-machine-config-pools).
 
 ## ClusterResourceSet \{#cluster-resource-set}
 
-`ClusterResourceSet=true` is enabled on the `global` cluster. The vSphere CPI reaches the workload cluster through a `ClusterResourceSet`; without it, the nodes stay uninitialized.
+`ClusterResourceSet=true` is enabled on the `global` cluster. Without it, the vSphere CPI never reaches the workload cluster and the nodes stay uninitialized.
 
 ## Image Registry \{#image-registry}
 
@@ -55,15 +49,24 @@ The cluster inherits the registry of the `global` cluster: `ac` does not support
 
 ## vCenter Credential Secret \{#before-you-start}
 
-Create the vCenter credential Secret in `cpaas-system` of the `global` cluster. `ac` references it through `credentialRef` and never creates it. Use `kubectl create`, not `kubectl apply`, which would store the password in an annotation of the Secret:
+Create the vCenter credential Secret in `cpaas-system` of the `global` cluster; `ac` references it through `credentialRef` and never creates it. Write the account to `vsphere-credential.env` with an editor, one `key=value` per line, unquoted:
 
-```bash
-kubectl -n cpaas-system create secret generic <cluster-name>-credential \
-  --from-literal=username=<administrator@vsphere.local> \
-  --from-literal=password='<password>'
+```text title="vsphere-credential.env"
+username=<administrator@vsphere.local>
+password=<password>
 ```
 
-The provider takes ownership of the Secret and deletes it with the cluster, so create it again before each installation, and do not share one Secret between two vSphere clusters. `ac` renders the CPI credential from the same account; you do not prepare a second one.
+Run the following commands from a machine where `ac` is logged in to the platform, then remove the file:
+
+```bash
+ac config use-cluster global
+ac -n cpaas-system create secret generic <cluster-name>-credential --from-env-file=vsphere-credential.env
+rm -f vsphere-credential.env
+```
+
+Do not create the Secret with `ac apply`: it stores the password in an annotation of the Secret.
+
+Use one Secret per cluster: the provider deletes it with the cluster, so create it again before you recreate a cluster. `ac` renders the CPI credential from the same account; you do not prepare a second one.
 
 The account must be able to read the inventory, and to clone, power, reconfigure, and delete VMs and their disks. When custom attributes are in use, it also needs the privileges in [Install the Provider](./reference/install_provider.mdx#prerequisites).
 

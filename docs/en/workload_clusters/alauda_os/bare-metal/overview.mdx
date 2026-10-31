@@ -12,168 +12,35 @@ queries:
 
 # Bare Metal Provider
 
-## Overview
+The Infrastructure Provider for Bare Metal creates Alauda OS clusters on physical servers, with no virtualization layer in between. When you plan a cluster, note what is specific to Bare Metal:
 
-The Infrastructure Provider for Bare Metal creates and manages Alauda OS clusters on physical servers, with no virtualization layer in between. It composes two long-running components on the `global` cluster:
+- The provider does not create machines. Each host boots an ISO built by the platform once, installs Alauda OS to disk, and registers with the `global` cluster as a `MachineInventory`. You list the hosts of each node group in a `MachineInventoryPool`. `ac` renders the cluster objects; it does not register hosts or create pools.
+- A host stays registered for its whole life. When a node is removed, its host is cleaned and returns to its pool; when a node is added, a host of the pool is reinstalled with the image of the cluster's Kubernetes version and joins the cluster. Each pool holds at least the `replicas` of its node group.
+- Each reinstall clears the Kubernetes state on the host. Data volumes that you declare on the `MachineInventory` keep their data, and stay with that host rather than following a node.
+- A host keeps the network address it had when it registered.
+- Every Kubernetes version that a cluster uses must be in the image catalog, `elemental-image-catalog`.
+- The control plane endpoint is a Self-built VIP on the control plane nodes, `internal`, the default, or your external load balancer.
 
-- **`elemental-operator`** — registers physical hosts, builds installation ISOs (`SeedImage`), and maintains the long-lived `MachineInventory` object for every host. `elemental-system-agent` runs on each host and executes `MachineInventory` plan secrets.
-- **`cluster-api-provider-baremetal`** — the Cluster API infrastructure provider. It groups available `MachineInventory` objects into pools, binds each `Machine` to a `MachineInventory`, and writes `clean` / `reprovision` plans that drive the host through Kubernetes node lifecycle.
+## `BaremetalMachine` Phases \{#baremetalmachine}
 
-Unlike VM providers (DCS, vSphere), the bare-metal provider does **not** create or destroy machines. A host is installed once (live ISO → on-disk OS via `elemental install`), registers itself as a `MachineInventory`, and stays in the inventory across the cluster lifecycle. Node "creation" and "deletion" are realized through `elemental upgrade` driven by plans, followed by reboot and cloud-init re-execution.
+A `BaremetalMachine` moves through `Pending → Allocated → Reprovisioning → Running`; on deletion, `Running → Preparing → Deleted`; on failure, to `Failed`.
 
-## Status
+## Host Lifecycle Plans \{#clean-reprovision}
 
-Clusters are created with ACP CLI (ac): `ac adm alpha cluster create` renders and applies the Cluster API objects from one `install-config.yaml`. `ac` does not register hosts or create pools; those steps use `kubectl apply` and are part of [Create a Cluster](./create_cluster.mdx). There is no Fleet Essentials UI for bare-metal clusters.
+The provider drives each host through a plan, named in the `baremetal.alauda.io/plan.type` annotation of the host's plan Secret:
 
-## Key Features
-
-- **`MachineInventoryPool` allocation model** — operators pre-declare which `MachineInventory` objects may back a `KubeadmControlPlane` or `MachineDeployment`. The provider picks an `Available` inventory from that pool when a `Machine` is created; nothing is provisioned outside the declared set.
-- **Plan-driven node lifecycle** — node attach uses a `reprovision` plan (write cloud-init, `cloud-init clean`, `elemental upgrade`, reboot, cloud-init re-execute, `kubeadm init/join`). Node detach uses a `clean` plan (stop kubelet, clear CRI workload, stop containerd). `MachineInventory` is never deleted by the provider during scaling, upgrade, or cluster deletion.
-- **Cluster API native object tree** — uses upstream `Cluster`, `KubeadmControlPlane`, `MachineDeployment`, `Machine`. The provider only owns the infrastructure tree (`BaremetalCluster`, `BaremetalMachine`, `BaremetalMachineTemplate`, `MachineInventoryPool`). There is no custom control-plane CRD.
-- **Image-catalog driven Kubernetes versions** — the provider keeps a cluster-scoped `elemental-image-catalog` ConfigMap that maps `Machine.spec.version` to an `elemental upgrade` image. Upgrades become "patch the version, controller resolves the matching image, reprovisions the node."
-- **Two control-plane endpoint modes** — `BaremetalCluster.spec.controlPlaneLoadBalancer.type: Internal` deploys Alive (keepalived + IPVS + `kube-lock` Lease arbitration) and reconciles the Self-built VIP. `External` skips Alive and uses a pre-provisioned Layer 4 TCP LoadBalancer whose backends are maintained outside the cluster. See [Plan the Control Plane Endpoint](../prepare/control-plane-endpoint.mdx).
-- **Network identity preservation** — `elemental-register` reports the live-ISO observed network as `MachineInventory.spec.observedNetwork`. The first `elemental install` and every later `reprovision` plan replay that snapshot as cloud-init `network-config v2`, so a host keeps its address, default route, and DNS across the entire lifecycle.
-- **Inventory-owned managed data disks** — an operator can declare up to 32 XFS or ext4 data volumes in `MachineInventory.spec.storage`. The provider prepares them before allocation, activates their mount units before kubelet during reprovision, deactivates them during node removal, and preserves their filesystems and data for reuse of the same inventory. See [Manage Data Disks on Bare-Metal Hosts](../../../configure/nodes/alauda_os/manage-bare-metal-storage.mdx).
-
-## Differences from VM-Based Providers
-
-| Aspect | VM providers (DCS, vSphere) | Bare-metal provider |
-|---|---|---|
-| Node creation | Clone a VM template from a credential-scoped platform | Reprovision an already-installed physical host via `elemental upgrade` |
-| Node deletion | Power-off and delete the VM | Run `clean` plan; host stays in inventory and returns to pool |
-| Pool model | IP pool / hostname pool sized per replica | `MachineInventoryPool` listing concrete `MachineInventory` names |
-| Data on the node | System and template disks recreated on every replacement; declared persistent disks survive (DCS) | `initramfs` clears Kubernetes-managed system state on every reprovision. Data volumes explicitly declared on the long-lived `MachineInventory` can retain their filesystems and data, but the data stays with that inventory and does not follow a replacement `Machine` automatically. |
-| Recovery time | Minutes per replacement | Minutes per `elemental upgrade` + reboot |
-| First install path | One-off VM template upload by the platform admin | Live ISO built by `SeedImage`, booted on the host, `elemental install` to disk |
-| Control-plane LB | External LB supplied by operator | Internal LB managed by `alive` static pods on the control-plane nodes (External LB supported through `type: External`) |
-| Cluster creation | `ac`, or the Fleet Essentials UI (DCS) | `ac`; hosts and pools with `kubectl apply` |
-
-## Concepts and Terminology \{#concepts-and-terminology}
-
-### Object hierarchy
-
-| Layer | Owned resources | Role in the workflow |
-|---|---|---|
-| `elemental.cattle.io` | `MachineRegistration`, `SeedImage`, `MachineInventory` | Registers physical hosts, builds the bootable ISO, and keeps the long-lived host identity. |
-| Host agent | `elemental-system-agent` on each host | Polls the default plan secret referenced by `MachineInventory.status.plan.secretRef` and reports plan state back to `MachineInventory.status.plan.state`. |
-| `infrastructure.cluster.x-k8s.io` | `BaremetalCluster`, `BaremetalMachineTemplate`, `BaremetalMachine`, `MachineInventoryPool` | Implements the Cluster API infrastructure provider, selects inventories from pools, and writes `clean` / `reprovision` plans. |
-
-The ownership boundary is deliberate: `elemental-operator` owns host registration and `MachineInventory` lifecycle, while `cluster-api-provider-baremetal` owns the Cluster API infrastructure tree. The provider references `MachineInventory` objects by name and writes plans through the inventory's existing plan secret; it does not create or delete inventories.
-
-### Bare-metal concepts
-
-#### `MachineRegistration` \{#machineregistration}
-
-Declares the registration endpoint and first-install cloud-config that `elemental-register` consumes on the live ISO. Operators set `machineName`, `machineInventoryLabels`, and `machineInventoryAnnotations` (with `${SMBIOS/...}` templating) plus the `elemental.install` and `elemental.registration` blocks. `MachineRegistration` is queried but not modified by the bare-metal provider — it belongs to the elemental layer.
-
-#### `SeedImage` \{#seedimage}
-
-Triggers `elemental-operator` to build a bootable ISO that contains the registration URL and the operator's TLS material baked into it. `spec.baseImage` must reference the **ISO** variant of the OS image that matches the target Kubernetes version (the repository name carries the `-iso` suffix; the tag/digest matches the `elemental-image-catalog` entry for the version you intend to install). The ISO is booted once per physical host; on boot, the host runs `elemental-register` followed by `elemental install` and creates a `MachineInventory`.
-
-#### `MachineInventory` \{#machineinventory}
-
-The long-lived host identity object. The provider relies on the following parts of its contract:
-
-- `status.plan.secretRef` — the single default plan secret owned by `elemental-operator`.
-- `status.plan.state` — `Applied` / `Failed` transitions used to drive the `BaremetalMachine` state machine.
-- `status.conditions` — host-side readiness signals.
-- `spec.observedNetwork` — fork-only field populated by `elemental-register` from the live-ISO NICs; replayed during install and during every `reprovision` plan.
-- `spec.storage` — optional operator-authored declaration of inventory-owned data volumes.
-- `status.observedStorage` — objective device, filesystem, mount, and multipath facts reported by `elemental-storage-observer.service` on the host.
-- `status.storage` — provider-owned Prepare / Activate / Deactivate / Release state, operation journal, conditions, and applied-volume identities.
-
-The provider never deletes a `MachineInventory`, never uses `MachineInventorySelector`, and does not run a separate `MachineInventoryLifecycleController` — that lifecycle remains with `elemental-operator`.
-
-#### `MachineInventoryPool` \{#machineinventorypool}
-
-Operator-authored set of `MachineInventory` names that a given `BaremetalMachineTemplate` is allowed to draw from. Pools are scoped to a single `clusterName`, and each `MachineInventory` belongs to at most one active pool at a time. The pool reconciler aggregates the pool-wide capacity counters used everywhere in the docs:
-
-- `available` — free for allocation
-- `allocated` — bound to an active `BaremetalMachine`
-- `preparing` — running a `clean` plan
-- `reprovisioning` — running a `reprovision` plan
-- `unavailable` — Ready=False, plan failed, missing plan secret, or not present in the cluster
-
-#### `BaremetalCluster` \{#baremetalcluster}
-
-The Cluster API infrastructure cluster resource. Owns `controlPlaneLoadBalancer` (the VIP and `vrid` consumed by the `alive` chart) and `controlPlaneEndpoint` (backfilled from `controlPlaneLoadBalancer` when only the VIP is set). The reconciler defers cluster-addon deployment (`alive`, `kube-ovn`) until the workload control plane is reachable.
-
-#### `BaremetalMachineTemplate` \{#baremetalmachinetemplate}
-
-The Cluster API infrastructure template referenced by `KubeadmControlPlane.spec.machineTemplate.infrastructureRef` and by `MachineDeployment.spec.template.spec.infrastructureRef`. Templates only carry `machineInventoryPoolRef` (which pool this machine group draws from). The provider picks the first `Available` inventory in the pool's declaration order.
-
-There is deliberately no `version`, `role`, or `upgradeImage` on the template. Role comes from the owning Cluster API resource; the version comes from `Machine.spec.version`; the upgrade image is resolved at reprovision time from the global image catalog.
-
-#### `BaremetalMachine` \{#baremetalmachine}
-
-The Cluster API infrastructure machine. Reconciles a single `Machine` against a single `MachineInventory`:
-
-1. Picks an `Available` inventory from the pool referenced by the owning template.
-2. Reads the owning `Machine.spec.bootstrap.dataSecretName` and resolves the elemental upgrade image for `Machine.spec.version` from the image catalog.
-3. Normalizes the bootstrap user-data (hostname, kubelet `provider-id`, `criSocket`) and writes the `reprovision` plan into the `MachineInventory` plan secret.
-4. Watches `MachineInventory.status.plan.state` until the plan reports `Applied`, then sets `BaremetalMachine.spec.providerID = baremetal:///<inventory-name>`.
-5. On deletion, writes a `clean` plan and clears the owner annotations once the plan applies, returning the inventory to the pool.
-
-Phase transitions: `Pending → Allocated → Reprovisioning → Running`; deletion: `Running → Preparing → Deleted`; failure: `* → Failed`.
-
-#### Image catalog \{#image-catalog}
-
-A cluster-scoped `ConfigMap` (default name `elemental-image-catalog` in `cpaas-system`) that maps `Machine.spec.version` to an `elemental upgrade` image. The bare-metal provider chart renders this ConfigMap from `provider.imageCatalog.images` (`global.registry.address` is prepended to each repository) and from `provider.imageCatalog.data` (for fully-qualified overrides such as digest-pinned images). Both values are empty by default, so the ConfigMap has no entries until you add them; see [OS Images and Image Catalog](./prerequisites.mdx#os-images-and-image-catalog). The reconciler hot-reloads the ConfigMap; a missing key is a terminal `Failed` state, not a fallback to a default image.
-
-Obtain the matching `base-image` and `base-image-iso` references from Alauda technical support. The image catalog uses `base-image` for reprovisioning, while `SeedImage.spec.baseImage` uses `base-image-iso` for live installation. Do not derive one reference from the other or substitute an independently built image.
-
-#### Host lifecycle plans \{#clean-reprovision}
-
-The provider serializes all host work through the inventory's single default plan secret. The secret's `baremetal.alauda.io/plan.type` annotation identifies the current lifecycle plan:
-
-- **`storage-prepare`** — runs while an inventory is available and before allocation. It preflights every declared volume, then adopts an existing matching filesystem or initializes an explicitly authorized blank device. It does not mount business paths.
-- **`reprovision`** — runs on node attach. It embeds managed-volume activation, writes NoCloud `user-data` / `meta-data` (and, when `MachineInventory.spec.observedNetwork` is non-empty, `network-config` v2), writes a cleanup marker, runs `cloud-init clean --logs --seed`, runs `elemental upgrade --reboot=false --system <image>`, and triggers a delayed reboot. After reboot, `initramfs` clears `/var/lib/kubelet`, `/var/lib/containerd`, `/var/lib/etcd`, and `/etc/kubernetes`; managed mount units start before kubelet, and cloud-init performs `kubeadm init` / `kubeadm join`.
-- **`clean`** — runs on node detach. It stops kubelet, deactivates managed mounts, clears CRI workload, and stops containerd. It explicitly **does not** wipe managed filesystems, run `kubeadm reset`, run `cloud-init clean`, run `elemental upgrade`, or reboot. OS cleanup is deferred to the next `reprovision` plan.
-- **`storage-release`** — runs only while an inventory is available and all managed volumes are inactive. It removes provider ownership and activation metadata for volumes removed from `spec.storage` without wiping their filesystems or data.
-
-The provider does not use `MachineInventorySelector` or `FleetBundle`. Storage lifecycle details, safety gates, and examples are documented in [Manage Data Disks on Bare-Metal Hosts](../../../configure/nodes/alauda_os/manage-bare-metal-storage.mdx).
-
-#### `alive` (control-plane HA) \{#alive}
-
-`alive` is a set of static pods (keepalived + IPVS) plus a `kube-lock` Lease arbitrator that maintain the control-plane VIP described in `BaremetalCluster.spec.controlPlaneLoadBalancer`. The provider deploys `alive` as an `AppRelease` on the workload cluster once the first control-plane Node is Ready, and re-renders it whenever the control-plane membership changes. During the very first `kubeadm init`, the provider prepends a one-off `ip addr add <control-plane-vip>/32 dev eth0` command to the bootstrap so that the first node holds the VIP until `alive` takes over.
-
-The VIP must live in the control-plane nodes' Layer-2 broadcast domain; `vrid` must be unique within that domain.
-
-#### `MachineInventory.spec.observedNetwork` \{#observed-network}
-
-Fork-only field populated by `elemental-register` from the live-ISO NIC state and reported back via the `MsgObservedNetworkConfig` registration message. It is consumed in two places:
-
-- During the first `elemental install`, when `MachineInventory.spec.network` is empty, the registration server falls back to translating `observedNetwork` into an `nmconnections` `NetworkConfig` so the on-disk OS keeps the same address that the live ISO had.
-- During every `reprovision`, the provider translates `observedNetwork` into cloud-init `network-config` v2 (a netplan subset) and writes it as the third NoCloud seed file. Explicit `spec.network` takes precedence in both cases.
-
-## API Group
-
-All bare-metal infrastructure resources belong to `infrastructure.cluster.x-k8s.io/v1beta1`. Elemental resources belong to `elemental.cattle.io/v1beta1`.
-
-| Resource | Description | Documentation |
-|---|---|---|
-| `BaremetalCluster` | Cluster-level infrastructure (control-plane VIP, endpoint, network type) | [BaremetalCluster](../../../apis/kubernetes_apis/infrastructure_providers/bare-metal/baremetalcluster.mdx) |
-| `BaremetalMachine` | Single infra Machine bound to one `MachineInventory` | [BaremetalMachine](../../../apis/kubernetes_apis/infrastructure_providers/bare-metal/baremetalmachine.mdx) |
-| `BaremetalMachineTemplate` | Template that binds a pool to a `KubeadmControlPlane` or `MachineDeployment` | [BaremetalMachineTemplate](../../../apis/kubernetes_apis/infrastructure_providers/bare-metal/baremetalmachinetemplate.mdx) |
-| `MachineInventoryPool` | Allowed set of `MachineInventory` names for a cluster | [MachineInventoryPool](../../../apis/kubernetes_apis/infrastructure_providers/bare-metal/machineinventorypool.mdx) |
-
-## Supported Kubernetes Versions
-
-Use the product support matrix for the Kubernetes versions supported by each ACP release. See [OS Support Matrix](../../../overview/alauda_os_support_matrix.mdx) for the release-approved Kubernetes version and matching component versions.
-
-The bare-metal provider enforces that support decision through `elemental-image-catalog`: every `Machine.spec.version` used by a cluster must exist as a key in that ConfigMap. The catalog is populated as described in [OS Images and Image Catalog](./prerequisites.mdx#os-images-and-image-catalog) and [Upgrade Kubernetes](../../../upgrade/workload/alauda_os/bare-metal.mdx).
-
-## Requirements
-
-See [Prerequisites for Bare Metal Workload Clusters](./prerequisites.mdx).
+- **`storage-prepare`**: prepares the declared data volumes of an unallocated host.
+- **`reprovision`**: reinstalls the host and joins it to the cluster.
+- **`clean`**: removes the node from the cluster; the next `reprovision` reinstalls the OS. Managed data volumes are not wiped.
+- **`storage-release`**: releases data volumes removed from `spec.storage`, without wiping their data.
 
 ## Documentation
 
-For detailed instructions on using the bare-metal provider, see:
+Read the pages in this order:
 
-- [Prerequisites](./prerequisites.mdx)
-- [Create a Cluster](./create_cluster.mdx)
-- [Manage Nodes](../../../configure/nodes/alauda_os/bare-metal.mdx)
-- [Managing Data Disks](../../../configure/nodes/alauda_os/manage-bare-metal-storage.mdx)
-- [Upgrade Kubernetes](../../../upgrade/workload/alauda_os/bare-metal.mdx)
-- [API Reference](../../../apis/kubernetes_apis/infrastructure_providers/bare-metal/index.mdx)
+1. [Prerequisites](./prerequisites.mdx)
+2. [Create a Cluster](./create_cluster.mdx), and [Select a Fixed System Disk](./reference/configure-fixed-install-disk.mdx) for hosts with several disks
+3. [Troubleshooting](./troubleshooting.mdx), when a creation stage does not advance
+4. [Delete a Cluster](./deleting.mdx)
+
+Related: [Parameters](./reference/install-config-parameters.mdx), [Manage Nodes](../../../configure/nodes/alauda_os/bare-metal.mdx), [Managing Data Disks](../../../configure/nodes/alauda_os/manage-bare-metal-storage.mdx), [Upgrade Kubernetes](../../../upgrade/workload/alauda_os/bare-metal.mdx), [API Reference](../../../apis/kubernetes_apis/infrastructure_providers/bare-metal/index.mdx).

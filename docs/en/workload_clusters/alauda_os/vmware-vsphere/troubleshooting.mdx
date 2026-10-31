@@ -18,59 +18,87 @@ Start from the stage that `ac adm alpha cluster status` reports. For failures th
 
 | Symptom | Where to look first |
 |---|---|
+| `create` reports a vCenter object that it cannot find | Fix the name in `install-config.yaml` and run `create` again. `ac` reports one missing object per run. Names given as inventory paths, which contain `/`, are checked only when the VMs are cloned. |
 | Stage 1 does not advance | The `Cluster` and `VSphereCluster` conditions. |
 | Stage 2 does not advance | The `KubeadmControlPlane`, `Machine`, `VSphereMachine`, and `VSphereVM` conditions, and the pool conditions and `status.configStatuses`. |
-| The control plane does not come up | The endpoint and the registry: LoadBalancer or VIP health, DNS, the registry API, the ACP port rules, and reachability from the `global` cluster and the nodes. |
+| The control plane does not come up | The endpoint and the registry: load balancer or VIP health, DNS, the registry API, the ACP port rules, and reachability from the `global` cluster and the nodes. |
 | Nodes stay uninitialized | The CPI delivery: the `ClusterResourceSetBinding` and the CPI Pods in the workload cluster. |
 | Stage 3 does not advance | The `MachineDeployment` rollout, the VM status, the CPI, and the CNI. |
 | Stage 4 does not advance | The platform `ClusterView`, the registry API, and the provider manager log. |
 
-Collect the state first:
+Collect the state first. Run the following commands from a machine where `ac` is logged in to the platform:
 
 ```bash
-kubectl -n cpaas-system describe cluster <cluster-name>
-kubectl -n cpaas-system describe vspherecluster <cluster-name>
-kubectl -n cpaas-system describe kubeadmcontrolplane <cluster-name>-control-plane
-kubectl -n cpaas-system describe machinedeployment <cluster-name>-<group>
-kubectl -n cpaas-system get cluster,vspherecluster,kubeadmcontrolplane,machinedeployment,machine,vspheremachine,vspherevm
-kubectl -n cpaas-system logs deploy/capi-controller-manager
+ac config use-cluster global
+ac -n cpaas-system describe cluster <cluster-name>
+ac -n cpaas-system describe vspherecluster <cluster-name>
+ac -n cpaas-system describe kubeadmcontrolplane <cluster-name>-control-plane
+ac -n cpaas-system describe machinedeployment <cluster-name>-<group>
+ac -n cpaas-system get cluster,vspherecluster,kubeadmcontrolplane,machinedeployment,machine,vspheremachine,vspherevm
+ac -n cpaas-system logs deploy/capi-controller-manager
 ```
 
-`deploy/capi-controller-manager` runs in `cpaas-system` of the `global` cluster; do not use the workload cluster kubeconfig to read its logs. If platform controllers process the cluster network annotations, also inspect the platform network-controller and cluster-lifecycle-controller logs.
+If the network plugin is not installed, also inspect the logs of the platform network controller and cluster lifecycle controller.
 
 ## Common Causes \{#common-causes}
 
-- If the CPI resources are not delivered, verify `ClusterResourceSet=true`, `ClusterResourceSet`, and `ClusterResourceSetBinding`.
-- If `ClusterResourceSet` exists but no `ClusterResourceSetBinding` is created, check whether the controller has the required delete permission on the referenced `ConfigMap` and `Secret` resources.
-- If the network plugin is not installed, verify that the required cluster annotations are present and that the platform controllers processed them.
-- If the `cpaas.io/registry-address` annotation is missing or incorrect, verify that it is set to the permanent `<registry_address>` without a scheme or `/v2/`. Then verify the credential that backs it, `cpaas-system/public-registry-credential`.
-- If a machine is stuck in `Provisioning`, check `VSphereMachine` conditions for `MachineConfigPoolReady` — it shows whether slot allocation failed due to pool binding or datacenter mismatch. Then read the pool's own conditions: `MembersValid`, `MembersUnique`, `PersistentDisksReady`, `ClusterRefReady`, and `VCenterAvailable`.
-- If a machine never bootstraps, check the `BootstrapReady` condition on `VSphereVM` and `VSphereMachine`. The reason `BootstrapSecretGetFailed` means the bootstrap Secret is missing or unreadable; `BootstrapSecretContentInvalid` means it exists but cannot be used. Inspect the `KubeadmConfig` for that Machine and its bootstrap data Secret before looking at vCenter.
-- If a node was powered off in vCenter and stays off, that is expected behavior. `VSphereVM` latches `InitialPowerOnCompleted=True` after its first successful power-on and never clears it; from then on a powered-off VM is treated as a deliberate out-of-band action and is not powered back on. `PoweredOn=False` propagates into `VSphereVM.Ready` and then into `VSphereMachine.Ready`, so reporting not-ready is correct. Power the VM on in vCenter to recover; a rollout is not required. A replacement VM created by a rollout has an unset latch, so its first boot is unaffected.
-- If `VSphereMachine` clears `Ready` without an obvious cause, note that `Ready` is cleared while the backing `VSphereVM`, its `providerID`, or its network information is unavailable, and that out-of-band power changes are now observed. Read the `VSphereVM` conditions before treating it as a controller fault.
-- If nothing reconciles at all and no condition changes, check whether the management cluster is a disaster-recovery standby. See [Standby Management Clusters](./reference/install_provider.mdx#standby-management-cluster).
-- If a VM is waiting for IP allocation, verify VMware Tools, the static IP settings, and `VSphereVM.status.addresses`.
-- If workload `Node` objects remain without `spec.providerID`, first verify the CPI delivery resources and then check for duplicate vCenter guest hostnames. When an old VM in the same datacenter still reports the same guest hostname as a new node, `cloud-provider-vsphere` can fall back to node-name lookup, cache the old VM, and reject the new node because the VM IP does not match the kubelet node IP. Check the leader `vsphere-cloud-controller-manager` logs, the node `SystemUUID`, the real VM UUID, and vCenter guest hostname/IP values. After you fix or remove the duplicate hostname or old VM conflict, restart the workload cluster's `vsphere-cloud-controller-manager` Pods to clear the bad in-memory cache:
-  ```bash
-  kubectl --kubeconfig=/tmp/<cluster-name>.kubeconfig -n kube-system delete pod \
-    -l k8s-app=vsphere-cloud-controller-manager
-  ```
-- If datastore space is exhausted, first list all current and terminating `VSphereMachineConfigPool` objects and compare their names with every `VSphereMachineTemplate.spec.template.spec.machineConfigPoolRef.name`. Different pool names own independent slots and VMDKs; repeated deployments can therefore accumulate multiple disk sets. Then inspect `status.configStatuses[]` for `state` and `lastReleasedTime`, and `status.persistentDiskStatuses[]` for `phase`, `lastError`, `retryAfter`, and `taskRef`, together with related Events and the vCenter attachment state. `insufficient disk available` confirms a datastore capacity failure but does not by itself prove that reclaim failed. Do not manually delete a VMDK or remove a pool finalizer while reuse or provider-managed reclaim is pending. See [Persistent disk lifecycle](./reference/install-config-parameters.mdx#persistent-disk-lifecycle).
-- Do not delete a `phase: Reclaimed` entry from `status.persistentDiskStatuses[]`. It is a deliberate tombstone: the backing VMDK is already gone, and the record is what stops the controller from re-seeding the disk from the frozen `spec` `volumePath`. Deleting it produces a seed, delete, and re-seed loop that prevents the pool finalizer from ever clearing.
-- If the system disk keeps the template's size although `rootDisk.sizeGiB` is set, the VM is a linked clone; see [`rootDisk.sizeGiB`](../../../install/alauda_os/vmware-vsphere/reference/install-config-parameters.mdx#root-disk-size).
-- If the control plane endpoint does not come up, verify TCP `6443` passthrough, all control plane backends, HTTPS `/healthz` results, DNS and certificate SANs, and reachability from the `global` cluster and control plane nodes.
-- If the TLS connection to vCenter fails, verify the thumbprint, the vCenter address, and whether proxy settings interfere with the connection.
+| Result | Action |
+|---|---|
+| The CPI resources are not delivered | Check that `ClusterResourceSet=true` is enabled on the `global` cluster, and that the `ClusterResourceSet` and its `ClusterResourceSetBinding` exist. |
+| A `ClusterResourceSet` exists, but no `ClusterResourceSetBinding` is created | Check that the controller has delete permission on the referenced `ConfigMap` and `Secret`. |
+| The network plugin is not installed | Check that the cluster annotations are present and that the platform controllers processed them. |
+| The `cpaas.io/registry-address` annotation is missing or wrong | Set it to the permanent `<registry_address>` without a scheme or `/v2/`, then check `cpaas-system/public-registry-credential`. |
+| A machine is stuck in `Provisioning` | Read the `MachineConfigPoolReady` condition of the `VSphereMachine`, then the pool conditions `MembersValid`, `MembersUnique`, `PersistentDisksReady`, `ClusterRefReady`, and `VCenterAvailable`. |
+| A machine never bootstraps; `BootstrapReady` is `False` with `BootstrapSecretGetFailed` or `BootstrapSecretContentInvalid` | Inspect the `KubeadmConfig` of that `Machine` and its bootstrap data Secret before you look at vCenter. |
+| A node was powered off in vCenter and stays off | Power the VM on in vCenter. The provider does not power on a VM that was powered off after its first boot; no rollout is needed. |
+| `VSphereMachine` clears `Ready` without an obvious cause | Read the `VSphereVM` conditions: `Ready` is cleared while the VM, its `providerID`, or its network information is unavailable. |
+| Nothing reconciles and no condition changes | Check whether the `global` cluster is a disaster recovery standby; see [Standby Management Clusters](./reference/install_provider.mdx#standby-management-cluster). |
+| A VM waits for an IP address | Check VMware Tools, the static IP settings, and `VSphereVM.status.addresses`. |
+| Workload `Node` objects have no `spec.providerID` | Check the CPI delivery first, then look for an old VM in the same datacenter with the same guest hostname. Fix or remove the duplicate, then restart the CPI Pods as shown below this table. |
+| The datastore runs out of space | List every `VSphereMachineConfigPool`, including terminating ones: each pool owns its own persistent disks, so repeated deployments accumulate disk sets. Read `status.configStatuses[]` and `status.persistentDiskStatuses[]` (`phase`, `lastError`, `retryAfter`, `taskRef`) and the pool Events. Do not delete a VMDK, remove a pool finalizer, or edit `status.persistentDiskStatuses[]` by hand; if reclaim does not progress, contact technical support. See [Persistent disk lifecycle](./reference/install-config-parameters.mdx#persistent-disk-lifecycle). |
+| The system disk keeps the template's size although `rootDisk.sizeGiB` is set | The VM is a linked clone: `rootDisk.sizeGiB` takes effect only when the template has no snapshot (full clone). See [vSphere Fields](../../../install/alauda_os/vmware-vsphere/reference/install-config-parameters.mdx#fields). |
+| The control plane endpoint does not come up | Check TCP `6443` passthrough, all control plane backends, HTTPS `/healthz`, DNS and certificate SANs, and reachability from the `global` cluster and the control plane nodes. |
+| The TLS connection to vCenter fails | Check the thumbprint, the vCenter address, and any proxy settings. |
+
+To restart the CPI Pods after you fixed a duplicate hostname:
+
+```bash
+ac config sync
+ac config use-cluster <cluster-name>
+ac -n kube-system delete pod -l k8s-app=vsphere-cloud-controller-manager
+ac config use-cluster global
+```
+
+## Self-built VIP \{#self-built-vip}
+
+Read `SelfBuiltLoadBalancerReady` on the `VSphereCluster`, as in [Verify the Self-built VIP](./create_cluster.mdx#verify-self-built-vip):
+
+| Result | Action |
+|---|---|
+| `False`, reason `SelfBuiltLoadBalancerReconciling` | The VIP is still converging. Check again later. |
+| `False`, reason `SelfBuiltLoadBalancerNotReady` | Check the Alive Pods in `kube-system` and the `alive` `AppRelease` in `cpaas-system` of the workload cluster. Check that the VIP is in the control plane Layer 2 domain, the `vrid` is unique, and VRRP and gratuitous ARP are allowed. |
+| `False`, reason `InvalidSelfBuiltLoadBalancerConfiguration` | The `loadBalancer` values are invalid. They cannot be changed on an existing cluster; delete the cluster and create it again with corrected values. |
+| No Alive Pods and no `alive` `AppRelease` | Check the Alive plugin on the `global` cluster with the commands below. |
+
+```bash
+ac config use-cluster global
+ac get clustermodule global -o jsonpath='{.spec.version}{"\n"}'
+ac get moduleplugin alive -o jsonpath='{.status.targetClusterVersions}{"\n"}'
+ac get moduleplugin alive -o jsonpath='{.status.latestVersion}{"\n"}'
+ac get moduleconfig alive-<alive-version> -o jsonpath='{.status.readyForDeploy}{"\n"}'
+```
+
+`<alive-version>` is the `targetClusterVersions` entry for the version printed by the first command, or `latestVersion` when there is no such entry. Continue when the last command prints `true`; otherwise the Core Package on this platform is incomplete: import the complete Core Package of your platform release.
 
 ## Admission Rejections \{#admission-rejections}
 
-An `apply` or `edit` can be rejected before anything is created. The rules behind these messages are in [Provider Requirements](./reference/install-config-parameters.mdx#provider-requirements). Match a fragment of the rejection message against the following table.
+An `apply` or `edit` can be rejected before anything is created. Match a fragment of the rejection message against the following table. The rules are listed in [Provider Requirements](./reference/install-config-parameters.mdx#provider-requirements).
 
 | Rejection contains | Cause and fix |
 |---|---|
 | `maxSurge must be 0 when the infrastructure template references a machineConfigPoolRef` | Set `maxSurge` to the integer `0` on the `KubeadmControlPlane` or `MachineDeployment`. Leaving it unset means the Cluster API default `1`. |
 | `maxUnavailable must be at least 1` | Set `maxUnavailable` to `1` or more on the `MachineDeployment`. Leaving it unset means the Cluster API default `0`. |
 | `must have 1 or at least 3 replicas` | The control plane has `2` replicas. Use `1`, or `3` or more with `maxSurge: 0`. |
-| `unit number 7 is reserved for the SCSI controller` | Choose another `unitNumber` between `0` and `15`. |
 | `also used by pool` | A hostname or primary IP collides with a slot in another pool bound to the same `Cluster` in this namespace. |
 | `allocated slot` | The slot is `InUse` or `Released`. The message names what is frozen — the primary IP or IPv6, or a persistent disk's `sizeGiB` or `mountPath` — or reports that the slot, or one of its persistent disks, cannot be removed. See [Allocated slot restrictions](./reference/install-config-parameters.mdx#create-the-machine-config-pools). |
 | `cannot delete pool while` | The pool still owns `InUse` slots. Delete the Machines that hold them first. |
