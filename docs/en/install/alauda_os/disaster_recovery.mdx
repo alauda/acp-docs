@@ -1,6 +1,6 @@
 ---
 weight: 20
-title: Disaster Recovery
+title: Global Cluster Disaster Recovery
 queries:
   - global cluster disaster recovery on immutable infrastructure
   - immutable infra etcd sync
@@ -11,9 +11,9 @@ queries:
   - serviceAccountSigningKey disaster recovery
 ---
 
-# Disaster Recovery
+# Global Cluster Disaster Recovery
 
-A disaster recovery (DR) pair is a primary and a standby `global` cluster. Each side is an ordinary installation with ACP CLI (ac), run from its own bootstrap node with its own `install-config.yaml`. `etcd-sync` on the standby then copies the primary's data to it. `ac` prepares every `global` cluster for DR in the same way, so a DR pair needs no manifest edits: it writes the side's own control plane VIP, the platform access address, and `etcd.kube-system` into the etcd server certificate, imports the provider credential and encryption Secrets into the `global` cluster, and writes the `global-etcd-sync-rules` ConfigMap, which keeps each side's infrastructure credentials out of synchronization, so the two sides can use different accounts.
+A disaster recovery (DR) pair is a primary and a standby `global` cluster. Each side is an ordinary installation with ACP CLI (`ac`), run from its own bootstrap node with its own `install-config.yaml`. **<Term name="product" /> Global Cluster Disaster Recovery** (`etcd-sync`) on the standby then copies the primary's data to it. `ac` prepares every `global` cluster for DR, so a DR pair needs no manifest edits. Each side's infrastructure credentials are not synchronized, so the two sides can use different accounts.
 
 This page applies to every provider. Configuration that differs by provider is shown in tabs; manual steps that only one provider needs are marked with the provider name.
 
@@ -29,19 +29,27 @@ The platform access address must be a DNS name. During normal operation it resol
 
 Before installing either cluster:
 
-- Forward the ports below on each cluster's VIP to the control plane nodes behind it. Port `80` is needed only when users access the platform over HTTP. With an external load balancer (`loadBalancer.type: external`) these listeners are yours to configure; do not forget `2379`. With the Bare Metal or VMware vSphere internal VIP (`loadBalancer.type: internal`), the provider already serves `80`, `443`, and `2379` on the VIP. On Huawei Cloud Stack, the provider opens `443` and `2379` on the control plane ELB; add `80` yourself when needed.
+- Forward the ports below on each cluster's VIP to the control plane nodes behind it. Port `80` is needed only when users access the platform over HTTP.
+  - External load balancer (`loadBalancer.type: external`): configure the listeners yourself, including `2379`.
+  - Self-built VIP (`loadBalancer.type: internal`) on Bare Metal, Huawei DCS, or VMware vSphere: the provider already serves `80`, `443`, and `2379` on the VIP.
+  - Huawei Cloud Stack: the provider opens `443` and `2379` on the control plane ELB; add `80` yourself when needed.
 - Allow the ports in **both directions** between the primary and standby networks: firewalls, security groups, router ACLs, and any other inter-site controls. After failover the roles are reversed, so the former primary must reach the new primary on the same ports.
 
 | TCP port | Service | Why it is required |
 |----------|---------|--------------------|
-| `443` | <Term name="productShort" /> platform HTTPS | The standby reaches the active platform through the platform access address. **<Term name="product" /> Global Cluster Disaster Recovery** uses it, and logging and monitoring send alert callbacks to it. |
+| `443` | <Term name="productShort" /> platform HTTPS | The standby reaches the primary's platform through the platform access address. **<Term name="product" /> Global Cluster Disaster Recovery** uses it, and logging and monitoring send alert callbacks to it. |
 | `80` | <Term name="productShort" /> platform HTTP | Only when users access the platform over HTTP. |
-| `6443` | Kubernetes API server | During installation or reinstallation of **<Term name="product" /> Global Cluster Disaster Recovery**, the standby reads the etcd CA material from the active API server. |
+| `6443` | Kubernetes API server | During installation or reinstallation of **<Term name="product" /> Global Cluster Disaster Recovery**, the standby reads the etcd CA material from the primary's API server. |
 | `2379` | etcd | **<Term name="product" /> Global Cluster Disaster Recovery** on the standby reads etcd data from the primary and writes it to the local etcd. |
 
-Each side pulls its images from its own external registry, so no registry port crosses the sites. Bidirectional policy does not make replication bidirectional: the plugin runs only on the current standby.
+Each side pulls its images from its own external registry, so no registry port crosses the sites.
 
 ## Procedure
+
+Run the commands on a machine with `ac` that reaches both sides:
+
+- **Primary**: log in once with `ac login https://<platform-domain>` as the platform administrator while the domain points at the primary. Commands for the primary start with `ac config use-cluster global`.
+- **Standby**: use the standby's kubeconfig, `output/kubeconfig` in its installation directory, here `<standby-kubeconfig>`. Commands for the standby start with `export KUBECONFIG=<standby-kubeconfig>` and end with `unset KUBECONFIG`.
 
 ### 1. Write Both install-config.yaml Files \{#configure-install-config}
 
@@ -50,19 +58,20 @@ Write each side's `install-config.yaml` as for a single `global` cluster, follow
 | Field | Primary | Standby |
 |---|---|---|
 | `global.platform.address` | The platform domain | The same domain |
-| `global.platform.cert` | A third-party certificate whose SANs cover the domain | The same certificate |
+| `global.platform.cert` | A third-party certificate and key whose SANs cover the domain | The same certificate and key files |
 | `global.platform.extraAddresses` | `[<primary-vip>]` | `[<standby-vip>]` |
 | `cluster.network.loadBalancer.address` (`provider.hcs.elb.vipAddress` on HCS) | The primary VIP | The standby VIP |
 | `global.registry` | The primary's external registry | The standby's external registry |
 | `cluster.encryptionProviderConfig` | A key, or empty to have one generated | The primary's key |
 | `provider.baremetal.serviceAccountSigningKey` (Bare Metal) | A key, or empty to have one generated | The primary's key |
 
-- **Certificate**: clients reach both sides through the same domain, so `install-config.yaml` on both sides must set the same third-party certificate and key. Self-signed certificates are not supported for DR. Without `global.platform.cert`, each side generates its own self-signed certificate, and clients that trust one side's certificate reject the other's after a failover; on Bare Metal this includes the agents of the workload hosts.
+- **Certificate**: do not omit `global.platform.cert`. Without it, each side generates its own self-signed certificate, and after a failover clients reject the other side's certificate; on Bare Metal this includes the agents of the workload hosts.
 - **`extraAddresses`**: each side's own VIP, which you use to reach that side while the domain points at the other one. `ac` does not add it.
-- **Encryption key**: the standby cannot decrypt Secrets encrypted with another key. When the primary's is generated, read it on the primary before you install the standby. `ac` always names the key `default`, so a primary installed by another method must use that key name too.
+- **Encryption key**: the standby cannot decrypt Secrets encrypted with another key. When the primary's is generated, read it on the primary before you install the standby:
 
   ```bash
-  kubectl -n cpaas-system get secret global-encryption-provider-config \
+  ac config use-cluster global
+  ac -n cpaas-system get secret global-encryption-provider-config \
     -o jsonpath='{.data.encryption-provider\.conf}' | base64 -d | awk '$1=="secret:"{print $2}'
   ```
 
@@ -72,59 +81,52 @@ Write each side's `install-config.yaml` as for a single `global` cluster, follow
   awk '$1=="secret:"{print $2}' /etc/kubernetes/encryption-provider.conf
   ```
 
-- **ServiceAccount signing key** (Bare Metal): the agents of the workload hosts hold tokens signed by the primary, and the standby must accept them after a failover. When the primary's is generated, read it on the primary; the value is already in the form the field expects:
+- **ServiceAccount signing key** (Bare Metal): when the primary's is generated, read it on the primary; the value is already in the form the field expects:
 
   ```bash
-  kubectl -n cpaas-system get secret global-sa -o jsonpath='{.data.tls\.key}'
+  ac config use-cluster global
+  ac -n cpaas-system get secret global-sa -o jsonpath='{.data.tls\.key}'
   ```
 
-  To set it in advance, generate a key with `openssl genrsa -out sa.key 2048` and set `base64 -w0 sa.key` on both sides. The key cannot be changed after installation: if the cluster already holds a different `global-sa`, `ac` stops rather than overwrite it.
+  To set it in advance, generate a key with `openssl genrsa -out sa.key 2048` and set `base64 -w0 sa.key` on both sides. Keep the file private (`chmod 600 sa.key`); it holds the signing key. The key cannot be changed after installation: if the cluster already holds a different `global-sa`, `ac` stops rather than overwrite it.
 
-- **VM folder** (VMware vSphere): when both sides share a vCenter, set a different `provider.vsphere.folder` on each side to keep their VMs apart for operations. The same folder also works.
+- **VM folder** (VMware vSphere): when both sides share a vCenter, you can set a different `provider.vsphere.folder` on each side to keep their VMs apart. The same folder also works.
 
 ### 2. Install the Primary and the Standby \{#install-primary-and-standby-clusters}
 
-Some platform resources are rendered with the platform domain, so the domain must point to the side being installed. While the domain points at one side, reach the other side through its VIP, for example with the kubeconfig in its installation directory or `ac login https://<vip>`.
+The platform domain must point to the side being installed. While the domain points at one side, reach the other side through its VIP with the kubeconfig in its installation directory.
 
-1. Point the platform domain at the primary VIP. On the primary bootstrap node, install the cluster as described on its provider's installation page.
+1. Point the platform domain at the primary VIP. On the primary bootstrap node, install the cluster as described on the Create the global Cluster page of its provider ([Bare Metal](./bare-metal/create_cluster.mdx), [Huawei DCS](./huawei-dcs/create_cluster.mdx), [VMware vSphere](./vmware-vsphere/create_cluster.mdx), or [Huawei Cloud Stack](./huawei-cloud-stack/create_cluster.mdx)), then return here.
 2. When the primary is installed, point the platform domain at the standby VIP. On the standby bootstrap node, install the standby the same way.
-3. **Bare Metal only:** on the standby, set the provider's `sharedAuthReadOnly` to `true`, so that the standby does not write the shared agent identity while it receives data. Change no other `elemental` value:
+3. **Bare Metal only:** on the standby, set the provider's `sharedAuthReadOnly` to `true`. Change no other `elemental` value:
 
    ```bash
-   kubectl get moduleinfo -l cpaas.io/cluster-name=global,cpaas.io/module-name=cluster-api-provider-baremetal
-   kubectl patch moduleinfo <name> --type=json -p '[{"op":"replace","path":"/spec/valuesOverride/acp~1chart-cluster-api-provider-baremetal/elemental/systemAgent/sharedAuthReadOnly","value":true}]'
+   export KUBECONFIG=<standby-kubeconfig>
+   ac get moduleinfo -l cpaas.io/cluster-name=global,cpaas.io/module-name=cluster-api-provider-baremetal
+   ac patch moduleinfo <name> --type=json -p '[{"op":"replace","path":"/spec/valuesOverride/acp~1chart-cluster-api-provider-baremetal/elemental/systemAgent/sharedAuthReadOnly","value":true}]'
+   ac -n cpaas-system get deploy elemental-operator -o yaml | grep -- --system-agent-shared-auth-read-only
+   unset KUBECONFIG
    ```
 
-   Then wait until the `elemental-operator` Deployment has the read-only argument; the command prints it when the setting is in effect:
-
-   ```bash
-   kubectl -n cpaas-system get deploy elemental-operator -o yaml | grep -- --system-agent-shared-auth-read-only
-   ```
+   Continue when the last command prints `--system-agent-shared-auth-read-only`; otherwise, wait and run it again.
 
 4. Point the platform domain back at the primary VIP.
-5. On each side, confirm that these Secrets exist in `cpaas-system`:
-
-   | Provider | Secrets |
-   |---|---|
-   | Bare Metal | `global-sa`, `global-encryption-provider-config` |
-   | Huawei DCS, Huawei Cloud Stack | `global-credential`, `global-encryption-provider-config` |
-   | VMware vSphere | `global-credential` |
-
-   Without the encryption Secret the installation still completes, but every later control plane machine creation fails: the new `Machine` stays in `Provisioning`, and the provider reports that the encryption provider config Secret is not found.
 
 Install the providers you use for workload clusters on **both** `global` clusters, so that the standby can reconcile the same workload clusters after a failover.
 
 ### 3. Bare Metal Only: Apply the Rule ConfigMap \{#apply-the-rule-configmap}
 
-Apply the same `baremetal-dr-rules` ConfigMap to the primary and the standby, **before** you install `etcd-sync`. It lists every `global` plan Secret of both clusters, which the handover creates, so collect the names after both sides have completed `create`. On each side, list them with:
+Apply the same `baremetal-dr-rules` ConfigMap to the primary and the standby, **before** you install `etcd-sync`. It lists every `global` plan Secret of both clusters; collect the names after both sides have completed `create`. On each side, list them with:
 
 ```bash
-kubectl -n cpaas-system get machineinventories.elemental.cattle.io -o json | jq -r '.items[]
+# Primary: ac config use-cluster global
+# Standby: export KUBECONFIG=<standby-kubeconfig>, and unset KUBECONFIG afterwards
+ac -n cpaas-system get machineinventories.elemental.cattle.io -o json | jq -r '.items[]
   | select(.metadata.annotations["baremetal.cluster.io/system-agent-auth-scope"]=="global")
   | .status.plan.secretRef.name // empty | "/registry/secrets/cpaas-system/" + .'
 ```
 
-Update the ConfigMap on both sides whenever a `global` host is added or replaced, because that creates a new plan Secret.
+Update the ConfigMap on both sides whenever a `global` host is added or replaced.
 
 ```yaml
 apiVersion: v1
@@ -138,113 +140,176 @@ metadata:
     etcd-sync.cpaas.io/weight: "100"
 data:
   ignore-equal.txt: |
-    # One line for every Global plan Secret on both sides, as printed above.
+    # One line for every global plan Secret on both sides, as printed above.
     /registry/secrets/cpaas-system/<primary-global-plan-secret>
     /registry/secrets/cpaas-system/<standby-global-plan-secret>
 ```
 
 <Directive type="warning" title="Create the rule source before the mirror can start">
-  Installing `etcd-sync` with the active cluster VIP and token already set starts synchronization immediately. Without the rule source, the first synchronization overwrites the standby's `global` plan Secrets with the primary's, and the standby `global` hosts receive plans that belong to the primary. Until `etcd-sync` is installed, the ConfigMap is an ordinary ConfigMap that nothing reads. If you must install the plugin first, leave the active cluster VIP unset until the rule source reports `accepted`.
+  Installing `etcd-sync` with the active cluster VIP and token already set starts synchronization immediately. Without the rule source, the first synchronization overwrites the standby's `global` plan Secrets with the primary's, and the standby `global` hosts receive plans that belong to the primary. If you must install the plugin first, leave the active cluster VIP unset until the rule source reports `accepted`.
 </Directive>
 
 ### 4. Install etcd-sync \{#install-etcd-sync}
 
-Install **<Term name="product" /> Global Cluster Disaster Recovery** (`etcd-sync`) on the standby `global` cluster only, after both sides have completed `create`. Never run it on both sides at once. Use the version released with <Term name="productShort" /> 4.5; earlier versions lack the Bare Metal synchronization rules.
+Install **<Term name="product" /> Global Cluster Disaster Recovery** (`etcd-sync`) on the standby `global` cluster only, after both sides have completed `create`. Never run it on both sides at once. Use the version released with <Term name="productShort" /> 4.5.
 
-The platform domain must point at the primary when you install it: on startup the plugin resolves the domain and refuses to start when the cluster behind it runs `etcd-sync` itself. Reach the standby through its VIP.
+The platform domain must point at the primary when you install it. Reach the standby through its VIP.
 
 1. Download the plugin package from the Customer Portal and upload it to the standby with `violet push`, setting the platform address to `https://<standby-vip>`; see [Upload Packages](../../extend/upload_package.mdx#violet_push_usage).
-2. Create the token Secret on the standby. The value is the bearer token of the active cluster's `cpaas-system/k8sadmin` ServiceAccount:
+2. Create the token Secret on the standby. The value is the bearer token of the primary's `cpaas-system/k8sadmin` ServiceAccount:
 
    ```shell
-   # On the active cluster:
-   kubectl -n cpaas-system get secret k8sadmin -o jsonpath='{.data.token}' | base64 -d
+   # On the primary:
+   ac config use-cluster global
+   ac -n cpaas-system get secret k8sadmin -o jsonpath='{.data.token}' | base64 -d
 
-   # On the standby cluster, with the value copied from above:
-   ACTIVE_CLUSTER_TOKEN='<paste-the-token-from-the-active-cluster>'
-   kubectl -n cpaas-system create secret generic etcd-sync-active-cluster-token \
+   # On the standby, with the value copied from above:
+   export KUBECONFIG=<standby-kubeconfig>
+   ACTIVE_CLUSTER_TOKEN='<paste-the-token-from-the-primary>'
+   ac -n cpaas-system create secret generic etcd-sync-active-cluster-token \
      --from-literal=token="${ACTIVE_CLUSTER_TOKEN}" \
-     --dry-run=client -o yaml | kubectl apply -f -
+     --dry-run=client -o yaml | ac apply -f -
+   unset KUBECONFIG
    ```
 
 3. Open the standby Web Console at `https://<standby-vip>`, go to **Marketplace** → **Cluster Plugins**, select the `global` cluster, and install **<Term name="product" /> Global Cluster Disaster Recovery** with these parameters:
 
    | Parameter | Value |
    |-----------|-------|
-   | Active Global Cluster VIP | Control plane VIP of the active `global` cluster |
-   | Active Global Cluster ETCD Endpoints | `https://<active-control-plane-vip>:2379` |
+   | Active Global Cluster VIP | Control plane VIP of the primary `global` cluster |
+   | Active Global Cluster ETCD Endpoints | `https://<primary-control-plane-vip>:2379` |
    | Standby Cluster ETCD Endpoints | Default value |
    | Active Global Cluster Token Secret | `etcd-sync-active-cluster-token` |
    | Data Check Interval | Default value |
    | Print detail logs | Disabled unless troubleshooting |
 
-   During installation, the `etcd-sync-bootstrap` Job runs before the `etcd-sync` Deployment starts. It prepares `remote-etcd-ca`, `remote-etcd-issuer`, and `remote-etcd-client`.
-
-4. **Bare Metal only:** immediately after installation, confirm on the standby that the rule source reports `accepted` and appears in `ConfigMap/etcd-sync-rule-snapshot`. A rejected source is not active; fix it before you continue.
+4. **Bare Metal only:** immediately after the installation, check the rule source on the standby:
 
    ```shell
-   kubectl -n cpaas-system get configmap baremetal-dr-rules \
+   export KUBECONFIG=<standby-kubeconfig>
+   ac -n cpaas-system get configmap baremetal-dr-rules \
      -o jsonpath='{.metadata.annotations.etcd-sync\.cpaas\.io/status}{"\n"}'
-   kubectl -n cpaas-system get configmap etcd-sync-rule-snapshot \
+   ac -n cpaas-system get configmap etcd-sync-rule-snapshot \
      -o jsonpath='{.data.snapshot\.json}'
+   unset KUBECONFIG
    ```
+
+   Continue when the first command prints `accepted` and the snapshot contains `baremetal-dr-rules`; otherwise, fix the ConfigMap as described in [Troubleshooting](#troubleshooting) before you continue.
 
 ### 5. Start and Verify Synchronization \{#start-and-verify-synchronization}
 
 1. Wait for the `etcd-sync` `AppRelease` and both Deployments to become Ready.
-2. Run the sync check on the standby as described in [Check sync status](../non_alauda_os/global_dr.mdx#etcd_sync). It returns HTTP `425` when called too often; retry until a check is allowed. Require zero missed and zero surplus keys; the `AppRelease` status alone is not an acceptance result. For missed keys, restart the current leader Pod as described there.
-3. **Bare Metal only:** confirm that the shared workload agent identity is either absent on both sides or complete on both sides; partial presence is a failure. Run on each side:
+2. Check the synchronization. Read the monitor's address on your machine:
 
    ```bash
-   kubectl -n cpaas-system get sa/baremetal-system-agent secret/baremetal-system-agent-token \
+   export KUBECONFIG=<standby-kubeconfig>
+   ac -n cpaas-system get svc etcd-sync-monitor -o jsonpath='{.spec.clusterIP}{"\n"}'
+   unset KUBECONFIG
+   ```
+
+   Then run the check on a standby control plane node; put an IPv6 address in brackets, for example `[fd00::10]`:
+
+   ```bash
+   curl -g "http://<monitor-cluster-ip>/check"
+   ```
+
+   | Result | Action |
+   |---|---|
+   | Zero missed and zero surplus keys | Continue. |
+   | HTTP `425` | Wait, then run the check again. |
+   | `LOCAL ETCD missed keys` | Restart the current leader Pod with the commands below, then run the check again. |
+   | `LOCAL ETCD surplus keys` | Contact technical support. |
+
+   ```bash
+   export KUBECONFIG=<standby-kubeconfig>
+   leader_pod=$(ac -n cpaas-system get lease etcd-sync-mirror -o jsonpath='{.spec.holderIdentity}')
+   ac -n cpaas-system delete pod "$leader_pod"
+   unset KUBECONFIG
+   ```
+
+3. **Bare Metal only:** check the shared workload agent identity on each side:
+
+   ```bash
+   # Primary: ac config use-cluster global
+   # Standby: export KUBECONFIG=<standby-kubeconfig>, and unset KUBECONFIG afterwards
+   ac -n cpaas-system get sa/baremetal-system-agent secret/baremetal-system-agent-token \
      role/baremetal-system-agent rolebinding/baremetal-system-agent
    ```
+
+   Continue when all four objects exist on both sides, or none exists on either side; otherwise, contact technical support.
 
 4. On each side, restart the Pods that must reload the DR and endpoint configuration, where installed:
 
    ```shell
-   kubectl delete po -n cpaas-system -l 'service_name in (alertmanager,vmselect,vminsert)'
-   kubectl delete po -n cpaas-system -l service_name=cpaas-elasticsearch
-   kubectl delete po -n cpaas-system -l service_name=cluster-transformer
+   # Primary: ac config use-cluster global
+   # Standby: export KUBECONFIG=<standby-kubeconfig>, and unset KUBECONFIG afterwards
+   ac delete po -n cpaas-system -l 'service_name in (alertmanager,vmselect,vminsert)'
+   ac delete po -n cpaas-system -l service_name=cpaas-elasticsearch
+   ac delete po -n cpaas-system -l service_name=cluster-transformer
    ```
 
 ## Failover \{#failover-procedure}
 
-The sequence is driven by the platform domain and the `etcd-sync` lifecycle, not by a provider API. Run the commands against each side through its VIP.
+Run the commands on the standby with `<standby-kubeconfig>`.
 
 1. Fence the primary so it cannot write workload resources: stop its control plane, or block its VIP from the workload networks.
-2. Run the [sync check](#start-and-verify-synchronization) and require no differences. Then **uninstall** `etcd-sync` from the standby in **Marketplace** → **Cluster Plugins**; scaling the Deployments to zero is not enough, see the warning below. Confirm that the plugin's marker is gone, because the providers do not reconcile workload clusters while it exists:
+2. Run the [sync check](#start-and-verify-synchronization) and require no differences. If the primary is unreachable, the check cannot run: contact technical support before you uninstall the plugin. Then **uninstall** `etcd-sync` from the standby in **Marketplace** → **Cluster Plugins**; scaling the Deployments to zero is not enough, see the warning below. Check that the plugin's marker is gone:
 
    ```bash
-   kubectl -n kube-public get configmap etcd-sync    # expect NotFound
+   export KUBECONFIG=<standby-kubeconfig>
+   ac -n kube-public get configmap etcd-sync
+   unset KUBECONFIG
    ```
 
-   If the primary is unreachable, the check cannot run. Contact technical support before you uninstall the plugin.
+   Continue when the command reports `NotFound`; otherwise, wait and run it again. The providers do not reconcile workload clusters while the marker exists.
 
-3. **Bare Metal only:** on the standby, which becomes the active cluster, set `sharedAuthReadOnly` back to `false` with the `kubectl patch` command in [step 2](#install-primary-and-standby-clusters) and the value `false`. Wait until the grep command there prints nothing; until then, new worker nodes cannot obtain their plans.
-4. Switch the platform domain to the standby VIP, and confirm that the platform resolves it there:
+3. **Bare Metal only:** on the standby, which becomes the active cluster, set `sharedAuthReadOnly` back to `false`:
 
    ```bash
-   kubectl exec -n cpaas-system deployments/sentry -- nslookup <platform-domain>
+   export KUBECONFIG=<standby-kubeconfig>
+   ac get moduleinfo -l cpaas.io/cluster-name=global,cpaas.io/module-name=cluster-api-provider-baremetal
+   ac patch moduleinfo <name> --type=json -p '[{"op":"replace","path":"/spec/valuesOverride/acp~1chart-cluster-api-provider-baremetal/elemental/systemAgent/sharedAuthReadOnly","value":false}]'
+   ac -n cpaas-system get deploy elemental-operator -o yaml | grep -- --system-agent-shared-auth-read-only
+   unset KUBECONFIG
    ```
 
-5. Restart the Pods listed in [step 5](#start-and-verify-synchronization) on the new active cluster. If workload clusters send monitoring data to the `global` cluster, also restart `warlock` in each workload cluster: `kubectl delete po -n cpaas-system -l service_name=warlock`.
-6. To protect the new active cluster again, make the former primary the new standby once it is healthy: install `etcd-sync` on it with the reverse active and standby values, as in [step 4](#install-etcd-sync). The active-cluster token now comes from the new active cluster. **Bare Metal only:** first set `sharedAuthReadOnly: true` on it as in [step 2](#install-primary-and-standby-clusters), and keep the same `baremetal-dr-rules` ConfigMap.
+   Continue when the last command prints nothing; otherwise, wait and run it again. Until then, new worker nodes cannot obtain their plans.
+
+4. Switch the platform domain to the standby VIP, and check that the platform resolves it there:
+
+   ```bash
+   export KUBECONFIG=<standby-kubeconfig>
+   ac exec -n cpaas-system deployments/sentry -- nslookup <platform-domain>
+   unset KUBECONFIG
+   ```
+
+   Continue when the answer is the standby VIP; otherwise, correct the DNS record and run it again.
+
+5. Restart the Pods listed in [step 5](#start-and-verify-synchronization) on the new active cluster. If workload clusters send monitoring data to the `global` cluster, also restart `warlock` in each workload cluster. Log in again first: the platform domain now reaches the new active cluster.
+
+   ```bash
+   ac login https://<platform-domain>
+   ac config use-cluster <cluster-name>
+   ac delete po -n cpaas-system -l service_name=warlock
+   ac config use-cluster global
+   ```
+
+6. To protect the new active cluster again, make the former primary the new standby once it is healthy: install `etcd-sync` on it with the reverse active and standby values, as in [step 4](#install-etcd-sync), with the former primary's kubeconfig in place of `<standby-kubeconfig>`. The active-cluster token now comes from the new active cluster. **Bare Metal only:** first set `sharedAuthReadOnly: true` on it as in [step 2](#install-primary-and-standby-clusters), and keep the same `baremetal-dr-rules` ConfigMap.
 
 <Directive type="warning" title="Uninstall the mirror, do not just scale it down">
-  On startup `etcd-sync` resolves the platform domain and checks that the cluster the domain points to does not have `etcd-sync` installed. This prevents the mirror from running on both sides at once. If step 2 only scaled the Deployments to zero, the `ModuleInfo` still exists and the new standby refuses to start with:
+  On startup `etcd-sync` refuses to run when the cluster the platform domain points to has `etcd-sync` installed. If step 2 only scaled the Deployments to zero, the `ModuleInfo` still exists and the new standby refuses to start with:
 
   ~~~text
   check failed, error: moduleinfo <name> is found, it shouldn't happen,
     please remove it or check the DNS resolution of platformURL: <platform-domain>
   ~~~
 
-  This is the safety check working as intended. Delete the `ModuleInfo` on the new active cluster and the new standby starts normally.
+  Delete the `etcd-sync` `ModuleInfo` on the new active cluster; the new standby then starts normally.
 </Directive>
 
 Switching back to the former primary is not this procedure run in reverse: plan it separately, deciding which side holds the authoritative data and how changes made on the standby since the failover are kept.
 
-After the switch, verify on the new active cluster that every workload `Cluster` and `Machine` object is intact: on Alauda OS those objects back real machines, so a resource lost in the switch becomes a deleted node. Also check:
+After the switch, verify on the new active cluster that every workload `Cluster` and `Machine` object is intact: on Alauda OS a lost `Machine` object becomes a deleted node. Also check:
 
 <Tabs>
 <Tab label="Bare Metal">
@@ -257,7 +322,7 @@ After the switch, verify on the new active cluster that every workload `Cluster`
 </Tab>
 <Tab label="Huawei DCS">
 
-- The `DCSMachine` objects are intact, and no VM was deleted. The `global-` name prefix identifies the objects that belong to the `global` pair, so do not rename them.
+- The `DCSMachine` objects are intact, and no VM was deleted.
 - The workload clusters' credential Secrets exist in `cpaas-system`.
 
 </Tab>
@@ -303,11 +368,10 @@ For the synchronized and excluded scope, see [Global Cluster Disaster Recovery](
 | --- | --- |
 | The new standby's `etcd-sync` refuses to start after a failover | The warning in [Failover](#failover-procedure). |
 | The monitor reports differences | The active and standby direction, the rule snapshot, and the fencing state. |
-| A control plane machine stays in `Provisioning` because the encryption provider config Secret is not found | The Secrets in [step 2](#install-primary-and-standby-clusters). |
 | Workload machines are not reconciled after a failover | Whether `kube-public/etcd-sync` still exists on the new active cluster. |
 | Bare Metal: the rule source is `rejected` | The rule data keys, the syntax, and the `message` annotation. |
-| Bare Metal: a Global plan is overwritten | Its exact Secret key is missing from `ignore-equal.txt`. Stop sync and update both rule ConfigMaps. |
-| Bare Metal: a Global inventory is deleted | The `etcd-sync` version; see [step 4](#install-etcd-sync). Stop sync before restoring the local object. |
+| Bare Metal: a `global` plan is overwritten | Its exact Secret key is missing from `ignore-equal.txt`. Stop sync and update both rule ConfigMaps. |
+| Bare Metal: a `global` inventory is deleted | The `etcd-sync` version; see [step 4](#install-etcd-sync). Stop sync before restoring the local object. |
 | Bare Metal: a workload host gets `401` or `403` | `sharedAuthReadOnly` still `true` on the active cluster, the signing key, the shared token Secret, and the Role `resourceNames`. |
 
 For how Bare Metal DR handles host endpoints, identities, and synchronization rules, see [Bare Metal DR Model](./bare-metal/reference/dr-model.mdx).

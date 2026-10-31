@@ -20,14 +20,14 @@ The `provider.vsphere` and node group fields are the same as for the `global` cl
 
 | Field | Required | Description |
 |---|---|---|
-| `cluster.clusterName` | Yes | The cluster name, a DNS-1123 subdomain of at most 63 characters. It must not be `global`, which is reserved for the `global` cluster, or start with `global-`, which identifies the resources of the `global` disaster recovery pair. `Cluster` and `VSphereCluster` take this name, and every other object is prefixed with `<cluster-name>-`. |
-| `credentialRef` | Yes | The credential Secret, in `cpaas-system`. `provider.vsphere.credential` is rejected: the credential has one source. |
+| `cluster.clusterName` | Yes | The cluster name, a DNS-1123 subdomain of at most 63 characters. It must not be `global` or start with `global-`. `Cluster` and `VSphereCluster` take this name, and every other object is prefixed with `<cluster-name>-`. |
+| `credentialRef` | Yes | The credential Secret, in `cpaas-system`. `provider.vsphere.credential` is rejected. |
 | `cluster.registrySecretRef` | Not supported | A vSphere workload cluster inherits the registry of the `global` cluster. |
 | `global`, `ntpServers`, `deployMode` | Not supported | They apply to the `global` cluster only. |
 
 Notes on the values:
 
-- **Versions.** You do not set the Kubernetes or etcd version: `ac` installs the version described in [VM Template](../prerequisites.mdx#vm-template-requirements), the default entry in the `kube-public/base-component-version` ConfigMap, with the etcd tag that matches it, and prints them as `Pinning Kubernetes <version>, etcd <tag>`. `ac` reads the CPI build from the vSphere provider installed on the `global` cluster, so the CPI matches the provider.
+- **Versions.** You do not set the Kubernetes or etcd version: `ac` installs the version described in [VM Template](../prerequisites.mdx#vm-template-requirements) and prints it as `Pinning Kubernetes <version>, etcd <tag>`.
 - **Network names.** `provider.vsphere.network.name` is the vCenter port group or distributed port group. `deviceName` is the NIC name inside the guest; when it is empty, the provider names the NICs `eth0`, `eth1`, and so on by NIC order.
 - **Addresses.** `hosts[].ip` is the bare IPv4 address and `network.mask` is its prefix length; `ac` writes them into the slot as `<ip>/<prefix-length>`. `network.gateway` is the gateway IP address only.
 - **Disks.** The standard disks are required and keep the persistent and ephemeral split of the template; extra volumes are `rawDisks`. See [Add Data Disks](#add-data-disks).
@@ -88,7 +88,7 @@ controlPlane: # [!code callout]
 3. `vrid`: required for `internal`, from 1 to 255. See [Self-built VIP](#use-self-built-vip).
 4. `interface`: optional, for `internal` only. Set it explicitly on multi-NIC nodes.
 5. `folder`: optional. Empty uses the datacenter's VM folder.
-6. `rootDisk.sizeGiB`: optional. Applies only to a full clone; see [`rootDisk.sizeGiB`](../../../../install/alauda_os/vmware-vsphere/reference/install-config-parameters.mdx#root-disk-size).
+6. `rootDisk.sizeGiB`: optional. It takes effect only when the template has no snapshot (full clone); a linked clone keeps the template's size. It must not be smaller than the template's system disk.
 7. `deviceName`: optional. The NIC name in the guest; empty names them `eth0`, `eth1`, and so on.
 8. The same fields apply to each `computes` entry.
 9. `cpuCore` and `memoryGiB`: optional. Empty keeps the template's size.
@@ -113,7 +113,7 @@ controlPlane: # [!code callout]
 | `MachineDeployment`, `VSphereMachineTemplate`, `VSphereMachineConfigPool` | `<cluster-name>-<group>` | `maxSurge: 0`, `maxUnavailable: 1`. |
 | `KubeadmConfigTemplate` | `<cluster-name>-<group>-config` | |
 
-Every VM is a linked clone (`cloneMode: linkedClone`) powered off with `trySoft`; for the full-clone fallback and `rootDisk.sizeGiB`, see [`rootDisk.sizeGiB`](../../../../install/alauda_os/vmware-vsphere/reference/install-config-parameters.mdx#root-disk-size). The credential Secret is yours; `ac` neither renders nor deletes it.
+Every VM is a linked clone (`cloneMode: linkedClone`) powered off with `trySoft`; for `rootDisk.sizeGiB`, see [vSphere Fields](../../../../install/alauda_os/vmware-vsphere/reference/install-config-parameters.mdx#fields). The credential Secret is yours; `ac` neither renders nor deletes it.
 
 ### Machine Config Pools \{#create-the-machine-config-pools}
 
@@ -173,12 +173,12 @@ For scale-out and runtime changes, see [Manage Nodes on VMware vSphere](../../..
 
 ### Provider Requirements \{#provider-requirements}
 
-`ac` renders values that satisfy the following rules. They matter when you edit these objects by hand later, for example during node management or an upgrade. They apply when the `VSphereMachineTemplate` referenced by a controller sets `machineConfigPoolRef`, which every template that `ac` renders does. The provider's admission webhooks enforce the `KubeadmControlPlane`, `MachineDeployment`, and pool rules on `CREATE` and `UPDATE`, and the last rule on `DELETE`.
+`ac` renders values that satisfy the following rules. Keep them when you edit these objects by hand later, for example during node management or an upgrade. The provider rejects changes to the `KubeadmControlPlane` and the pools that break them; a `MachineDeployment` that breaks them stalls during its next rollout.
 
-- With `spec.replicas` of `3` or more, `KubeadmControlPlane.spec.rolloutStrategy.rollingUpdate.maxSurge` is the integer `0`; an unset `maxSurge` means the Cluster API default `1`, which is not accepted. A single replica is accepted with the Cluster API default, because Cluster API rejects `maxSurge: 0` below three replicas, but it cannot be upgraded: its replacement is created first and needs a slot the pool does not have.
+- With `spec.replicas` of `3` or more, `KubeadmControlPlane.spec.rolloutStrategy.rollingUpdate.maxSurge` is the integer `0`; an unset `maxSurge` means the Cluster API default `1`, which is not accepted. A single replica keeps the Cluster API default. With fewer than three control plane nodes, contact technical support before you upgrade the cluster.
 - `MachineDeployment.spec.strategy.rollingUpdate.maxSurge` is `0` and `maxUnavailable` is at least `1`; an unset value is not accepted. `strategy.type: OnDelete` needs neither.
 - `VSphereMachineConfigPool.spec.configs` declares at least one slot, and every slot declares `network` with a non-empty `network.primary.networkName`. Hostnames and primary IP addresses are unique across every pool bound to the same `Cluster`.
-- One pool serves exactly one controller. When a machine allocates a slot, the provider records the owning `KubeadmControlPlane` or `MachineDeployment` in `status.consumerRef`, and a second controller whose template references the same pool is not accepted. Use one pool for the control plane and one pool per `MachineDeployment`.
+- One pool serves exactly one controller. Use one pool for the control plane and one pool per `MachineDeployment`.
 - A slot that is already `InUse` or `Released` rejects some changes. See [Allocated slot restrictions](#create-the-machine-config-pools).
 - A pool that still owns `InUse` slots cannot be deleted.
 
@@ -186,17 +186,10 @@ Confirm the webhooks are registered in your environment with the webhook check i
 
 ### Provider-managed Fields \{#provider-managed-fields}
 
-Some fields on the objects `ac` applies are owned by the provider after creation. Knowing which ones prevents a repository fight during upgrades.
-
-- The provider patches the `KubeadmControlPlane` after it is applied. Expect the CoreDNS and kube-proxy skip annotations set to `"true"`.
-- CoreDNS needs no version: the platform installs it, so `ac` leaves `dns` out of the `KubeadmControlPlane` and kubeadm skips its own CoreDNS phase.
-- The kube-proxy repository is derived from the Kubernetes version: `acp/k8s` at `v1.35` and later, `tkestack` below it. The Kube-OVN chart is `acp/chart-kube-ovn` at chart `v4.4` and later, `acp/chart-cpaas-kube-ovn` below it.
-- The registry prefix for both comes from the `Cluster` annotation `cpaas.io/registry-address`.
-- The workload cluster's `kube-system/kube-proxy` DaemonSet and `kube-system/coredns` Deployment image repositories are reconciled as well, but **only after the control plane rollout completes**. A lag between the `KubeadmControlPlane` reaching the target version and those workloads changing repository is expected.
-- Image pull credentials for these managed components come from the workload cluster's `cpaas-system/sentry` ServiceAccount.
+The provider sets the CoreDNS and kube-proxy skip annotations to `"true"` on the `KubeadmControlPlane` after it is applied. On an ACP 4.5 platform, the platform manages CoreDNS and Kube-OVN in the workload cluster, and the provider manages kube-proxy: its repository is `acp/k8s` from Kubernetes `v1.35` and `tkestack` below it, prefixed with the `cpaas.io/registry-address` annotation of the `Cluster`.
 
 <Directive type="warning">
-Do not remove the CoreDNS and kube-proxy skip annotations, and do not re-apply a stored `KubeadmControlPlane` manifest that omits them. Returning CoreDNS or kube-proxy to kubeadm's management while the provider also manages them produces a repository conflict that flips the images back and forth.
+Do not remove the CoreDNS and kube-proxy skip annotations, and do not re-apply a stored `KubeadmControlPlane` manifest that omits them: kubeadm would then manage those components as well, and their images flip back and forth.
 </Directive>
 
 ## Optional Topology \{#creation-time-topology-variants}
@@ -205,32 +198,18 @@ The template in [Write `install-config.yaml`](../create_cluster.mdx#write-instal
 
 ### Self-built VIP \{#use-self-built-vip}
 
-Use this variant to create the cluster with a provider-managed VIP instead of an external LoadBalancer. Decide the mode first in [Control Plane Endpoint](../prerequisites.mdx#control-plane-endpoint-modes).
+Use this variant to create the cluster with a Self-built VIP instead of an external load balancer. Decide the mode first in [Control Plane Endpoint](../prerequisites.mdx#control-plane-endpoint-modes).
 
 #### Prerequisites \{#self-built-vip-prerequisites}
 
 Complete all of the following before you set `type: internal`.
 
-- The platform is ACP `v4.4` or later. An earlier platform release does not support the Self-built VIP, whatever the provider version. `ac` checks the platform version in preflight.
 - The VIP is IPv4, is currently unclaimed, and lives in the same Layer 2 broadcast domain as the control plane node IPs. IPv6 and dual-stack endpoints are not accepted.
-- The VIP is not one of the `hosts[].ip` or `hosts[].additionalIps` addresses of this cluster, and it falls outside every external IPAM pool range. The provider checks the slot addresses; it cannot read external IPAM pools and will not detect that conflict.
+- The VIP is not one of the `hosts[].ip` or `hosts[].additionalIps` addresses of this cluster, and it falls outside every external IPAM pool range; nothing checks the IPAM pools for you.
 - The `vrid` is unique in that Layer 2 domain.
 - The network path allows VRRP (IP protocol `112`, multicast `224.0.0.18`) and gratuitous ARP between the control plane nodes. Confirm that the dvPortGroup security policy and any NSX-T distributed firewall rule do not block them.
 
-The provider installs Alive, which holds the VIP: it creates a `ModuleInfo` on the `global` cluster, and the platform renders the workload `cpaas-system/alive` `AppRelease` from it. The Core Package carries the Alive artifact, so you do not install it yourself.
-
-If Alive does not install, check the plugin on the `global` cluster:
-
-```bash
-kubectl get clustermodule global -o jsonpath='{.spec.version}{"\n"}'
-kubectl get moduleplugin alive -o jsonpath='{.status.targetClusterVersions}{"\n"}'
-kubectl get moduleplugin alive -o jsonpath='{.status.latestVersion}{"\n"}'
-kubectl get moduleconfig alive-<alive-version> -o jsonpath='{.status.readyForDeploy}{"\n"}'
-```
-
-The provider resolves `<alive-version>` in this order: the `--plugin-alive-version` override on the provider deployment when it is set, then the `ModulePlugin/alive` entry `status.targetClusterVersions[<ClusterModule spec.version>].version`, and only then `status.latestVersion`. Read the `targetClusterVersions` entry that matches the version printed by the first command first; `latestVersion` applies only when the map has no entry for it.
-
-The last command must print `true` for the version that resolution selects. If `ModulePlugin/alive` is absent, or the matching `ModuleConfig` is missing or reports `false`, the Core Package on this platform is incomplete. Import the complete Core Package of your platform release.
+The provider installs Alive, which holds the VIP. The Core Package carries Alive, so you do not install it yourself; if it does not install, see [Self-built VIP troubleshooting](../troubleshooting.mdx#self-built-vip).
 
 #### `controlPlaneLoadBalancer` Fields \{#control-plane-load-balancer-fields}
 
@@ -261,7 +240,7 @@ cluster:
       interface: <vip-interface>   # set explicitly on multi-NIC nodes
 ```
 
-The provider also reconciles the workload cluster's `kube-system/kube-proxy` configuration, setting `ipvs.strictARP: true` and adding `<vip>/32` to `ipvs.excludeCIDRs`, then rolling the kube-proxy DaemonSet. Do not revert those values by hand; the provider reapplies them and rolls the DaemonSet again.
+The provider sets `ipvs.strictARP: true` and adds `<vip>/32` to `ipvs.excludeCIDRs` in the workload cluster's `kube-system/kube-proxy` configuration. Do not revert those values by hand: the provider reapplies them and rolls the kube-proxy DaemonSet again.
 
 To check it, see [Verify the Self-built VIP](../create_cluster.mdx#verify-self-built-vip).
 
@@ -324,9 +303,7 @@ On a rolling update, the same VMDK is reattached to the new VM and the symlink i
 | SCSI unit | Assigned by the controller at the first clone and reused when the VM is recreated | Assigned by the controller at every clone |
 | Guest addressing | `/dev/disk/by-capv/<name>`, located by VMDK `diskUUID`, then by SCSI unit | `/dev/disk/by-capv/<name>`, located by SCSI unit only |
 
-`/var/cpaas` holds platform state that has to survive VM replacement. `/var/lib/kubelet`, `/var/lib/containerd`, and `/var/lib/etcd` are rebuilt on every new VM; keeping them persistent would carry stale kubelet, runtime, and etcd member data onto the replacement node. `ephemeralDisks[]` requires provider `v1.0.17` or later, so this split is available only to a cluster created on `v1.0.17` or later; see [Upgrading the Provider](./install_provider.mdx#upgrade-the-provider).
-
-`ac` does not pin SCSI unit numbers, mount options, or `wipeFilesystem`.
+`/var/cpaas` survives VM replacement; `/var/lib/kubelet`, `/var/lib/containerd`, and `/var/lib/etcd` are rebuilt on every new VM.
 
 #### Persistent Disk Lifecycle \{#persistent-disk-lifecycle}
 
@@ -339,11 +316,12 @@ Persistent disks are owned by a slot in one specific `VSphereMachineConfigPool`,
 
 A new pool does not reuse the VMDKs of an earlier one, even under the same name. When you destroy a cluster and create it again, plan datastore capacity for both sets of persistent disks until the earlier pools finish reclaiming, or destroy with `--reclaim-disks`; see [Delete a Cluster](../deleting.mdx). Pool deletion is asynchronous: the finalizer waits for the Machines to go and for persistent-disk reclaim to finish. Do not remove the finalizer or delete the backing VMDKs by hand to speed it up. Ephemeral VMDKs are deleted with their VM, so they never accumulate across pools.
 
-Read per-disk state from `status.persistentDiskStatuses[]`. Its `phase` is `Creating`, `Attached`, `Available`, `Reclaiming`, `Reclaimed`, or `Error`, and each entry also reports `lastError`, `retryAfter`, `taskRef`, and the owning machine. `status.configStatuses[].lastReleasedTime` records when a slot entered `Released`. The `status.configStatuses[].reclaimStatus` subtree and the `spec.configs[].persistentDisks[].volumePath` and `.diskUUID` fields are deprecated; the provider migrates existing pools onto `persistentDiskStatuses[]`, see [Upgrading the Provider](./install_provider.mdx#upgrade-the-provider).
+Read per-disk state from `status.persistentDiskStatuses[]`. Its `phase` is `Creating`, `Attached`, `Available`, `Reclaiming`, `Reclaimed`, or `Error`, and each entry also reports `lastError`, `retryAfter`, `taskRef`, and the owning machine. `status.configStatuses[].lastReleasedTime` records when a slot entered `Released`.
 
 ```bash
-kubectl -n cpaas-system get vspheremachineconfigpool <pool-name> -o yaml
-kubectl -n cpaas-system get events \
+ac config use-cluster global
+ac -n cpaas-system get vspheremachineconfigpool <pool-name> -o yaml
+ac -n cpaas-system get events \
   --field-selector involvedObject.kind=VSphereMachineConfigPool,involvedObject.name=<pool-name>
 ```
 
@@ -355,6 +333,6 @@ Do not delete a VMDK by hand while its slot is `Released`, or while its `phase` 
 
 When any disk in a slot mounts at `/var/lib/containerd`, the guest disk-reconcile script points `/var/log/pods` at a directory on that disk, so pod logs land on the data disk instead of the root filesystem. In the standard layout that disk is ephemeral, so relocated pod logs are destroyed with the VM they belong to; ship anything you need to keep to the platform log store.
 
-<Directive type="warning">
-This relocation is written into the guest through `guestinfo` user data **before first boot only**. Upgrading the provider does not retrofit it onto existing machines; the change is picked up when nodes are rolled and replaced. See [OS Image Update Without a Kubernetes Version Change](../../../../upgrade/workload/alauda_os/vmware-vsphere.mdx#os-image-only-rollout). Remediating a running node in place requires an out-of-band script and is not part of this workflow.
-</Directive>
+:::note
+This relocation is written into the guest before the first boot only. An existing node gets it only when it is replaced; see [OS Image Update Without a Kubernetes Version Change](../../../../upgrade/workload/alauda_os/vmware-vsphere.mdx#os-image-only-rollout).
+:::

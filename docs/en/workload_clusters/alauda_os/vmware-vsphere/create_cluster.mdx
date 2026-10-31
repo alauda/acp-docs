@@ -11,18 +11,19 @@ queries:
 
 # Create a Cluster on VMware vSphere
 
-ACP CLI (ac) renders the Cluster API, vSphere, and CPI objects from one `install-config.yaml`, applies them to the `global` cluster, and reports the creation stages. Every object lives in the `cpaas-system` namespace of the `global` cluster. There is no web UI for vSphere clusters. For how the provider objects fit together, see [How It Works](./overview.mdx#how-it-works).
+ACP CLI (ac) renders the Cluster API, vSphere, and CPI objects from one `install-config.yaml`, applies them to the `global` cluster, and reports the creation stages. Every object lives in the `cpaas-system` namespace of the `global` cluster. For how the provider objects fit together, see [How It Works](./overview.mdx#how-it-works).
 
 ## Prerequisites \{#prerequisites}
 
-- You meet the [VMware vSphere prerequisites](./prerequisites.mdx): the providers, vCenter reachability, the VM template, the control plane endpoint, the static addresses, `ClusterResourceSet`, the registry, and the credential Secret.
-- `ac` is logged in to the `global` cluster with `ac login`, and the `global` cluster is the current context. It is the active management cluster, not a disaster recovery standby; see [Standby Management Clusters](./reference/install_provider.mdx#standby-management-cluster).
+- You meet the [VMware vSphere prerequisites](./prerequisites.mdx).
+- `ac` is logged in to the platform as a platform administrator (`ac login https://<platform-address>`).
+- You work against the primary `global` cluster, not a disaster recovery standby; see [Standby Management Clusters](./reference/install_provider.mdx#standby-management-cluster).
 
 ## Procedure
 
 ### 1. Write `install-config.yaml` \{#write-install-config}
 
-Create an installation directory for the cluster and write `install-config.yaml` in it. `ac` renders one `VSphereMachineConfigPool` and one `VSphereMachineTemplate` per node group from it, and writes `manifests/` and `logs/ac.log` next to it. The template holds the required fields. The optional fields, such as the Self-built VIP, a second NIC, and data disks, are in [Parameters](./reference/install-config-parameters.mdx#optional-fields).
+Create an installation directory for the cluster and write `install-config.yaml` in it. `ac` writes `manifests/` and `logs/ac.log` next to it. The template holds the required fields. The optional fields, such as the Self-built VIP, a second NIC, and data disks, are in [Parameters](./reference/install-config-parameters.mdx#optional-fields).
 
 ```yaml title="install-config.yaml"
 cluster:
@@ -32,7 +33,7 @@ cluster:
   network:
     loadBalancer:
       type: external # [!code callout]
-      address: <control-plane-vip> # [!code callout]
+      address: <control-plane-endpoint> # [!code callout]
       port: 6443
 
 credentialRef: # [!code callout]
@@ -100,6 +101,7 @@ computes: # [!code callout]
         ip: <worker-2-ip>
 ```
 
+
 <Callouts>
 
 1. `clusterName`: required. It must not be `global` or start with `global-`.
@@ -108,13 +110,13 @@ computes: # [!code callout]
 4. `address`: required. The control plane endpoint, an IPv4 address.
 5. `credentialRef`: required. The credential Secret.
 6. `server`: required. The vCenter address.
-7. `datacenter`: required. A name or inventory path. A nested path, such as `/folder/dc`, cannot be combined with `computeResource`.
+7. `datacenter`: required. The datacenter name. Use an inventory path, such as `/folder/dc`, only when you do not set `computeResource`.
 8. `template`: required. The VM template every node is cloned from.
 9. `datastore`: required.
-10. `computeResource`: set it when the datacenter has more than one.
-11. `releaseDelayHours`: defaults to `24`.
+10. `computeResource`: the name of the DRS cluster or host, not a path. Set it when the datacenter has more than one.
+11. `releaseDelayHours`: how long a released slot keeps its persistent disks before the provider deletes them.
 12. `network.name`: required. The port group of the primary NIC.
-13. `replicas`: an odd number, `1` or `3` or more. A single control plane node cannot be upgraded.
+13. `replicas`: an odd number, `1` or `3` or more. With fewer than three control plane nodes, contact technical support before you upgrade the cluster.
 14. `gateway`: required.
 15. `dns`: required.
 16. `mask`: required. A prefix length from 1 to 32.
@@ -129,121 +131,116 @@ computes: # [!code callout]
 
 ### 2. Create the Cluster \{#create-with-ac}
 
+Run the following command from a machine where `ac` is logged in to the platform:
+
 ```bash
+ac config use-cluster global
 ac adm alpha cluster create --dir <install-dir> --provider vsphere
 ```
 
-Before it applies anything, `ac` checks the following:
+`ac` first checks the provider CRDs on the `global` cluster, the credential and the vCenter sign-in, the vCenter objects named in `install-config.yaml`, and the registry. If a check fails, nothing is changed and the error names the item.
 
-- The provider CRDs, including `ClusterResourceSet` and `VSphereMachineConfigPool`, are served on the `global` cluster. `ac` cannot tell whether the `ClusterResourceSet=true` feature gate is on.
-- The credential Secret exists, vCenter answers, and the account signs in. `ac` pins the certificate fingerprint that vCenter presents in `VSphereCluster.spec.thumbprint`.
-- The datacenter, the template, the datastores, the folders, the port groups, and the compute resources exist.
-- For an `internal` VIP, the platform version supports it. An `external` load balancer is not probed.
-- The CPI image is read from the `CPI_IMAGE` setting of the vSphere provider Deployment.
-- The registry address resolves from the `registry` key of `cpaas-system/public-registry-credential`.
-- Every rendered object passes a server-side dry run on the `global` cluster. `ac` names any object it could not dry-run yet.
-
-`create` returns once the objects are applied, and the cluster keeps building. Add `--wait` to wait until all stages are ready; `--timeout` limits the wait, defaults to `2h`, and ends only the wait, not the creation. To render without applying, run `ac adm alpha cluster manifests` with the same flags.
+`create` returns once the objects are applied, and the cluster keeps building. Add `--wait` to wait until all stages are ready; `--timeout` (default `2h`) limits only the wait. To render without applying, run `ac adm alpha cluster manifests` with the same flags.
 
 ### 3. Monitor the Creation \{#monitor-creation}
 
 ```bash
+ac config use-cluster global
 ac adm alpha cluster status --cluster <cluster-name>                      # prints the four stages once
 ac adm alpha cluster wait-for install-complete --cluster <cluster-name>   # waits until all four are ready
 ```
 
-Both commands change nothing and need no installation directory. `--namespace` defaults to `cpaas-system`.
-
-| # | Stage | Done when |
-|---:|---|---|
-| 1 | `Cluster` | The object exists, is not being deleted, its `infrastructureRef` and `controlPlaneRef` resolve, it reports no failure, and `Available` is `True` when the `Cluster` reports it. |
-| 2 | Control plane | `KubeadmControlPlane` `status.readyReplicas` reaches `spec.replicas`. |
-| 3 | `MachineDeployment` | Every node group is ready. |
-| 4 | `ClusterView` | The platform's view of the cluster reports `status.phase: Running`. `status` also shows the control plane endpoint and the ready node counts. |
-
-When a stage does not advance, see [Troubleshooting](./troubleshooting.mdx).
+Continue when all four stages are ready; otherwise see [Troubleshooting](./troubleshooting.mdx).
 
 ### 4. Verify the Cluster \{#verify-the-cluster}
 
-1. Check the CPI delivery resources in the `global` cluster:
-   ```bash
-   kubectl -n cpaas-system get clusterresourceset
-   kubectl -n cpaas-system get clusterresourcesetbinding
-   ```
-2. Export the workload kubeconfig:
-   ```bash
-   kubectl -n cpaas-system get secret <cluster-name>-kubeconfig -o jsonpath='{.data.value}' | base64 -d > /tmp/<cluster-name>.kubeconfig
-   ```
-3. Check whether the vSphere CPI daemonset is created in the workload cluster:
-   ```bash
-   kubectl --kubeconfig=/tmp/<cluster-name>.kubeconfig -n kube-system get daemonset
-   ```
-4. Check the `global` cluster objects:
-   ```bash
-   kubectl -n cpaas-system get cluster,vspherecluster,kubeadmcontrolplane,machinedeployment,machine,vspheremachine,vspherevm
-   ```
-5. Check the workload nodes:
-   ```bash
-   kubectl --kubeconfig=/tmp/<cluster-name>.kubeconfig get nodes -o wide
-   ```
-6. Check the pool slot counters and the per-disk state of both lists:
-   ```bash
-   kubectl -n cpaas-system get vspheremachineconfigpool
-   kubectl -n cpaas-system get vspheremachineconfigpool <cluster-name>-control-plane \
-     -o jsonpath='{range .status.persistentDiskStatuses[*]}{.hostname}{" "}{.name}{" "}{.phase}{" unit="}{.unitNumber}{"\n"}{end}'
-   kubectl -n cpaas-system get vspheremachineconfigpool <cluster-name>-control-plane \
-     -o jsonpath='{range .status.ephemeralDiskStatuses[*]}{.hostname}{" "}{.name}{" unit="}{.unitNumber}{"\n"}{end}'
-   ```
+Run the following commands from a machine where `ac` is logged in to the platform:
 
-Expect:
+```bash
+ac config sync
+ac config use-cluster <cluster-name>
+ac get nodes
+ac config use-cluster global
+```
 
-- `vsphere-cloud-controller-manager` appears in the workload cluster.
-- Control plane and worker nodes are created and eventually become `Ready`.
-- Each pool reports `Ready=True`, and its `ALLOCATED` count equals the number of running Machines drawn from that pool.
-- Every persistent disk on an allocated slot reports `phase: Attached`.
-- Every ephemeral disk on an allocated slot appears in `status.ephemeralDiskStatuses[]` with an assigned unit number. Ephemeral disks carry no phase; they are created with the VM.
+Continue when every node is `Ready`; otherwise see [Troubleshooting](./troubleshooting.mdx).
+
+#### CPI and Pools \{#verify-cpi-and-pools}
+
+```bash
+ac config use-cluster global
+ac -n cpaas-system get clusterresourceset,clusterresourcesetbinding
+ac -n cpaas-system get vspheremachineconfigpool
+ac config sync
+ac config use-cluster <cluster-name>
+ac -n kube-system get daemonset
+ac config use-cluster global
+```
+
+Continue when a `ClusterResourceSetBinding` exists for the cluster, `vsphere-cloud-controller-manager` is listed in `kube-system`, and each pool reports `Ready=True` with `ALLOCATED` equal to the number of its machines; otherwise see [Troubleshooting](./troubleshooting.mdx#common-causes).
+
+#### Persistent Disks \{#verify-persistent-disks}
+
+Run it for each pool, `<cluster-name>-control-plane` and `<cluster-name>-<group>`:
+
+```bash
+ac config use-cluster global
+ac -n cpaas-system get vspheremachineconfigpool <pool-name> \
+  -o jsonpath='{range .status.persistentDiskStatuses[*]}{.hostname}{" "}{.name}{" "}{.phase}{"\n"}{end}'
+```
+
+Continue when every persistent disk of an allocated slot reports `Attached`; otherwise see [Troubleshooting](./troubleshooting.mdx#common-causes).
 
 #### Optional Topology \{#verify-creation-time-variants}
 
-With a second NIC or extra data disks, also check the pools:
+**Applies to**: node groups with `network.additions` or `rawDisks`. Skip it when you use neither.
 
 ```bash
-kubectl -n cpaas-system get vspheremachineconfigpool <pool-name> -o yaml
-kubectl -n cpaas-system get vspheremachineconfigpool <pool-name> \
-  -o jsonpath='{range .status.ephemeralDiskStatuses[*]}{.hostname}{" "}{.name}{" unit="}{.unitNumber}{"\n"}{end}'
+ac config use-cluster global
+ac -n cpaas-system get vspheremachineconfigpool <pool-name> -o yaml
 ```
 
-Expect the NIC and disk definitions reflected in the pools and the VMs, the nodes `Ready`, and every declared ephemeral disk with an assigned unit number and addressable in the guest at `/dev/disk/by-capv/<name>`.
+On a node of that group:
+
+```bash
+ls -l /dev/disk/by-capv/
+```
+
+Continue when each slot lists the declared additional NICs and disks, and every raw disk appears in `/dev/disk/by-capv/`; otherwise contact technical support.
 
 #### Self-built VIP \{#verify-self-built-vip}
 
-With `type: internal`:
+**Applies to**: `type: internal`. Skip it for an external load balancer.
 
 ```bash
-kubectl -n cpaas-system get vspherecluster <cluster-name> \
-  -o jsonpath='{range .status.conditions[*]}{.type}={.status} ({.reason}){"\n"}{end}'
-kubectl --kubeconfig=/tmp/<cluster-name>.kubeconfig -n kube-system get pods -l app=alive -o wide
-kubectl --kubeconfig=/tmp/<cluster-name>.kubeconfig -n cpaas-system get apprelease alive
-kubectl --kubeconfig=/tmp/<cluster-name>.kubeconfig get --raw='/version'
+ac config use-cluster global
+ac -n cpaas-system get vspherecluster <cluster-name> \
+  -o jsonpath='{.status.conditions[?(@.type=="SelfBuiltLoadBalancerReady")].status}{"\n"}'
+ac config sync
+ac config use-cluster <cluster-name>
+ac -n kube-system get pods -l app=alive -o wide
+ac config use-cluster global
 ```
 
-Expect `SelfBuiltLoadBalancerReady=True`, one Alive Pod per control plane node, and a successful API response through the VIP without disabling TLS verification.
+Continue when the condition is `True` and one Alive Pod runs on each control plane node; otherwise see [Troubleshooting](./troubleshooting.mdx#self-built-vip).
 
-The Alive Pods run in `kube-system`; `cpaas-system` holds the `alive` `AppRelease` that the platform renders from the provider's `ModuleInfo`. `SelfBuiltLoadBalancerReady` covers the whole chain, so check both namespaces when it is `False`.
+On a control plane node of the cluster:
 
-<Directive type="info">
-`SelfBuiltLoadBalancerReady` reports the VIP chain only. It does not gate `VSphereCluster.status.ready`, so the infrastructure cluster can report ready while the VIP is still converging. The condition reasons are `SelfBuiltLoadBalancerReady`, `SelfBuiltLoadBalancerReconciling`, `SelfBuiltLoadBalancerNotReady`, and `InvalidSelfBuiltLoadBalancerConfiguration`.
+```bash
+curl --cacert /etc/kubernetes/pki/ca.crt https://<vip>:6443/healthz
+```
 
-While the VIP is not ready, the provider also defers the workload cluster CoreDNS and kube-proxy repository reconciliation described in [Provider-managed fields](./reference/install-config-parameters.mdx#provider-managed-fields).
-</Directive>
+Continue when it prints `ok`; otherwise see [Troubleshooting](./troubleshooting.mdx#self-built-vip).
 
 ## Run `create` Again \{#rerun-create}
 
-Running `create` again on the same directory puts back anything that has drifted, except the credential Secret, which `ac` does not render. When `manifests/` already exists, `create` asks whether to reuse it: press Enter to reuse it, or answer `n` to render again after you change `install-config.yaml`. When standard input is not a terminal, pass `--reuse-manifests=true` or `--reuse-manifests=false`.
+If `create` stops, run the same command again; completed work is skipped. Running `create` again on the same directory puts back anything that has drifted, except the credential Secret, which `ac` does not render. When `manifests/` already exists, `create` asks whether to reuse it: press Enter to reuse it, or answer `n` to render again after you change `install-config.yaml`. When standard input is not a terminal, pass `--reuse-manifests=true` or `--reuse-manifests=false`. Reusing `manifests/` ignores `install-config.yaml` and skips every check.
 
-- Reusing `manifests/` skips `install-config.yaml` and every check, and applies the files as they are.
-- Rendering again discards hand edits in `manifests/`.
-- A generated encryption key is kept only in `manifests/`. Keep that directory, or set `cluster.encryptionProviderConfig`: rendering again without either generates a new key and writes it into the `KubeadmControlPlane`, which the existing cluster cannot use.
+Do not edit the files in `manifests/`.
+
+:::warning
+Keep `<install-dir>/manifests/`, or set `cluster.encryptionProviderConfig`: a generated encryption key is kept only in `manifests/`. Rendering again without either generates a new key, and `manifests/` then no longer records the key the cluster uses.
+:::
 
 ## Add or Change Node Groups \{#create-the-worker-objects}
 

@@ -10,104 +10,57 @@ queries:
 
 # Create a Cluster on Alauda OS
 
-On this path, <Term name="productShort" /> creates workload clusters whose nodes run Alauda OS, an immutable operating system. Unlike clusters whose nodes run a non-Alauda OS, all node configurations are baked into images and remain unchanged after deployment. Cluster upgrades and configuration changes are applied by replacing nodes with new images, ensuring consistency, reliability, and simplified operations throughout the cluster lifecycle.
-
-Clusters on this path are created and managed declaratively through Cluster API. An infrastructure provider for each supported IaaS platform creates the nodes from Alauda OS images. On Bare Metal, you supply the physical servers; they boot an installation ISO built by the provider and install Alauda OS.
-
-This path follows these principles:
-
-- **Declarative Configuration**: All infrastructure is defined as code
-- **Version Control**: Infrastructure changes are tracked and versioned
-- **Reproducible Deployments**: Consistent environments across different deployments
-- **Stage-Aware Recovery**: Reproducible machine replacement for safe template recovery, with backup-based recovery when a Kubernetes minor upgrade has changed control-plane state
+On this path, <Term name="productShort" /> creates clusters whose nodes run Alauda OS, an image-based, read-only operating system. The nodes are virtual machines on Huawei DCS, Huawei Cloud Stack, or VMware vSphere, or physical servers on Bare Metal.
 
 ## Architecture \{#architecture}
 
-Cluster lifecycle management on Alauda OS is built on the Cluster API (CAPI) framework, which provides a declarative, Kubernetes-native approach:
+A cluster on Alauda OS is described by Cluster API objects on the `global` cluster. Two providers run on `global` and act on those objects:
 
-- **Declarative API**: Kubernetes-native resources for cluster management
-- **Provider Interface**: Standardized interfaces for different infrastructure providers
-- **Lifecycle Management**: Automated cluster provisioning, scaling, and upgrades
-- **GitOps Integration**: Native support for GitOps workflows
-
-Three Cluster API providers work together, delivered as two packages: the **Alauda Container Platform Cluster Bootstrap Provider** handles Kubernetes bootstrap and control plane management, and an infrastructure provider manages the IaaS platform.
-
-### Bootstrap Provider (Kubeadm)
-
-The Cluster API bootstrap provider for kubeadm handles the initialization and configuration of Kubernetes nodes:
-
-- **Node Initialization**: Automates the process of turning bare machines into Kubernetes nodes
-- **Configuration Management**: Manages kubelet configuration, certificates, and bootstrap tokens
-- **Join Process**: Handles the process of joining worker nodes to the cluster
-- **Certificate Management**: Automates certificate generation and rotation
-
-### Control Plane Provider (Kubeadm)
-
-The Cluster API control plane provider for kubeadm manages the Kubernetes control plane:
-
-- **Control Plane Deployment**: Deploys and manages the Kubernetes API server, etcd, and control plane components
-- **High Availability**: Supports multi-node control plane deployments with load balancing
-- **Upgrade Management**: Handles rolling upgrades of control plane components
-- **Health Monitoring**: Monitors control plane health and performs recovery operations
-
-### Infrastructure Provider
-
-The infrastructure provider for the target IaaS platform, such as Huawei DCS, manages the underlying infrastructure:
-
-- **Compute Provisioning**: Creates and manages virtual machines or instances on the target platform
-- **Network Configuration**: Sets up networking infrastructure
-- **Resource Management**: Manages compute, storage, and network resources
-- **Provider Integration**: Integrates with the provider's APIs and services
+- The **Alauda Container Platform Cluster Bootstrap Provider** turns machines into Kubernetes nodes with kubeadm and runs the control plane.
+- An **infrastructure provider**, one for each IaaS platform, creates the machines from Alauda OS images. On Bare Metal, it reinstalls physical servers that you have registered instead of creating virtual machines.
 
 ![Cluster API Architecture](./assets/architecture.jpeg)
 
+### What `ac` Does and What the Platform Does \{#ac-and-the-platform}
+
+You create a cluster with `ac adm alpha cluster create`. `ac` renders the Cluster API and provider objects from one `install-config.yaml`, checks them, and applies them to the `global` cluster. From then on, the providers on `global` create the machines and keep the cluster running. Node changes are covered in [Manage Nodes on Alauda OS Clusters](../../configure/nodes/alauda_os/index.mdx), and version changes in the upgrade documentation.
+
+### Nodes Are Replaced, Not Changed in Place \{#nodes-are-replaced}
+
+A Kubernetes or Alauda OS version change replaces the nodes one at a time. On Huawei DCS, Huawei Cloud Stack, and VMware vSphere, each node is replaced with a new virtual machine. On Bare Metal, the existing hosts are reinstalled; a host removed from the cluster returns to its pool, and its declared data volumes stay with that host. The replacement node gets the same host, and its data volumes, only when the pool has no other available host. Supported OS settings are changed through [Machine Configuration](../../configure/machine_config/index.mdx).
+
+With fewer than three control plane nodes, contact technical support before you upgrade the cluster.
+
+| Data | When a node is replaced |
+| --- | --- |
+| Data on the node's own disks, such as `hostPath` volumes and local PersistentVolumes, unless they are on pool-managed persistent disks (Bare Metal: declared data volumes) | Not kept. Keep data that must survive on CSI storage or on a pool-managed persistent disk. |
+| Data on pool-managed persistent disks (Huawei DCS, Huawei Cloud Stack, VMware vSphere) and on declared data volumes (Bare Metal), such as the platform data in `/var/cpaas` | Kept when the replacement node takes over the pool entry or host of the node it replaces. |
+| External storage, such as volumes provided through CSI | Not affected. |
+
+### Fixed at Creation \{#fixed-at-creation}
+
+Decide the following before you create the cluster. They cannot be changed on an existing cluster:
+
+- The control plane endpoint mode and address. See [Plan the Control Plane Endpoint](./prepare/control-plane-endpoint.mdx).
+- The image registry of the cluster: the registry of the `global` cluster or a dedicated one. See [Choose the Image Registry for a Workload Cluster](./prepare/workload-cluster-image-registry.mdx).
+- On Huawei DCS, Huawei Cloud Stack, and VMware vSphere, the layout of an existing persistent disk, such as its size and, on Huawei DCS, its datastore. On VMware vSphere, the addresses and disks of a pool slot are also fixed once a machine takes the slot. Plan the disks of each node pool before you create the cluster.
+
 ## Supported Providers \{#supported-providers}
 
-Each infrastructure provider integrates with one IaaS platform to deliver cluster lifecycle management.
-
-| Provider | Description |
-|----------|-------------|
-| [Bare Metal](./bare-metal/overview.mdx) | Bare-metal servers without virtualization |
-| [Huawei DCS](./huawei-dcs/overview.mdx) | Huawei Datacenter Virtualization Solution |
-| [Huawei Cloud Stack](./huawei-cloud-stack/overview.mdx) | Huawei Cloud Stack |
-| [VMware vSphere](./vmware-vsphere/overview.mdx) | VMware vSphere virtualization platform |
+| Provider | Machines | Control plane endpoint | Notable for planning |
+|---|---|---|---|
+| [Bare Metal](./bare-metal/overview.mdx) | Physical servers that register once from an installation ISO built by the platform and are listed per node group in a pool | Self-built VIP (default), or an external load balancer | You register the hosts and create the pools before you run `ac`. |
+| [Huawei DCS](./huawei-dcs/overview.mdx) | Virtual machines cloned from a DCS VM template | External load balancer (default), or a Self-built VIP | Each node has a fixed address and hostname that you reserve; DCS does not reserve them. The Kubernetes version comes from the VM template. |
+| [Huawei Cloud Stack](./huawei-cloud-stack/overview.mdx) | ECS instances in an existing VPC, subnet, and security group | An HCS ELB that the provider creates | Each node pool is placed in one availability zone. The ELB takes one VIP and two L4 and two L7 addresses. |
+| [VMware vSphere](./vmware-vsphere/overview.mdx) | Virtual machines cloned from a vSphere VM template, each with a static IP address and hostname from `install-config.yaml` (no DHCP) | External load balancer (default), or a Self-built VIP | Every node group needs its own machine config pool. A dedicated image registry is not available. |
 
 ### Control Plane Endpoint \{#control-plane-endpoint}
 
-Each cluster's Kubernetes API server (`kube-apiserver`, port `6443`) is reached through a control plane endpoint — a virtual IP (VIP) or load balancer address that fronts the control plane nodes. How that endpoint is provided differs by provider, which determines what you must prepare before cluster creation.
-
-| Provider | Control plane endpoint | Mechanism | What you prepare |
-|----------|------------------------|-----------|------------------|
-| Bare Metal | The provider creates it (or you provide it) | `BaremetalCluster.spec.controlPlaneLoadBalancer.type=Internal` deploys the `alive` chart (`keepalived` + IPVS + `kube-lock` Lease arbitration) onto the control-plane nodes; `type=External` delegates the LB to an existing external appliance | Choose a free VIP, port (typically `6443`), and a `vrid` unique in the control-plane Layer-2 broadcast domain |
-| Huawei DCS | You provide it, or the provider manages a Self-built VIP | An external load balancer, or a provider-managed `type: internal` Self-built VIP | For external mode, provision the load balancer before cluster creation. For internal mode, reserve an IPv4 VIP in the control-plane Layer 2 network and set `type: internal` in `install-config.yaml` |
-| Huawei Cloud Stack | The provider creates it | An HCS Elastic Load Balance (ELB) instance created automatically during cluster reconciliation | Plan the ELB inputs — VIP subnet, VIP address, bandwidth, and public-IP preference — in `HCSCluster.spec.controlPlaneLoadBalancer` |
-| VMware vSphere | The provider creates it (or you provide it) | `VSphereCluster.spec.controlPlaneLoadBalancer.type=internal` deploys Alive (`keepalived` + IPVS) onto the control-plane nodes; `type=external`, and an absent field, delegate the LB to an existing external appliance. The mode is fixed at cluster creation | For `internal`, choose a free IPv4 VIP, a port (typically `6443`), and a `vrid` unique in the control-plane Layer-2 broadcast domain. For `external`, provision the load balancer before cluster creation |
-
-Huawei Cloud Stack is the only VM provider that creates a platform load balancer object for you. An external load balancer — including its VIP allocation and backend (real-server) maintenance — is prepared and owned outside the cluster. On Bare Metal, Huawei DCS, and VMware vSphere, the provider can instead deploy an in-cluster VIP component (`alive`). For the requirements of each mode, see [Plan the Control Plane Endpoint](./prepare/control-plane-endpoint.mdx).
-
-### Web UI Support (Fleet Essentials) \{#fleet-essentials}
-
-Fleet Essentials is a cluster plugin that provides a shared web UI framework for cluster management. Infrastructure providers can extend it through UI extension anchors to add platform-specific pages and workflows.
-
-When installed, Fleet Essentials enables:
-
-- **Unified Cluster Management**: Single interface for managing clusters across all platforms
-- **Infrastructure Resource Management**: Configure cloud credentials, IP pools, and machine templates
-- **Cluster Lifecycle Operations**: Create, view, upgrade, and destroy clusters through guided workflows
-- **Node Pool Management**: Declarative node pool management with scaling and upgrade capabilities
-
-Providers that implement these Fleet Essentials extension anchors can add their own cluster creation workflows and management pages:
-
-- **Bare Metal Provider**: Clusters are created with ACP CLI (ac). There is no Fleet Essentials UI for bare-metal clusters
-- **DCS Provider**: Clusters are created with ACP CLI (ac), or through DCS-specific UI pages on Huawei DCS; see [Create in the Web UI](./huawei-dcs/create_cluster.mdx#create-in-web-ui)
-- **HCS Provider**: Clusters are created with ACP CLI (ac), or through the web UI on Huawei Cloud Stack when Fleet Essentials `1.0.2` or later is installed
-- **vSphere Provider**: Clusters are created with ACP CLI (ac). There is no Fleet Essentials UI extension for vSphere cluster creation and management
+What to prepare for each endpoint mode is in [Plan the Control Plane Endpoint](./prepare/control-plane-endpoint.mdx).
 
 ## Install the Providers on the global Cluster \{#install-providers}
 
-After the `global` cluster is installed, and before you create a workload cluster on Bare Metal, Huawei DCS, Huawei Cloud Stack, or VMware vSphere, upload and install the infrastructure provider for that IaaS platform, together with the Cluster Bootstrap Provider, on the `global` cluster. A `global` cluster installed with `ac` already runs the Cluster Bootstrap Provider and the provider of its own platform.
-
-To install a provider, download its package from the Customer Portal, where the providers are listed under **Common ACP Extensions**, upload it with `violet push`, and install it as a cluster plugin. See [Install the Infrastructure Provider](./prepare/index.mdx#install-the-provider).
+Install the provider for the IaaS platform, and the Cluster Bootstrap Provider, on the `global` cluster as described in [Install the Infrastructure Provider](./prepare/index.mdx#install-the-provider). A `global` cluster installed with `ac` already runs the Cluster Bootstrap Provider and the provider of its own platform.
 
 Upgrading Kubernetes on an Alauda OS `global` cluster also requires the provider for that IaaS platform to be uploaded and installed on the `global` cluster first.
 
@@ -116,7 +69,7 @@ Upgrading Kubernetes on an Alauda OS `global` cluster also requires the provider
 Create a workload cluster on Alauda OS in the following order. [Prepare](./prepare/index.mdx) describes the first three steps in the same order.
 
 1. **Install the Provider**: Install the provider for your IaaS platform, and the Cluster Bootstrap Provider, on the `global` cluster.
-2. **Infrastructure Resources**: Prepare what the provider requires, as listed in its Prerequisites page. With `ac`, this is mainly the credential Secret and the IaaS objects that `install-config.yaml` names; `ac` renders the IP pools and machine templates. Only Huawei DCS has a separate infrastructure resource page, which the web UI path also uses.
+2. **Infrastructure Resources**: Prepare what the provider requires, as listed in its Prerequisites page. With `ac`, this is mainly the credential Secret and the IaaS objects that `install-config.yaml` names.
 3. **Plan the Cluster**: Read [Prepare](./prepare/index.mdx) for the decisions that apply to every provider, such as the control plane endpoint mode and the image registry of the cluster. Also check the following before you create the cluster:
    - **Node Labels and Taints**: If dedicated node pools (monitoring, logging, ingress) are planned, read how to declare role labels and taints on the pool in [Infra Nodes](../../configure/nodes/node_planning.mdx#create-infra-nodes-alauda-os) before creating the pools.
    - **CPU Baseline**: For x86_64 cluster nodes that use ACP-provided Alauda OS images, the underlying CPUs must support the `x86-64-v2` ISA baseline. For details, see [OS Support Matrix](../../overview/alauda_os_support_matrix.mdx).
@@ -131,8 +84,7 @@ Each provider has its own pages for these steps:
 | Huawei Cloud Stack | [Overview](./huawei-cloud-stack/overview.mdx) | [Prerequisites](./huawei-cloud-stack/prerequisites.mdx) | [Create](./huawei-cloud-stack/create_cluster.mdx) | [Delete](./huawei-cloud-stack/deleting.mdx) | [Troubleshooting](./huawei-cloud-stack/troubleshooting.mdx) | [Reference](./huawei-cloud-stack/reference/index.mdx) |
 | VMware vSphere | [Overview](./vmware-vsphere/overview.mdx) | [Prerequisites](./vmware-vsphere/prerequisites.mdx) | [Create](./vmware-vsphere/create_cluster.mdx) | [Delete](./vmware-vsphere/deleting.mdx) | [Troubleshooting](./vmware-vsphere/troubleshooting.mdx) | [Reference](./vmware-vsphere/reference/index.mdx) |
 
-Installing the provider is covered by Prerequisites. If a failure is not provider-specific, see [Troubleshooting](./troubleshooting/index.mdx).
-
+If a failure is not provider-specific, see [Troubleshooting](./troubleshooting/index.mdx).
 
 ## Related Tasks \{#related-tasks}
 
