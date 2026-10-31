@@ -4,145 +4,425 @@ weight: 60
 
 # Upgrade Troubleshooting
 
-Use this page when preflight reports a blocking check, CVO reports `Ready=False`, `Reconciling=True`, or `Stalled=True`, or a Core or Aligned module does not reach its target version.
+Use this page when an upgrade check fails or an upgrade does not advance. An upgrade cannot be rolled back. Fix the reported cause and the upgrade continues; if it cannot be fixed, contact technical support.
 
 ## Inspect Upgrade State \{#inspect-upgrade-state}
 
-Replace `<cluster>` with `global` or the workload cluster name:
+Each command block on this page names the cluster it runs on. Run it from the execution host after `ac login`. Commands run on `global` unless the block switches to another cluster with `ac config use-cluster <cluster-name>`; such a block ends with `ac config use-cluster global`. `ac whoami --show-server` shows the cluster you are on: the platform address followed by `/kubernetes/<cluster-name>/`. For the standby `global` cluster in a DR environment, skip `ac config use-cluster` and add `--kubeconfig <standby-kubeconfig>` to each other `ac` command; `ac whoami --show-server` then prints the VIP of the standby.
+
+For example, on the `global` cluster, read the state of the cluster being upgraded. Use `--cluster=global` for a `global` cluster itself:
 
 ```bash
-kubectl -n cpaas-system get cvsh <cluster> \
-  -o jsonpath='{range .status.conditions[*]}{.type}{"\t"}{.status}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
-
-kubectl -n cpaas-system get cvsh <cluster> \
-  -o jsonpath='{.status.preflight.observedAt}{"\n"}{range .status.preflight.checks[*]}{.name}{"\t"}{.policy}{"\t"}{.state}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
-
-kubectl -n cpaas-system get cvsh <cluster> \
-  -o jsonpath='{range .status.history[*]}{.version}{"\t"}{.state}{"\t"}{.startedTime}{"\t"}{.completionTime}{"\n"}{end}'
+ac config use-cluster global
+ac whoami --show-server
+ac adm upgrade status --cluster=<cluster-name> --verbose
 ```
 
-Resolve the first failing preflight check or the relevant `Ready`, `Reconciling`, or `Stalled` condition before changing the upgrade request.
+`Upgrade` shows the state of the request:
+
+- `Blocked`: a preflight check failed. Resolve the first `Failed` check under `Preflight`.
+- `Retrying`: a preflight check reports `Retry`, and it runs again automatically.
+- `InProgress`: the upgrade runs. A step that is being retried also shows `InProgress`.
+- `Completed`: the cluster runs the target version.
+
+`Conditions` (`Ready`, `Reconciling`, `Stalled`) and `Preflight` give the reason and message. `Failed (non-blocking)` does not stop the upgrade. `Upgrade stages` shows what is running.
+
+On Huawei DCS and Bare Metal, when `Upgrade` stays `InProgress` in the `Kubernetes` stage, a node replacement that does not advance shows only on the `InfraClusterVersion` of the cluster. On the `global` cluster that manages the cluster, read its `Stalled` condition:
+
+```bash
+ac -n cpaas-system get infraclusterversion <cluster-name> \
+  -o jsonpath='{range .status.conditions[?(@.type=="Stalled")]}{.status}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
+```
+
+If it prints `True`, see [Stalled Reasons](#infra-stalled). For the full progress, see [Read the Progress](#infra-progress).
+
+Before the request, `bash upgrade.sh --preflight` prints the same checks; for a workload cluster, add `--cluster=<cluster-name>`. After the request, the Cluster Version Operator (CVO) retries automatically. Submitting the request again does not clear a block.
 
 ## Handle Preflight Blocks \{#handle-preflight-blocks-when-needed}
 
-A `ResourcePatch` records a customization applied to a platform resource. The upgrade refuses to overwrite one unless it is exempted for the target version, so `ResourcePatchUpgradeable` is the most frequent block on a customized environment.
-
-If `ResourcePatchUpgradeable` fails with `reason=UnexemptResourcePatches`, inspect the named `ResourcePatch` and add the required target-version exemption only after reviewing the patch:
+A `ResourcePatch` records a customization of a platform resource. `ResourcePatchUpgradeable` fails with the reason `UnexemptResourcePatches` until each `ResourcePatch` is exempted for the target version. The message names up to five of them. Run the commands on the cluster being upgraded: for a `global` cluster, use `global` as `<cluster-name>`; in a DR environment, run them on the primary and again on the standby `global` cluster, with `--kubeconfig <standby-kubeconfig>` instead of `ac config use-cluster`. List the patches and their exemptions, review each patch, then exempt it:
 
 ```bash
-kubectl -n cpaas-system get cvsh <cluster> \
-  -o jsonpath='{range .status.preflight.checks[?(@.name=="ResourcePatchUpgradeable")]}{.state}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
-
-kubectl get resourcepatches <rp-name> -o yaml
-kubectl annotate resourcepatches <rp-name> \
-  config.cpaas.io/exempt-for-ver=<target-version> \
-  --overwrite
+ac config use-cluster <cluster-name>
+ac get resourcepatches \
+  -o custom-columns='NAME:.metadata.name,EXEMPT:.metadata.annotations.config\.cpaas\.io/exempt-for-ver'
+ac get resourcepatches <rp-name> -o yaml
+ac annotate resourcepatches <rp-name> config.cpaas.io/exempt-for-ver=<target-version> --overwrite
+ac config use-cluster global
 ```
 
-The exemption annotation key is `config.cpaas.io/exempt-for-ver`, and its value is the target version. The exemption is matched on the major and minor version, so an exemption recorded for one patch version also covers the other patch versions of the same minor release.
+The value is the target version, for example `4.5.0`, and covers every patch version of that minor version. An exemption keeps the customization in place; it does not confirm that the customization still works on the target version. Confirm that with the technical support contact who supplied it.
 
-Exempting a patch tells the upgrade to leave that customization in place. It does not verify that the customization is still valid on the target version — confirm that with the technical support contact who supplied it.
+### Resolve Other Preflight Blocks \{#resolve-other-preflight-blocks}
 
-### Resolve Other Common Preflight Blocks \{#resolve-other-preflight-blocks}
-
-List every check that is not `Passed` with the command in [Inspect Upgrade State](#inspect-upgrade-state), then resolve each one:
-
-| Check | What it validates | Resolution |
+| Check | What it verifies | What to do |
 | --- | --- | --- |
-| `KubernetesVersionSupported` | The cluster's Kubernetes version is within the target release's supported range. | Follow the [Kubernetes Support Matrix](/overview/kubernetes-support-matrix.html); do not disable the check. |
-| `VersionUpgradePath` | The current patch can reach the requested target through a supported edge. | Use a target in `availableUpdates` or follow an offered intermediate target. |
-| `ClusterRunning` | The cluster is healthy and reconciled. | Inspect `kubectl get clusterview <cluster>` and resolve unhealthy nodes or components. |
-| `DockerRuntimeUnsupported` | No node uses the unsupported Docker runtime. | Migrate affected nodes to `containerd`. |
-| `ClusterModuleStable`, `ModuleInfoStable` | Core and installed Aligned modules are stable. | Follow [Verify Module Stability Before You Upgrade](./pre-upgrade.mdx#module-stability-self-check). |
+| `VersionUpgradePath` | The ACP version (Distribution Version) of the cluster can be upgraded directly to the requested version. On a `global` cluster, every registered cluster, imported clusters included, is also within the direct upgrade window of the target. | Message `Upgrade path blocked`: request a version listed under `Available updates`, or contact technical support. Message `upgrade path blocked for <cluster>(<version>)`: upgrade the named clusters first. |
+| `GlobalVersionReady` | Workload clusters only: the `global` cluster has reached the target version. | Reason `GlobalVersionPending`: finish the `global` upgrade first; in a DR environment, on both `global` clusters, or on the primary while synchronization is paused. |
+| `KubernetesVersionSupported` | The target release supports the Kubernetes version of the cluster. | Contact technical support. |
+| `ClusterRunning` | The cluster status is `Running`. | Repair the cluster until its status is `Running`. The message shows the current status. |
+| `DockerRuntimeUnsupported` | No node uses the Docker runtime. | Migrate the affected nodes to `containerd`. |
+| `ClusterModuleStable`, `ModuleInfoStable` | ACP Core and the installed Extensions (Operators and Cluster Plugins) with the `Aligned` lifecycle are stable. | Follow the module rows of [Check the Registry, Modules, and etcd Backup](./pre-upgrade.mdx#global-common-checks); for a workload cluster, use its name instead of `global` in the `moduleinfo` and `clustermodule` commands. |
+| `InfraClusterVersionPreflight` | Huawei DCS and Bare Metal: the Kubernetes upgrade can run. | See [Kubernetes Upgrade Checks](#infra-preflight-checks). |
+| `AdminAckRequired` | `global` clusters only: every administrator gate is acknowledged. | See [Handle Administrator Acknowledgement Gates](#handle-administrator-acknowledgement-gates). |
+| `DRSplitUpgradeWindow` | Standby `global` cluster, identified by the DR marker `kube-public/etcd-sync`: synchronization is paused, the marker exists, no listed object is being deleted, and the token rotator is disabled and rolled out. | See [DR Standby Checks](#dr-split-upgrade-window). |
+| Any other check | — | Contact technical support with the check name, reason, and message. |
 
-Do not force an upgrade past a failed check. `VersionUpgradePath`, `KubernetesVersionSupported`, and `AdminAckRequired` gate the supported upgrade path itself, and an upgrade that bypasses them reaches a state the platform has not validated. If a block cannot be resolved from this page, contact technical support before continuing.
+Do not force an upgrade past a failed check. `spec.desiredUpdate.force` on the request turns every blocking failure of the whole preflight into a warning at once, not only the one you have reviewed; it releases nothing while any failure that cannot be bypassed remains. If a block cannot be resolved from this page, contact technical support.
+
+### DR Standby Checks \{#dr-split-upgrade-window}
+
+On a standby that has the DR marker, `DRSplitUpgradeWindow` passes only while synchronization is paused, as in [Upgrade the Standby `global` Cluster After the Workload Clusters](./global/upgrade_global_dr_deferred_standby.mdx#upgrade-standby). Without the marker, for example after the plugin is uninstalled in [Upgrade `global` Clusters in a DR Environment](./global/upgrade_global_dr.mdx#before-you-begin), the check passes. In [Upgrade `global` Clusters in a DR Environment](./global/upgrade_global_dr.mdx#before-you-begin), a failure on the standby before the uninstall is expected: continue as described there, and do not pause synchronization or disable the token rotator. The table applies only to [Upgrade the Standby `global` Cluster After the Workload Clusters](./global/upgrade_global_dr_deferred_standby.mdx). The message names the reason:
+
+| Reason | Action |
+| --- | --- |
+| `EtcdSyncNotPaused` | Before the pause, in [Prepare Both `global` Clusters](./global/upgrade_global_dr_deferred_standby.mdx#prepare-both), this reason is expected; continue with the pause. After the pause: if the message says `etcd-sync is not paused yet`, wait until `status.phase` is `Paused` and run the preflight again; otherwise do not pause or resume synchronization yourself, and contact technical support. |
+| `DRMarkerMissing` | The DR marker `kube-public/etcd-sync` was removed. Do not continue the standby upgrade, do not reinstall the plugin, and contact technical support. |
+| `DeletingObjectsPresent` | The message lists objects that are being deleted on the standby. Before synchronization is paused, let the deletion finish on the primary, wait until the standby is synchronized, and run the preflight again. While synchronization is paused, changes on the primary do not reach the standby: contact technical support. |
+| `TokenRotatorEnabled` | Disable the token rotator on the standby as described in [Prepare Both `global` Clusters](./global/upgrade_global_dr_deferred_standby.mdx#prepare-both), wait until its rollout finishes, and run the preflight again. |
+| `DRSplitUpgradeWindowNotReady` | The message lists each failed item with its reason. Handle each of them as described in this table. |
+| `DependencyReadFailed` | The check could not read the standby. Confirm that its API server responds, for example with `ac get nodes`, and run the preflight again; a submitted upgrade request retries the check automatically. If it does not pass, contact technical support. |
 
 ## Handle Administrator Acknowledgement Gates \{#handle-administrator-acknowledgement-gates}
 
-If `AdminAckRequired` fails, inspect the keys supplied by the target release:
+`AdminAckRequired` runs only for `global` clusters. In a DR environment, record the acknowledgement on the primary and again on the standby `global` cluster; it is not synchronized. On the `global` cluster, read the gates supplied by the target release:
 
 ```bash
-kubectl -n cpaas-system get configmap admin-gates -o yaml
+ac config use-cluster global
+ac -n cpaas-system get configmap admin-gates -o yaml
 ```
 
-Complete the action described by the applicable gate. For a Kubernetes 1.35 or later node-readiness gate, complete [Kubernetes 1.35 or Later Node Readiness](./pre-upgrade.mdx#kubernetes-135-node-readiness) on every production node.
-
-The first gate introduced for that requirement, for the ACP 4.4 and Kubernetes 1.35 target, is `ack-4.4-kubernetes-1.35-kernel-update`. Treat it as an example — a later target release can supply a different key, so always read the key out of `admin-gates` rather than reusing this one.
-
-Copy the applicable key from `admin-gates`, record the acknowledgement in `admin-acks`, and rerun preflight:
+Complete the action that the gate describes. On a `global` cluster on ACP 4.4 or earlier, `AdminAckRequired` reports `Confirm Linux kernel 5.8+ and cgroup v2 readiness before upgrading to Kubernetes 1.35.` (gate key `ack-4.4-kubernetes-1.35-kernel-update`); complete [Check Node Readiness for Kubernetes 1.35 or Later](./pre-upgrade.mdx#kubernetes-135-node-readiness) for it. Then, on the same `global` cluster, record the acknowledgement with the key copied from `admin-gates`, and run the preflight again from the `installer/` directory of the extracted target Core Package. On the standby, run `export KUBECONFIG=<standby-kubeconfig>` instead of `ac config use-cluster global`, and `unset KUBECONFIG` afterwards. Continue when `Summary` shows `Passed` or `PassedWithWarnings`:
 
 ```bash
+ac config use-cluster global
+ac whoami --show-server
 ACK_KEY='<key-from-admin-gates>'
-kubectl -n cpaas-system patch configmap admin-acks --type merge \
+ac -n cpaas-system patch configmap admin-acks --type merge \
   -p "{\"data\":{\"${ACK_KEY}\":\"true\"}}"
-
 bash upgrade.sh --preflight
 ```
 
-Confirm that the check now passes:
+## Kubernetes Upgrade on Huawei DCS and Bare Metal \{#infra-kubernetes-upgrade}
+
+On Huawei DCS and Bare Metal, the upgrade request also upgrades Kubernetes and Alauda OS. The platform tracks this in an `InfraClusterVersion` named after the cluster, on the `global` cluster that manages it; a `global` cluster has its own, named `global`.
+
+### Kubernetes Upgrade Checks \{#infra-preflight-checks}
+
+The platform checks the whole path to the target, including every intermediate Kubernetes version, and evaluates the checks again every 5 minutes. A fixed problem passes on the next evaluation. A message about one version on the path starts with `hop <version>: `, for example `hop v1.36.4-acp.3: DCS VM template <vm-template-name> not found`.
+
+The result appears in the upgrade preflight as `InfraClusterVersionPreflight`. Until the `global` upgrade installs the new provider, it is a non-blocking warning with the reason `ProviderCapabilityNotDeclared`. This is expected: the checks run again in the `Kubernetes` stage after ACP Core is upgraded. If a blocking check fails then, the upgrade waits in that stage and continues by itself once you fix the cause. On the `global` cluster that manages the cluster, read the checks:
 
 ```bash
-kubectl -n cpaas-system get cvsh <cluster> \
-  -o jsonpath='{range .status.preflight.checks[?(@.name=="AdminAckRequired")]}{.state}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
+ac -n cpaas-system get infraclusterversionpreflight -l upgrade.alauda.io/cluster=<cluster-name>
+ac -n cpaas-system get infraclusterversionpreflight <preflight-name> \
+  -o jsonpath='{range .status.checks[*]}{.name}{"\t"}{.severity}{"\t"}{.state}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
 ```
 
-## Recover a Missing Aligned Package \{#recover-missing-aligned-package}
+<Tabs>
+  <Tab label="Huawei DCS">
 
-An unavailable Aligned package does not change the application's current installed state. Depending on the package type and reconciliation stage, CVO can report the problem through `Ready=False` or `Reconciling=True` rather than `Stalled=True`.
+| Check | Effect | What it verifies | What to do |
+| --- | --- | --- | --- |
+| `UpgradePathResolvable` | Blocks | The target and every intermediate Kubernetes version have a VM template ConfigMap, and the cluster topology is supported. The message lists the planned path. | Create the missing ConfigMaps as described in [Stage the Alauda OS Images](./pre-upgrade.mdx#stage-alauda-os-images). For the reason `UnsupportedTopology`, contact technical support. |
+| `TargetImagePresent` | Blocks | Every VM template on the path exists on DCS, and the DCS credentials work. | Register the missing VM template, or fix the DCS credential or API access. |
+| `RolloutMaxSurgeZero` | Blocks | `maxSurge` is `0` on each node group (`KubeadmControlPlane` or `MachineDeployment`) whose IP pool declares persistent disks. An unset value counts as `1`. | Set `maxSurge: 0` as described in [Set the Rollout Settings](./pre-upgrade.mdx#rollout-settings). |
+| `KubeletPatchReady` | Blocks | When any version on the path is Kubernetes 1.35 or later, the `KubeadmControlPlane` and every worker `KubeadmConfigTemplate` contain a readable `/etc/kubernetes/patches/kubeletconfiguration0+strategic.json`. Every Secret and key referenced by `contentFrom.secret` exists. | Reason `KubeletPatchFileMissing` or `KubeletPatchInvalid`: contact technical support. Reason `KubeletPatchSourceUnavailable` or `FileSecretMissing`: restore the Secret or key named in the message; if you cannot, contact technical support. |
+| `ControlPlaneTopology` | Blocks | The control plane has at least 3 nodes. | Contact technical support. |
+| `PersistentDiskLayout` | Blocks | No `DCSMachineTemplate` declares `/var/cpaas` as a template disk. | Migrate the cluster as described in [Migrate to Pool-Managed Persistent Disks](./persistent_disk_migration.mdx). |
+| `PersistentDiskTemplateVersion` | Blocks | When the IP pool declares persistent disks, the current and target VM templates are made from Alauda OS of ACP 4.2.1 or later. | Contact technical support. |
+| `NoHostPathWorkloads` | Blocks | No Pod outside `kube-system`, `kube-public`, `kube-node-lease`, and `cpaas-system` uses a `hostPath` volume or a PVC bound to a local or `hostPath` PersistentVolume. DaemonSet Pods, static Pods, and Pods that have finished are exempt. The reason `WorkloadClusterUnreachable` means the check could not reach the cluster. | Move the data to storage outside the nodes, such as NFS or an external Ceph cluster; it is lost when the node is replaced. To accept the loss instead, contact technical support; see the note on `force` in [Resolve Other Preflight Blocks](#resolve-other-preflight-blocks). |
+| `UniformVmTemplate` | Blocks | The control plane and every worker node pool use the same VM template. | Contact technical support. |
+| `IPPoolCapacity` | Warning | Each IP pool has as many free entries as the `maxSurge` of the node groups that use it. | Set `maxSurge` to `0` as described in [Set the Rollout Settings](./pre-upgrade.mdx#rollout-settings). With `maxSurge: 0`, the pool needs exactly one entry for each node; do not add free entries. |
+| `AllNodesReady` | Warning | Every node of the cluster is `Ready`. | Repair the nodes, or confirm that the upgrade can proceed. |
+| `KubeletPatchPolicy` | Warning | `imagePullCredentialsVerificationPolicy` in the kubelet patch file is `NeverVerify` or absent. The platform adds it when absent and never changes an existing value. | Set the value to `NeverVerify`, or confirm the existing value. |
+
+  </Tab>
+  <Tab label="Bare Metal">
+
+| Check | Effect | What it verifies | What to do |
+| --- | --- | --- | --- |
+| `UpgradePathResolvable` | Blocks | `elemental-image-catalog` has an OS image key for every host type in the pool of each node group that is replaced at a version, spare hosts included, and a `<kubernetes-version>_etcd` key for each version at which the control plane is replaced. The OS identity of every host can be read. A missing intermediate version is reported as `no catalog version for minor <minor> ...`. | Add the missing keys as described in [Stage the Alauda OS Images](./pre-upgrade.mdx#stage-alauda-os-images). For the reason `UnsupportedTopology` or `OSFamilyUnknown`, contact technical support. |
+| `TargetImagePresent` | Blocks | Every OS image that a reinstalled host uses exists in the platform registry. | Import the missing image. For the reason `ImageRegistryMissing`, check that the `Cluster` carries the `cpaas.io/registry-address` annotation. |
+| `RolloutMaxSurgeZero` | Blocks | `maxSurge` is `0` on every `MachineDeployment` and on a `KubeadmControlPlane` with 3 or more replicas; a single-node control plane needs `1`. An unset value counts as `1`. | Set `maxSurge: 0` as described in [Set the Rollout Settings](./pre-upgrade.mdx#rollout-settings). With fewer than three control-plane nodes, contact technical support. |
+| `ControlPlaneSpareInventory` | Blocks | Single control-plane node clusters only: the control-plane pool has an `Available` host. | Contact technical support. |
+| `NoFailedMachines` | Blocks | No `BaremetalMachine` is `Failed`, and no machine has passed the node-join (20 minutes) or rollout (90 minutes) threshold. Machines still within the thresholds are listed but pass. | Repair or replace the machines named in the message; see [Stalled Reasons](#infra-stalled). |
+| `KubeletPatchReady` | Blocks | When any version on the path is Kubernetes 1.35 or later, the `KubeadmControlPlane` and every worker `KubeadmConfigTemplate` contain a readable `/etc/kubernetes/patches/kubeletconfiguration0+strategic.json`. Every Secret and key referenced by `contentFrom.secret` exists. | Reason `KubeletPatchFileMissing` or `KubeletPatchInvalid`: contact technical support. Reason `KubeletPatchSourceUnavailable` or `FileSecretMissing`: restore the Secret or key named in the message; if you cannot, contact technical support. |
+| `ControlPlaneTopology` | Blocks | The cluster uses a `KubeadmControlPlane` and Bare Metal machine templates, and no worker node pool runs a newer Kubernetes version than the control plane. | Contact technical support. |
+| `NoHostPathWorkloads` | Blocks | No Pod outside `kube-system`, `kube-public`, `kube-node-lease`, and `cpaas-system` uses a `hostPath` volume or a PVC bound to a local or `hostPath` PersistentVolume. DaemonSet Pods, static Pods, and Pods that have finished are exempt. The reason `WorkloadClusterUnreachable` means the check could not reach the cluster. | Move the data to storage outside the nodes, such as NFS or an external Ceph cluster; it is not kept when the host is reinstalled. To accept the loss instead, contact technical support; see the note on `force` in [Resolve Other Preflight Blocks](#resolve-other-preflight-blocks). |
+| `AllNodesReady` | Warning | Every node of the cluster is `Ready`. | Repair the nodes, or confirm that the upgrade can proceed. |
+| `PoolHealthy` | Warning | Every pool used by the cluster exists and has no `Unavailable` members. | Repair or remove the unavailable hosts. |
+
+  </Tab>
+</Tabs>
+
+### Read the Progress \{#infra-progress}
+
+On the `global` cluster that manages the cluster, read the summary, the conditions, the planned versions, the current step, and the events:
+
+```bash
+ac -n cpaas-system get infraclusterversion <cluster-name>
+ac -n cpaas-system get infraclusterversion <cluster-name> \
+  -o jsonpath='{range .status.conditions[*]}{.type}={.status} {.reason}: {.message}{"\n"}{end}'
+ac -n cpaas-system get infraclusterversion <cluster-name> \
+  -o jsonpath='{range .status.hops[*]}{.kubernetesVersion}{"\t"}{.phase}{"\n"}{end}{range .status.steps[*]}{.name}{"\t"}{.phase}{"\t"}{.message}{"\n"}{end}'
+ac -n cpaas-system get events --field-selector involvedObject.kind=InfraClusterVersion,involvedObject.name=<cluster-name>
+```
+
+```text
+NAME        PROVIDER     CURRENT         DESIRED         PHASE         HOLDER                     AGE
+cluster-1   DCSCluster   v1.35.6-acp.9   v1.36.4-acp.3   Progressing   cluster-api-provider-dcs   128d
+```
+
+`CURRENT` advances after each intermediate Kubernetes version completes; `DESIRED` is the target. `PHASE` moves from `Pending` to `Preparing` (no node is replaced yet), `Progressing` (nodes are replaced one at a time; on Bare Metal, hosts are reinstalled), and `Succeeded`. There is no failed phase: a problem shows as `Stalled=True`, see [Stalled Reasons](#infra-stalled). On Bare Metal, a worker node pool that is not replaced at an intermediate version shows the step phase `Skipped`.
+
+The Kubernetes upgrade is complete when `PHASE` is `Succeeded` and `Ready` is `True`. The `Ready` message `kube-proxy rollout pending` also means complete: kube-proxy is still rolling out; check the `kube-system/kube-proxy` DaemonSet on the cluster. While the upgrade runs, do not edit the `KubeadmControlPlane`, the `MachineDeployment` resources, their templates, the VM template ConfigMaps (Huawei DCS), or `elemental-image-catalog` (Bare Metal).
+
+### Stalled Reasons \{#infra-stalled}
+
+A problem shows as the `InfraClusterVersion` condition `Stalled=True`. Its message names the affected resources and the next action. In `Preparing`, no node has been replaced: fix the cause, and the platform retries automatically within 15 minutes. In `Progressing`, the upgrade waits where it is and continues as soon as the cause is cleared.
+
+<Tabs>
+  <Tab label="Huawei DCS">
+
+| Reason | Meaning | What to do |
+| --- | --- | --- |
+| A check reason, such as `ImageCatalogMiss`, `ImageNotFound`, `UnsupportedTopology`, or `RolloutMaxSurgeNotZero` | Planning found the same problem as the check. | Fix it as described in [Kubernetes Upgrade Checks](#infra-preflight-checks). |
+| `NodeJoinFailed` | A new VM has not joined the cluster 20 minutes after it became ready. A common cause is an etcd tag in the VM template ConfigMap that does not match the images in the VM template. | On the VM, read `journalctl -u kubeadm`. If kubeadm failed in its own preflight, delete the named `Machine`; a new one is created. If kubeadm got past its preflight, confirm that the machine is not an etcd member before you delete it. |
+| `RolloutFailed` | A `Machine` failed, a new machine was not `Running` and healthy 60 minutes after it was created, or the control plane reported unhealthy components or etcd for more than 60 minutes. | Inspect the named `Machine` and `DCSMachine` resources. For unhealthy control plane components, check the static Pods on the new VMs with `crictl ps -a` and `journalctl -u kubelet`. |
+
+  </Tab>
+  <Tab label="Bare Metal">
+
+| Reason | Meaning | What to do |
+| --- | --- | --- |
+| A check reason, such as `ImageCatalogMiss`, `ImageNotFound`, `NoSpareInventory`, or `FailedMachinesPresent` | Planning found the same problem as the check. | Fix it as described in [Kubernetes Upgrade Checks](#infra-preflight-checks). |
+| `RolloutFailed` | A `BaremetalMachine` is `Failed`, a new machine was not `Running` with a healthy Node 90 minutes after it was created, or the control plane reported unhealthy components or etcd for more than 90 minutes. | Fix the cause reported by the `BaremetalMachine`, such as `COS_STATE` space or a missing catalog key. Remove a faulty host from the pool's `spec.machineInventories`, because the pool can select it again. Then delete the `Machine`; a new one is created. A `Failed` machine does not recover on its own. |
+| `NodeJoinFailed` | A reinstalled host has not joined the cluster 20 minutes after its `BaremetalMachine` became ready. | On the host, read `journalctl -u kubelet` and the cloud-init log. Confirm that the machine is not an etcd member, then delete the `Machine`. |
+| `PoolExhausted` | A new machine has waited more than 15 minutes for an `Available` host. Shorter waits are normal while a replaced host is cleaned. | Add a host to the pool, or repair its `Unavailable` hosts. |
+
+  </Tab>
+</Tabs>
+
+If `PHASE` stays `Pending` and the upgrade status reports `InfraClusterVersionUnconsumed`, check that the Deployment `cluster-api-provider-dcs-icv-controller` (Huawei DCS) or `cluster-api-provider-baremetal-icv-controller` (Bare Metal) in `cpaas-system` on the `global` cluster is running.
+
+Before you change a Cluster API resource of the cluster by hand during an upgrade, stop this `InfraClusterVersion` controller on the `global` cluster that manages the cluster, and start it again when you are done; otherwise it continues the upgrade while you work. On Bare Metal, this includes deleting a `Machine`.
+
+:::warning
+Stopping the `InfraClusterVersion` controller pauses the upgrade of every cluster of that provider on this `global` cluster. Start it again as soon as your change is done.
+:::
+
+```bash
+CONTROLLER=cluster-api-provider-dcs-icv-controller   # Bare Metal: cluster-api-provider-baremetal-icv-controller
+ac -n cpaas-system scale deployment "${CONTROLLER}" --replicas=0
+# ... manual changes ...
+ac -n cpaas-system scale deployment "${CONTROLLER}" --replicas=1
+```
+
+### Free Space on COS_STATE (Bare Metal) \{#check-cos-state-free-space}
+
+Each Bare Metal host needs at least 4 GiB free on its `COS_STATE` partition to install the new OS image. A host that runs short fails with `no space left on device`, and each failed attempt leaves a partial snapshot that reduces the free space further. Check every host of the affected pools, because any `Available` host can receive the new image. On each host, read the free space and the snapshots. Use `btrfs`, not `df`, because `df` does not count snapshots. `Free (estimated)` must be at least 4 GiB:
+
+```bash
+btrfs filesystem usage -h /
+snapper --no-dbus list
+```
+
+#### Remove Partial Snapshots \{#remove-partial-snapshots}
+
+A snapshot left by a failed attempt shows `no` in the `default` and `active` columns and `update-in-progress=yes` in its userdata. On the host, list the snapshots, then delete only snapshots that match all three conditions:
+
+:::warning
+Never delete a snapshot whose `default` or `active` column is `yes`. The host boots the default snapshot and runs the active one; deleting either leaves the host unable to boot.
+:::
+
+```bash
+snapper --no-dbus --csvout list --columns number,default,active,userdata
+snapper --no-dbus delete --sync <number>
+```
+
+Run `btrfs filesystem usage -h /` again to confirm that the space was reclaimed. If the deletion fails, or the host still has less than 4 GiB free, the partition is too small. A host whose `COS_STATE` has the default 8 GiB size, which it gets when the host installation does not [size COS_STATE](../workload_clusters/alauda_os/bare-metal/create_cluster.mdx#size-cos-state), needs a reinstall with a larger partition. Reinstall such hosts before you upgrade the cluster; a reinstall replaces the node. If a host cannot be reinstalled, contact technical support.
+
+### Hosts on a Different Image (Bare Metal) \{#correct-image-mismatch}
+
+If `elemental-image-catalog` changed during the upgrade, some reinstalled hosts can run another image than the catalog now lists. The upgrade still completes and reports a Warning event `ImageMismatch` that names the `BaremetalMachine` objects and both images. After the cluster's `InfraClusterVersion` is `Succeeded`, confirm that the catalog holds the image you want. Then, on the `global` cluster, start a new rollout of the affected node group; its hosts are reinstalled according to the rollout settings, from the image now in the catalog:
+
+```bash
+ac -n cpaas-system patch machinedeployment <md-name> --type merge \
+  -p "{\"spec\":{\"rolloutAfter\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}}"
+ac -n cpaas-system patch kubeadmcontrolplane <kcp-name> --type merge \
+  -p "{\"spec\":{\"rolloutAfter\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}}"
+```
+
+### Node Replacement Symptoms (Bare Metal) \{#bm-node-replacement}
+
+| Symptom | What to check |
+| --- | --- |
+| The rollout stops at the first new node | The `ImageResolved` condition of the new `BaremetalMachine`: the key is in `elemental-image-catalog`, and the `Cluster` carries `cpaas.io/registry-address`. |
+| A host does not become allocatable after it is cleaned | `MachineInventory.status.storage` and `status.observedStorage`. Managed volumes must be reported inactive and prepared by a fresh host observation before the host can be allocated again. |
+| A new `BaremetalMachine` reports `StorageReady=False` | The selected inventory is the intended one, the required device IDs and filesystem UUIDs still match, the required mount units are active, and the host reported a fresh observation after the reboot. |
+| A host reboots but never joins the cluster | `MachineInventory.status.plan.state` (`Failed` is final). Read the `elemental upgrade` errors on the host's serial console, and check that the platform registry is reachable from the host. |
+| A new control-plane node fails `kubeadm join` | The control-plane VIP is reachable. Check `ac -n kube-system get lease` on the cluster being upgraded, and, on its control-plane nodes, `ipvsadm -Ln` and the `keepalived` logs of the static Pod. |
+
+## Manual Kubernetes Upgrade on Huawei Cloud Stack or VMware vSphere \{#manual-kubernetes-upgrade}
+
+The platform does not pre-check the manual Kubernetes upgrade. Do not set versions or machine templates back to earlier values: fix the cause and continue, or contact technical support. The `KubeadmControlPlane` controller does not replace machines while etcd is unhealthy. If replacement stops for that reason, or a new control-plane machine was created but never joined, do not remove machines or change version fields; restore etcd quorum, or contact technical support.
+
+<Tabs>
+  <Tab label="Huawei Cloud Stack">
+
+| Symptom | What to check |
+| --- | --- |
+| New nodes do not join the cluster | The Kubernetes version of the Alauda OS image in the new `HCSMachineTemplate` matches the `spec.version` you set. Different versions cause join failures. |
+| Data is missing on a replaced node | Only disks in `HCSMachineConfigPool.spec.configs[].persistentDisks[]` keep their data. Disks in `HCSMachineTemplate.spec.template.spec.dataVolumes[]` are lost with the old VM. |
+
+  </Tab>
+  <Tab label="VMware vSphere">
+
+| Symptom | What to check |
+| --- | --- |
+| An edit or patch of the `KubeadmControlPlane` is rejected | [Set the Rollout Settings](./pre-upgrade.mdx#rollout-settings). For the message-to-cause map, see [Admission rejections](../workload_clusters/alauda_os/vmware-vsphere/create_cluster.mdx#admission-rejections). |
+| A `VSphereMachineTemplate` update is rejected as immutable | Create a new template under a new name. |
+| The rollout stops after the first machine is deleted, the pool reports `SlotAvailable=False`, or a powered-off node stays off | Usually expected; see [vSphere Rollout Holds That Are Not Failures](#rollout-holds). |
+| Data is missing on a replaced node | Only disks in `VSphereMachineConfigPool.spec.configs[].persistentDisks[]` keep their data. Disks in `ephemeralDisks[]` start empty on every replacement. |
+| Nothing reconciles on a workload cluster, and no condition or error changes | You may be working on a standby `global` cluster. If `ac -n kube-public get configmap etcd-sync -o name` returns the ConfigMap, run the workload cluster upgrade on the primary `global` cluster, through `ac login` and not with the standby kubeconfig. |
+| A new control-plane machine never bootstraps | The `BootstrapReady` condition of the `VSphereVM` and `VSphereMachine`; the reasons are `BootstrapSecretGetFailed` and `BootstrapSecretContentInvalid`. |
+| `kube-proxy` or `coredns` still uses the old image repository after the control plane reaches the target version | Expected: they are updated only after the control-plane rollout completes. |
+
+  </Tab>
+</Tabs>
+
+### vSphere Rollout Holds That Are Not Failures \{#rollout-holds}
+
+Some pauses during a vSphere rollout protect data. Do not clear them by hand.
+
+- **Attachment-safety hold.** While an old VM still has the slot's persistent disks attached, the provider keeps the deletion of the `VSphereVM` pending. A rollout that seems stuck at the deletion of the first old machine is often this hold. Do not remove the finalizer.
+- **`Reclaimed` is a tombstone.** Do not delete a `phase: Reclaimed` entry to unstick a rollout.
+- **`SlotAvailable=False` is expected.** With `maxSurge: 0` and a fully allocated pool, no slot is free until an old machine is deleted.
+- **Power state.** A node that is powered off in vCenter stays off until you power it on there. A replacement VM is powered on, even if the node it replaces was off before the upgrade.
+
+On the `global` cluster, read the disk handoff and the pending deletions. The normal handoff is `Attached`, then `Available` once the old VM is gone, then `Attached` again on the replacement:
+
+```bash
+ac -n <namespace> get vspheremachineconfigpool <pool-name> \
+  -o jsonpath='{range .status.persistentDiskStatuses[*]}{.hostname}{" "}{.name}{" "}{.phase}{" owner="}{.ownerMachineName}{" err="}{.lastError}{"\n"}{end}'
+ac -n <namespace> get vspherevm -o custom-columns='NAME:.metadata.name,DELETED:.metadata.deletionTimestamp,FINALIZERS:.metadata.finalizers'
+```
+
+## Kube-OVN and CoreDNS Takeover Is Blocked \{#core-addons-handoff-blocked}
+
+On an Alauda OS cluster upgraded from a version earlier than v4.5, the platform takes over Kube-OVN and CoreDNS after the cluster and `global` both run v4.5. On the `global` cluster that manages the cluster, read the state from the cluster resource of its provider, `dcscluster`, `baremetalcluster`, `hcscluster`, or `vspherecluster`:
+
+```bash
+ac -n cpaas-system get <provider-cluster-resource> <cluster-name> \
+  -o jsonpath='{range .status.conditions[?(@.type=="CoreAddonsHandedOff")]}{.status}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
+```
+
+- `True`: the platform manages Kube-OVN and CoreDNS.
+- `False` with `CoreAddonsHandoffPending` or `CoreDNSSkipPhasePending`: the takeover is waiting, for example for a node rollout to finish. Check again later; if it does not change, contact technical support.
+- `False` with `CoreAddonsHandoffNotApplicable`: the cluster is not on v4.5 yet; check again after its upgrade completes. If it still reports this reason then, contact technical support.
+- `False` with `CoreAddonsHandoffBlocked`: the message names the setting. Contact technical support.
+- No output: the cluster does not use Kube-OVN, and there is nothing to take over.
+
+While the takeover is blocked, the cluster does not pass validation, and on Huawei Cloud Stack and VMware vSphere the Kubernetes upgrade of the cluster cannot start.
+
+## Recover a Missing Aligned Extension Package \{#recover-missing-aligned-package}
+
+Use this section when the target `ProductManifest` is not `Ready` after you deploy CVO, or when the upgrade status reports that an installed platform-aligned component `has no ready ModulePluginConfig`. A missing package does not change what is installed now. CVO can report it as `Ready=False` or `Reconciling=True` instead of `Stalled=True`.
+
+On the `global` cluster, list the artifacts of the target release that are not `Ready`. Entries for optional components, for Extensions with the `Agnostic` lifecycle, or for components that are not installed can legitimately appear; compare the output with the installed Core and Aligned Extensions:
+
+```bash
+ac get productmanifest v<target-version> -o json | jq -r '
+  .status.artifacts[] as $artifact
+  | $artifact.channels[]
+  | select(.artifactStatus != "Ready")
+  | [$artifact.name, .channel, .tag, .artifactStatus]
+  | @tsv'
+```
 
 ### Aligned Cluster Plugins
 
-If a `ClusterVersionShadow` condition contains `required ready ModulePluginConfig for installed platform-aligned component`, identify the target `ProductManifest` and the named `ModulePluginConfig`:
+`artifactStatus: Absent` means that the matching `ModulePluginConfig` is not fully `Ready`; it does not prove that the image is missing from the registry. On the `global` cluster, inspect the `ModulePluginConfig` named in the message, or identified by the component name and channel tag from the output above:
 
 ```bash
-kubectl get productmanifest v<target-version> -o yaml
-
-kubectl get modulepluginconfig <modulepluginconfig-name> \
+ac get modulepluginconfig <modulepluginconfig-name> \
   -o jsonpath='{.spec.image}{"\n"}{range .status.conditions[*]}{.type}{"\t"}{.status}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
 ```
 
-For a ModulePlugin channel, `artifactStatus: Absent` in the target `ProductManifest` means that the matching target `ModulePluginConfig` is not fully Ready. It does not mean that the currently installed application became absent, and it does not by itself prove that the image is missing from the registry.
-
-Use the `ModulePluginConfig` condition and the exact image in `.spec.image` to select the recovery:
-
 | Evidence | Recovery |
 | --- | --- |
-| The named `ModulePluginConfig` does not exist | Inspect the target `ProductManifest` conditions and controller reconciliation. A missing object does not by itself prove that the package image is absent. |
-| `ResolveDigestFailed` reports `manifest unknown` or `not found`, or the registry confirms that `.spec.image` is absent | Republish the exact target package by using the applicable method below. |
-| The condition reports `unauthorized`, `denied`, or another authentication error | Correct the registry credentials or repository permissions, then let the existing request retry. |
-| The condition reports an `x509` or certificate trust error | Correct the registry certificate chain or node trust configuration. |
-| The condition reports DNS, routing, timeout, or connection errors | Restore registry reachability from the component that performs the resolution. |
-| `LoadModulePluginFailed` | Inspect the package contents and `module-plugin.yaml`; publish a corrected package only after confirming the package is invalid. |
+| The named `ModulePluginConfig` does not exist | Inspect the conditions of the target `ProductManifest`. A missing object does not by itself prove that the package is absent. |
+| `ResolveDigestFailed` reports `manifest unknown` or `not found`, or the registry confirms that `.spec.image` is absent | Publish the exact target package again, as described below. |
+| An authentication (`unauthorized`, `denied`), certificate (`x509`), DNS, routing, timeout, or connection error | Correct the registry credentials, the certificate trust, or the network access from the component that resolves the image. |
+| `LoadModulePluginFailed` | Inspect the package contents and `module-plugin.yaml`. Publish a corrected package only after you confirm that the package is invalid. |
 
-- For an application in **ACP Upgrade to v4.5**, copy its package into the target Core Package's `plugins/` directory. With the platform built-in Registry, rerun `upgrade.sh --only-sync-image`. With an external registry, rerun both modes in [Prepare the Target-Version Payload](../install/prepare/external-platform-image-registry.mdx#prepare-the-target-version-payload).
-- For another Aligned cluster plugin, publish the target package to the global tier with `violet push`.
+- For a plugin of the `Upgrade from ACP 4.3 or earlier` scenario, copy its package into the `plugins/` directory of the target Core Package, then publish again as described in [Publish Core and the Staged Packages](./pre-upgrade.mdx#publish-core).
+- For another Aligned Cluster Plugin, publish the target package with `violet push` to the `global` cluster whose upgrade reports it.
 
 ### Aligned Operators
 
-Aligned operators do not use `ModulePluginConfig`. If an installed operator does not advance, inspect its `Subscription`, target `InstallPlan`, catalog, and `ModuleInfo` on the affected cluster:
+Aligned Operators do not use `ModulePluginConfig`. On the affected cluster, inspect the `Subscription`, the target `InstallPlan`, and the catalog; on the `global` cluster, inspect the `ModuleInfo`:
 
 ```bash
-kubectl get subscription -A
-kubectl get installplan -A
-kubectl get moduleinfo -l cpaas.io/cluster-name=<cluster>
+ac config use-cluster <cluster-name>   # the affected cluster
+ac get subscription -A
+ac get installplan -A
+ac config use-cluster global
+ac get moduleinfo -l cpaas.io/cluster-name=<cluster-name>
 ```
 
-If the target operator package is missing, publish it to every cluster where that operator is installed. If only one workload cluster is missing it, push to that cluster with `--clusters "<workload-cluster-name>"`. If the package exists, resolve the `Subscription`, `InstallPlan`, catalog, or `ModuleInfo` condition actually reported by CVO.
+If the target Operator package is missing, publish it to every cluster where the Operator is installed; for one workload cluster, use `violet push` with `--clusters "<cluster-name>"`. If the package exists, resolve the condition that CVO reports. Then watch the existing request with `ac adm upgrade status --cluster=<cluster-name>`; CVO retries automatically.
 
-Continue observing the existing request after correcting the problem. CVO retries automatically; do not clear or resubmit `desiredUpdate`.
+## Diagnose a Module That Does Not Advance \{#module-not-advancing}
 
-## Diagnose a Module That Does Not Advance
+On the `global` cluster, list the modules of the cluster, then read the conditions of the one that does not advance. Inspect the resource named in the condition and its Events; for an image pull failure, check registry access, CA trust, pull credentials, and the referenced manifest from the affected node:
 
 ```bash
-kubectl get moduleinfo -l cpaas.io/cluster-name=<cluster> \
-  -o custom-columns='MODULE:.metadata.labels.cpaas\.io/module-name,CURRENT:.status.version,TARGET:.spec.version,NEW:.status.availableVersions[0].version,PHASE:.status.phase'
-
-kubectl get moduleinfo <name> \
+ac get moduleinfo -l cpaas.io/cluster-name=<cluster-name> \
+  -o custom-columns='MODULE:.metadata.labels.cpaas\.io/module-name,CURRENT:.status.version,TARGET:.spec.version,AVAILABLE:.status.availableVersions[*].version,PHASE:.status.phase'
+ac get moduleinfo <moduleinfo-name> \
   -o jsonpath='{range .status.conditions[*]}{.type}{"\t"}{.status}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
 ```
 
-Inspect the named resource and related Events. For image-pull failures, verify registry reachability, CA trust, pull credentials, and the referenced manifest from the affected node.
+## Global Cluster Disaster Recovery Does Not Synchronize \{#dr-sync-diagnostics}
 
-## Collect Evidence Before Escalation
+Use this section when the Pods of the Alauda Container Platform Global Cluster Disaster Recovery plugin are not `Running`, or the `/check` command does not report `localMissedKeys [0]` and `localSurplusKeys [0]`. Run every command on the standby `global` cluster: export its kubeconfig, and confirm that `ac whoami --show-server` prints the VIP of the standby. The `etcd-sync-bootstrap` Job runs before the synchronization starts: check the Job and the credentials it creates (if the Job failed, its log names the failing step), then the synchronization Pods and the current leader:
 
-Capture the `cvsh` conditions, preflight checks, stages and history, the affected `ModuleInfo` or `ModulePluginConfig`, related Events, and the exact source and target versions. Do not include platform tokens, registry passwords, or Secret contents.
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
+ac get job -n cpaas-system etcd-sync-bootstrap
+ac logs -n cpaas-system job/etcd-sync-bootstrap
+ac get secret -n cpaas-system remote-etcd-ca remote-etcd-client
+ac get issuer -n cpaas-system remote-etcd-issuer
+ac get certificate -n cpaas-system remote-etcd-client
+ac get po -n cpaas-system -l app=etcd-sync
+ac get lease -n cpaas-system etcd-sync-mirror
+leader_pod=$(ac get lease -n cpaas-system etcd-sync-mirror -o jsonpath='{.spec.holderIdentity}')
+ac logs -n cpaas-system "$leader_pod" | grep -E "Acquired leader lease|Start Sync update"
+unset KUBECONFIG
+```
+
+In the `/check` output, the keys under `localSurplusKeys` (lines starting with `+`) exist on the standby but not on the primary; review them with your operations team before you delete them. The keys under `localMissedKeys` (lines starting with `-`) exist on the primary but not on the standby; this often resolves after you recreate the current leader Pod. Recreate it also when resources with `ownerReference` dependencies must be synchronized again. Wait until `Start Sync update` appears in its log, then run on the standby:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+leader_pod=$(ac get lease -n cpaas-system etcd-sync-mirror -o jsonpath='{.spec.holderIdentity}')
+ac delete po -n cpaas-system "$leader_pod"
+unset KUBECONFIG
+```
+
+Run the `/check` command again. If it still does not report `localMissedKeys [0]` and `localSurplusKeys [0]`, or a Pod is not `Running`, contact technical support.
+
+## Collect Evidence Before Escalation \{#collect-evidence}
+
+Record the source and target ACP versions, the affected `ModuleInfo` or `ModulePluginConfig`, and, for a manual Kubernetes upgrade, the `KubeadmControlPlane`, `MachineDeployment`, and `Machine` status. Do not include tokens, registry passwords, kubeconfig files, or Secret contents. On the `global` cluster that manages the cluster, also save the upgrade state and, on Huawei DCS and Bare Metal, the Kubernetes upgrade state:
+
+```bash
+ac config use-cluster global
+ac adm upgrade status --cluster=<cluster-name> --verbose > upgrade-status.txt
+ac -n cpaas-system get infraclusterversion <cluster-name> -o yaml > infraclusterversion.yaml
+ac -n cpaas-system get infraclusterversionpreflight -l upgrade.alauda.io/cluster=<cluster-name> -o yaml > infraclusterversionpreflight.yaml
+ac -n cpaas-system get events --sort-by=.lastTimestamp > events.txt
+```

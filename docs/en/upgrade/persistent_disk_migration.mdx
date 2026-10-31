@@ -1,0 +1,414 @@
+---
+weight: 25
+title: Migrate to Pool-Managed Persistent Disks
+category: howto
+queries:
+  - migrate huawei dcs cluster to pool-managed persistent disks
+  - migrate huawei cloud stack cluster to pool-managed persistent disks
+  - keep /var/cpaas when nodes are replaced
+---
+
+# Migrate to Pool-Managed Persistent Disks
+
+Use this page for a Huawei DCS or Huawei Cloud Stack cluster that still keeps platform data, such as `/var/cpaas`, on disks declared in its machine template. After the migration, these disks are declared in the machine pool, and the upgrade keeps them when it replaces the nodes. Migrate every affected cluster, the `global` cluster included.
+
+:::warning
+Complete the migration before you upgrade the cluster. It replaces every node of the cluster with a new VM, one at a time.
+:::
+
+Run the commands from the execution host, after `ac login`, on the `global` cluster that manages the cluster: the `global` cluster itself, with `global` as `<cluster-name>`, or the primary `global` cluster for a workload cluster. In a DR environment, migrate each `global` cluster; for the standby, use its kubeconfig instead of `ac login`. All objects are in the `cpaas-system` namespace.
+
+## Before You Start \{#before-you-start}
+
+Select the `global` cluster that runs the commands, and confirm that the printed address ends with `/kubernetes/global/`:
+
+```bash
+ac config use-cluster global
+ac whoami --show-server
+```
+
+For the standby `global` cluster in a DR environment, replace the first command with `export KUBECONFIG=<standby-kubeconfig>`; the second command then prints the VIP of the standby, and every later `ac` command on this page uses this kubeconfig. Run `unset KUBECONFIG` when the migration of the standby is complete.
+
+Also confirm that all nodes of the cluster are `Ready`, and that the cluster has a recent successful etcd backup, as described in [Check the etcd Backup](./pre-upgrade.mdx#etcd-backup).
+
+Then run the following checks on the same cluster.
+
+### Check the Provider Requirements \{#migration-provider-requirements}
+
+<Tabs>
+<Tab label="Huawei DCS">
+
+- The cluster runs ACP v4.2.1 or later, as read in [Check Cluster Versions](./pre-upgrade.mdx#check-compatibility), and its VM templates are v4.2.1 or later.
+- Guest tools (`vmtools`) run inside the VMs.
+- Each node has a fixed IP entry in a `DCSIpHostnamePool`.
+- You can read the disks of each VM, with their `sequenceNum`, from the DCS platform or the DCS API (`QueryVmInfo`).
+
+Then confirm that the provider supports the field:
+
+```bash
+ac explain dcsiphostnamepools.spec.pool.persistentDisk
+```
+
+Continue when every item above holds and the command describes the field; otherwise, contact technical support.
+
+</Tab>
+<Tab label="Huawei Cloud Stack">
+
+- The cluster runs ACP v4.3.1 or later, as read in [Check Cluster Versions](./pre-upgrade.mdx#check-compatibility).
+- The cluster assigns fixed hostnames and IP addresses through `HCSMachineConfigPool`.
+- Every disk to keep has a non-empty `mountPath` in `HCSMachineTemplate.spec.template.spec.dataVolumes[]`.
+
+Then confirm that the provider supports the field:
+
+```bash
+ac explain hcsmachineconfigpools.spec.configs.persistentDisks
+```
+
+Continue when every item above holds and the command describes the field; otherwise, contact technical support.
+
+</Tab>
+</Tabs>
+
+### Check the Rollout Settings \{#migration-rollout-settings}
+
+```bash
+ac -n cpaas-system get clusters.cluster.x-k8s.io <cluster-name> \
+  -o jsonpath='{.spec.controlPlaneRef.name}{"\n"}'
+ac -n cpaas-system get kubeadmcontrolplane <kcp-name> \
+  -o jsonpath='replicas={.spec.replicas} maxSurge={.spec.rolloutStrategy.rollingUpdate.maxSurge}{"\n"}'
+ac -n cpaas-system get kubeadmcontrolplane <kcp-name> \
+  -o custom-columns='NAME:.metadata.name,TEMPLATE:.spec.machineTemplate.infrastructureRef.name'
+ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=<cluster-name> \
+  -o custom-columns='NAME:.metadata.name,SURGE:.spec.strategy.rollingUpdate.maxSurge,UNAVAILABLE:.spec.strategy.rollingUpdate.maxUnavailable,TEMPLATE:.spec.template.spec.infrastructureRef.name'
+```
+
+The first command prints the KubeadmControlPlane name, `<kcp-name>`. The `TEMPLATE` columns list the machine templates in use; the procedure works on each of them.
+
+| Result | Action |
+|---|---|
+| `replicas` is 3 or more and `maxSurge` is `0`, and every MachineDeployment shows `SURGE` `0` and `UNAVAILABLE` `1` | Continue. |
+| `replicas` is less than 3 | Contact technical support. |
+| `replicas` is 3 or more and `maxSurge` is empty or not `0` | Run the `kubeadmcontrolplane` command below. |
+| A MachineDeployment shows `SURGE` empty or not `0`, or `UNAVAILABLE` empty or not `1` | Run the `machinedeployment` command below for it. |
+
+```bash
+ac -n cpaas-system patch kubeadmcontrolplane <kcp-name> --type=merge \
+  -p '{"spec":{"rolloutStrategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":0}}}}'
+ac -n cpaas-system patch machinedeployment <machinedeployment-name> --type=merge \
+  -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":0,"maxUnavailable":1}}}}'
+```
+
+### Check the Pools for Free Entries \{#migration-free-entries}
+
+Check each pool that the cluster uses, control-plane and worker pools alike:
+
+<Tabs>
+<Tab label="Huawei DCS">
+
+The last command prints the type and the address of the control-plane load balancer of the cluster:
+
+```bash
+ac -n cpaas-system get dcsiphostnamepool \
+  -o custom-columns='NAME:.metadata.name,IPS:.spec.pool[*].ip,DISKS:.spec.pool[*].persistentDisk[*].path,KEPT_DISKS:.status.persistentDiskStatus[*].ip'
+ac -n cpaas-system get dcsmachine -l cluster.x-k8s.io/cluster-name=<cluster-name> -o custom-columns='NAME:.metadata.name,POOL:.spec.ipHostPoolRef.name,IP:.status.networkConfig.ip'
+ac -n cpaas-system get dcscluster <cluster-name> -o jsonpath='{.spec.controlPlaneLoadBalancer.type}{" "}{.spec.controlPlaneLoadBalancer.host}{"\n"}'
+```
+
+Check each pool in the `POOL` column. A free entry is an IP address of the pool that no machine of the cluster uses and that is not the load balancer address when the type is `internal`.
+
+</Tab>
+<Tab label="Huawei Cloud Stack">
+
+Read the pool of each template in the `TEMPLATE` columns, then each pool in `POOL`:
+
+```bash
+ac -n cpaas-system get hcsmachinetemplate <template-name> -o custom-columns='NAME:.metadata.name,POOL:.spec.template.spec.configPoolRef.name'
+ac -n cpaas-system get hcsmachineconfigpool <pool-name> \
+  -o custom-columns='NAME:.metadata.name,TOTAL:.status.totalCount,AVAILABLE:.status.availableCount,DISKS:.spec.configs[*].persistentDisks[*].mountPath,HOSTNAMES:.spec.configs[*].hostname,USED:.status.usedConfigs[*].hostname'
+```
+
+</Tab>
+</Tabs>
+
+| Result | Action |
+|---|---|
+| Huawei DCS: the pools have no free entry. Huawei Cloud Stack: each pool in `POOL` shows `AVAILABLE` empty or `0` | Continue. |
+| Huawei DCS: a free entry is not in `KEPT_DISKS` | Remove it from `spec.pool` with `ac -n cpaas-system edit dcsiphostnamepool <pool-name>`. Keep the entry of the internal load balancer address. |
+| Huawei DCS: a free entry is in `KEPT_DISKS` | Contact technical support. Do not remove the entry. |
+| Huawei Cloud Stack: a pool in `POOL` shows `AVAILABLE` greater than `0` | Run `ac -n cpaas-system edit hcsmachineconfigpool <pool-name>` and remove the free configurations, the ones in `HOSTNAMES` that are not in `USED`, from `spec.configs`. |
+| Huawei Cloud Stack: the edit is rejected for a free configuration that was used before | Contact technical support. |
+
+## Migration Procedure \{#migration-procedure}
+
+Do each step for the control plane template and for every MachineDeployment template that you listed.
+
+<Steps>
+
+### Inspect the Disks and Choose Which to Keep \{#choose-disks}
+
+<Tabs>
+<Tab label="Huawei DCS">
+
+List the VMs of the cluster and the pools:
+
+```bash
+ac -n cpaas-system get dcsmachine -l cluster.x-k8s.io/cluster-name=<cluster-name>
+ac -n cpaas-system get dcsiphostnamepool
+```
+
+For every disk to keep on each VM, record:
+
+- From the DCS platform or the VM details of the DCS API (`QueryVmInfo`): `sequenceNum`, size (`quantityGB`), `pciType`, and the volume URN (`volumeUrn`).
+- From the entry of the disk in `spec.template.spec.vmConfig.dcsMachineDiskSpec[]` of the current `DCSMachineTemplate`: `path`, `format`, and `datastoreName` or `datastoreClusterName`. The data disk entries follow the old disk order, after the system disk.
+
+A disk can be kept only if it sits at the end of the old disk order. Compute its `slot` in the pool from its old `sequenceNum`:
+
+```text
+slot = oldSequenceNum - systemDiskCount - newTemplateDataDiskCount - 1
+```
+
+`systemDiskCount` is `1`. `newTemplateDataDiskCount` is the number of non-system disks that stay in the template after the migration. The `slot` must be `0` or greater and unique within the IP entry. If a disk gives a negative `slot`, either also move the disks between it and the end of the old order to the pool, or accept that the disk is deleted with the old VM.
+
+For example, with the old disk order 1 system disk, 2 `/var/lib/kubelet`, 3 `/var/lib/etcd`, 4 `/var/lib/containerd`, 5 `/var/cpaas`, and a new template that keeps every data disk that is not moved:
+
+| Disks to keep | Old `sequenceNum` | Data disks left in the template | `slot` | Can be kept |
+|---|---|---|---|---|
+| `/var/cpaas` | 5 | 3 (`/var/lib/kubelet`, `/var/lib/etcd`, `/var/lib/containerd`) | `5 - 1 - 3 - 1 = 0` | Yes |
+| `/var/lib/containerd` and `/var/cpaas` | 4, 5 | 2 (`/var/lib/kubelet`, `/var/lib/etcd`) | `0` and `1` | Yes |
+| `/var/lib/etcd` only | 3 | 3 (`/var/lib/kubelet`, `/var/lib/containerd`, `/var/cpaas`) | `3 - 1 - 3 - 1 = -2` | No |
+
+</Tab>
+<Tab label="Huawei Cloud Stack">
+
+Read each template in use, and record its pool in `spec.template.spec.configPoolRef.name`:
+
+```bash
+ac -n cpaas-system get hcsmachinetemplate <template-name> -o yaml
+```
+
+The provider claims an existing data volume by its `mountPath`. For every entry of `spec.template.spec.dataVolumes[]` to keep, record `mountPath`, `size`, `type`, and `format`. Keep only the disks that must survive node replacement:
+
+| Path | Declare in |
+|---|---|
+| `/var/cpaas`, including monitoring and log data under it | `HCSMachineConfigPool.spec.configs[].persistentDisks[]` |
+| `/var/lib/kubelet`, `/var/lib/containerd` | `HCSMachineTemplate.spec.template.spec.dataVolumes[]`, unless your design requires keeping them |
+| `/var/lib/etcd` | Do not rely on keeping this disk; protect etcd with etcd backups |
+
+</Tab>
+</Tabs>
+
+### Update the Machine Template \{#update-template}
+
+<Tabs>
+<Tab label="Huawei DCS">
+
+Edit each template in place and keep its name:
+
+```bash
+ac -n cpaas-system get dcsmachinetemplate <template-name> -o yaml > current-template.yaml
+```
+
+In `current-template.yaml`:
+
+- In `spec.template.spec.vmConfig.dcsMachineDiskSpec[]`, keep the system disk and the disks that may be recreated with the VM. Remove every disk to keep, and the disks that you move with it to make it claimable.
+- Keep `metadata.name`. Remove `metadata.resourceVersion`, `metadata.uid`, `metadata.creationTimestamp`, and `metadata.managedFields`.
+
+Then apply it with `ac apply -f current-template.yaml`.
+
+</Tab>
+<Tab label="Huawei Cloud Stack">
+
+Create a new template for each template in use; do not edit the old one:
+
+```bash
+ac -n cpaas-system get hcsmachinetemplate <current-template-name> -o yaml > new-template.yaml
+```
+
+In `new-template.yaml`:
+
+- Set `metadata.name` to a new name. Remove `metadata.resourceVersion`, `metadata.uid`, `metadata.creationTimestamp`, `metadata.managedFields`, and `status`.
+- Leave `spec.template.spec.providerID` and `spec.template.spec.serverId` unset.
+- Remove the disks to keep from `spec.template.spec.dataVolumes[]`, so that it lists only disks that may be recreated with the VM. Keep every other field, `imageName` included.
+
+Then create it with `ac apply -f new-template.yaml`.
+
+</Tab>
+</Tabs>
+
+### Update the Pool \{#update-pool}
+
+<Tabs>
+<Tab label="Huawei DCS">
+
+Edit the `DCSIpHostnamePool` that the template references in `spec.template.spec.ipHostPoolRef.name`:
+
+```bash
+ac -n cpaas-system edit dcsiphostnamepool <pool-name>
+```
+
+Under the IP entry of each node, add one `persistentDisk` entry for each disk to keep, with the `slot` you computed:
+
+```yaml
+  pool:
+  - ip: "<node-ip>"
+    mask: "<mask>"
+    gateway: "<gateway>"
+    dns: "<dns>"
+    hostname: "<hostname>"
+    machineName: "<machine-name>"
+    persistentDisk:
+    - slot: <calculated-slot>
+      quantityGB: 40
+      datastoreClusterName: <datastore-cluster-name>
+      path: /var/cpaas
+      format: xfs
+      pciType: VIRTIO
+```
+
+The existing disk is claimed only when `quantityGB` (exact size), `datastoreName` or `datastoreClusterName` (same storage), and `pciType` match the live disk. Always set `pciType` to the value of the live disk; it cannot be changed after you save the entry. `path` applies on the replacement VM; `format` and `isThin` are used only for a new, empty disk.
+
+</Tab>
+<Tab label="Huawei Cloud Stack">
+
+Edit the `HCSMachineConfigPool` that the old and the new templates reference in `spec.template.spec.configPoolRef.name`:
+
+```bash
+ac -n cpaas-system edit hcsmachineconfigpool <pool-name>
+```
+
+Under the hostname of each node, add one `persistentDisks` entry for each disk to keep:
+
+```yaml
+  configs:
+    - hostname: <node-hostname>
+      networks:
+        - subnetName: <subnet-name>
+          ipAddress: <node-ip>
+      persistentDisks:
+        - slot: 0
+          size: 40
+          type: SSD
+          mountPath: /var/cpaas
+          format: xfs
+          mountOptions:
+            - defaults
+            - noatime
+```
+
+- Start `slot` at `0` for each hostname and keep the slots contiguous.
+- Set `size`, `type`, `mountPath`, and `format` to the values of the old data volume. If `mountPath` does not match exactly, the provider creates a new empty disk, and the old disk is deleted with the old VM.
+- Use the same declaration on every node that keeps the same path.
+- If the pool has no `cluster.x-k8s.io/cluster-name: <cluster-name>` label, add it.
+- Once the entry is saved, its `size`, `type`, `format`, and `mountPath` cannot change, and its `slot` cannot be removed or changed while the status of the slot records a `volumeID`. A change to `mountOptions` applies only to replacement VMs.
+
+</Tab>
+</Tabs>
+
+### Confirm the Disks Are Claimed \{#confirm-claimed}
+
+Before you start the replacement, read the disk states of each pool:
+
+<Tabs>
+<Tab label="Huawei DCS">
+
+```bash
+ac -n cpaas-system get dcsiphostnamepool <pool-name> \
+  -o jsonpath='{range .status.persistentDiskStatus[*]}{.ip}{"\t"}{.slot}{"\t"}{.path}{"\t"}{.phase}{"\t"}{.volumeUrn}{"\t"}{.lastError}{"\n"}{end}'
+```
+
+</Tab>
+<Tab label="Huawei Cloud Stack">
+
+```bash
+ac -n cpaas-system get hcsmachineconfigpool <pool-name> \
+  -o jsonpath='{range .status.persistentDiskStatus[*]}{.hostname}{"\t"}{.slot}{"\t"}{.phase}{"\t"}{.volumeID}{"\t"}{.lastError}{"\n"}{end}'
+```
+
+</Tab>
+</Tabs>
+
+| Result | Action |
+|---|---|
+| Every disk to keep is `Attached`. Huawei DCS: its `volumeUrn` is the volume URN that you recorded for that disk. Huawei Cloud Stack: it has a `volumeID` | Continue. |
+| A disk is `Attaching` or `Available`, or is missing from the output | Read the states again after one minute; if they do not change, contact technical support. |
+| A disk is in `Error` | Fix it as described in [If a Disk Reports an Error](#disk-errors). |
+| Huawei DCS: a disk is `Attached` with another `volumeUrn` than the one you recorded | Do not start the replacement; contact technical support. |
+| A disk is in `Creating` or another phase | Do not start the replacement; contact technical support. |
+| A column is empty | Read the pool with `-o yaml` and handle the status of the disk as in the rows above. |
+
+### Trigger the Rolling Replacement \{#trigger-replacement}
+
+<Tabs>
+<Tab label="Huawei DCS">
+
+Start the replacement of the control plane, then of each MachineDeployment:
+
+```bash
+ac -n cpaas-system patch kubeadmcontrolplane <kcp-name> --type=merge \
+  -p '{"spec":{"rolloutAfter":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}}'
+ac -n cpaas-system patch machinedeployment <machinedeployment-name> --type=merge \
+  -p '{"spec":{"rolloutAfter":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}}'
+```
+
+</Tab>
+<Tab label="Huawei Cloud Stack">
+
+Right after the disks are claimed, point the control plane and each MachineDeployment to the new templates. Do not leave the pool declaring a disk while a controller still uses an old template that declares the same path.
+
+```bash
+ac -n cpaas-system patch kubeadmcontrolplane <kcp-name> --type=merge \
+  -p '{"spec":{"machineTemplate":{"infrastructureRef":{"name":"<new-template-name>"}}}}'
+ac -n cpaas-system patch machinedeployment <machinedeployment-name> --type=merge \
+  -p '{"spec":{"template":{"spec":{"infrastructureRef":{"name":"<new-template-name>"}}}}}'
+```
+
+If a controller already uses its new template, start its replacement by setting `spec.rolloutAfter` to the current time, as in the Huawei DCS tab.
+
+</Tab>
+</Tabs>
+
+### Verify the Migration \{#verify-migration}
+
+Follow the replacement:
+
+```bash
+ac -n cpaas-system get kubeadmcontrolplane <kcp-name>
+ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=<cluster-name>
+ac -n cpaas-system get machines.cluster.x-k8s.io -l cluster.x-k8s.io/cluster-name=<cluster-name>
+```
+
+Then read the disk states of each pool with the commands in [Confirm the Disks Are Claimed](#confirm-claimed). Each disk goes from `Attached` on the old VM to `Available` after it is detached, then to `Attached` on the replacement VM; `Detaching` and `Attaching` appear in between. The migration is complete when the KubeadmControlPlane shows `REPLICAS` equal to `DESIRED`, the KubeadmControlPlane and every MachineDeployment show `UPDATED` equal to `REPLICAS` and `UNAVAILABLE` at `0`, every Machine is `Running`, and every disk is `Attached`.
+
+</Steps>
+
+## If a Disk Reports an Error \{#disk-errors}
+
+When a disk is in `phase: Error`, read its `lastError` with the command in [Confirm the Disks Are Claimed](#confirm-claimed). Fix the cause, and the provider retries and the replacement continues. If the cause cannot be fixed, contact technical support.
+
+<Tabs>
+<Tab label="Huawei DCS">
+
+A claim fails when `quantityGB`, the datastore, or `pciType` in the pool entry differs from the live disk. For `quantityGB` or the datastore, correct the pool entry; the provider retries on its own. `pciType` cannot be changed after the entry is saved; if it differs, contact technical support.
+
+</Tab>
+<Tab label="Huawei Cloud Stack">
+
+| `lastError` reports | Action |
+|---|---|
+| A mount path conflict | The same path is in the `dataVolumes[]` of the new `HCSMachine` and in `persistentDisks[]`. Contact technical support. |
+| A size or type mismatch | Delete this `persistentDisks` entry and save, then add it again with the `size` and `type` of the existing disk. This is possible only while the status of the slot has no `volumeID`; otherwise, contact technical support. |
+| An availability zone conflict | Use an ECS availability zone that matches the disk, or contact technical support. |
+| The disk is attached to another ECS | Confirm which ECS owns the disk. Detach it manually only after you confirm, then let the provider retry. |
+| `volumeID` was not found | The tracked disk was deleted. Contact technical support. |
+
+Do not delete the old `HCSMachine` or remove finalizers while a disk is in `Error`. The provider holds the deletion so that the old VM is not deleted before the disk is detached.
+
+</Tab>
+</Tabs>
+
+## Limitations \{#limitations}
+
+- Only disks declared in the pool are kept. Every other disk of the machine template is deleted with the old VM.
+- Do not declare the same disk in both the machine template and the pool.
+
+When every affected cluster is migrated, return to [Prepare for the Upgrade](./pre-upgrade.mdx).

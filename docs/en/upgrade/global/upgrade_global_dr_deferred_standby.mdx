@@ -1,0 +1,420 @@
+---
+weight: 40
+title: "DR Environment: Standby After Workload Clusters"
+---
+
+# Upgrade the Standby `global` Cluster After the Workload Clusters
+
+Use this page for a patch upgrade within the same minor version, from ACP 4.5.0 or later, when the standby is not upgraded together with the primary: you upgrade the primary and the workload clusters that you choose first, and the standby afterwards. The plugin stays installed and synchronization is paused, so the standby remains a standby. There is no DR protection from the pause until synchronization is resumed and checked at the end of this page, through the upgrades of the primary, of those workload clusters, and of the standby; in that time, make no changes on either `global` cluster other than those upgrades and the steps on this page. For a minor upgrade, or to upgrade both `global` clusters before the workload clusters, use [Upgrade `global` Clusters in a DR Environment](./upgrade_global_dr.mdx); [Upgrade Order and Compatibility](../overview.mdx#upgrade-order) compares the two procedures.
+
+## Before You Begin \{#before-you-begin}
+
+- Both `global` clusters run the same ACP version (Distribution Version), 4.5.0 or later, and the target is a later patch version of the same minor version. `<target-version>` on this page is that target ACP version, for example `4.5.1`.
+- [Prepare for the Upgrade](../pre-upgrade.mdx) is complete on both `global` clusters. These items are not synchronized between them, so each side has its own: published packages, including the Global Cluster Disaster Recovery package on the standby; Alauda OS image ConfigMaps or catalog entries; the administrator acknowledgement; `ResourcePatch` exemptions; and a preflight result that lets you continue. On the standby, every check passes except `DRSplitUpgradeWindow`, which passes after you pause synchronization below.
+- Each `global` cluster has a recent successful etcd backup, as described in [Check the etcd Backup](../pre-upgrade.mdx#etcd-backup).
+- You are on the execution host, logged in with `ac login` as a platform administrator, in the `installer/` directory of the extracted target Core Package, with a kubeconfig of the standby that points to its VIP: `<standby-kubeconfig>`.
+
+On the primary, `ac` commands use the `ac login` session, and `upgrade.sh` uses `kubectl` with the kubeconfig that `ac login` saved, after `ac config use-cluster global`; `ac whoami --show-server` prints `https://<platform-address>/kubernetes/global/`. Each command block for the standby starts with `export KUBECONFIG=<standby-kubeconfig>` and ends with `unset KUBECONFIG`, and `ac whoami --show-server` prints the standby VIP. Confirm the printed address before you continue with a block.
+
+:::info
+On Alauda OS, run the upgrade commands from the execution host, not from a node of either `global` cluster: the upgrade replaces the nodes.
+:::
+
+## Upgrade the Primary and the Workload Clusters \{#part-primary}
+
+<Steps>
+
+### Verify Data Consistency \{#verify-dr-consistency}
+
+:::warning
+Do not pause synchronization until this check passes.
+:::
+
+Run the check on a control plane node of the standby `global` cluster, then return to the execution host:
+
+```bash
+export KUBECONFIG=/etc/kubernetes/admin.conf
+mirror_svc=$(kubectl get svc -n cpaas-system etcd-sync-monitor -o jsonpath='{.spec.clusterIP}')
+if [[ $mirror_svc =~ ^[0-9a-fA-F:]+$ ]]; then mirror_host="[$mirror_svc]"; else mirror_host="$mirror_svc"; fi
+curl -g "http://${mirror_host}/check"
+```
+
+| Result | Action |
+|---|---|
+| `localMissedKeys [0]` and `localSurplusKeys [0]` | Continue. |
+| `check too frequent` | Wait one minute and run the check again; if it does not change, contact technical support. |
+| Any other value | Run the steps in [Global Cluster Disaster Recovery Does Not Synchronize](../troubleshooting.mdx#dr-sync-diagnostics), then run the check again. |
+
+Then check the machines and ongoing upgrades. On the primary:
+
+```bash
+ac config use-cluster global
+ac whoami --show-server
+ac get machines.platform.tkestack.io
+ac get machines.cluster.x-k8s.io -A   # Alauda OS
+ac -n cpaas-system get cvsh \
+  -o custom-columns='CLUSTER:.metadata.name,REQUESTED:.spec.desiredUpdate.version,CURRENT:.status.current.version'
+```
+
+On the standby:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server   # the standby VIP
+ac get machines.platform.tkestack.io
+ac get machines.cluster.x-k8s.io -A   # Alauda OS
+unset KUBECONFIG
+```
+
+| Result | Action |
+|---|---|
+| Every machine on both `global` clusters is `Running`, and on every row of the `cvsh` list `REQUESTED` is empty or equal to `CURRENT` | Continue. |
+| On a row of the `cvsh` list, `REQUESTED` differs from `CURRENT` | Run the block on the primary again after that workload cluster upgrade completes. If that upgrade does not advance, see [Inspect Upgrade State](../troubleshooting.mdx#inspect-upgrade-state). |
+| A machine is not `Running` | Contact technical support. |
+
+### Prepare Both `global` Clusters \{#prepare-both}
+
+On the standby, restart the cluster-transformer Pods, so that no work started before the pause keeps running on the standby, and disable the token rotator, which can otherwise revoke workload cluster tokens that the primary still uses. The `set env` command prints `The operation is allowed, and ResourcePatch <name> is created`; the block exempts that `ResourcePatch` for the target version, so that preflight does not block on it:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server   # the standby VIP
+ac -n cpaas-system delete pod -l service_name=cluster-transformer
+ac -n cpaas-system set env deploy/cluster-api-provider-alauda-manager \
+  -c cluster-api-provider-alauda CLUSTER_TOKEN_ROTATOR_ENABLED=false
+ac -n cpaas-system rollout status deploy/cluster-api-provider-alauda-manager
+RP=$(ac get resourcepatches \
+  -o jsonpath='{range .items[?(@.spec.target.name=="cluster-api-provider-alauda-manager")]}{.metadata.name}{"\n"}{end}')
+ac annotate resourcepatches "${RP}" config.cpaas.io/exempt-for-ver=<target-version> --overwrite
+ac -n cpaas-system get pod -l service_name=cluster-transformer
+ac -n cpaas-system get deploy cluster-api-provider-alauda-manager \
+  -o jsonpath='{.spec.template.spec.containers[?(@.name=="cluster-api-provider-alauda")].env[?(@.name=="CLUSTER_TOKEN_ROTATOR_ENABLED")].value}{"\n"}'
+unset KUBECONFIG
+```
+
+On the primary, disable the token rotator and exempt its `ResourcePatch` as well: the paused standby does not receive the tokens it writes, and the standby's copies stop working when it deletes the replaced tokens:
+
+```bash
+ac config use-cluster global
+ac whoami --show-server   # ends with /kubernetes/global/
+ac -n cpaas-system set env deploy/cluster-api-provider-alauda-manager \
+  -c cluster-api-provider-alauda CLUSTER_TOKEN_ROTATOR_ENABLED=false
+ac -n cpaas-system rollout status deploy/cluster-api-provider-alauda-manager
+RP=$(ac get resourcepatches \
+  -o jsonpath='{range .items[?(@.spec.target.name=="cluster-api-provider-alauda-manager")]}{.metadata.name}{"\n"}{end}')
+ac annotate resourcepatches "${RP}" config.cpaas.io/exempt-for-ver=<target-version> --overwrite
+ac -n cpaas-system get deploy cluster-api-provider-alauda-manager \
+  -o jsonpath='{.spec.template.spec.containers[?(@.name=="cluster-api-provider-alauda")].env[?(@.name=="CLUSTER_TOKEN_ROTATOR_ENABLED")].value}{"\n"}'
+```
+
+Continue when, on both sides, the rollout completes, `annotate` reports the `ResourcePatch` as annotated, and the last command prints `false`, and on the standby every cluster-transformer Pod is `Running`. Then run the preflight check on the standby:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server   # the standby VIP
+bash upgrade.sh --preflight
+unset KUBECONFIG
+```
+
+| Result | Action |
+|---|---|
+| `DRSplitUpgradeWindow` is the only failed check, and its only reason is `EtcdSyncNotPaused` | Continue. |
+| `DRSplitUpgradeWindow` fails for another reason | See [DR Standby Checks](../troubleshooting.mdx#dr-split-upgrade-window), then run the check again. |
+| Another check fails | See [Handle Preflight Blocks](../troubleshooting.mdx#handle-preflight-blocks-when-needed), then run the check again. |
+
+### Pause Synchronization \{#pause}
+
+:::warning
+From the pause until synchronization is resumed and checked, there is no DR protection. Do not fail over to the standby. Do not uninstall the plugin: uninstalling it removes the DR marker `kube-public/etcd-sync`, which the plugin creates, and the standby then acts on workload clusters. Do not delete or edit the marker or `cpaas-system/etcd-sync-control` except in [Resume Synchronization](#resume). On either `global` cluster, make no changes other than the upgrades and steps on this page: the primary, the workload clusters with their Kubernetes upgrade on Huawei Cloud Stack or VMware vSphere, and the standby.
+:::
+
+On the standby, pause synchronization, with a change reference of your choice as `reason`, then read the pause state, its message and self-check (`status.pauseCheck`), and the DR marker:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server   # the standby VIP
+if ac -n cpaas-system get configmap etcd-sync-control >/dev/null 2>&1; then
+  ac -n cpaas-system patch configmap etcd-sync-control --type merge \
+    -p '{"data":{"mode":"Paused","reason":"<change-reference>"}}'
+else
+  ac -n cpaas-system create configmap etcd-sync-control \
+    --from-literal=mode=Paused --from-literal=reason="<change-reference>"
+fi
+ac -n cpaas-system get configmap etcd-sync-control \
+  -o jsonpath='{.data.mode}{" "}{.data.status\.phase}{" "}{.data.status\.observedMode}{"\n"}{.data.status\.message}{"\n"}{.data.status\.pauseCheck}{"\n"}'
+ac -n kube-public get configmap etcd-sync -o name
+unset KUBECONFIG
+```
+
+Run the block again without the lines from `if` to `fi` until the second value on the line after the address is `Paused`. In the table, "the state line" is that line.
+
+| Result | Action |
+|---|---|
+| The state line is `Paused Paused Paused`, the `status.pauseCheck` line shows `"unexpected":0` and no `error`, and the last command prints `configmap/etcd-sync` | Continue. |
+| On the state line, the second and third values stay empty | etcd-sync did not take the request. Do not upgrade the primary; contact technical support. |
+| The state line stays `Paused Pausing Paused` or `Paused Running Running` when you run the block again | Read the `status.message` line and contact technical support. |
+| `unexpected` is not `0`, `error` is set, or the marker is missing | Do not upgrade the primary; contact technical support. |
+
+### Upgrade the Primary `global` Cluster \{#upgrade-primary}
+
+:::warning
+An upgrade cannot be rolled back. When the target changes the Kubernetes build or the Alauda OS image, the request also replaces every node with a new VM on Huawei DCS, and reinstalls every host on Bare Metal, one at a time.
+:::
+
+On the primary, **deploy the Cluster Version Operator (CVO)** and the target release information. `<target-version>` is the target ACP version:
+
+```bash
+ac config use-cluster global
+ac whoami --show-server   # ends with /kubernetes/global/
+bash upgrade.sh --skip-sync-image
+ac get productmanifest v<target-version>
+```
+
+| Result | Action |
+|---|---|
+| The script completes without an error, and `READY` is `True` | Continue. |
+| The script reports that the product manifest did not become ready, or `READY` is not `True` | Follow [Recover a Missing Aligned Extension Package](../troubleshooting.mdx#recover-missing-aligned-package). |
+| The script fails with another error | Contact technical support. |
+
+Then **run the final preflight check**:
+
+```bash
+ac config use-cluster global
+ac whoami --show-server   # ends with /kubernetes/global/
+bash upgrade.sh --preflight
+```
+
+Continue when `Summary` shows `Passed` or `PassedWithWarnings`. Otherwise, resolve the checks on the primary as described in [Handle Preflight Blocks](../troubleshooting.mdx#handle-preflight-blocks-when-needed) and run the check again; `AdminAckRequired` can appear for the first time here, see [Handle Administrator Acknowledgement Gates](../troubleshooting.mdx#handle-administrator-acknowledgement-gates). Then **request the upgrade** with the target version exactly as `ac adm upgrade` lists it:
+
+```bash
+ac adm upgrade
+ac adm upgrade --cluster=global --to=<target-version>
+```
+
+**Monitor the upgrade:**
+
+```bash
+ac adm upgrade status --cluster=global
+ac -n cpaas-system get infraclusterversion global   # Huawei DCS and Bare Metal
+```
+
+Run the commands again until `Current` shows the target version and `Ready` is `True`, and on Huawei DCS and Bare Metal `PHASE` is `Succeeded`. While control plane nodes are replaced, a command can fail to connect; run it again. If `Upgrade` shows `Blocked` or `Retrying`, see [Inspect Upgrade State](../troubleshooting.mdx#inspect-upgrade-state). On Huawei DCS and Bare Metal, if the upgrade stays `InProgress` in the `Kubernetes` stage, read the `Stalled` condition of the `InfraClusterVersion` as described there. Fix the reported cause and the upgrade continues; if it cannot be fixed, contact technical support.
+
+Then, on Huawei Cloud Stack or VMware vSphere, upgrade Kubernetes right after the request completes, also for a patch upgrade whose Kubernetes build changes: follow [Upgrade Kubernetes on Huawei Cloud Stack and VMware vSphere](../upgrade_kubernetes_hcs_vsphere.mdx) for the primary, then return to this page.
+
+### Upgrade the Workload Clusters \{#upgrade-workload-clusters}
+
+First, on the primary, check that the token rotator is still disabled after the upgrade:
+
+```bash
+ac config use-cluster global
+ac whoami --show-server   # ends with /kubernetes/global/
+ac -n cpaas-system get deploy cluster-api-provider-alauda-manager \
+  -o jsonpath='{.spec.template.spec.containers[?(@.name=="cluster-api-provider-alauda")].env[?(@.name=="CLUSTER_TOKEN_ROTATOR_ENABLED")].value}{"\n"}'
+```
+
+Continue when it prints `false`; otherwise, run the primary block of [Prepare Both `global` Clusters](#prepare-both) again. Then complete [Upgrade Validation](../validation.mdx) on the primary.
+
+Upgrade the workload clusters that you choose to upgrade now by following [Upgrade Workload Clusters](../workload/upgrade_workload_cluster.mdx), with these differences, then return to this page:
+
+- In **Confirm the `global` Clusters Are Upgraded**, check only the primary; skip the standby block.
+- Skip **Check DR Synchronization** while synchronization is paused.
+- Skip **Upgrade the Agnostic Extensions**; upgrade them in [Upgrade the Agnostic Extensions and Validate](#upgrade-agnostic-extensions), after synchronization is resumed.
+
+Continue when every workload cluster that you upgraded shows the target version in `Current` with `Ready` `True` and has passed its validation, and no workload cluster upgrade is running. Upgrade the other workload clusters after this page is complete.
+
+</Steps>
+
+## Upgrade the Standby and Resume Synchronization \{#part-standby}
+
+<Steps>
+
+### Check the State Before Upgrading the Standby \{#before-standby-upgrade}
+
+Start here when you return to upgrade the standby. Log in again with `ac login` if the session expired, and check that each `global` cluster still has a recent successful etcd backup, as in **Before You Begin**. Then check that the state is unchanged. On the primary:
+
+```bash
+ac config use-cluster global
+ac whoami --show-server   # ends with /kubernetes/global/
+ac adm upgrade status --cluster=global
+ac -n cpaas-system get cvsh \
+  -o custom-columns='CLUSTER:.metadata.name,REQUESTED:.spec.desiredUpdate.version,CURRENT:.status.current.version'
+ac -n cpaas-system get deploy cluster-api-provider-alauda-manager \
+  -o jsonpath='{.spec.template.spec.containers[?(@.name=="cluster-api-provider-alauda")].env[?(@.name=="CLUSTER_TOKEN_ROTATOR_ENABLED")].value}{"\n"}'
+```
+
+Continue when `Current` shows the target version and `Ready` is `True`, on every row of the `cvsh` list `REQUESTED` is empty or equal to `CURRENT`, and the last command prints `false`. Use this `Current` value as `<target-version>` for the standby.
+
+On the standby, check the pause state, the marker, and the token rotator, then check from the execution host that the token of the plugin still gives access to the primary. The block reads the primary VIP from the plugin settings and puts an IPv6 address in brackets; the token is passed to `curl` through standard input and is not printed:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server   # the standby VIP
+ac -n cpaas-system get configmap etcd-sync-control \
+  -o jsonpath='{.data.mode}{" "}{.data.status\.phase}{" "}{.data.status\.observedMode}{"\n"}'
+ac -n kube-public get configmap etcd-sync -o name
+ac -n cpaas-system get deploy cluster-api-provider-alauda-manager \
+  -o jsonpath='{.spec.template.spec.containers[?(@.name=="cluster-api-provider-alauda")].env[?(@.name=="CLUSTER_TOKEN_ROTATOR_ENABLED")].value}{"\n"}'
+TOKEN_SECRET=$(ac get moduleinfo -l cpaas.io/module-name=etcd-sync,cpaas.io/cluster-name=global \
+  -o jsonpath='{.items[0].spec.config.active_cluster_token_secret_ref}')
+TOKEN_SECRET=${TOKEN_SECRET:-etcd-sync-token}
+ACTIVE_VIP=$(ac get moduleinfo -l cpaas.io/module-name=etcd-sync,cpaas.io/cluster-name=global \
+  -o jsonpath='{.items[0].spec.config.active_cluster_vip}')
+if [[ $ACTIVE_VIP =~ ^[0-9a-fA-F:]+$ ]]; then ACTIVE_VIP="[$ACTIVE_VIP]"; fi
+{ printf 'Authorization: Bearer '
+  ac -n cpaas-system get secret "${TOKEN_SECRET}" -o jsonpath='{.data.token}' | base64 -d
+  printf '\n'
+} | curl -sk -H @- -o /dev/null -w '%{http_code}\n' \
+  "https://${ACTIVE_VIP}:6443/api/v1/namespaces/cpaas-system/secrets/etcd-ca"
+unset KUBECONFIG
+```
+
+| Result | Action |
+|---|---|
+| `Paused Paused Paused`, `configmap/etcd-sync`, `false`, and `200` | Continue. |
+| The token rotator value is not `false` | Run the standby block of [Prepare Both `global` Clusters](#prepare-both) again, then run this block again. |
+| `401` or `403` | The token of the plugin no longer gives access to the primary. Contact technical support. |
+| The pause state is not `Paused Paused Paused`, or the marker is missing | Do not upgrade the standby; contact technical support. |
+| `000` | The execution host does not reach the primary VIP on port `6443`. Fix the connection from the execution host and run the block again. |
+| Any other HTTP code | Contact technical support. |
+
+### Upgrade the Standby `global` Cluster \{#upgrade-standby}
+
+:::warning
+An upgrade cannot be rolled back. When the target changes the Kubernetes build or the Alauda OS image, the request also replaces every node with a new VM on Huawei DCS, and reinstalls every host on Bare Metal, one at a time.
+:::
+
+On the standby, **deploy CVO** and the target release information:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server   # the standby VIP
+bash upgrade.sh --skip-sync-image
+ac get productmanifest v<target-version>
+unset KUBECONFIG
+```
+
+| Result | Action |
+|---|---|
+| The script completes without an error, and `READY` is `True` | Continue. |
+| The script reports that the product manifest did not become ready, or `READY` is not `True` | Follow [Recover a Missing Aligned Extension Package](../troubleshooting.mdx#recover-missing-aligned-package). |
+| The script fails with another error | Contact technical support. |
+
+Then **run the final preflight check**. Check the marker first, because without the marker `DRSplitUpgradeWindow` passes without checking the standby:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server   # the standby VIP
+ac -n kube-public get configmap etcd-sync -o name
+bash upgrade.sh --preflight
+unset KUBECONFIG
+```
+
+If the first command does not print `configmap/etcd-sync`, do not upgrade the standby, and contact technical support. Continue when `Summary` shows `Passed` or `PassedWithWarnings`. If `DRSplitUpgradeWindow` fails, see [DR Standby Checks](../troubleshooting.mdx#dr-split-upgrade-window). For other checks, resolve them on the standby as described in [Handle Preflight Blocks](../troubleshooting.mdx#handle-preflight-blocks-when-needed) and run the check again; `AdminAckRequired` can appear for the first time here, see [Handle Administrator Acknowledgement Gates](../troubleshooting.mdx#handle-administrator-acknowledgement-gates). Then **request the upgrade** with the target version exactly as `ac adm upgrade` lists it:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server   # the standby VIP
+ac adm upgrade
+ac adm upgrade --cluster=global --to=<target-version>
+unset KUBECONFIG
+```
+
+**Monitor the upgrade:**
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server   # the standby VIP
+ac adm upgrade status --cluster=global
+ac -n cpaas-system get infraclusterversion global   # Huawei DCS and Bare Metal
+unset KUBECONFIG
+```
+
+Run the block again until `Current` shows the target version and `Ready` is `True`, and on Huawei DCS and Bare Metal `PHASE` is `Succeeded`. While control plane nodes are replaced, a command can fail to connect; run it again. If `Upgrade` shows `Blocked` or `Retrying`, see [Inspect Upgrade State](../troubleshooting.mdx#inspect-upgrade-state). On Huawei DCS and Bare Metal, if the upgrade stays `InProgress` in the `Kubernetes` stage, read the `Stalled` condition of the `InfraClusterVersion` as described there. Fix the reported cause and the upgrade continues; if it cannot be fixed, contact technical support.
+
+Then, on Huawei Cloud Stack or VMware vSphere, upgrade Kubernetes right after the request completes, also for a patch upgrade whose Kubernetes build changes: follow [Upgrade Kubernetes on Huawei Cloud Stack and VMware vSphere](../upgrade_kubernetes_hcs_vsphere.mdx) for the standby with `<standby-kubeconfig>`, then return to this page.
+
+### Resume Synchronization \{#resume}
+
+:::warning
+Resuming makes the standby match the primary: objects that existed at the pause and were deleted on the primary since then are also deleted on the standby. Resume only after the checks below pass.
+:::
+
+First, on the standby, check that synchronization is still paused, the marker exists, and the token rotator is still disabled after the upgrade:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server   # the standby VIP
+ac -n cpaas-system get configmap etcd-sync-control \
+  -o jsonpath='{.data.mode}{" "}{.data.status\.phase}{" "}{.data.status\.observedMode}{"\n"}'
+ac -n kube-public get configmap etcd-sync -o name
+ac -n cpaas-system get deploy cluster-api-provider-alauda-manager \
+  -o jsonpath='{.spec.template.spec.containers[?(@.name=="cluster-api-provider-alauda")].env[?(@.name=="CLUSTER_TOKEN_ROTATOR_ENABLED")].value}{"\n"}'
+unset KUBECONFIG
+```
+
+Continue when the output is `Paused Paused Paused`, `configmap/etcd-sync`, and `false`. If the token rotator value is not `false`, run the standby block of [Prepare Both `global` Clusters](#prepare-both) again. If the pause state or the marker differs, do not resume, and contact technical support. Then resume synchronization on the standby and read the result:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server   # the standby VIP
+ac -n cpaas-system patch configmap etcd-sync-control --type merge -p '{"data":{"mode":"Running"}}'
+ac -n cpaas-system get configmap etcd-sync-control \
+  -o jsonpath='{.data.status\.phase}{"\n"}{.data.status\.message}{"\n"}{.data.status\.lastResume}{"\n"}{.data.status\.deleteBlocked}{"\n"}'
+unset KUBECONFIG
+```
+
+Run the block again without the `patch` command until the line after the address shows `Running`. Then run the `/check` command from [Verify Data Consistency](#verify-dr-consistency) again on a standby control plane node.
+
+| Result | Action |
+|---|---|
+| `status.phase` is `Running`, `status.lastResume` contains `"deleteSkipped":false`, the `status.deleteBlocked` line is empty, and `/check` shows `localMissedKeys [0]` and `localSurplusKeys [0]` | Continue. |
+| `status.phase` stays `Resuming`, or stays `Paused` | Do not edit `etcd-sync-control`; contact technical support. |
+| `"deleteSkipped":true`, or the `status.deleteBlocked` line is not empty | Contact technical support. |
+| `check too frequent` | Wait one minute and run the check again; if it does not change, contact technical support. |
+| `/check` shows any other value | Run the steps in [Global Cluster Disaster Recovery Does Not Synchronize](../troubleshooting.mdx#dr-sync-diagnostics), then run the check again. |
+
+### Restore the Token Rotator \{#restore-token-rotator}
+
+On the primary, remove the setting, then check it and list the `ResourcePatch` objects for its Deployment:
+
+```bash
+ac config use-cluster global
+ac whoami --show-server   # ends with /kubernetes/global/
+ac -n cpaas-system set env deploy/cluster-api-provider-alauda-manager \
+  -c cluster-api-provider-alauda CLUSTER_TOKEN_ROTATOR_ENABLED-
+ac -n cpaas-system rollout status deploy/cluster-api-provider-alauda-manager
+ac -n cpaas-system get deploy cluster-api-provider-alauda-manager \
+  -o jsonpath='{.spec.template.spec.containers[?(@.name=="cluster-api-provider-alauda")].env[?(@.name=="CLUSTER_TOKEN_ROTATOR_ENABLED")].value}{"\n"}'
+ac get resourcepatches \
+  -o jsonpath='{range .items[?(@.spec.target.name=="cluster-api-provider-alauda-manager")]}{.metadata.name}{"\n"}{end}'
+```
+
+On the standby:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server   # the standby VIP
+ac -n cpaas-system set env deploy/cluster-api-provider-alauda-manager \
+  -c cluster-api-provider-alauda CLUSTER_TOKEN_ROTATOR_ENABLED-
+ac -n cpaas-system rollout status deploy/cluster-api-provider-alauda-manager
+ac -n cpaas-system get deploy cluster-api-provider-alauda-manager \
+  -o jsonpath='{.spec.template.spec.containers[?(@.name=="cluster-api-provider-alauda")].env[?(@.name=="CLUSTER_TOKEN_ROTATOR_ENABLED")].value}{"\n"}'
+ac get resourcepatches \
+  -o jsonpath='{range .items[?(@.spec.target.name=="cluster-api-provider-alauda-manager")]}{.metadata.name}{"\n"}{end}'
+unset KUBECONFIG
+```
+
+Continue when, on both sides, the rollout completes, the `jsonpath` command for the setting prints an empty line, and the last command lists no `ResourcePatch`: removing the setting also removes the `ResourcePatch` that it created. If a `ResourcePatch` is still listed, it holds another customization of the Deployment; keep it, and check that it does not contain `CLUSTER_TOKEN_ROTATOR_ENABLED`.
+
+### Upgrade the Agnostic Extensions and Validate \{#upgrade-agnostic-extensions}
+
+The upgrade requests do not upgrade Extensions (Operators and Cluster Plugins) with the `Agnostic` lifecycle. Upgrade each Agnostic Extension installed on the primary, on the standby, and on the workload clusters that you upgraded, by following its own documentation. For example, see <ExternalSiteLink name="ai" href="/upgrade/upgrade-from-aml-1.2.html" children="Upgrade Alauda AI" /> and <ExternalSiteLink name="devops" href="/upgrade/index.html" children="Upgrade Alauda DevOps" />. Then complete [Upgrade Validation](../validation.mdx) on the standby; the primary was validated before the workload clusters.
+
+The upgrade of the two `global` clusters is complete only when every step on this page is done, including the synchronization check after the resume; do not start another upgrade of either `global` cluster before that.
+
+</Steps>
+
+## Next Step
+
+Upgrade the remaining workload clusters. See [Upgrade Workload Clusters](../workload/upgrade_workload_cluster.mdx).

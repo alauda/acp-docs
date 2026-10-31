@@ -1,438 +1,119 @@
 ---
 weight: 10
-title: Upgrade the Distribution Version
+title: Standard Upgrade
 ---
 
-# Upgrade the Distribution Version of the `global` Cluster
+# Upgrade the `global` Cluster
 
-<Directive type="info" title="Upgrade Path">
-This page applies to both node operating systems. On a non-Alauda OS `global` cluster, this procedure also upgrades Kubernetes in place, and the `global` cluster upgrade is complete when it finishes. If your `global` cluster uses Alauda OS, complete this page first, then continue with [Upgrade Kubernetes on Alauda OS](./upgrade_kubernetes_on_alauda_os.mdx) to roll out Kubernetes by replacing nodes.
-</Directive>
+Use this page to upgrade a `global` cluster that has no disaster recovery standby, for every upgrade, patch upgrades included. If the platform has a primary and a standby `global` cluster, use [Upgrade `global` Clusters in a DR Environment](./upgrade_global_dr.mdx) instead.
 
-<Term name="productShort" /> consists of a **global** cluster and one or more
-workload clusters. To move the platform to a new ACP Distribution Version,
-upgrade the global tier to the target Distribution Version first, and then
-upgrade workload clusters to that same Distribution Version.
+One upgrade request moves the `global` cluster to the target ACP version (Distribution Version): ACP Core and the installed Extensions (Operators and Cluster Plugins) with the `Aligned` lifecycle. On Huawei DCS and Bare Metal, the same request also upgrades Kubernetes, one node at a time. On Huawei Cloud Stack and VMware vSphere, you upgrade Kubernetes yourself right after the request completes. On non-Alauda OS clusters, the request upgrades Kubernetes in place.
 
-Cluster upgrades use the CVO-based workflow. A typical `global` cluster upgrade includes artifact preparation, preflight checks, upgrade request, and status observation.
+## Before You Begin \{#before-you-begin}
 
-Before upgrading the `global` cluster, verify that every workload cluster is within the target release's **Compatible Versions** in the [Kubernetes Support Matrix](/overview/kubernetes-support-matrix.mdx). This prerequisite is separate from the third-party cluster onboarding range.
+- [Prepare for the Upgrade](../pre-upgrade.mdx) is complete for the `global` cluster, including the `global` cluster checks on Huawei DCS and Bare Metal.
+- The preflight check has passed, including any administrator acknowledgement that it reported. On a cluster that has never run the Cluster Version Operator (CVO), the final preflight check on this page is the first one.
+- The `global` cluster has a recent successful etcd backup. See [etcd Backup and Restore](../../configure/backup/etcd.mdx).
+- You are on the execution host, logged in with `ac login` as a platform administrator, in the `installer/` directory of the extracted target Core Package. `upgrade.sh` uses `kubectl` with the kubeconfig that `ac login` saved.
 
-This Compatible Versions prerequisite applies whether or not the environment uses global DR. Global DR changes the procedure used to upgrade the global tier, but it does not change the requirement that workload clusters must remain within the compatible Kubernetes version range before the global tier is upgraded to the target Distribution Version.
+Select the `global` cluster, then confirm that no workload cluster upgrade is running; the platform does not block a `global` upgrade while one runs:
 
-Global cluster upgrades follow the validated `upgrade.sh`-based procedure documented on this page. You can request the global-cluster upgrade from the Web Console, by updating `ClusterVersionShadow.spec.desiredUpdate`, or by using ACP CLI with `--cluster=global`. For the complete AC CLI workflow and output interpretation, see [Upgrading Clusters](/ui/cli_tools/ac/upgrading-clusters.md). For full command and flag syntax, see [AC CLI Administrator Command Reference](/ui/cli_tools/ac/administrator-command-reference.md).
+```bash
+ac config use-cluster global
+ac whoami --show-server
+ac -n cpaas-system get cvsh \
+  -o custom-columns='CLUSTER:.metadata.name,REQUESTED:.spec.desiredUpdate.version,CURRENT:.status.current.version'
+```
 
-If the environment uses **global DR**, follow [Upgrade Global Clusters in a DR Environment](./upgrade_global_dr.mdx). Otherwise, follow the standard workflow below.
+Continue when the address ends with `/kubernetes/global/` and, on every row, `REQUESTED` is empty or equal to `CURRENT`; otherwise, wait until that upgrade completes. If the last command reports `the server doesn't have a resource type`, the cluster has never been upgraded with CVO; continue.
 
-## Standard Workflow
+:::info
+On Alauda OS, run the upgrade commands from the execution host, not from a node of the `global` cluster. The upgrade replaces the nodes, and files and sessions on a replaced node are lost.
+:::
 
-A global cluster upgrade is staged across a timeline. Most of the work is completed **before** the maintenance window so the window itself stays short and predictable:
-
-| Phase | When | What happens | Cluster impact |
-| --- | --- | --- | --- |
-| 1. Sync artifacts | Any time before the window | For the platform built-in Registry, `upgrade.sh --only-sync-image` uploads Core artifacts and the eleven packages that you manually place in `plugins/`. For an external registry, manually upload the target Core payload before running `upgrade.sh`. In both cases, `violet` publishes the other Aligned and Agnostic packages needed for the window. | None — images and catalog entries are published, but no running plugin is changed; no downtime. |
-| 2. Preflight | 1–2 weeks before the window | `upgrade.sh --preflight` validates upgrade readiness. Resolve every blocking item before the window opens. | None — read-only validation. |
-| 3. Upgrade | During the maintenance window | `upgrade.sh --skip-sync-image` deploys or updates the cluster version operator (CVO); the upgrade is then requested and observed. | The cluster is upgraded. |
-
-Phase 1 and Phase 2 do not change cluster state — run them early so the maintenance window only contains Phase 3. A small or lab environment can instead run a single `bash upgrade.sh` that performs synchronization and CVO deployment together, but production windows usually keep them separate.
+## Upgrade the `global` Cluster \{#upgrade-the-global-cluster}
 
 <Steps>
 
-### Sync upgrade artifacts \{#sync-upgrade-artifacts}
+### Deploy the Cluster Version Operator \{#deploy-the-cluster-version-operator}
 
-**When:** any time before the maintenance window. This step uploads artifacts to the registry and does not change cluster state.
-
-First, record the configured registry address and determine whether the platform uses the built-in or an external registry:
+Deploy CVO and the target release information. The artifacts were published during preparation, so skip the image sync. `<target-version>` is the target ACP version, for example `4.5.0`:
 
 ```bash
-kubectl get productbase base \
-  -o jsonpath='{.spec.registry.address}{"\t"}{.spec.registry.external}{"\n"}'
+ac config use-cluster global
+ac whoami --show-server   # ends with /kubernetes/global/
+bash upgrade.sh --skip-sync-image
+ac get productmanifest v<target-version>
 ```
 
-The second value is `false` for the platform built-in Registry and `true` for an external registry. The publication command is selected after the target Aligned packages are copied into `plugins/`.
+Continue when the script completes without an error and `READY` is `True`. Otherwise, see [Recover a Missing Aligned Extension Package](../troubleshooting.mdx#recover-missing-aligned-package).
 
-The Core Package does not contain the Aligned packages from **ACP Upgrade to v4.5**. Copy each of the eleven separately downloaded packages listed in [Pre-Upgrade Preparation](../pre-upgrade.mdx#download-acp-upgrade-to-v45) into the `plugins/` directory of the extracted Core Package. Run the following command once for each package:
-
-```bash
-cp <path-to-upgrade-extension-package> ./plugins/
-```
-
-Confirm that the directory contains all eleven packages before synchronization:
+### Run the Final Preflight Check \{#final-preflight}
 
 ```bash
-ls -1 ./plugins/
-```
-
-Publish the staged payload by following the branch that matches the value of `ProductBase.spec.registry.external`.
-
-For the platform built-in Registry (`false`), run `upgrade.sh` in sync-only mode from the extracted Core Package directory:
-
-```bash
-bash upgrade.sh --only-sync-image
-```
-
-`--only-sync-image` uploads Core images and the packages that you manually placed in `plugins/`, without deploying the cluster version operator or changing running applications. The CVO is deployed later, inside the maintenance window — see [Deploy the cluster version operator](#deploy-the-cluster-version-operator).
-
-For an external registry (`true`), do not use `--only-sync-image` as proof of publication. `upgrade.sh` automatically skips image synchronization. From the target Core Package's `installer/` directory, run both `res/upload.sh all` and `res/upload.sh necessary` by following [Prepare the Target-Version Payload](../../install/prepare/external-platform-image-registry.mdx#prepare-the-target-version-payload). The modes may run in either order, but both must succeed.
-
-The selected publication path makes the artifacts required by the CVO-based workflow available, including:
-
-| Type             | Content                    | Purpose                                                                    |
-| ---------------- | -------------------------- | -------------------------------------------------------------------------- |
-| Product images   | `product-image`            | Used to resolve the target version and image in `ProductManifest` and CVO. |
-| CVO image        | `cluster-version-operator` | Used to deploy or update the cluster version operator.                     |
-| Plugin artifacts | `plugins/*.tgz`            | Used by the upgrade plan when plugin artifacts are required.               |
-
-For the eleven Aligned applications from **ACP Upgrade to v4.5**, always stage the packages in `plugins/`. The built-in Registry path publishes them with `upgrade.sh --only-sync-image`; the external Registry path publishes them through `res/upload.sh all`. CVO upgrades an application only when it is already installed; publishing a package for an application that is not installed does not install it.
-
-Use `violet push` for the other packages downloaded from the `violet list` inventory:
-
-| Package group | Publication path | Requirement |
-| --- | --- | --- |
-| Other Aligned cluster plugins | `violet push` to the global tier | Required for each installed plugin that is not part of **ACP Upgrade to v4.5**. |
-| Other Aligned operators | `violet push` to the global tier and each workload cluster where the operator is installed | Required before upgrading each cluster that runs the operator. |
-| Agnostic cluster plugins and operators | `violet push` to the clusters where you plan to upgrade them | Optional for CVO; required before starting their separate Marketplace or operator upgrade. |
-
-```bash
-# Publish another cluster plugin to the global tier
-violet push <path-to-other-cluster-plugin-package> \
-  --platform-address "https://<your-platform-domain>" \
-  --platform-token "<platform_token>"
-
-# Publish another operator to global and each workload cluster that runs it
-violet push <path-to-other-operator-package> \
-  --platform-address "https://<your-platform-domain>" \
-  --platform-token "<platform_token>" \
-  --clusters "global,<workload-cluster-1>,<workload-cluster-2>"
-```
-
-Pushing every operator package to every <Term name="productShort" /> cluster from the global window is the recommended pattern. If the global window has already passed and you discover a workload cluster missing an operator package, you can still push to that workload cluster before the workload upgrade — see [Upgrade workload clusters](../workload/upgrade_workload_cluster.mdx#operator-push-fallback).
-
-:::warning
-Before requesting the upgrade, make the target package available for every Aligned plugin installed on the cluster. Use `upgrade.sh` for applications from **ACP Upgrade to v4.5**, and `violet` for the other Aligned packages. Synchronizing a package does not install an application that is not currently installed. For an installed Aligned cluster plugin, CVO requires the matching target `ModulePluginConfig` to be Ready; otherwise, CVO cannot build the upgrade plan, reports the error through `ClusterVersionShadow`, and retries the existing request. An installed Aligned operator requires a matching target `InstallPlan` from its catalog.
-:::
-
-Registry behavior depends on how the environment is configured:
-
-| Scenario                                      | Behavior                                                                      |
-| --------------------------------------------- | ----------------------------------------------------------------------------- |
-| `--registry` is specified                     | Use the provided registry directly.                                           |
-| `--registry` is not specified                 | Read the registry address from `ProductBase.spec.registry.address`.           |
-| Built-in platform registry                    | Rebuild the access address by using the global VIP.                           |
-| External registry                             | Automatically set `SKIP_SYNC_IMAGE=true`; the target payload must already have been uploaded through the canonical [target-version payload procedure](../../install/prepare/external-platform-image-registry.mdx#prepare-the-target-version-payload). |
-| Image upload required but credentials omitted | Read `username` and `password` from the `cpaas-system/registry-admin` Secret. |
-
-When the target registry is not the platform default, add registry parameters:
-
-| Parameter                   | Purpose                               |
-| --------------------------- | ------------------------------------- |
-| `--registry`                | Specify the target registry address.  |
-| `--username` / `--password` | Specify registry credentials.         |
-
-Artifact validation compares each package that is present in `plugins/` against the version the target Core Package expects, and fails on a version mismatch. It does not verify that the set is complete: a package that was never staged is simply not examined, and the run continues. Confirm the eleven packages against [Download ACP Upgrade to v4.5](../pre-upgrade.mdx#download-acp-upgrade-to-v45) before relying on a successful validation.
-
-:::warning
-Do not open the maintenance window until image and plugin synchronization is complete.
-:::
-
-Before running preflight, confirm that the registry configuration is still correct:
-
-```bash
-kubectl get productbase base \
-  -o jsonpath='{.spec.registry.address}{"\t"}{.spec.registry.external}{"\n"}'
-```
-
-Use successful completion of the selected publication commands and the registry administration interface or API as the Phase 1 evidence. Confirm that the expected target repositories and tags exist, and compare the published Extension set with the installed inventory exported to `apps.yaml`. Do not use `ProductBase.status.artifacts` as a zero-output target-version gate: it represents the current catalog and can legitimately contain `Absent` entries for optional or uninstalled packages.
-
-### Run preflight checks
-
-**When:** 1–2 weeks before the maintenance window, so there is time to resolve any blocking items before the window opens.
-
-Run `upgrade.sh` in preflight mode:
-
-```bash
+ac config use-cluster global
+ac whoami --show-server   # ends with /kubernetes/global/
 bash upgrade.sh --preflight
 ```
 
-Preflight is read-only — it validates upgrade readiness and does not change cluster state.
+Continue when `Summary` shows `Passed` or `PassedWithWarnings`. Otherwise, resolve the reported checks as described in [Handle Preflight Blocks](../troubleshooting.mdx#handle-preflight-blocks-when-needed), then run the check again. `AdminAckRequired` can appear for the first time here, after the target CVO is deployed; handle it as described in [Handle Administrator Acknowledgement Gates](../troubleshooting.mdx#handle-administrator-acknowledgement-gates).
 
-:::warning Preflight requires the CVO custom resources to exist
-On a cluster that has never had the cluster version operator deployed, `--preflight` cannot run yet and fails with:
+### Request the Upgrade \{#request-the-upgrade}
 
-```
-resolve desired release: get ProductManifest for version "<target-version>": no matches for kind "ProductManifest" in version "config.alauda.io/v1"
-```
-
-The message names an API group, but the cause is ordering, not a version mismatch: the `ProductManifest` custom resource definition and the target-version `ProductManifest` are both created by [Deploy the cluster version operator](#deploy-the-cluster-version-operator). Run that step first, then preflight. On a cluster whose previous upgrade already used the CVO workflow, the resources exist and preflight runs at any point after artifact synchronization.
+:::warning
+An upgrade cannot be rolled back. On Huawei DCS, the request also replaces every node with a new VM, one at a time; on Bare Metal, it reinstalls every host, one at a time. This happens on every minor upgrade, and on a patch upgrade when the target changes the Kubernetes build or the Alauda OS image.
 :::
 
-Preflight returns two parts:
-
-| Output    | Purpose                                                                        |
-| --------- | ------------------------------------------------------------------------------ |
-| `Summary` | Shows the overall result, current version, desired version, and desired image. |
-| `Checks`  | Shows the result of each individual validation item.                           |
-
-The default check set includes:
-
-- `ResourcePatchUpgradeable`
-- `ClusterVersionUpgradeable`
-- `AdminAckRequired`
-- `VersionUpgradePath`
-- `KubernetesVersionSupported`
-- `DockerRuntimeUnsupported`
-- `ClusterRunning`
-- `ClusterModuleStable`
-- `ControlPlaneStaticPodsPresent`
-- `CustomEtcdBackupCronJobsAbsent`
-- `CRIUpgradePodsAbsent`
-- `ModuleInfoStable`
-- `PlatformLicense`
-
-### Handle preflight blocks \{#handle-preflight-blocks-when-needed}
-
-**When:** before the maintenance window, as soon as preflight reports a block.
-
-A clean first preflight run is not the norm on a customized environment. Treat resolving blocks as part of the preparation phase, not as an exception — that is why preflight is run one to two weeks ahead.
-
-If any check does not pass, do not open the maintenance window. Resolve each block with [Upgrade Troubleshooting](../troubleshooting.mdx#handle-preflight-blocks-when-needed), which covers:
-
-- [`ResourcePatchUpgradeable`](../troubleshooting.mdx#handle-preflight-blocks-when-needed) — the most frequent block on a customized environment, and the target-version exemption it requires.
-- [Other common blocks](../troubleshooting.mdx#resolve-other-preflight-blocks) — `KubernetesVersionSupported`, `VersionUpgradePath`, `ClusterRunning`, `DockerRuntimeUnsupported`, and module stability.
-- [Administrator acknowledgement gates](../troubleshooting.mdx#handle-administrator-acknowledgement-gates) — when `AdminAckRequired` fails.
-
-Do not force an upgrade past a failed check. `VersionUpgradePath`, `KubernetesVersionSupported`, and `AdminAckRequired` gate the supported upgrade path itself. If a block cannot be resolved, contact technical support before continuing.
-
-### Deploy the cluster version operator \{#deploy-the-cluster-version-operator}
-
-**When:** at the start of the maintenance window.
-
-Run `upgrade.sh` in skip-sync mode. Synchronization is skipped because the artifacts were already uploaded in [Sync upgrade artifacts](#sync-upgrade-artifacts):
+List the available updates, then request the target version exactly as it is listed:
 
 ```bash
-bash upgrade.sh --skip-sync-image
+ac adm upgrade
+ac adm upgrade --cluster=global --to=<target-version>
 ```
 
-This deploys or updates the cluster version operator (CVO) and completes the remaining preparation. The CVO drives the Core and Aligned plugin upgrade once the upgrade is requested in the next step.
-
-After the command completes, inspect the target `ProductManifest` before requesting the upgrade:
+### Monitor the Upgrade \{#monitor-the-upgrade}
 
 ```bash
-kubectl get productmanifest v<target-version> \
-  -o jsonpath='{range .status.conditions[*]}{.type}{"\t"}{.status}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
-
-kubectl get productmanifest v<target-version> -o json | jq -r '
-  .status.artifacts[] as $artifact
-  | $artifact.channels[]
-  | select(.artifactStatus != "Ready")
-  | [$artifact.name, .channel, .tag, .artifactStatus]
-  | @tsv'
+ac adm upgrade status --cluster=global
 ```
 
-The per-artifact output is diagnostic and is not required to be empty. The target manifest can include optional, Agnostic, or uninstalled entries that are legitimately not Ready. Compare the output with the installed Core and Aligned inventory. For an installed Aligned `ModulePlugin`, inspect the matching target `ModulePluginConfig` when its channel is not Ready:
+Run the command again until `Current` shows the target version and the `Ready` condition is `True`. Add `--verbose` to see every check and stage.
+
+On Huawei DCS and Bare Metal, also follow the Kubernetes upgrade:
 
 ```bash
-kubectl get modulepluginconfig <modulepluginconfig-name> -o yaml
+ac -n cpaas-system get infraclusterversion global
 ```
 
-Use the component name and channel tag from the target `ProductManifest`, or the name reported in the `ClusterVersionShadow` error, to identify the `ModulePluginConfig`. The component version in this name is not necessarily the ACP Distribution Version. Do not treat `artifactStatus: Absent` alone as proof that the registry manifest is missing; use the `ModulePluginConfig` condition and its `.spec.image` to distinguish a missing manifest from authentication, CA, network, or package-content failures.
+`CURRENT` advances through each intermediate Kubernetes version. Continue when `PHASE` is `Succeeded`. While the control plane nodes are replaced, a command can fail to connect; run it again. The upgrade continues on its own.
 
-### Request the upgrade
+If `Upgrade` shows `Blocked` or `Retrying`, see [Inspect Upgrade State](../troubleshooting.mdx#inspect-upgrade-state). On Huawei DCS and Bare Metal, if the upgrade stays `InProgress` in the `Kubernetes` stage, read the `Stalled` condition of the `InfraClusterVersion` as described there. Fix the reported cause and the upgrade continues; if it cannot be fixed, contact technical support.
 
-After the cluster version operator is deployed, request the upgrade through one of the following entry points. The entry points are equivalent; pick the one that fits your operating model.
+### Upgrade Kubernetes on Huawei Cloud Stack or VMware vSphere \{#upgrade-kubernetes-hcs-vsphere}
 
-The platform offers two cluster management interfaces in the Web Console. **Web Console** is the built-in interface that ships with the platform and is the default path. **Web Console (Fleet Essentials)** is the newer cluster management interface, delivered as a separate cluster plugin that must be installed before it can be used.
+:::warning
+On Huawei Cloud Stack and VMware vSphere, upgrade Kubernetes right after the upgrade request of the cluster completes, for every upgrade, including a patch upgrade whose Kubernetes build changes. Do not leave the cluster on the new ACP version with the previous Kubernetes version.
+:::
 
-<Tabs>
-  <Tab label="Web Console">
+Follow [Upgrade Kubernetes on Huawei Cloud Stack and VMware vSphere](../upgrade_kubernetes_hcs_vsphere.mdx) for the `global` cluster, then return to this page.
 
-  This is the built-in cluster management interface. It is present on every <Term name="productShort" /> platform and requires nothing to be installed beyond the platform itself.
+On Huawei DCS, Bare Metal, and non-Alauda OS clusters, skip this step.
 
-  Requesting the upgrade requires update permission on the target cluster's `ClusterVersionShadow` and `ResourcePatch` resources.
+### Upgrade the Agnostic Extensions \{#upgrade-agnostic-extensions}
 
-  1. In the left navigation bar, click **Clusters** > **Clusters**, then click the `global` cluster.
+The upgrade request does not upgrade Extensions (Operators and Cluster Plugins) with the `Agnostic` lifecycle. Upgrade each Agnostic Extension separately by following its own documentation, for example:
 
-  2. Open the **Functional Components** tab.
+- <ExternalSiteLink name="ai" href="/upgrade/upgrade-from-aml-1.2.html" children="Upgrade Alauda AI" />
+- <ExternalSiteLink name="devops" href="/upgrade/index.html" children="Upgrade Alauda DevOps" />
 
-     The tab lists each component with its **Status** and **Version**. A component that has a newer version available is marked **Upgradeable**. A component that cannot move to the new version carries a block reason instead, and the page shows which components are not compatible with the new version.
+If the source ACP version is earlier than 4.3, also upgrade these Agnostic Extensions to versions compatible with the target, or their pages can fail to open: Alauda DevOps v3, Alauda AI Essentials, Alauda Hyperflux, and Alauda Container Platform Data Services Essentials.
 
-  3. Click **Upgrade**.
+### Validate the Upgrade \{#validate}
 
-     The button is disabled when there is no upgradable version (**No upgradable version**), when an upgrade is already running (**Upgrading**), or when the cluster is not healthy (**Cluster Abnormality**). Hover over the button to read the reason.
-
-  4. On the **Personalized Configuration Confirmation** step, review the listed configurations, then click **Acknowledge**.
-
-     This step appears **only when the cluster carries personalized configuration** — a customized `ModuleInfo`, a customized `ClusterModule`, or a `ResourcePatch`. It lists each item and renders the selected item's overrides as read-only YAML, under the warning *There are the following personalized configurations in your environment, please confirm with the technical support staff whether you need to delete or adjust, otherwise, your upgrade may fail!*
-
-     When the cluster carries no personalized configuration, this step does not appear and the page opens directly on the confirmation form described in the next step.
-
-  5. On the **Confirm Component Upgrade** step, review **Current Version** and **Target Version**.
-
-     The target version is the first entry of `ClusterVersionShadow.status.availableUpdates`. It is determined by the upgrade artifacts already prepared for the cluster and cannot be selected manually in this interface.
-
-  6. Click **Upgrade**.
-
-  7. In the **Are you sure you want to upgrade the cluster version?** dialog, set **Maintenance mode**, then click **Upgrade** to submit the request.
-
-  :::warning Maintenance mode is switched on by default in this dialog
-  The confirmation dialog opens with **Maintenance mode** already enabled. While maintenance mode is on, users who are not platform administrators are restricted from accessing platform features, and the text in **Platform maintenance announcements** is shown to them. The announcement is required while the switch is on and is limited to 200 characters. Turn the switch off before submitting if the change window does not call for restricting access. The switch writes the platform-wide maintenance mode setting, so review that setting again after the change window closes.
-  :::
-
-  After the request is submitted, the page returns to the **Functional Components** tab and shows *The upgrade has been initiated. It may take 5~10 minute for the status to update.* Click the magnifier icon in a component's **Status** column to follow that component's upgrade progress.
-
-  </Tab>
-
-  <Tab label="Web Console (Fleet Essentials)">
-
-  This entry point belongs to the new cluster management interface, delivered as the **Alauda Container Platform Fleet Essentials** cluster plugin. It is **not installed by default**.
-
-  **Prerequisite**: install **Alauda Container Platform Fleet Essentials** **v1.0.4 or later** from **Marketplace** > **Cluster Plugins**. The plugin adds a **Clusters (New)** entry to the left navigation bar. When that entry is absent, the plugin is not installed on this platform — use the **Web Console** tab instead.
-
-  1. In the left navigation bar, click **Clusters (New)**, then click the `global` cluster.
-
-  2. Stay on the **Overview** tab and find the **Version & Update** card.
-
-     The card shows **Distribution Version** and **Kubernetes Version**, and a status banner: **Up to date**, **Update Available**, **Upgrading**, **Update Blocked**, or **Upgrade Not Enabled**. **Upgrade Not Enabled** means the cluster version operator is not deployed on the cluster — complete [Deploy the cluster version operator](#deploy-the-cluster-version-operator) first.
-
-     When a target version exists, the card also reports target-artifact readiness as **Target artifacts ready** or **Target artifacts not ready**, with a Core count and an Aligned count. Click **Show per-component** to list which Core and Aligned components are not Ready yet. Core artifacts are synced by `upgrade.sh --only-sync-image`; Aligned plugins are not bundled in the Core Package and need their own packages published with `violet push`. Readiness does not block the request, but a target version only appears once its artifacts are ready.
-
-  3. Click **Upgrade** to open the **Update Cluster** dialog.
-
-     The button is active only while an update is available. During a run the card shows a disabled **Upgrading**; when a preflight check blocks the upgrade, it shows a disabled **Update Blocked** and lists the blockers in the **Preflight Checks** section of the card. Re-requesting the upgrade does not clear a block — resolve the blocker and the upgrade resumes.
-
-  4. On the **Custom Configuration** step, review the resource patches that will be exempted, then click **Next**.
-
-     The table lists each pending `ResourcePatch` with its **Name**, **Target Resource**, **Current Exempt Version**, and **Exempt To (after upgrade)**. Starting the upgrade annotates each of them with the exempt-for-version annotation so the upgrade does not overwrite them. When there is nothing to confirm, the step shows **No custom configuration to confirm**.
-
-  5. On the **Confirm & Upgrade** step, review **Current Version** and **Target Version**.
-
-     On the `global` cluster, **Target Version** is a drop-down list when `ClusterVersionShadow.status.availableUpdates` contains more than one target; select the version whose artifacts you prepared. With a single available target the version is shown read-only. The step also restates the upgrade scope — Core, Aligned, Kubernetes, and Agnostic — and the caution that a cluster upgrade cannot be rolled back.
-
-  6. Click **Confirm & Start**.
-
-     This interface has no second confirmation dialog and no maintenance mode switch. The card refreshes into the **Upgrading** state, and the **Preflight Checks**, **Upgrade Progress**, and **Update History** sections of the card track the run.
-
-  </Tab>
-
-  <Tab label="ACP CLI">
-
-  Use this entry point when scripting the upgrade or when your current ACP session already targets the global cluster.
-
-  ```bash
-  # Request upgrade to the highest version currently published in availableUpdates
-  ac adm upgrade --cluster=global --to-latest
-
-  # Request upgrade to a specific target version
-  ac adm upgrade --cluster=global --to=<target-version>
-
-  # Show summary, preflight, and stage progress for the global cluster upgrade
-  ac adm upgrade status --cluster=global
-  ```
-
-  For the complete AC CLI workflow and output interpretation, see [Upgrading Clusters](/ui/cli_tools/ac/upgrading-clusters.md). For full command and flag syntax, see [AC CLI Administrator Command Reference](/ui/cli_tools/ac/administrator-command-reference.md).
-
-  </Tab>
-
-  <Tab label="kubectl">
-
-  Use this entry point when you need to operate the underlying CVO resource directly. Patch `ClusterVersionShadow.spec.desiredUpdate` with the target version.
-
-  ```bash
-  kubectl patch cvsh global -n cpaas-system --type merge -p '{
-    "spec": {
-      "desiredUpdate": {
-        "version": "<target-version>"
-      }
-    }
-  }'
-  ```
-
-  Or edit the resource directly:
-
-  ```bash
-  kubectl edit cvsh global -n cpaas-system
-  ```
-
-  Minimum configuration:
-
-  ```yaml
-  spec:
-    desiredUpdate:
-      version: <target-version>
-  ```
-
-  </Tab>
-</Tabs>
-
-### Observe execution
-
-Use the following command to inspect the overall status:
-
-```bash
-kubectl get cvsh -n cpaas-system
-```
-
-Important status fields:
-
-| Field                         | Purpose                                       |
-| ----------------------------- | --------------------------------------------- |
-| `status.conditions`           | Overall status entry point.                   |
-| `status.preflight.observedAt` | Time of the latest preflight run.             |
-| `status.preflight.checks`     | Detailed result of each preflight item.       |
-| `status.current`              | Current applied version and image.            |
-| `status.desired`              | Target version and image being reconciled.    |
-| `status.history`              | Upgrade history, newest first.                |
-| `status.stages`               | Upgrade stages and per-stage execution state. |
-
-Focus on these conditions first:
-
-| Condition        | Interpretation                                                 |
-| ---------------- | -------------------------------------------------------------- |
-| `PreflightReady` | `True` means preflight passed.                                 |
-| `Ready`          | `True` means the cluster has reached the desired version.      |
-| `Reconciling`    | `True` means the upgrade is still running.                     |
-| `Stalled`        | `True` means the upgrade is blocked and requires intervention. |
-
-If `Stalled=True`, follow [Upgrade Troubleshooting](../troubleshooting.mdx). To observe an individual plugin or operator module, read its `ModuleInfo`:
-
-```bash
-# Current version, target, next available version, and phase per installed module on this cluster
-kubectl get moduleinfo -l cpaas.io/cluster-name=global \
-  -o custom-columns='MODULE:.metadata.labels.cpaas\.io/module-name,CURRENT:.status.version,TARGET:.spec.version,NEW:.status.availableVersions[0].version,PHASE:.status.phase'
-
-# Conditions and any block reasons for one module
-kubectl get moduleinfo <name> \
-  -o jsonpath='{range .status.conditions[*]}{.type}{"\t"}{.status}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
-```
-
-A module has reached its target when `status.phase` is `Running` and `status.version` equals the target version.
-
-### Upgrade Agnostic plugins from Marketplace \{#upgrade-agnostic-from-marketplace}
-
-CVO drives Core and Aligned plugins. **Agnostic plugins are outside CVO's scope** and must be upgraded individually after the cluster has reached the target Distribution Version. Whether each Agnostic plugin needs to be upgraded depends on its own Kubernetes compatibility — see the plugin's release notes for compatibility with the target Kubernetes version.
-
-For each in-use Agnostic plugin on the global cluster:
-
-1. In the Web Console, switch to **Administrator** view.
-2. Navigate to **Marketplace > Cluster Plugins** for Agnostic cluster plugins, or to the operator workflow for Agnostic operators.
-3. Select the target plugin or operator and trigger the upgrade. The Marketplace upgrade flow reads the package previously pushed with `violet`.
-
-If you skipped pushing an Agnostic plugin during pre-upgrade and the Marketplace does not offer the target version, complete the `violet push` step first and then retry the Marketplace upgrade.
+Complete [Upgrade Validation](../validation.mdx) for the `global` cluster to finish its upgrade.
 
 </Steps>
 
-## Validate the Upgrade
+## Next Step
 
-After the cluster reaches the desired version and the in-use Agnostic plugins are handled, complete [Upgrade Validation](../validation.mdx). If the `global` cluster uses Alauda OS, first complete [Upgrade Kubernetes on Alauda OS](./upgrade_kubernetes_on_alauda_os.mdx).
-
-## Related Documentation
-
-- [Overview](../overview.mdx)
-- [Pre-upgrade](../pre-upgrade.mdx)
-- [Upgrade Kubernetes on Alauda OS for the `global` cluster](./upgrade_kubernetes_on_alauda_os.mdx)
-- [Upgrade global clusters in a DR environment](./upgrade_global_dr.mdx)
-- [Upgrade the Distribution Version of workload clusters](../workload/upgrade_workload_cluster.mdx)
-- [Upgrade validation](../validation.mdx)
-- [Upgrade troubleshooting](../troubleshooting.mdx)
-- [Upgrading Clusters](/ui/cli_tools/ac/upgrading-clusters.md)
-- [Global Cluster Disaster Recovery](/install/non_alauda_os/global_dr.mdx)
+Upgrade the workload clusters. See [Upgrade Workload Clusters](../workload/upgrade_workload_cluster.mdx).

@@ -2,153 +2,900 @@
 weight: 20
 ---
 
-# Pre-Upgrade Preparation
+import AlaudaOsUpgradePath /* eslint-disable-line no-unused-vars */ from '../../shared/components/AlaudaOsUpgradePath'
+import DcsVmTemplateConfigMap /* eslint-disable-line no-unused-vars */ from '../../shared/components/DcsVmTemplateConfigMap'
+import BareMetalImageCatalog /* eslint-disable-line no-unused-vars */ from '../../shared/components/BareMetalImageCatalog'
 
-**Supported upgrade paths:**
+# Prepare for the Upgrade
 
-At the minor-release policy level, ACP 4.2, 4.3, and 4.4 are within the n-3 direct-upgrade window for the ACP 4.5 release line. This policy does not make every source patch eligible for every target patch.
+Complete these steps before you upgrade. Prepare again for every upgrade, including a patch upgrade of the ACP version (Distribution Version) and an upgrade of `global` before every workload cluster has caught up.
 
-Upgrade only to a target 4.5.x version that the platform offers for the current source patch. After the target `ProductManifest` is registered, confirm that the target appears in `availableUpdates` in the Web Console or `ac adm upgrade`, and confirm that the `VersionUpgradePath` preflight check passes. If no 4.5.x target is offered, use a later 4.5.x target that includes the current source patch or first follow an intermediate target offered by the platform. Do not use an explicit upgrade request or disable `VersionUpgradePath` to bypass an unsupported source-to-target combination.
+In a DR environment with Alauda Container Platform Global Cluster Disaster Recovery, do every step that names `global` on both `global` clusters. If your clusters run on more than one provider, complete the steps for each of them, including the provider of the `global` cluster.
 
-ACP 4.1.x and earlier releases are outside the direct-upgrade window for ACP 4.5. Follow the intermediate upgrade chain offered by the platform, and verify `availableUpdates` and `VersionUpgradePath` at every hop.
+## Checks at a Glance \{#lead-time}
 
-:::info
-For clusters that use Alauda OS, the ACP Distribution Version must follow the same CVO-offered source-to-target path. When the target ACP version is more than one Kubernetes minor above the cluster's current version, [Upgrade Kubernetes on Alauda OS](./workload/alauda_os/index.mdx) requires additional pre-staging of intermediate-version artifacts. See [Preparing for Cross-Version Upgrades](./workload/alauda_os/index.mdx#cross-version-preparation) before starting the upgrade window.
+| Check | Applies to |
+| --- | --- |
+| [Check Cluster Versions](#check-compatibility) | Every cluster |
+| [Check the Registry, Modules, and etcd Backup of `global`](#global-common-checks) | Every `global` cluster |
+| [Check by OS and Provider](#global-provider-checks) | Every `global` cluster, in the tab of its OS or infrastructure provider |
+| [Check the Staged Images](#check-staged-images) | Every `global` cluster on Alauda OS, in the tab of its infrastructure provider |
+| [Check DR Synchronization](#check-dr-sync) | DR environments |
+| [Run Preflight Checks](#run-preflight) | Every `global` cluster |
+| [Before You Upgrade the Clusters](./workload/upgrade_workload_cluster.mdx#before-the-window) | Each workload cluster, before its upgrade |
+
+## Prepare the Execution Host \{#execution-host}
+
+Run every upgrade command from one execution host. The few steps that run on a node say so; return to the execution host after each of them.
+
+- A Linux host (x86_64 or aarch64) outside every cluster that reaches the platform address, and the VIP and registry of each `global` cluster.
+- `kubectl`, ACP CLI (`ac`), and Violet v4.2.13 or later (`violet version`).
+- A platform account with the platform administrator role.
+- In DR, a kubeconfig of the standby `global` cluster that points to its VIP, `<standby-kubeconfig>`. For example, copy `/etc/kubernetes/admin.conf`, with any certificate files it references, from a control-plane node of the standby, and set its `server` to the VIP if it points elsewhere.
+- The extracted target Core Package, kept on this host until every cluster is upgraded.
+
+Log in once with the platform administrator account, with `KUBECONFIG` unset:
+
+```bash
+ac login https://<platform-address> --name <session>
+ac config use-cluster <cluster-name>
+ac whoami --show-server
+ac config use-cluster global
+```
+
+- The session is saved in `~/.kube/config`, and `ac` commands run on `global`, the primary in DR. For a workload cluster, run `ac config use-cluster <cluster-name>` first and `ac config use-cluster global` afterwards; `ac whoami --show-server` then ends with `/kubernetes/<cluster-name>/`.
+- `upgrade.sh` uses `kubectl` with this session. Run `ac config use-cluster global` right before the script.
+- For the standby, run `export KUBECONFIG=<standby-kubeconfig>` first, confirm that `ac whoami --show-server` prints the standby VIP, and run `unset KUBECONFIG` afterwards.
+
+## Check Cluster Versions \{#check-compatibility}
+
+**Applies to**: every cluster registered on `global`, `global` included, imported clusters included. In DR, run it on each `global` cluster; on the standby, read only its own version.
+
+On `global`, list the ACP version (the `CURRENT` column of the first list), the Kubernetes version, and the infrastructure provider of every cluster. In the last list, `DCSCluster`, `BaremetalCluster`, `HCSCluster`, and `VSphereCluster` mark an Alauda OS cluster, `UserProvisionedCluster` a cluster that does not run Alauda OS, and `<none>` an imported cluster:
+
+```bash
+ac config use-cluster global
+ac whoami --show-server
+ac -n cpaas-system get cvsh
+ac -n cpaas-system get clusters.clusterregistry.k8s.io -o custom-columns='NAME:.metadata.name,KUBERNETES:.status.version'
+ac -n cpaas-system get clusters.cluster.x-k8s.io -o custom-columns='NAME:.metadata.name,INFRASTRUCTURE:.spec.infrastructureRef.kind'
+```
+
+If `cvsh` reports `the server doesn't have a resource type`, or does not list a cluster, take the ACP version of that cluster from `VERSION`:
+
+```bash
+ac get clustermodule -o custom-columns='NAME:.metadata.name,VERSION:.spec.version'
+```
+
+In DR, read the version of the standby, from `CURRENT`, or from `VERSION` when `cvsh` is not available:
+
+```bash
+ac --kubeconfig <standby-kubeconfig> -n cpaas-system get cvsh global
+ac --kubeconfig <standby-kubeconfig> get clustermodule global -o custom-columns='NAME:.metadata.name,VERSION:.spec.version'
+```
+
+### Upgrade Path and Compatibility \{#check-upgrade-path}
+
+Compare each cluster with the table. Continue when every cluster matches a row whose action is Continue; otherwise, take the action of each row that matches.
+
+| Result for a cluster | Action |
+| --- | --- |
+| ACP 4.2, 4.3, or 4.4 (on Alauda OS: ACP v4.3.2 or later); and, for a cluster created by ACP, a Kubernetes version within the Compatible Versions of the target in the [Kubernetes Support Matrix](../overview/kubernetes-support-matrix.mdx) | Continue. The preflight check `VersionUpgradePath` confirms the exact patch version. |
+| Already the target minor version: a patch upgrade, or `global` upgraded again | Continue. |
+| ACP 4.1 or earlier | Contact technical support. |
+| On Alauda OS, an ACP version earlier than v4.3.2 | Contact technical support. |
+| Created by ACP, with a Kubernetes version outside the Compatible Versions of the target | Upgrade the cluster on the current `global` first, as described in the documentation of its current ACP version. |
+| No version is shown for the cluster | Contact technical support. |
+
+## Check the Registry, Modules, and etcd Backup of `global` \{#global-common-checks}
+
+**Applies to**: every `global` cluster. In DR, run each block on the standby too, as the comments on its first and last lines show: start with `export KUBECONFIG=<standby-kubeconfig>` and finish with `unset KUBECONFIG`.
+
+On `global`:
+
+```bash
+ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
+echo "== Registry"
+ac get productbase base -o jsonpath='external={.spec.registry.external}{"\n"}'
+echo "== Modules"
+ac get moduleinfo -l cpaas.io/cluster-name=global \
+  -o custom-columns='MODULE:.metadata.labels.cpaas\.io/module-name,CURRENT:.status.version,TARGET:.spec.version,PHASE:.status.phase'
+ac get clustermodule global -o jsonpath='deployStatus={.status.base.deployStatus}{"\n"}'
+echo "== etcd backup records"
+ac get etcdbackupconfiguration etcd-backup-default \
+  -o jsonpath='{range .status.records[*]}{.backupTimestamp}{"\t"}{.result}{"\n"}{end}'
+# on the standby: unset KUBECONFIG
+```
+
+`external=` with an empty value or `false` is the platform built-in Registry. With it, on each control-plane node of `global`, run the line for the OS of the node:
+
+```bash
+df -h /var/cpaas/minio   # Alauda OS
+df -h /cpaas/minio       # non-Alauda OS
+```
+
+Continue when every part of the output matches its Continue row; otherwise, take the action of each row that matches.
+
+| Result | Action |
+| --- | --- |
+| `external=true`, or each control-plane node has at least 120 GB available | Continue. |
+| A control-plane node has less than 120 GB available | Expand that disk. If you cannot, contact technical support. |
+| Every module shows `PHASE` `Running` and `CURRENT` equal to `TARGET`, and `deployStatus=` shows a value other than `Upgrading`, `DeployFailed`, or `UpgradeFailed` | Continue. |
+| A module shows `CURRENT` different from `TARGET`, or `deployStatus` is empty or `Upgrading` | Run the block again later. If the output does not change, contact technical support. |
+| A module shows `PHASE` `Failed` or `Blocked`, or `deployStatus` is `DeployFailed` or `UpgradeFailed` | Run the steps in [Diagnose a Module That Does Not Advance](./troubleshooting.mdx#module-not-advancing). If the module does not recover, contact technical support. |
+| A module shows any other `PHASE` | Contact technical support. |
+| The etcd backup record with the latest time shows `Success` | Continue. |
+| The etcd command reports `NotFound` or `the server doesn't have a resource type` | Install Alauda Container Platform Cluster Enhancement on the cluster, as described in [etcd Backup and Restore](../configure/backup/etcd.mdx), and run the command again after its first backup. If you cannot install it, contact technical support. |
+| The etcd backup record with the latest time does not show `Success`, or there is no record | Contact technical support. |
+
+## Check the `global` Cluster \{#check-global-cluster}
+
+**Applies to**: every `global` cluster. In DR, run each block on the standby too, as the comments on its first and last lines show: start with `export KUBECONFIG=<standby-kubeconfig>` and finish with `unset KUBECONFIG`.
+
+Run each block on the execution host unless it says that it runs on a node. Each table has a Continue row for each part of the output: continue when every part matches its Continue row; otherwise, take the action of each row that matches. [Check the Staged Images](#check-staged-images) checks the images after you stage them.
+
+### Check by OS and Provider \{#global-provider-checks}
+
+Use the Non-Alauda OS tab when the nodes of `global` do not run Alauda OS; otherwise, use the tab of the infrastructure provider of `global`, shown in `INFRASTRUCTURE` in [Check Cluster Versions](#check-compatibility).
+
+:::warning
+On Alauda OS, data on a node's own disks, such as `hostPath` volumes and local PersistentVolumes, is not kept when the node is replaced, unless it is on a pool-managed persistent disk (Bare Metal: a declared data volume). Move it to storage outside the nodes, such as NFS or an external Ceph cluster, before the upgrade. For volumes of [LVM Storage](../storage/storagesystem_topolvm/index.mdx), contact technical support before the upgrade.
 :::
 
-## Important Notes
+<Tabs>
+  <Tab label="Non-Alauda OS">
 
-* Ensure the directory `/cpaas/minio` on the control plane nodes of global cluster has at least **120 GB** of free disk space.
-* Before upgrading the global tier, verify that all workload clusters remain within the target Distribution Version's **Compatible Versions** documented in [Kubernetes Support Matrix](/overview/kubernetes-support-matrix.html).
-* If any workload cluster is outside the target compatible range, upgrade that workload cluster first until it enters the range before upgrading the global tier.
-* A workload cluster can be upgraded only to a Distribution Version that the global tier has already reached.
-
-## Verify Module Stability Before You Upgrade \{#module-stability-self-check}
-
-The cluster upgrade preflight requires every installed **Core** and **Aligned** plugin module on the target cluster to be in a stable state. If any such module is mid-install, mid-upgrade, or failed, the `ModuleInfoStable` and `ClusterModuleStable` preflight checks block the upgrade until it is resolved. A common cause is a standalone plugin upgrade that is still running when the cluster upgrade is requested.
-
-Before you request the upgrade, list the installed modules on the target cluster and confirm every one is in the `Running` phase:
-
-```bash
-kubectl get moduleinfo -l cpaas.io/cluster-name=<cluster> \
-  -o custom-columns='MODULE:.metadata.labels.cpaas\.io/module-name,CURRENT:.status.version,TARGET:.spec.version,PHASE:.status.phase'
-```
-
-Also confirm the cluster module itself is not in a deploy or upgrade failure state:
-
-```bash
-kubectl get clustermodule <cluster> -o jsonpath='{.status.base.deployStatus}{"\n"}'
-```
-
-Every module `PHASE` must be `Running`, and `deployStatus` must not be `Upgrading`, `DeployFailed`, or `UpgradeFailed`. If a module is still upgrading, wait for it to reach `Running`; if a module is `Failed` or `Blocked`, resolve it before you request the cluster upgrade.
-
-## Kubernetes 1.35 or Later Node Readiness \{#kubernetes-135-node-readiness}
-
-If the target release is ACP 4.4 or later, upgrades the cluster to Kubernetes 1.35 or later, and reports an administrator acknowledgement gate for node readiness, verify every production node that will run the target cluster before acknowledging the gate.
-
-Log in to each node through SSH or another administrative node access method available in your environment, and run the following checks directly on the node operating system. The account and credentials depend on how the cluster nodes were provisioned.
-
-Verify the Linux kernel version:
+On each node of `global`:
 
 ```bash
 uname -r
-```
-
-The kernel must be `5.8` or later and must also be within the ACP supported operating system and kernel matrix for the target release.
-
-Verify that the node uses cgroup v2:
-
-```bash
 stat -fc %T /sys/fs/cgroup/
 ```
 
-The expected output is:
+Continue when the kernel is `5.8` or later and within [Supported OS and Kernel Versions](../install/non_alauda_os/node_preprocessing.mdx#supported_os_and_kernels), and the second command prints `cgroup2fs`; otherwise, update the OS of the node before the upgrade, and if you cannot, contact technical support. The update restarts the node.
 
-```text
-cgroup2fs
-```
+  </Tab>
+  <Tab label="Huawei DCS">
 
-On Alauda OS clusters, Kubernetes is upgraded by replacing nodes. On the hop to Kubernetes 1.35 or later, also apply the [required kubelet patch](./workload/alauda_os/index.mdx#kubernetes-1-35-kubelet-patch) to the control-plane and worker bootstrap configurations.
-
-## Download the Packages for Offline Environments
-
-A production maintenance window typically upgrades **<Term name="productShort" /> Core**, the **Aligned plugins** (cluster plugins and operators released together with the same ACP version), and the in-use **Agnostic plugins** (independently released cluster plugins and operators) in the same window. Core and Extension packages are separate downloads. Prepare all three package sets before the maintenance window so that artifact synchronization can finish early.
-
-### Step 1: Download the Core Package
-
-From the **<Term name="company" /> Customer Portal**, download the **<Term name="productShort" /> 4.5 Core Package** that matches your target architecture. The Core Package contains Core artifacts only; it does not contain any Aligned or Agnostic Extension package.
-
-### Step 2: Download ACP Upgrade to v4.5 \{#download-acp-upgrade-to-v45}
-
-Use **Violet v4.2.13 or later** to download the scenario packages directly. Run `violet version` to verify the version, and use `violet ac login` to log in to the <Term name="company" /> Customer Portal. For installation and login instructions, see [Download Packages](/extend/download_package.mdx).
-
-Set `<target-platform-version>` to the exact ACP Distribution Version of the Core Package, such as `v4.5.0`. Set `<arch>` to `amd64`, `arm64`, or `hybrid` to match the Core Package. List the scenarios first, and then download **ACP Upgrade to v4.5**:
+On `global`:
 
 ```bash
-violet ac scenarios --arch=<arch> --platformVersion=<target-platform-version>
-violet ac download-app --arch=<arch> --platformVersion=<target-platform-version> --scenario="ACP Upgrade to v4.5"
+ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
+KCP=$(ac -n cpaas-system get clusters.cluster.x-k8s.io global -o jsonpath='{.spec.controlPlaneRef.name}')
+echo "== Rollout settings"
+ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='replicas={.spec.replicas} maxSurge={.spec.rolloutStrategy.rollingUpdate.maxSurge}{"\n"}'
+ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=global \
+  -o custom-columns='NAME:.metadata.name,SURGE:.spec.strategy.rollingUpdate.maxSurge,UNAVAILABLE:.spec.strategy.rollingUpdate.maxUnavailable'
+echo "== Machine templates in use"
+ac -n cpaas-system get dcsmachinetemplate \
+  $(ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{.spec.machineTemplate.infrastructureRef.name}') \
+  $(ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=global -o jsonpath='{.items[*].spec.template.spec.infrastructureRef.name}') \
+  -o custom-columns='NAME:.metadata.name,TEMPLATE_DISKS:.spec.template.spec.vmConfig.dcsMachineDiskSpec[*].path'
+echo "== Machines, IP pools, and the type and address of the control-plane load balancer"
+ac -n cpaas-system get dcsmachine -l cluster.x-k8s.io/cluster-name=global \
+  -o custom-columns='NAME:.metadata.name,POOL:.spec.ipHostPoolRef.name,IP:.status.networkConfig.ip,VM_TEMPLATE:.spec.vmTemplateName,READY:.status.ready'
+ac -n cpaas-system get dcsiphostnamepool \
+  -o custom-columns='NAME:.metadata.name,IPS:.spec.pool[*].ip,DISKS:.spec.pool[*].persistentDisk[*].slot,KEPT_DISKS:.status.persistentDiskStatus[*].ip'
+ac -n cpaas-system get dcscluster global -o jsonpath='{.spec.controlPlaneLoadBalancer.type}{" "}{.spec.controlPlaneLoadBalancer.host}{"\n"}'
+echo "== Secrets that the DCSCluster references"
+ac -n cpaas-system get secret $(ac -n cpaas-system get dcscluster global -o jsonpath='{.spec.credentialSecretRef.name} {.spec.encryptionProviderConfigRef.name}')
+echo "== Kubelet patch files: the encoding, then the content or a Secret name and key"
+echo "${KCP}:"
+ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{range .spec.kubeadmConfigSpec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
+for t in $(ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=global -o jsonpath='{.items[*].spec.template.spec.bootstrap.configRef.name}'); do
+  echo "${t}:"
+  ac -n cpaas-system get kubeadmconfigtemplate "${t}" -o jsonpath='{range .spec.template.spec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
+done
+echo "== Providers"
+ac get moduleinfo -l cpaas.io/cluster-name=global \
+  -o custom-columns='MODULE:.metadata.labels.cpaas\.io/module-name,PHASE:.status.phase' | grep -E '^MODULE|cluster-api-provider'
+echo "== Pods with hostPath volumes"
+ac get pods -A --no-headers \
+  -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,OWNER:.metadata.ownerReferences[*].kind,MIRROR:.metadata.annotations.kubernetes\.io/config\.mirror,PHASE:.status.phase,HOSTPATH:.spec.volumes[*].hostPath.path' \
+  | awk '$1 !~ /^(kube-system|kube-public|kube-node-lease|cpaas-system)$/ && $3 !~ /DaemonSet/ && $4 == "<none>" && $5 !~ /^(Succeeded|Failed)$/ && $6 != "<none>"'
+echo "== Local and hostPath PersistentVolumes with a claim"
+ac get pv --no-headers \
+  -o custom-columns='NAME:.metadata.name,CLAIM_NAMESPACE:.spec.claimRef.namespace,CLAIM:.spec.claimRef.name,LOCAL:.spec.local.path,HOSTPATH:.spec.hostPath.path' \
+  | awk '$2 !~ /^(<none>|kube-system|kube-public|kube-node-lease|cpaas-system)$/ && ($4 != "<none>" || $5 != "<none>")'
+echo "== LVM Storage PersistentVolumes"
+ac get pv --no-headers \
+  -o custom-columns='NAME:.metadata.name,DRIVER:.spec.csi.driver,CLAIM_NAMESPACE:.spec.claimRef.namespace,CLAIM:.spec.claimRef.name' \
+  | awk '$2 ~ /^topolvm\./'
+# on the standby: unset KUBECONFIG
 ```
 
-Confirm that **ACP Upgrade to v4.5** appears in the scenario list before downloading it.
+A free entry is an IP address of a pool in `POOL` whose `DISKS` lists slot numbers, that no machine uses, and that is not the load balancer address when the type is `internal`.
 
-As an alternative to Violet, in the Customer Portal, go to **Marketplace > Batch Download > Install**. On the page, select the target Core Package version from **Your ACP Version**, select the matching **Architecture**, select **ACP Upgrade to v4.5** from **Scenarios**, and download the packages.
+| Result | Action |
+| --- | --- |
+| `replicas` is 3 or more and `maxSurge` is `0`, and every MachineDeployment shows `SURGE` `0` and `UNAVAILABLE` `1` | Continue. |
+| `replicas` is less than 3 | Contact technical support. |
+| `replicas` is 3 or more and `maxSurge` is empty or not `0`, or a MachineDeployment shows `SURGE` empty, `<none>`, or not `0`, or `UNAVAILABLE` empty, `<none>`, or not `1` | Run the commands in [Set the Rollout Settings](#rollout-settings). |
+| No machine template lists `/var/cpaas` in `TEMPLATE_DISKS` | Continue. |
+| A machine template lists `/var/cpaas` | [Migrate to pool-managed persistent disks](./persistent_disk_migration.mdx) before the upgrade. The migration replaces nodes. |
+| Every machine shows `READY` `true` | Continue. |
+| A machine shows `READY` empty, `<none>`, or `false` | Run the block again later. If the machine still does not show `true`, contact technical support. |
+| Every machine shows the same `VM_TEMPLATE` | Continue. |
+| The machines show different `VM_TEMPLATE` values | Contact technical support. |
+| The pools in `POOL` whose `DISKS` lists slot numbers have no free entry | Continue. |
+| A free entry is not in `KEPT_DISKS` | Remove it from `spec.pool` with `ac -n cpaas-system edit dcsiphostnamepool <pool-name>`. Keep the entry of the internal load balancer address. |
+| A free entry is in `KEPT_DISKS` | Contact technical support. Do not remove the entry. |
+| Each Secret is listed | Continue. |
+| A Secret is reported `NotFound` | Contact technical support. |
+| Each kubelet patch file shows `encoding=[]`, then its content, or a Secret name and a key for which the command in [Kubelet Patch File](#kubernetes-1-35-kubelet-patch) prints the content | Continue. |
+| No `encoding=` line follows a name under `== Kubelet patch files`, a file shows a value inside `encoding=[]`, such as `encoding=[base64]`, or no content, or its Secret or key does not exist | Contact technical support. |
+| `cluster-api-provider-kubeadm` and `cluster-api-provider-dcs` show `PHASE` `Running` | Continue. |
+| A provider is missing, or shows another `PHASE` | Contact technical support. |
+| Nothing is listed under `== Pods with hostPath volumes`, and nothing under `== Local and hostPath PersistentVolumes with a claim` | Continue. |
+| A Pod or a PersistentVolume is listed under `== Pods with hostPath volumes` or `== Local and hostPath PersistentVolumes with a claim` | Move its data to storage outside the nodes, such as NFS or an external Ceph cluster, before the upgrade. If the data is on a pool-managed persistent disk, or you cannot move it, contact technical support. |
+| Nothing is listed under `== LVM Storage PersistentVolumes` | Continue. |
+| A PersistentVolume is listed under `== LVM Storage PersistentVolumes`, in any namespace, `cpaas-system` included | Contact technical support before the upgrade. |
 
-This package set provides the target-version packages for the following Aligned applications. These packages remain separate from the Core Package.
+  </Tab>
+  <Tab label="Bare Metal">
 
-Downloaded files are named `<package-name>.<arch>.<version>.tgz`, which does not repeat the display name. Each entry below gives the package name so that you can confirm you received all eleven:
-
-| Application | Package name |
-| ----------- | ------------ |
-| **Alauda Container Platform Web Console** | `console` |
-| **Alauda Container Platform Web Console Central** | `console-central` |
-| **Alauda Container Platform Marketplace Web Console** | `console-marketplace` |
-| **Alauda Container Platform Application Catalog** | `application-catalog` |
-| **Alauda Container Platform Observability Essentials** | `aiops-base` |
-| **Alauda Container Platform Essentials** | `container-platform` |
-| **Alauda Container Platform Cluster Essentials** | `acp-business` |
-| **Alauda Container Platform GatewayAPI Plugin** | `gatewayapi-plugin` |
-| **Alauda Container Platform Basic Monitoring** | `prometheus` |
-| **Alauda Language Pack for Chinese** | `i18n-zh` |
-| **Alauda Container Platform Networking E1** | `calico` |
-
-Before publishing upgrade artifacts, manually copy all eleven packages into the `plugins/` directory of the extracted Core Package. [Sync upgrade artifacts](./global/upgrade_global_cluster.mdx#sync-upgrade-artifacts) describes the built-in and external Registry publication branches.
-
-### Step 3: Inventory other Extensions on every cluster in scope
-
-Cluster plugins and operators are managed by different mechanisms. Both are needed in this step:
-
-- **Cluster plugins** are global resources. A cluster plugin pushed to the global tier becomes installable and upgradable on every cluster in the platform; you only push each cluster plugin once.
-- **Operators** are scoped to each cluster. Pushing an operator to the global tier is the recommended starting point, but the same operator package must be available on each workload cluster before that cluster's upgrade.
-
-Use the same `violet` installation from Step 2 to inventory installed Extensions and publish packages that are not part of **ACP Upgrade to v4.5**. For more information, see [Download Packages](/extend/download_package.html) and [Upload Packages](/extend/upload_package.html).
-
-On any machine with network access to the **<Term name="company" />** platform endpoint, run `violet list` to list the plugins (both Aligned and Agnostic) installed in the current environment and export the result to `./apps.yaml`:
+On `global`. Keep the output; after the upgrade, validation compares the `INVENTORY` values with it.
 
 ```bash
-violet list \
-  --platform-address "https://<your-platform-domain>" \
-  --platform-token "<platform_token>" \
-  --output-file "./apps.yaml"
+ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
+KCP=$(ac -n cpaas-system get clusters.cluster.x-k8s.io global -o jsonpath='{.spec.controlPlaneRef.name}')
+echo "== Rollout settings"
+ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='replicas={.spec.replicas} maxSurge={.spec.rolloutStrategy.rollingUpdate.maxSurge}{"\n"}'
+ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=global \
+  -o custom-columns='NAME:.metadata.name,SURGE:.spec.strategy.rollingUpdate.maxSurge,UNAVAILABLE:.spec.strategy.rollingUpdate.maxUnavailable'
+echo "== Machines, host pools, and hosts"
+ac -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io -l cluster.x-k8s.io/cluster-name=global \
+  -o custom-columns='NAME:.metadata.name,INVENTORY:.status.machineInventoryRef.name,PHASE:.status.phase'
+ac -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io \
+  -o custom-columns='NAME:.metadata.name,CLUSTER:.spec.clusterName,TOTAL:.status.total,ALLOCATED:.status.allocated,HOSTS:.spec.machineInventories[*].name'
+ac -n cpaas-system get machineinventories.elemental.cattle.io \
+  -o custom-columns='NAME:.metadata.name,OS:.metadata.labels.os\.baremetal\.alauda\.io/id,STORAGE:.status.storage.phase'
+echo "== Kubelet patch files: the encoding, then the content or a Secret name and key"
+echo "${KCP}:"
+ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{range .spec.kubeadmConfigSpec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
+for t in $(ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=global -o jsonpath='{.items[*].spec.template.spec.bootstrap.configRef.name}'); do
+  echo "${t}:"
+  ac -n cpaas-system get kubeadmconfigtemplate "${t}" -o jsonpath='{range .spec.template.spec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
+done
+echo "== Providers"
+ac get moduleinfo -l cpaas.io/cluster-name=global \
+  -o custom-columns='MODULE:.metadata.labels.cpaas\.io/module-name,PHASE:.status.phase' | grep -E '^MODULE|cluster-api-provider'
+echo "== Pods with hostPath volumes"
+ac get pods -A --no-headers \
+  -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,OWNER:.metadata.ownerReferences[*].kind,MIRROR:.metadata.annotations.kubernetes\.io/config\.mirror,PHASE:.status.phase,HOSTPATH:.spec.volumes[*].hostPath.path' \
+  | awk '$1 !~ /^(kube-system|kube-public|kube-node-lease|cpaas-system)$/ && $3 !~ /DaemonSet/ && $4 == "<none>" && $5 !~ /^(Succeeded|Failed)$/ && $6 != "<none>"'
+echo "== Local and hostPath PersistentVolumes with a claim"
+ac get pv --no-headers \
+  -o custom-columns='NAME:.metadata.name,CLAIM_NAMESPACE:.spec.claimRef.namespace,CLAIM:.spec.claimRef.name,LOCAL:.spec.local.path,HOSTPATH:.spec.hostPath.path' \
+  | awk '$2 !~ /^(<none>|kube-system|kube-public|kube-node-lease|cpaas-system)$/ && ($4 != "<none>" || $5 != "<none>")'
+echo "== LVM Storage PersistentVolumes"
+ac get pv --no-headers \
+  -o custom-columns='NAME:.metadata.name,DRIVER:.spec.csi.driver,CLAIM_NAMESPACE:.spec.claimRef.namespace,CLAIM:.spec.claimRef.name' \
+  | awk '$2 ~ /^topolvm\./'
+# on the standby: unset KUBECONFIG
 ```
 
-Prefer `--platform-token` over `--platform-password` to avoid exposing passwords in shell history and process listings (`ps aux`).
+The hosts of `global` are the ones in `HOSTS` of the pools whose `CLUSTER` is `global`, spare hosts included. On each of these hosts whose `OS` is `alaudaos.m.55`, empty, or `<none>` (Alauda OS M55):
 
-Violet v4.2.13 or later is required for this token-based inventory workflow. Earlier versions can fail with `failed to get user info from platform server`; upgrade Violet before continuing.
+```bash
+lsblk -o NAME,SIZE,LABEL | grep COS_STATE
+btrfs filesystem usage -h /
+snapper --no-dbus --csvout list --columns number,default,active,userdata
+```
 
-### Step 4: Download the other Extension packages
-
-Import the exported `apps.yaml` file into the **<Term name="company" /> Customer Portal** to align the package list with what your clusters currently run. Download the matching target-version packages for the other Aligned and Agnostic Extensions that your clusters use.
-
-If the result includes one of the eleven applications from **ACP Upgrade to v4.5**, do not publish that duplicate with `violet`. Use the package from **ACP Upgrade to v4.5** through the Core Package's `plugins/` directory instead. Use `violet push` only for the remaining Extension packages.
-
-Download every package you will need so they are all available locally before the upgrade window starts. The next page, [Upgrade the global cluster](./global/upgrade_global_cluster.mdx), describes how the selected Registry path publishes Core and the eleven manually staged packages, and how `violet` publishes the other Extensions. Artifact publication does not upgrade any already-running plugin, so complete it before the maintenance window.
-
-:::warning Required Aligned Plugin Packages
-Every Aligned plugin installed on a cluster being upgraded must have its target-version package available before the upgrade request. CVO does not require target packages for Aligned applications that are not installed, and synchronizing a package does not install an application that is not currently installed.
-
-If a required package is unavailable, CVO blocks progress and keeps retrying the existing request. For an installed Aligned cluster plugin, the `ClusterVersionShadow` condition reports a missing or non-Ready target `ModulePluginConfig`. For an installed Aligned operator, inspect its target catalog, `Subscription`, `InstallPlan`, and `ModuleInfo`. Add packages from **ACP Upgrade to v4.5** through the `plugins/` publication path in [Sync upgrade artifacts](./global/upgrade_global_cluster.mdx#sync-upgrade-artifacts); publish other packages with `violet`.
-:::
+For Alauda OS KU hosts, ask technical support how much free space `/persist` needs. Every host must also reach the platform registry. Do not add a storage declaration to a host installed before managed storage was available.
 
 :::warning
-Starting with v4.2, we introduced a new plugin named **Alauda Container Platform Log Essentials**. If you previously installed the log storage plugin, you also have to upload that plugin before starting the upgrade.
+A node pool with a single host has no worker while that host is reinstalled. Make sure its workloads can run on other nodes, or accept the interruption.
 :::
+
+| Result | Action |
+| --- | --- |
+| `replicas` is 3 or more and `maxSurge` is `0`, and every MachineDeployment shows `SURGE` `0` and `UNAVAILABLE` `1` | Continue. |
+| `replicas` is less than 3 | Contact technical support. |
+| `replicas` is 3 or more and `maxSurge` is empty or not `0`, or a MachineDeployment shows `SURGE` empty, `<none>`, or not `0`, or `UNAVAILABLE` empty, `<none>`, or not `1` | Run the commands in [Set the Rollout Settings](#rollout-settings). |
+| Every machine shows `PHASE` `Running` | Continue. |
+| A machine shows `PHASE` empty, `<none>`, or not `Running` | Run the block again later. If the machine still does not show `Running`, contact technical support. |
+| A host declares data volumes when its `STORAGE` is not `Unmanaged`, empty, or `<none>`. Each such host shows `Prepared`, or `Active` once it is allocated | Continue. |
+| A host that declares data volumes shows another `STORAGE` | Contact technical support. |
+| Each pool of `global` with a host that declares data volumes shows `TOTAL` equal to `ALLOCATED` | Continue. |
+| `replicas` is 3 or more, and such a pool shows `TOTAL` greater than `ALLOCATED` | Remove the free hosts, the ones in `HOSTS` that no machine uses as its `INVENTORY`, from `spec.machineInventories` with `ac -n cpaas-system edit machineinventorypools.infrastructure.cluster.x-k8s.io <pool-name>`. Removing a free host from the pool does not change the host. |
+| Each kubelet patch file shows `encoding=[]`, then its content, or a Secret name and a key for which the command in [Kubelet Patch File](#kubernetes-1-35-kubelet-patch) prints the content | Continue. |
+| No `encoding=` line follows a name under `== Kubelet patch files`, a file shows a value inside `encoding=[]`, such as `encoding=[base64]`, or no content, or its Secret or key does not exist | Contact technical support. |
+| `cluster-api-provider-kubeadm` and `cluster-api-provider-baremetal` show `PHASE` `Running` | Continue. |
+| A provider is missing, or shows another `PHASE` | Contact technical support. |
+| Nothing is listed under `== Pods with hostPath volumes`, and nothing under `== Local and hostPath PersistentVolumes with a claim` | Continue. |
+| A Pod or a PersistentVolume is listed under `== Pods with hostPath volumes` or `== Local and hostPath PersistentVolumes with a claim` | Move its data to storage outside the nodes, such as NFS or an external Ceph cluster, before the upgrade. If the data is on a declared data volume, or you cannot move it, contact technical support. |
+| Nothing is listed under `== LVM Storage PersistentVolumes` | Continue. |
+| A PersistentVolume is listed under `== LVM Storage PersistentVolumes`, in any namespace, `cpaas-system` included | Contact technical support before the upgrade. |
+| `COS_STATE` is larger than 8 GiB, `Free (estimated)` is at least 4 GiB, and no snapshot shows `no` in `default` and `active` and `update-in-progress=yes` in `userdata` | Continue. |
+| `Free (estimated)` is less than 4 GiB, or a snapshot shows `no` in `default` and `active` and `update-in-progress=yes` in `userdata` | Run the steps in [Free Space on COS_STATE](./troubleshooting.mdx#check-cos-state-free-space). |
+| `COS_STATE` is 8 GiB or smaller | Reinstall the host with a larger partition, as described in [Size COS_STATE before the first install](../workload_clusters/alauda_os/bare-metal/create_cluster.mdx#size-cos-state), before the upgrade. The reinstall replaces the node. |
+
+  </Tab>
+  <Tab label="Huawei Cloud Stack">
+
+On `global`:
+
+```bash
+ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
+KCP=$(ac -n cpaas-system get clusters.cluster.x-k8s.io global -o jsonpath='{.spec.controlPlaneRef.name}')
+echo "== Rollout settings"
+ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='replicas={.spec.replicas} maxSurge={.spec.rolloutStrategy.rollingUpdate.maxSurge}{"\n"}'
+ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=global \
+  -o custom-columns='NAME:.metadata.name,SURGE:.spec.strategy.rollingUpdate.maxSurge,UNAVAILABLE:.spec.strategy.rollingUpdate.maxUnavailable'
+echo "== Machine templates in use, and the pools"
+ac -n cpaas-system get hcsmachinetemplate \
+  $(ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{.spec.machineTemplate.infrastructureRef.name}') \
+  $(ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=global -o jsonpath='{.items[*].spec.template.spec.infrastructureRef.name}') \
+  -o custom-columns='NAME:.metadata.name,DATA_VOLUMES:.spec.template.spec.dataVolumes[*].mountPath,POOL:.spec.template.spec.configPoolRef.name'
+ac -n cpaas-system get hcsmachineconfigpool \
+  -o custom-columns='NAME:.metadata.name,AVAILABLE:.status.availableCount,DISKS:.spec.configs[*].persistentDisks[*].slot,HOSTNAMES:.spec.configs[*].hostname,USED:.status.usedConfigs[*].hostname'
+echo "== Kubelet patch files: the encoding, then the content or a Secret name and key"
+echo "${KCP}:"
+ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{range .spec.kubeadmConfigSpec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
+for t in $(ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=global -o jsonpath='{.items[*].spec.template.spec.bootstrap.configRef.name}'); do
+  echo "${t}:"
+  ac -n cpaas-system get kubeadmconfigtemplate "${t}" -o jsonpath='{range .spec.template.spec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
+done
+echo "== Providers"
+ac get moduleinfo -l cpaas.io/cluster-name=global \
+  -o custom-columns='MODULE:.metadata.labels.cpaas\.io/module-name,PHASE:.status.phase' | grep -E '^MODULE|cluster-api-provider'
+echo "== Pods with hostPath volumes"
+ac get pods -A --no-headers \
+  -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,OWNER:.metadata.ownerReferences[*].kind,MIRROR:.metadata.annotations.kubernetes\.io/config\.mirror,PHASE:.status.phase,HOSTPATH:.spec.volumes[*].hostPath.path' \
+  | awk '$1 !~ /^(kube-system|kube-public|kube-node-lease|cpaas-system)$/ && $3 !~ /DaemonSet/ && $4 == "<none>" && $5 !~ /^(Succeeded|Failed)$/ && $6 != "<none>"'
+echo "== Local and hostPath PersistentVolumes with a claim"
+ac get pv --no-headers \
+  -o custom-columns='NAME:.metadata.name,CLAIM_NAMESPACE:.spec.claimRef.namespace,CLAIM:.spec.claimRef.name,LOCAL:.spec.local.path,HOSTPATH:.spec.hostPath.path' \
+  | awk '$2 !~ /^(<none>|kube-system|kube-public|kube-node-lease|cpaas-system)$/ && ($4 != "<none>" || $5 != "<none>")'
+echo "== LVM Storage PersistentVolumes"
+ac get pv --no-headers \
+  -o custom-columns='NAME:.metadata.name,DRIVER:.spec.csi.driver,CLAIM_NAMESPACE:.spec.claimRef.namespace,CLAIM:.spec.claimRef.name' \
+  | awk '$2 ~ /^topolvm\./'
+# on the standby: unset KUBECONFIG
+```
+
+| Result | Action |
+| --- | --- |
+| `replicas` is 3 or more and `maxSurge` is `0`, and every MachineDeployment shows `SURGE` `0` and `UNAVAILABLE` `1` | Continue. |
+| `replicas` is less than 3 | Contact technical support. |
+| `replicas` is 3 or more and `maxSurge` is empty or not `0`, or a MachineDeployment shows `SURGE` empty, `<none>`, or not `0`, or `UNAVAILABLE` empty, `<none>`, or not `1` | Run the commands in [Set the Rollout Settings](#rollout-settings). |
+| No machine template lists `/var/cpaas` in `DATA_VOLUMES` | Continue. |
+| A machine template lists `/var/cpaas` in `DATA_VOLUMES` | [Migrate to pool-managed persistent disks](./persistent_disk_migration.mdx) before the upgrade. The migration replaces nodes. |
+| Every pool in `POOL` whose `DISKS` lists slot numbers shows `AVAILABLE` empty, `<none>`, or `0` | Continue. |
+| Such a pool shows `AVAILABLE` greater than `0` | Remove its free configurations, the ones in `HOSTNAMES` that are not in `USED`, from `spec.configs` with `ac -n cpaas-system edit hcsmachineconfigpool <pool-name>`. |
+| The edit is rejected for a free configuration that was used before | Contact technical support. |
+| Each kubelet patch file shows `encoding=[]`, then its content, or a Secret name and a key for which the command in [Kubelet Patch File](#kubernetes-1-35-kubelet-patch) prints the content | Continue. |
+| No `encoding=` line follows a name under `== Kubelet patch files`, a file shows a value inside `encoding=[]`, such as `encoding=[base64]`, or no content, or its Secret or key does not exist | Contact technical support. |
+| A kubelet patch file lacks `"imagePullCredentialsVerificationPolicy": "NeverVerify"` | Continue. Add it in the Kubernetes upgrade, for each version 1.35 or later: see [Update the KubeadmControlPlane](./upgrade_kubernetes_hcs_vsphere.mdx#update-kcp) and [Create the Worker Templates](./upgrade_kubernetes_hcs_vsphere.mdx#create-worker-templates). |
+| `cluster-api-provider-kubeadm` and `cluster-api-provider-hcs` show `PHASE` `Running` | Continue. |
+| A provider is missing, or shows another `PHASE` | Contact technical support. |
+| Nothing is listed under `== Pods with hostPath volumes`, and nothing under `== Local and hostPath PersistentVolumes with a claim` | Continue. |
+| A Pod or a PersistentVolume is listed under `== Pods with hostPath volumes` or `== Local and hostPath PersistentVolumes with a claim` | Move its data to storage outside the nodes, such as NFS or an external Ceph cluster, before the upgrade. If the data is on a pool-managed persistent disk, or you cannot move it, contact technical support. |
+| Nothing is listed under `== LVM Storage PersistentVolumes` | Continue. |
+| A PersistentVolume is listed under `== LVM Storage PersistentVolumes`, in any namespace, `cpaas-system` included | Contact technical support before the upgrade. |
+
+  </Tab>
+  <Tab label="VMware vSphere">
+
+On `global`. Do not restructure the disk lists of the machine config pools as part of an upgrade.
+
+```bash
+ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
+KCP=$(ac -n cpaas-system get clusters.cluster.x-k8s.io global -o jsonpath='{.spec.controlPlaneRef.name}')
+echo "== Rollout settings"
+ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='replicas={.spec.replicas} maxSurge={.spec.rolloutStrategy.rollingUpdate.maxSurge}{"\n"}'
+ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=global \
+  -o custom-columns='NAME:.metadata.name,SURGE:.spec.strategy.rollingUpdate.maxSurge,UNAVAILABLE:.spec.strategy.rollingUpdate.maxUnavailable'
+echo "== Machine config pools"
+ac -n cpaas-system get vspheremachineconfigpool \
+  -o custom-columns='NAME:.metadata.name,CLUSTER:.spec.clusterRef.name,READY:.status.conditions[?(@.type=="Ready")].status'
+echo "== Kubelet patch files: the encoding, then the content or a Secret name and key"
+echo "${KCP}:"
+ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{range .spec.kubeadmConfigSpec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
+for t in $(ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=global -o jsonpath='{.items[*].spec.template.spec.bootstrap.configRef.name}'); do
+  echo "${t}:"
+  ac -n cpaas-system get kubeadmconfigtemplate "${t}" -o jsonpath='{range .spec.template.spec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
+done
+echo "== Providers"
+ac get moduleinfo -l cpaas.io/cluster-name=global \
+  -o custom-columns='MODULE:.metadata.labels.cpaas\.io/module-name,PHASE:.status.phase' | grep -E '^MODULE|cluster-api-provider'
+echo "== Pods with hostPath volumes"
+ac get pods -A --no-headers \
+  -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,OWNER:.metadata.ownerReferences[*].kind,MIRROR:.metadata.annotations.kubernetes\.io/config\.mirror,PHASE:.status.phase,HOSTPATH:.spec.volumes[*].hostPath.path' \
+  | awk '$1 !~ /^(kube-system|kube-public|kube-node-lease|cpaas-system)$/ && $3 !~ /DaemonSet/ && $4 == "<none>" && $5 !~ /^(Succeeded|Failed)$/ && $6 != "<none>"'
+echo "== Local and hostPath PersistentVolumes with a claim"
+ac get pv --no-headers \
+  -o custom-columns='NAME:.metadata.name,CLAIM_NAMESPACE:.spec.claimRef.namespace,CLAIM:.spec.claimRef.name,LOCAL:.spec.local.path,HOSTPATH:.spec.hostPath.path' \
+  | awk '$2 !~ /^(<none>|kube-system|kube-public|kube-node-lease|cpaas-system)$/ && ($4 != "<none>" || $5 != "<none>")'
+echo "== LVM Storage PersistentVolumes"
+ac get pv --no-headers \
+  -o custom-columns='NAME:.metadata.name,DRIVER:.spec.csi.driver,CLAIM_NAMESPACE:.spec.claimRef.namespace,CLAIM:.spec.claimRef.name' \
+  | awk '$2 ~ /^topolvm\./'
+# on the standby: unset KUBECONFIG
+```
+
+| Result | Action |
+| --- | --- |
+| `replicas` is 3 or more and `maxSurge` is `0`, and every MachineDeployment shows `SURGE` `0` and `UNAVAILABLE` `1` | Continue. |
+| `replicas` is less than 3 | Contact technical support. |
+| `replicas` is 3 or more and `maxSurge` is empty or not `0`, or a MachineDeployment shows `SURGE` empty, `<none>`, or not `0`, or `UNAVAILABLE` empty, `<none>`, or not `1` | Run the commands in [Set the Rollout Settings](#rollout-settings). |
+| Every pool whose `CLUSTER` is `global` shows `READY` `True` | Continue. |
+| Such a pool does not show `True` | Contact technical support. |
+| Each kubelet patch file shows `encoding=[]`, then its content, or a Secret name and a key for which the command in [Kubelet Patch File](#kubernetes-1-35-kubelet-patch) prints the content | Continue. |
+| No `encoding=` line follows a name under `== Kubelet patch files`, a file shows a value inside `encoding=[]`, such as `encoding=[base64]`, or no content, or its Secret or key does not exist | Contact technical support. |
+| A kubelet patch file lacks `"imagePullCredentialsVerificationPolicy": "NeverVerify"` | Continue. Add it in the Kubernetes upgrade, for each version 1.35 or later: see [Update the KubeadmControlPlane](./upgrade_kubernetes_hcs_vsphere.mdx#update-kcp) and [Create the Worker Templates](./upgrade_kubernetes_hcs_vsphere.mdx#create-worker-templates). |
+| `cluster-api-provider-kubeadm` and `cluster-api-provider-vsphere` show `PHASE` `Running` | Continue. |
+| A provider is missing, or shows another `PHASE` | Contact technical support. |
+| Nothing is listed under `== Pods with hostPath volumes`, and nothing under `== Local and hostPath PersistentVolumes with a claim` | Continue. |
+| A Pod or a PersistentVolume is listed under `== Pods with hostPath volumes` or `== Local and hostPath PersistentVolumes with a claim` | Move its data to storage outside the nodes, such as NFS or an external Ceph cluster, before the upgrade. If the data is on a pool-managed persistent disk, or you cannot move it, contact technical support. |
+| Nothing is listed under `== LVM Storage PersistentVolumes` | Continue. |
+| A PersistentVolume is listed under `== LVM Storage PersistentVolumes`, in any namespace, `cpaas-system` included | Contact technical support before the upgrade. |
+
+  </Tab>
+</Tabs>
+
+### Set the Rollout Settings \{#rollout-settings}
+
+Use this when a check table or another page points here. Set `<cluster-name>` to the cluster of the check: `global`, or a workload cluster. Run the `kubeadmcontrolplane` patch when `replicas` is 3 or more and `maxSurge` is empty or not `0`; when `replicas` is less than 3, contact technical support instead. Run the `machinedeployment` patch for each MachineDeployment whose `maxSurge` is empty, `<none>`, or not `0`, or whose `maxUnavailable` is empty, `<none>`, or not `1`.
+
+```bash
+ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
+KCP=$(ac -n cpaas-system get clusters.cluster.x-k8s.io <cluster-name> -o jsonpath='{.spec.controlPlaneRef.name}')
+# The control plane, only when replicas is 3 or more
+ac -n cpaas-system patch kubeadmcontrolplane "${KCP}" --type merge \
+  -p '{"spec":{"rolloutStrategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":0}}}}'
+# Each MachineDeployment to correct
+ac -n cpaas-system patch machinedeployment <md-name> --type merge \
+  -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":0,"maxUnavailable":1}}}}'
+# on the standby: unset KUBECONFIG
+```
+
+### Kubelet Patch File \{#kubernetes-1-35-kubelet-patch}
+
+Use this when a check table or another page points here. When a check shows a Secret name and a key for the file `/etc/kubernetes/patches/kubeletconfiguration0+strategic.json`, print the content from the Secret. Escape each `.` in `<secret-key>` as `\.`:
+
+```bash
+ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
+ac -n cpaas-system get secret <secret-name> -o jsonpath='{.data.<secret-key>}' | base64 -d
+# on the standby: unset KUBECONFIG
+```
+
+On Kubernetes 1.35 or later, the file needs this setting. Do not add it for Kubernetes 1.34 or earlier. In the Kubernetes upgrade, Huawei DCS and Bare Metal add it to the existing files; on Huawei Cloud Stack and VMware vSphere, you add it in [Upgrade Kubernetes on Huawei Cloud Stack and VMware vSphere](./upgrade_kubernetes_hcs_vsphere.mdx).
+
+```json
+{
+  "imagePullCredentialsVerificationPolicy": "NeverVerify"
+}
+```
+
+### Check the etcd Backup of a Cluster \{#etcd-backup}
+
+Use this when a check table or another page points here, for a cluster created by ACP; skip it for imported and registered clusters. During preparation, [Check the Registry, Modules, and etcd Backup of `global`](#global-common-checks) covers `global`, and [Check the etcd Backup](./workload/upgrade_workload_cluster.mdx#check-etcd-backup) covers each workload cluster.
+
+On the cluster:
+
+```bash
+ac config use-cluster <cluster-name>        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
+ac get etcdbackupconfiguration etcd-backup-default \
+  -o jsonpath='{range .status.records[*]}{.backupTimestamp}{"\t"}{.result}{"\n"}{end}'
+ac config use-cluster global        # on the standby, instead: unset KUBECONFIG
+```
+
+| Result | Action |
+| --- | --- |
+| The record with the latest time shows `Success` | Continue. |
+| The command reports `NotFound` or `the server doesn't have a resource type` | Install Alauda Container Platform Cluster Enhancement on the cluster, as described in [etcd Backup and Restore](../configure/backup/etcd.mdx), and run the command again after its first backup. If you cannot install it, contact technical support. |
+| The record with the latest time does not show `Success`, or there is no record | Contact technical support. |
+
+### Check Node Readiness for Kubernetes 1.35 or Later \{#kubernetes-135-node-readiness}
+
+Use this when a check table or another page points here. On a non-Alauda OS cluster created by ACP, run the node check of the Non-Alauda OS tab, on every node of the cluster:
+
+- For `global`: [Check by OS and Provider](#global-provider-checks).
+- For a workload cluster, before its upgrade: [Check the Cluster by Type](./workload/upgrade_workload_cluster.mdx#check-by-type).
+
+## Determine the Versions to Prepare \{#alauda-os-versions}
+
+**Applies to**: Alauda OS clusters. Skip it for non-Alauda OS clusters, and go to [Download the Packages](#download-packages).
+
+Select the current version of each cluster, and prepare every version that the calculator lists for all paths, in the Alauda OS variant that each cluster runs today:
+
+<AlaudaOsUpgradePath>
+  The Kubernetes version and the etcd tag of every ACP version are listed in [Version Mapping](../overview/alauda_os_support_matrix.mdx#version-mapping).
+</AlaudaOsUpgradePath>
+
+## Download the Packages \{#download-packages}
+
+<Steps>
+
+### Download the Core Package and the Alauda OS Images \{#download-core-package}
+
+From the <Term name="company" /> Customer Portal, download the Core Package of the target ACP version for your architecture, and extract it on the execution host. On Alauda OS, also download:
+
+- The Core Package of the ACP release of each intermediate Kubernetes version. You use it only to publish its images.
+- From the OS download page, the image of the target version and of each intermediate Kubernetes version, for the architecture and OS variant of your nodes: `qcow2` for Huawei DCS and Huawei Cloud Stack, `ova` for VMware vSphere, and the archive of an OCI image layout for Bare Metal.
+
+### Download the Other Extension Packages \{#download-other-extensions}
+
+Export the Extensions installed on `global` to `apps.yaml`. Then let the Customer Portal check the file and download the target-version packages of the installed Extensions, including the infrastructure providers and the Cluster Bootstrap Provider. Set `<arch>` to `amd64`, `arm64`, or `hybrid` to match the Core Package, and `<target-version>` to the target ACP version, such as `4.5.0`.
+
+```bash
+read -rsp "Customer Portal token: " AC_TOKEN; printf '\n'
+violet ac login --access-token="${AC_TOKEN}" --ac-url=<customer-portal-url>
+read -rsp "Platform token: " PLATFORM_TOKEN; printf '\n'
+violet list --platform-address "https://<platform-address>" --platform-token "${PLATFORM_TOKEN}" --output-file "./apps.yaml"
+violet ac import-yaml --arch=<arch> --platformVersion=v<target-version> --path=./apps.yaml --download=true
+```
+
+In a DR environment, do the same for the standby, into its own file. The two `global` clusters can run different Extensions; for example, Global Cluster Disaster Recovery runs only on the standby:
+
+```bash
+read -rsp "Standby platform token: " STANDBY_TOKEN; printf '\n'
+violet list --platform-address "https://<standby-vip>" --platform-token "${STANDBY_TOKEN}" --output-file "./standby-apps.yaml"
+violet ac import-yaml --arch=<arch> --platformVersion=v<target-version> --path=./standby-apps.yaml --download=true
+```
+
+### Download the Upgrade Scenario for ACP 4.3 or Earlier \{#download-upgrade-scenario}
+
+Only when the source ACP version is 4.3 or earlier. With the Customer Portal login of the previous step, download the `Upgrade from ACP 4.3 or earlier` scenario:
+
+```bash
+violet ac scenarios --arch=<arch> --platformVersion=v<target-version>
+violet ac download-app --arch=<arch> --platformVersion=v<target-version> --scenario="Upgrade from ACP 4.3 or earlier"
+```
+
+</Steps>
+
+## Publish the Packages \{#sync-upgrade-artifacts}
+
+Run the steps from the `installer/` directory of the extracted target Core Package, against `global`, and complete them before you upgrade `global`.
+
+<Steps>
+
+### Stage the Upgrade Scenario Packages \{#stage-plugins}
+
+Only when the source ACP version is 4.3 or earlier. Copy every package of [the upgrade scenario](#download-upgrade-scenario) into `plugins/`, then list the directory and compare it with the downloaded packages.
+
+```bash
+cp <path-to-scenario-package> ./plugins/
+ls -1 ./plugins/
+```
+
+### Publish Core and the Staged Packages \{#publish-core}
+
+Read the registry type of `global`: the second value is empty or `false` for the platform built-in Registry, and `true` for an external registry. Every Aligned Extension installed on a cluster needs its target-version package before that cluster's upgrade; otherwise the upgrade stops until you publish it.
+
+```bash
+ac config use-cluster global
+ac whoami --show-server
+ac get productbase base -o jsonpath='{.spec.registry.address}{"\t"}{.spec.registry.external}{"\n"}'
+```
+
+<Tabs>
+  <Tab label="Platform built-in Registry">
+
+```bash
+ac config use-cluster global
+ac whoami --show-server
+bash upgrade.sh --only-sync-image
+```
+
+  </Tab>
+  <Tab label="External registry">
+
+`upgrade.sh` does not upload to an external registry. Run both upload modes; both must succeed. Do not export the registry username or password: `bash upgrade.sh --preflight` stops while either is set in the environment.
+
+```bash
+REGISTRY_ADDRESS="<registry-address>"
+REGISTRY_USERNAME="<registry-username>"
+read -rsp "Registry password: " REGISTRY_PASSWORD; printf '\n'
+bash res/upload.sh all "$REGISTRY_ADDRESS" "$REGISTRY_USERNAME" "$REGISTRY_PASSWORD"
+bash res/upload.sh necessary "$REGISTRY_ADDRESS" "$REGISTRY_USERNAME" "$REGISTRY_PASSWORD"
+unset REGISTRY_USERNAME REGISTRY_PASSWORD
+```
+
+  </Tab>
+</Tabs>
+
+### Publish the Intermediate Core Images \{#sync-intermediate-images}
+
+On Alauda OS, when the path has an intermediate Kubernetes version, publish the images of the Core Package of each intermediate Kubernetes version, from its `installer/` directory, against the same `global` cluster. Do not request an upgrade to that release. Skip this step when there is no intermediate Kubernetes version.
+
+<Tabs>
+  <Tab label="Platform built-in Registry">
+
+```bash
+ac config use-cluster global
+ac whoami --show-server
+bash upgrade.sh --only-sync-image
+```
+
+  </Tab>
+  <Tab label="External registry">
+
+```bash
+REGISTRY_ADDRESS="<registry-address>"
+REGISTRY_USERNAME="<registry-username>"
+read -rsp "Registry password: " REGISTRY_PASSWORD; printf '\n'
+bash res/upload.sh all "$REGISTRY_ADDRESS" "$REGISTRY_USERNAME" "$REGISTRY_PASSWORD"
+unset REGISTRY_USERNAME REGISTRY_PASSWORD
+```
+
+  </Tab>
+</Tabs>
+
+### Publish the Other Extensions \{#publish-other-extensions}
+
+Publish the packages downloaded for `apps.yaml` in [Download the Other Extension Packages](#download-other-extensions) with `violet push`. The packages for the standby follow in the next step.
+
+| Packages | Publish to | When |
+| --- | --- | --- |
+| Cluster plugins, including the providers | `global` | Before the `global` upgrade |
+| Operators | `global` and each workload cluster that runs the operator | Before the upgrade of each such cluster |
+
+```bash
+# A cluster plugin: the platform distributes it
+violet push <cluster-plugin-package>.tgz --platform-address "https://<platform-address>" --platform-token "${PLATFORM_TOKEN}"
+# An operator: global and every workload cluster that runs it
+violet push <operator-package>.tgz --platform-address "https://<platform-address>" --platform-token "${PLATFORM_TOKEN}" \
+  --clusters "global,<cluster-name-1>,<cluster-name-2>"
+```
+
+### Publish to the Standby global Cluster \{#publish-standby}
+
+In a DR environment only. Select the standby for the rest of this step, and read its registry type, as on the primary:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
+ac get productbase base -o jsonpath='{.spec.registry.address}{"\t"}{.spec.registry.external}{"\n"}'
+```
+
+<Tabs>
+  <Tab label="Platform built-in Registry">
+
+Publish the images to the registry of the standby: run the command from the `installer/` directory of the target Core Package, and again from that of each intermediate Core Package. The script uses the registry of the cluster in `KUBECONFIG`.
+
+```bash
+bash upgrade.sh --only-sync-image
+```
+
+Then push the packages downloaded for `standby-apps.yaml` in [Download the Other Extension Packages](#download-other-extensions). Set `<registry-port>` to the port of the registry address printed above. Always set `--platform-address` and `--dest-repo`; without them, the packages go to the primary.
+
+```bash
+STANDBY_REGISTRY_USER=$(ac -n cpaas-system get secret registry-admin -o jsonpath='{.data.username}' | base64 -d)
+STANDBY_REGISTRY_PASSWORD=$(ac -n cpaas-system get secret registry-admin -o jsonpath='{.data.password}' | base64 -d)
+read -rsp "Standby platform token: " STANDBY_TOKEN; printf '\n'
+violet push <package>.tgz --platform-address "https://<standby-vip>" --platform-token "${STANDBY_TOKEN}" \
+  --dest-repo "<standby-vip>:<registry-port>" --username "${STANDBY_REGISTRY_USER}" --password "${STANDBY_REGISTRY_PASSWORD}"
+# Repeat violet push for each package, then:
+unset STANDBY_REGISTRY_USER STANDBY_REGISTRY_PASSWORD STANDBY_TOKEN
+```
+
+  </Tab>
+  <Tab label="External registry">
+
+`upgrade.sh` does not upload to an external registry. When the standby uses the same registry endpoint as the primary, the images are already there. When it uses its own endpoint, run the external registry commands of [Publish Core and the Staged Packages](#publish-core) and [Publish the Intermediate Core Images](#sync-intermediate-images) again, with the address and credentials of that endpoint.
+
+Then push the packages downloaded for `standby-apps.yaml` with `violet push --platform-address "https://<standby-vip>"`. Confirm its registry options for an external registry with technical support before you upgrade the standby.
+
+  </Tab>
+</Tabs>
+
+On the standby, list the versions of each Cluster Plugin you pushed, for example Global Cluster Disaster Recovery, then return to the login session:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
+ac get moduleconfigs -l cpaas.io/module-name=etcd-sync
+unset KUBECONFIG
+```
+
+Continue when each Cluster Plugin you pushed lists its target version; otherwise, run `violet push` for it again as above.
+
+</Steps>
+
+## Stage the Alauda OS Images \{#stage-alauda-os-images}
+
+On non-Alauda OS clusters, skip this section.
+
+Stage the image of the target version and of every intermediate Kubernetes version for each provider in use. The commands that the Huawei DCS and Bare Metal tabs generate run on `global`; in DR, run them on both `global` clusters, on the standby after `export KUBECONFIG=<standby-kubeconfig>`, and run `unset KUBECONFIG` afterwards:
+
+```bash
+ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
+```
+
+<Tabs>
+  <Tab label="Huawei DCS">
+
+Upload the `qcow2` image of each version to every DCS site that your clusters use, and register it as a VM template with the same name on every site. Then generate the VM template ConfigMaps and apply them on `global`:
+
+<DcsVmTemplateConfigMap mode="path">
+  Replace `<os>` with the OS of the VM templates, such as `m55`, `ko`, or `ku`, and take the ACP version, Kubernetes version, and etcd tag of each ConfigMap from [Version Mapping](../overview/alauda_os_support_matrix.mdx#version-mapping). Repeat the intermediate ConfigMap for each intermediate Kubernetes version, and omit it when there is none.
+</DcsVmTemplateConfigMap>
+
+  </Tab>
+  <Tab label="Bare Metal">
+
+On a host that has containerd and reaches the registry of `global`, such as a `global` control-plane node, import the archive of each version and push the images it holds; this push is the only step of this tab on a node, so return to the execution host afterwards. For Alauda OS M55, push both `baremetal-base-image` and `baremetal-base-image-iso`. For Alauda OS KU, push the OS image that the list command prints to the repository used in the command below, which the catalog command also uses. The `admin` password is in the `cpaas-system/registry-admin` Secret of `global`. In DR, push to the registry of both `global` clusters.
+
+{/* lint ignore no-legacy-os-names */}
+
+```bash
+ctr -n bare-metal-os images import --all-platforms --no-unpack <bare-metal-os-archive>
+ctr -n bare-metal-os images ls -q
+read -rsp "Registry password: " REGISTRY_PASSWORD; printf '\n'
+# Alauda OS M55
+for repo in baremetal-base-image baremetal-base-image-iso; do
+  ctr -n bare-metal-os images push --local --skip-verify -u "<registry-username>:${REGISTRY_PASSWORD}" \
+    "<registry-address>/tkestack/${repo}:<os-image-tag>" "${repo}:<os-image-tag>"
+done
+# Alauda OS KU
+ctr -n bare-metal-os images push --local --skip-verify -u "<registry-username>:${REGISTRY_PASSWORD}" \
+  "<registry-address>/tkestack/kubeos-rootfs:<os-image-tag>" "<listed-os-image>"
+unset REGISTRY_PASSWORD
+```
+
+Add the keys of every version to the image catalog on `global` before you request the upgrade: a host replaced while its key is missing fails and does not recover when you add the key later. Run the command once for each combination of architecture and OS in the pools:
+
+<BareMetalImageCatalog mode="path">
+  The command creates a `ResourcePatch` on `global`. Do not delete it. Exempt it for the target version before the `global` upgrade, and again for each later minor upgrade, as described in [Resolve Preflight Blocks](#resolve-preflight-blocks).
+</BareMetalImageCatalog>
+
+List the architecture and OS labels of the hosts with `ac -n cpaas-system get machineinventories.elemental.cattle.io -L os.baremetal.alauda.io/arch,os.baremetal.alauda.io/id`. The key of a host combines the Kubernetes version with these labels; see [OS Image Keys per Architecture and OS](../workload_clusters/alauda_os/bare-metal/install_provider.mdx#catalog-key-format). A host without the labels resolves to `amd64` and Alauda OS M55. That needs no action for `amd64` hosts with Alauda OS M55; for any other host without the labels, contact technical support.
+
+  </Tab>
+  <Tab label="Huawei Cloud Stack">
+
+1. Upload the `qcow2` image of each version to the HCS image service, as an image in each region and project that your clusters use. The image must meet the image requirements in [Compute Values](../workload_clusters/alauda_os/huawei-cloud-stack/infrastructure.mdx#compute-values).
+2. Record the image name of each version. The Kubernetes upgrade of each cluster uses it.
+
+  </Tab>
+  <Tab label="VMware vSphere">
+
+1. In each vCenter datacenter that your clusters use, deploy the `ova` of each version, and convert the deployed virtual machine to a VM template. Use the same template name in every datacenter. The template must meet the [VM template requirements](../workload_clusters/alauda_os/vmware-vsphere/infrastructure.mdx#vm-template-requirements).
+2. Record the template name of each version. The Kubernetes upgrade of each cluster uses it.
+
+  </Tab>
+</Tabs>
+
+## Check the Staged Images \{#check-staged-images}
+
+**Applies to**: every `global` cluster on Alauda OS, in the tab of its infrastructure provider, as in [Check by OS and Provider](#global-provider-checks). In DR, run each block on the standby too, as the comments on its first and last lines show.
+
+<Tabs>
+  <Tab label="Non-Alauda OS">
+
+No action is needed.
+
+  </Tab>
+  <Tab label="Huawei DCS">
+
+On `global`:
+
+```bash
+ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
+ac -n cpaas-system get configmap -l cpaas.io/dcs-vm-template -L cpaas.io/dcs-vm-template,cpaas.io/distribution-version
+# on the standby: unset KUBECONFIG
+```
+
+Continue when, for the target version and for each intermediate Kubernetes version, a ConfigMap shows its ACP version in `DISTRIBUTION-VERSION`, and, in the DCS console of every site that `global` uses, a VM template has the name in its `DCS-VM-TEMPLATE` column; otherwise, run the Huawei DCS steps of [Stage the Alauda OS Images](#stage-alauda-os-images) for that version.
+
+  </Tab>
+  <Tab label="Bare Metal">
+
+On `global`:
+
+```bash
+ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
+ac -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io \
+  -o custom-columns='NAME:.metadata.name,CLUSTER:.spec.clusterName,HOSTS:.spec.machineInventories[*].name'
+ac -n cpaas-system get machineinventories.elemental.cattle.io \
+  -o custom-columns='NAME:.metadata.name,ARCH:.metadata.labels.os\.baremetal\.alauda\.io/arch,OS:.metadata.labels.os\.baremetal\.alauda\.io/id'
+ac -n cpaas-system get configmap elemental-image-catalog -o yaml
+# on the standby: unset KUBECONFIG
+```
+
+The hosts of `global` are the ones in `HOSTS` of the pools whose `CLUSTER` is `global`. For a host whose `ARCH` or `OS` is empty or `<none>`, use `amd64` or `alaudaos.m.55`. Continue when, for each Kubernetes version on the path, the catalog has the key `<kubernetes-version>_etcd` and, for the `ARCH` and `OS` of each host of `global`, the OS image key `<kubernetes-version>_<arch>_<os-id>`, or the bare `<kubernetes-version>` for `amd64` with `alaudaos.m.55`, as described in [OS Image Keys per Architecture and OS](../workload_clusters/alauda_os/bare-metal/install_provider.mdx#catalog-key-format); otherwise, run the Bare Metal steps of [Stage the Alauda OS Images](#stage-alauda-os-images) for the missing keys.
+
+  </Tab>
+  <Tab label="Huawei Cloud Stack">
+
+In the HCS console, confirm that the image that you recorded for the target version and for each intermediate Kubernetes version exists in each region and project that `global` uses. Continue when it does; otherwise, run the Huawei Cloud Stack steps of [Stage the Alauda OS Images](#stage-alauda-os-images) for that version.
+
+  </Tab>
+  <Tab label="VMware vSphere">
+
+In vCenter, confirm that the VM template that you recorded for the target version and for each intermediate Kubernetes version exists in each datacenter that `global` uses. Continue when it does; otherwise, run the VMware vSphere steps of [Stage the Alauda OS Images](#stage-alauda-os-images) for that version.
+
+  </Tab>
+</Tabs>
+
+## Check DR Synchronization \{#check-dr-sync}
+
+**Applies to**: DR environments. Skip it for a single `global` cluster.
+
+Log in to a control-plane node of the standby `global` cluster, run the check there, and then return to the execution host:
+
+```bash
+export KUBECONFIG=/etc/kubernetes/admin.conf
+mirror_svc=$(kubectl get svc -n cpaas-system etcd-sync-monitor -o jsonpath='{.spec.clusterIP}')
+if [[ $mirror_svc =~ ^[0-9a-fA-F:]+$ ]]; then mirror_host="[$mirror_svc]"; else mirror_host="$mirror_svc"; fi
+curl -g "http://${mirror_host}/check"
+```
+
+| Result | Action |
+| --- | --- |
+| `localMissedKeys [0]` and `localSurplusKeys [0]` | Continue. |
+| `check too frequent` | Wait one minute and run the check again; if it does not change, contact technical support. |
+| Any other value | Run the steps in [Global Cluster Disaster Recovery Does Not Synchronize](./troubleshooting.mdx#dr-sync-diagnostics), then run the check again. |
+
+## Run Preflight Checks \{#run-preflight}
+
+**Applies to**: every `global` cluster. In DR, run it on each `global` cluster. Skip it for workload clusters.
+
+From the `installer/` directory of the target Core Package, on each `global` cluster:
+
+```bash
+ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
+unset REGISTRY_USERNAME REGISTRY_PASSWORD
+ac get productmanifests
+bash upgrade.sh --preflight
+# on the standby: unset KUBECONFIG
+```
+
+| Result | Action |
+| --- | --- |
+| `Summary` shows `Passed` or `PassedWithWarnings` | Continue. |
+| `ac get productmanifests` reports `the server doesn't have a resource type` | Continue without `bash upgrade.sh --preflight`. You run it in [Run the Final Preflight Check](./global/upgrade_global_cluster.mdx#final-preflight), after you deploy the Cluster Version Operator (CVO). |
+| On the standby, `DRSplitUpgradeWindow` is the only failed check | Continue. |
+| On a `global` cluster on Huawei DCS or Bare Metal, `InfraClusterVersionPreflight` reports `ProviderCapabilityNotDeclared` | Continue. The tab of [Check by OS and Provider](#global-provider-checks) covers these checks. |
+| `ResourcePatchUpgradeable` fails | Run the exemption commands in [Resolve Preflight Blocks](#resolve-preflight-blocks). |
+| `AdminAckRequired` fails | Run the acknowledgement commands in [Resolve Preflight Blocks](#resolve-preflight-blocks). |
+| `VersionUpgradePath` fails | Follow [Resolve Other Preflight Blocks](./troubleshooting.mdx#resolve-other-preflight-blocks). Do not bypass the check with an explicit upgrade request. |
+| Any other check fails | Follow [Resolve Other Preflight Blocks](./troubleshooting.mdx#resolve-other-preflight-blocks). If the check is not listed there, contact technical support. |
+
+### Resolve Preflight Blocks \{#resolve-preflight-blocks}
+
+For `ResourcePatchUpgradeable`, review each listed patch with technical support, then exempt it on the `global` cluster, with the target version as the value; do not use `*`. In DR, do it on each side:
+
+```bash
+ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
+ac get resourcepatches \
+  -o custom-columns='NAME:.metadata.name,EXEMPT:.metadata.annotations.config\.cpaas\.io/exempt-for-ver'
+ac get resourcepatches <rp-name> -o yaml
+ac annotate resourcepatches <rp-name> config.cpaas.io/exempt-for-ver=<target-version> --overwrite
+# on the standby: unset KUBECONFIG
+```
+
+For `AdminAckRequired`, copy the key from `admin-gates`, record the acknowledgement, and run preflight again. On non-Alauda OS, first complete the node check in the Non-Alauda OS tab of [Check by OS and Provider](#global-provider-checks). In DR, do it on each side:
+
+```bash
+ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
+ac -n cpaas-system get configmap admin-gates -o yaml
+ACK_KEY='<key-from-admin-gates>'
+ac -n cpaas-system patch configmap admin-acks --type merge -p "{\"data\":{\"${ACK_KEY}\":\"true\"}}"
+bash upgrade.sh --preflight
+# on the standby: unset KUBECONFIG
+```
+
+## Next Step
+
+- With Global Cluster Disaster Recovery: [Upgrade `global` Clusters in a DR Environment](./global/upgrade_global_dr.mdx), or, for a patch upgrade within the same minor version when the standby is upgraded after the workload clusters, [Upgrade the Standby `global` Cluster After the Workload Clusters](./global/upgrade_global_dr_deferred_standby.mdx).
+- Otherwise: [Upgrade the `global` Cluster](./global/upgrade_global_cluster.mdx).
