@@ -5,11 +5,11 @@ title: "DR Environment: Standby After Workload Clusters"
 
 # Upgrade the Standby `global` Cluster After the Workload Clusters
 
-Use this page for a patch upgrade within the same minor version, from ACP 4.5.0 or later, when the standby is not upgraded together with the primary: you upgrade the primary and the workload clusters that you choose first, and the standby afterwards. The plugin stays installed and synchronization is paused; with the steps on this page, the standby remains a standby and does not act on workload clusters. There is no DR protection from the pause until synchronization is resumed and checked at the end of this page, through the upgrades of the primary, of those workload clusters, and of the standby; in that time, make no changes on either `global` cluster other than those upgrades and the steps on this page. For a minor upgrade, or to upgrade both `global` clusters before the workload clusters, use [Upgrade `global` Clusters in a DR Environment](./upgrade_global_dr.mdx); [Upgrade Order and Compatibility](../overview.mdx#upgrade-order) compares the two procedures.
+Use this page for a patch upgrade within the same minor version, from ACP 4.5.0 or later, when the standby is not upgraded together with the primary: you upgrade the primary and the workload clusters that you choose first, and the standby afterwards. The plugin stays installed and synchronization is paused, so the standby remains a standby. There is no DR protection from the pause until synchronization is resumed and checked at the end of this page, through the upgrades of the primary, of those workload clusters, and of the standby; in that time, make no changes on either `global` cluster other than those upgrades and the steps on this page. For a minor upgrade, or to upgrade both `global` clusters before the workload clusters, use [Upgrade `global` Clusters in a DR Environment](./upgrade_global_dr.mdx); [Upgrade Order and Compatibility](../overview.mdx#upgrade-order) compares the two procedures.
 
 ## Before You Begin \{#before-you-begin}
 
-- Both `global` clusters run the same ACP version (Distribution Version), 4.5.0 or later, and the target is a later patch version of the same minor version, as `ac adm upgrade` lists it.
+- Both `global` clusters run the same ACP version (Distribution Version), 4.5.0 or later, and the target is a later patch version of the same minor version. `<target-version>` on this page is that target ACP version, for example `4.5.1`.
 - [Prepare for the Upgrade](../pre-upgrade.mdx) is complete on both `global` clusters. These items are not synchronized between them, so each side has its own: published packages, including the Global Cluster Disaster Recovery package on the standby; Alauda OS image ConfigMaps or catalog entries; the administrator acknowledgement; `ResourcePatch` exemptions; and a preflight result that lets you continue. On the standby, every check passes except `DRSplitUpgradeWindow`, which passes after you pause synchronization below.
 - Each `global` cluster has a recent successful etcd backup, as described in [Check the etcd Backup](../pre-upgrade.mdx#etcd-backup).
 - You are on the execution host, logged in with `ac login` as a platform administrator, in the `installer/` directory of the extracted target Core Package, with a kubeconfig of the standby that points to its VIP: `<standby-kubeconfig>`.
@@ -74,7 +74,7 @@ unset KUBECONFIG
 
 ### Prepare Both `global` Clusters \{#prepare-both}
 
-On the standby, restart the cluster-transformer Pods, so that no work started before the pause keeps running on the standby, and disable the token rotator, which can otherwise revoke workload cluster tokens that the primary still uses:
+On the standby, restart the cluster-transformer Pods, so that no work started before the pause keeps running on the standby, and disable the token rotator, which can otherwise revoke workload cluster tokens that the primary still uses. The `set env` command prints `The operation is allowed, and ResourcePatch <name> is created`; the block exempts that `ResourcePatch` for the target version, so that preflight does not block on it:
 
 ```bash
 export KUBECONFIG=<standby-kubeconfig>
@@ -83,13 +83,16 @@ ac -n cpaas-system delete pod -l service_name=cluster-transformer
 ac -n cpaas-system set env deploy/cluster-api-provider-alauda-manager \
   -c cluster-api-provider-alauda CLUSTER_TOKEN_ROTATOR_ENABLED=false
 ac -n cpaas-system rollout status deploy/cluster-api-provider-alauda-manager
+RP=$(ac get resourcepatches \
+  -o jsonpath='{range .items[?(@.spec.target.name=="cluster-api-provider-alauda-manager")]}{.metadata.name}{"\n"}{end}')
+ac annotate resourcepatches "${RP}" config.cpaas.io/exempt-for-ver=<target-version> --overwrite
 ac -n cpaas-system get pod -l service_name=cluster-transformer
 ac -n cpaas-system get deploy cluster-api-provider-alauda-manager \
   -o jsonpath='{.spec.template.spec.containers[?(@.name=="cluster-api-provider-alauda")].env[?(@.name=="CLUSTER_TOKEN_ROTATOR_ENABLED")].value}{"\n"}'
 unset KUBECONFIG
 ```
 
-On the primary, disable the token rotator as well: the paused standby does not receive the tokens it writes, and the standby's copies stop working when it deletes the replaced tokens:
+On the primary, disable the token rotator and exempt its `ResourcePatch` as well: the paused standby does not receive the tokens it writes, and the standby's copies stop working when it deletes the replaced tokens:
 
 ```bash
 ac config use-cluster global
@@ -97,11 +100,14 @@ ac whoami --show-server   # ends with /kubernetes/global/
 ac -n cpaas-system set env deploy/cluster-api-provider-alauda-manager \
   -c cluster-api-provider-alauda CLUSTER_TOKEN_ROTATOR_ENABLED=false
 ac -n cpaas-system rollout status deploy/cluster-api-provider-alauda-manager
+RP=$(ac get resourcepatches \
+  -o jsonpath='{range .items[?(@.spec.target.name=="cluster-api-provider-alauda-manager")]}{.metadata.name}{"\n"}{end}')
+ac annotate resourcepatches "${RP}" config.cpaas.io/exempt-for-ver=<target-version> --overwrite
 ac -n cpaas-system get deploy cluster-api-provider-alauda-manager \
   -o jsonpath='{.spec.template.spec.containers[?(@.name=="cluster-api-provider-alauda")].env[?(@.name=="CLUSTER_TOKEN_ROTATOR_ENABLED")].value}{"\n"}'
 ```
 
-Continue when, on both sides, the rollout completes and the last command prints `false`, and on the standby every cluster-transformer Pod is `Running`. Then run the preflight check on the standby:
+Continue when, on both sides, the rollout completes, `annotate` reports the `ResourcePatch` as annotated, and the last command prints `false`, and on the standby every cluster-transformer Pod is `Running`. Then run the preflight check on the standby:
 
 ```bash
 export KUBECONFIG=<standby-kubeconfig>
@@ -113,19 +119,8 @@ unset KUBECONFIG
 | Result | Action |
 |---|---|
 | `DRSplitUpgradeWindow` is the only failed check, and its only reason is `EtcdSyncNotPaused` | Continue. |
-| `ResourcePatchUpgradeable` lists a `ResourcePatch` for `cluster-api-provider-alauda-manager` | Exempt it for the target version with the block below, then run the check again. |
 | `DRSplitUpgradeWindow` fails for another reason | See [DR Standby Checks](../troubleshooting.mdx#dr-split-upgrade-window), then run the check again. |
 | Another check fails | See [Handle Preflight Blocks](../troubleshooting.mdx#handle-preflight-blocks-when-needed), then run the check again. |
-
-```bash
-export KUBECONFIG=<standby-kubeconfig>
-ac whoami --show-server   # the standby VIP
-ac get resourcepatches \
-  -o custom-columns='NAME:.metadata.name,EXEMPT:.metadata.annotations.config\.cpaas\.io/exempt-for-ver'
-ac get resourcepatches <rp-name> -o yaml
-ac annotate resourcepatches <rp-name> config.cpaas.io/exempt-for-ver=<target-version> --overwrite
-unset KUBECONFIG
-```
 
 ### Pause Synchronization \{#pause}
 
@@ -151,22 +146,22 @@ ac -n kube-public get configmap etcd-sync -o name
 unset KUBECONFIG
 ```
 
-Run the block again without the lines from `if` to `fi` until the first line no longer shows `Pausing`.
+Run the block again without the lines from `if` to `fi` until the second value on the line after the address is `Paused`. In the table, "the state line" is that line.
 
 | Result | Action |
 |---|---|
-| The first line is `Paused Paused Paused`, the third line (`status.pauseCheck`) shows `"unexpected":0` and no `error`, and the last command prints `configmap/etcd-sync` | Continue. |
-| On the first line, the second and third values stay empty | etcd-sync did not take the request. Do not upgrade the primary; contact technical support. |
-| The first line stays `Paused Pausing Paused` when you run the block again | Read the second line (`status.message`) and contact technical support. |
+| The state line is `Paused Paused Paused`, the `status.pauseCheck` line shows `"unexpected":0` and no `error`, and the last command prints `configmap/etcd-sync` | Continue. |
+| On the state line, the second and third values stay empty | etcd-sync did not take the request. Do not upgrade the primary; contact technical support. |
+| The state line stays `Paused Pausing Paused` or `Paused Running Running` when you run the block again | Read the `status.message` line and contact technical support. |
 | `unexpected` is not `0`, `error` is set, or the marker is missing | Do not upgrade the primary; contact technical support. |
 
 ### Upgrade the Primary `global` Cluster \{#upgrade-primary}
 
 :::warning
-An upgrade cannot be rolled back. On Huawei DCS, the request also replaces every node with a new VM, one at a time; on Bare Metal, it reinstalls every host, one at a time, when the target changes the Kubernetes build or the Alauda OS image.
+An upgrade cannot be rolled back. When the target changes the Kubernetes build or the Alauda OS image, the request also replaces every node with a new VM on Huawei DCS, and reinstalls every host on Bare Metal, one at a time.
 :::
 
-On the primary, **deploy the Cluster Version Operator (CVO)** and the target release information. `<target-version>` is the target ACP version, as `ac adm upgrade` lists it:
+On the primary, **deploy the Cluster Version Operator (CVO)** and the target release information. `<target-version>` is the target ACP version:
 
 ```bash
 ac config use-cluster global
@@ -278,14 +273,15 @@ unset KUBECONFIG
 |---|---|
 | `Paused Paused Paused`, `configmap/etcd-sync`, `false`, and `200` | Continue. |
 | The token rotator value is not `false` | Run the standby block of [Prepare Both `global` Clusters](#prepare-both) again, then run this block again. |
-| `401` | Contact technical support. |
+| `401` or `403` | The token of the plugin no longer gives access to the primary. Contact technical support. |
 | The pause state is not `Paused Paused Paused`, or the marker is missing | Do not upgrade the standby; contact technical support. |
-| Any other HTTP code | Check that the standby control plane nodes reach the primary VIP on port `6443`; if they do, contact technical support. |
+| `000` | The execution host does not reach the primary VIP on port `6443`. Fix the connection from the execution host and run the block again. |
+| Any other HTTP code | Contact technical support. |
 
 ### Upgrade the Standby `global` Cluster \{#upgrade-standby}
 
 :::warning
-An upgrade cannot be rolled back. On Huawei DCS, the request also replaces every node with a new VM, one at a time; on Bare Metal, it reinstalls every host, one at a time, when the target changes the Kubernetes build or the Alauda OS image.
+An upgrade cannot be rolled back. When the target changes the Kubernetes build or the Alauda OS image, the request also replaces every node with a new VM on Huawei DCS, and reinstalls every host on Bare Metal, one at a time.
 :::
 
 On the standby, **deploy CVO** and the target release information:
@@ -304,7 +300,7 @@ unset KUBECONFIG
 | The script reports that the product manifest did not become ready, or `READY` is not `True` | Follow [Recover a Missing Aligned Extension Package](../troubleshooting.mdx#recover-missing-aligned-package). |
 | The script fails with another error | Contact technical support. |
 
-Then **run the final preflight check**. Check the marker first, because preflight does not check the standby when the marker is missing:
+Then **run the final preflight check**. Check the marker first, because without the marker `DRSplitUpgradeWindow` passes without checking the standby:
 
 ```bash
 export KUBECONFIG=<standby-kubeconfig>
@@ -318,6 +314,7 @@ If the first command does not print `configmap/etcd-sync`, do not upgrade the st
 
 ```bash
 export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server   # the standby VIP
 ac adm upgrade
 ac adm upgrade --cluster=global --to=<target-version>
 unset KUBECONFIG
@@ -327,6 +324,7 @@ unset KUBECONFIG
 
 ```bash
 export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server   # the standby VIP
 ac adm upgrade status --cluster=global
 ac -n cpaas-system get infraclusterversion global   # Huawei DCS and Bare Metal
 unset KUBECONFIG
@@ -366,12 +364,12 @@ ac -n cpaas-system get configmap etcd-sync-control \
 unset KUBECONFIG
 ```
 
-Run the block again without the `patch` command until the first line shows `Running`. Then run the `/check` command from [Verify Data Consistency](#verify-dr-consistency) again on a standby control plane node.
+Run the block again without the `patch` command until the line after the address shows `Running`. Then run the `/check` command from [Verify Data Consistency](#verify-dr-consistency) again on a standby control plane node.
 
 | Result | Action |
 |---|---|
 | `status.phase` is `Running`, `status.lastResume` contains `"deleteSkipped":false`, the `status.deleteBlocked` line is empty, and `/check` shows `localMissedKeys [0]` and `localSurplusKeys [0]` | Continue. |
-| `status.phase` stays `Resuming` | Do not edit `etcd-sync-control`; contact technical support. |
+| `status.phase` stays `Resuming`, or stays `Paused` | Do not edit `etcd-sync-control`; contact technical support. |
 | `"deleteSkipped":true`, or the `status.deleteBlocked` line is not empty | Contact technical support. |
 | `check too frequent` | Wait one minute and run the check again; if it does not change, contact technical support. |
 | `/check` shows any other value | Run the steps in [Global Cluster Disaster Recovery Does Not Synchronize](../troubleshooting.mdx#dr-sync-diagnostics), then run the check again. |
@@ -389,7 +387,7 @@ ac -n cpaas-system rollout status deploy/cluster-api-provider-alauda-manager
 ac -n cpaas-system get deploy cluster-api-provider-alauda-manager \
   -o jsonpath='{.spec.template.spec.containers[?(@.name=="cluster-api-provider-alauda")].env[?(@.name=="CLUSTER_TOKEN_ROTATOR_ENABLED")].value}{"\n"}'
 ac get resourcepatches \
-  -o jsonpath='{range .items[?(@.spec.target.name=="cluster-api-provider-alauda-manager")]}{.metadata.name}{"\t"}{.metadata.creationTimestamp}{"\n"}{end}'
+  -o jsonpath='{range .items[?(@.spec.target.name=="cluster-api-provider-alauda-manager")]}{.metadata.name}{"\n"}{end}'
 ```
 
 On the standby:
@@ -403,15 +401,15 @@ ac -n cpaas-system rollout status deploy/cluster-api-provider-alauda-manager
 ac -n cpaas-system get deploy cluster-api-provider-alauda-manager \
   -o jsonpath='{.spec.template.spec.containers[?(@.name=="cluster-api-provider-alauda")].env[?(@.name=="CLUSTER_TOKEN_ROTATOR_ENABLED")].value}{"\n"}'
 ac get resourcepatches \
-  -o jsonpath='{range .items[?(@.spec.target.name=="cluster-api-provider-alauda-manager")]}{.metadata.name}{"\t"}{.metadata.creationTimestamp}{"\n"}{end}'
+  -o jsonpath='{range .items[?(@.spec.target.name=="cluster-api-provider-alauda-manager")]}{.metadata.name}{"\n"}{end}'
 unset KUBECONFIG
 ```
 
-Continue when, on both sides, the rollout completes and the `jsonpath` command for the setting prints an empty line; otherwise, contact technical support. If the last command lists a `ResourcePatch`, contact technical support before the next upgrade.
+Continue when, on both sides, the rollout completes, the `jsonpath` command for the setting prints an empty line, and the last command lists no `ResourcePatch`: removing the setting also removes the `ResourcePatch` that it created. If a `ResourcePatch` is still listed, it holds another customization of the Deployment; keep it, and check that it does not contain `CLUSTER_TOKEN_ROTATOR_ENABLED`.
 
 ### Upgrade the Agnostic Extensions and Validate \{#upgrade-agnostic-extensions}
 
-The upgrade requests do not upgrade Extensions (Operators and Cluster Plugins) with the `Agnostic` lifecycle. Upgrade each Agnostic Extension installed on the primary, on the standby, and on the workload clusters that you upgraded, by following its own documentation; the plugin does not synchronize installed Extensions. For example, see <ExternalSiteLink name="ai" href="/upgrade/upgrade-from-aml-1.2.html" children="Upgrade Alauda AI" /> and <ExternalSiteLink name="devops" href="/upgrade/index.html" children="Upgrade Alauda DevOps" />. Then complete [Upgrade Validation](../validation.mdx) on the standby; the primary was validated before the workload clusters.
+The upgrade requests do not upgrade Extensions (Operators and Cluster Plugins) with the `Agnostic` lifecycle. Upgrade each Agnostic Extension installed on the primary, on the standby, and on the workload clusters that you upgraded, by following its own documentation. For example, see <ExternalSiteLink name="ai" href="/upgrade/upgrade-from-aml-1.2.html" children="Upgrade Alauda AI" /> and <ExternalSiteLink name="devops" href="/upgrade/index.html" children="Upgrade Alauda DevOps" />. Then complete [Upgrade Validation](../validation.mdx) on the standby; the primary was validated before the workload clusters.
 
 The upgrade of the two `global` clusters is complete only when every step on this page is done, including the synchronization check after the resume; do not start another upgrade of either `global` cluster before that.
 
