@@ -140,7 +140,7 @@ Run each block on the execution host unless it says that it runs on a node. Each
 Use the Non-Alauda OS tab when the nodes of `global` do not run Alauda OS; otherwise, use the tab of the infrastructure provider of `global`, shown in `INFRASTRUCTURE` in [Check Cluster Versions](#check-compatibility).
 
 :::warning
-On Alauda OS, data on a node's own disks, such as `hostPath` volumes and local PersistentVolumes, is not kept when the node is replaced, unless it is on a pool-managed persistent disk (Bare Metal: a declared data volume). Move it to CSI storage, or onto a pool-managed persistent disk, before the upgrade.
+On Alauda OS, data on a node's own disks, such as `hostPath` volumes and local PersistentVolumes, is not kept when the node is replaced, unless it is on a pool-managed persistent disk (Bare Metal: a declared data volume). Move it to CSI storage before the upgrade.
 :::
 
 <Tabs>
@@ -175,22 +175,30 @@ ac -n cpaas-system get dcsmachinetemplate \
   -o custom-columns='NAME:.metadata.name,TEMPLATE_DISKS:.spec.template.spec.vmConfig.dcsMachineDiskSpec[*].path'
 echo "== Machines, IP pools, and the type and address of the control-plane load balancer"
 ac -n cpaas-system get dcsmachine -l cluster.x-k8s.io/cluster-name=global \
-  -o custom-columns='NAME:.metadata.name,POOL:.spec.ipHostPoolRef.name,IP:.status.networkConfig.ip,VM_TEMPLATE:.spec.vmTemplateName'
+  -o custom-columns='NAME:.metadata.name,POOL:.spec.ipHostPoolRef.name,IP:.status.networkConfig.ip,VM_TEMPLATE:.spec.vmTemplateName,READY:.status.ready'
 ac -n cpaas-system get dcsiphostnamepool \
   -o custom-columns='NAME:.metadata.name,IPS:.spec.pool[*].ip,DISKS:.spec.pool[*].persistentDisk[*].slot,KEPT_DISKS:.status.persistentDiskStatus[*].ip'
 ac -n cpaas-system get dcscluster global -o jsonpath='{.spec.controlPlaneLoadBalancer.type}{" "}{.spec.controlPlaneLoadBalancer.host}{"\n"}'
 echo "== Secrets that the DCSCluster references"
 ac -n cpaas-system get secret $(ac -n cpaas-system get dcscluster global -o jsonpath='{.spec.credentialSecretRef.name} {.spec.encryptionProviderConfigRef.name}')
-echo "== Kubelet patch files: the content, or a Secret name and key"
+echo "== Kubelet patch files: the encoding, then the content or a Secret name and key"
 echo "${KCP}:"
-ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{range .spec.kubeadmConfigSpec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
+ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{range .spec.kubeadmConfigSpec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
 for t in $(ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=global -o jsonpath='{.items[*].spec.template.spec.bootstrap.configRef.name}'); do
   echo "${t}:"
-  ac -n cpaas-system get kubeadmconfigtemplate "${t}" -o jsonpath='{range .spec.template.spec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
+  ac -n cpaas-system get kubeadmconfigtemplate "${t}" -o jsonpath='{range .spec.template.spec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
 done
 echo "== Providers"
 ac get moduleinfo -l cpaas.io/cluster-name=global \
   -o custom-columns='MODULE:.metadata.labels.cpaas\.io/module-name,PHASE:.status.phase' | grep -E '^MODULE|cluster-api-provider'
+echo "== Pods with hostPath volumes"
+ac get pods -A --no-headers \
+  -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,OWNER:.metadata.ownerReferences[*].kind,MIRROR:.metadata.annotations.kubernetes\.io/config\.mirror,PHASE:.status.phase,HOSTPATH:.spec.volumes[*].hostPath.path' \
+  | awk '$1 !~ /^(kube-system|kube-public|kube-node-lease|cpaas-system)$/ && $3 !~ /DaemonSet/ && $4 == "<none>" && $5 !~ /^(Succeeded|Failed)$/ && $6 != "<none>"'
+echo "== Local and hostPath PersistentVolumes with a claim"
+ac get pv --no-headers \
+  -o custom-columns='NAME:.metadata.name,CLAIM_NAMESPACE:.spec.claimRef.namespace,CLAIM:.spec.claimRef.name,LOCAL:.spec.local.path,HOSTPATH:.spec.hostPath.path' \
+  | awk '$2 !~ /^(<none>|kube-system|kube-public|kube-node-lease|cpaas-system)$/ && ($4 != "<none>" || $5 != "<none>")'
 # on the standby: unset KUBECONFIG
 ```
 
@@ -203,6 +211,8 @@ A free entry is an IP address of a pool in `POOL` whose `DISKS` lists slot numbe
 | `replicas` is 3 or more and `maxSurge` is empty or not `0`, or a MachineDeployment shows `SURGE` empty, `<none>`, or not `0`, or `UNAVAILABLE` empty, `<none>`, or not `1` | Run the commands in [Set the Rollout Settings](#rollout-settings). |
 | No machine template lists `/var/cpaas` in `TEMPLATE_DISKS` | Continue. |
 | A machine template lists `/var/cpaas` | [Migrate to pool-managed persistent disks](./persistent_disk_migration.mdx) before the upgrade. The migration replaces nodes. |
+| Every machine shows `READY` `true` | Continue. |
+| A machine shows `READY` empty, `<none>`, or `false` | Run the block again later. If the machine still does not show `true`, contact technical support. |
 | Every machine shows the same `VM_TEMPLATE` | Continue. |
 | The machines show different `VM_TEMPLATE` values | Contact technical support. |
 | The pools in `POOL` whose `DISKS` lists slot numbers have no free entry | Continue. |
@@ -210,10 +220,12 @@ A free entry is an IP address of a pool in `POOL` whose `DISKS` lists slot numbe
 | A free entry is in `KEPT_DISKS` | Contact technical support. Do not remove the entry. |
 | Each Secret is listed | Continue. |
 | A Secret is reported `NotFound` | Contact technical support. |
-| Each kubelet patch file shows its content, or a Secret name and a key for which the command in [Kubelet Patch File](#kubernetes-1-35-kubelet-patch) prints the content | Continue. |
-| A kubelet patch file shows nothing, or its Secret or key does not exist | Contact technical support. |
+| Each kubelet patch file shows `encoding=[]`, then its content, or a Secret name and a key for which the command in [Kubelet Patch File](#kubernetes-1-35-kubelet-patch) prints the content | Continue. |
+| No `encoding=` line follows a name under `== Kubelet patch files`, a file shows a value inside `encoding=[]`, such as `encoding=[base64]`, or no content, or its Secret or key does not exist | Contact technical support. |
 | `cluster-api-provider-kubeadm` and `cluster-api-provider-dcs` show `PHASE` `Running` | Continue. |
 | A provider is missing, or shows another `PHASE` | Contact technical support. |
+| Nothing is listed under `== Pods with hostPath volumes`, and nothing under `== Local and hostPath PersistentVolumes with a claim` | Continue. |
+| A Pod or a PersistentVolume is listed under either title | Move its data to CSI storage before the upgrade. If the data is on a pool-managed persistent disk, or you cannot move it, contact technical support. |
 
   </Tab>
   <Tab label="Bare Metal">
@@ -230,21 +242,29 @@ ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=global
   -o custom-columns='NAME:.metadata.name,SURGE:.spec.strategy.rollingUpdate.maxSurge,UNAVAILABLE:.spec.strategy.rollingUpdate.maxUnavailable'
 echo "== Machines, host pools, and hosts"
 ac -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io -l cluster.x-k8s.io/cluster-name=global \
-  -o custom-columns='NAME:.metadata.name,INVENTORY:.status.machineInventoryRef.name'
+  -o custom-columns='NAME:.metadata.name,INVENTORY:.status.machineInventoryRef.name,PHASE:.status.phase'
 ac -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io \
   -o custom-columns='NAME:.metadata.name,CLUSTER:.spec.clusterName,TOTAL:.status.total,ALLOCATED:.status.allocated,HOSTS:.spec.machineInventories[*].name'
 ac -n cpaas-system get machineinventories.elemental.cattle.io \
   -o custom-columns='NAME:.metadata.name,OS:.metadata.labels.os\.baremetal\.alauda\.io/id,STORAGE:.status.storage.phase'
-echo "== Kubelet patch files: the content, or a Secret name and key"
+echo "== Kubelet patch files: the encoding, then the content or a Secret name and key"
 echo "${KCP}:"
-ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{range .spec.kubeadmConfigSpec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
+ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{range .spec.kubeadmConfigSpec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
 for t in $(ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=global -o jsonpath='{.items[*].spec.template.spec.bootstrap.configRef.name}'); do
   echo "${t}:"
-  ac -n cpaas-system get kubeadmconfigtemplate "${t}" -o jsonpath='{range .spec.template.spec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
+  ac -n cpaas-system get kubeadmconfigtemplate "${t}" -o jsonpath='{range .spec.template.spec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
 done
 echo "== Providers"
 ac get moduleinfo -l cpaas.io/cluster-name=global \
   -o custom-columns='MODULE:.metadata.labels.cpaas\.io/module-name,PHASE:.status.phase' | grep -E '^MODULE|cluster-api-provider'
+echo "== Pods with hostPath volumes"
+ac get pods -A --no-headers \
+  -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,OWNER:.metadata.ownerReferences[*].kind,MIRROR:.metadata.annotations.kubernetes\.io/config\.mirror,PHASE:.status.phase,HOSTPATH:.spec.volumes[*].hostPath.path' \
+  | awk '$1 !~ /^(kube-system|kube-public|kube-node-lease|cpaas-system)$/ && $3 !~ /DaemonSet/ && $4 == "<none>" && $5 !~ /^(Succeeded|Failed)$/ && $6 != "<none>"'
+echo "== Local and hostPath PersistentVolumes with a claim"
+ac get pv --no-headers \
+  -o custom-columns='NAME:.metadata.name,CLAIM_NAMESPACE:.spec.claimRef.namespace,CLAIM:.spec.claimRef.name,LOCAL:.spec.local.path,HOSTPATH:.spec.hostPath.path' \
+  | awk '$2 !~ /^(<none>|kube-system|kube-public|kube-node-lease|cpaas-system)$/ && ($4 != "<none>" || $5 != "<none>")'
 # on the standby: unset KUBECONFIG
 ```
 
@@ -267,14 +287,18 @@ A node pool with a single host has no worker while that host is reinstalled. Mak
 | `replicas` is 3 or more and `maxSurge` is `0`, and every MachineDeployment shows `SURGE` `0` and `UNAVAILABLE` `1` | Continue. |
 | `replicas` is less than 3 | Contact technical support. |
 | `replicas` is 3 or more and `maxSurge` is empty or not `0`, or a MachineDeployment shows `SURGE` empty, `<none>`, or not `0`, or `UNAVAILABLE` empty, `<none>`, or not `1` | Run the commands in [Set the Rollout Settings](#rollout-settings). |
+| Every machine shows `PHASE` `Running` | Continue. |
+| A machine shows `PHASE` empty, `<none>`, or not `Running` | Run the block again later. If the machine still does not show `Running`, contact technical support. |
 | A host declares data volumes when its `STORAGE` is not `Unmanaged`, empty, or `<none>`. Each such host shows `Prepared`, or `Active` once it is allocated | Continue. |
 | A host that declares data volumes shows another `STORAGE` | Contact technical support. |
 | Each pool of `global` with a host that declares data volumes shows `TOTAL` equal to `ALLOCATED` | Continue. |
 | `replicas` is 3 or more, and such a pool shows `TOTAL` greater than `ALLOCATED` | Remove the free hosts, the ones in `HOSTS` that no machine uses as its `INVENTORY`, from `spec.machineInventories` with `ac -n cpaas-system edit machineinventorypools.infrastructure.cluster.x-k8s.io <pool-name>`. Removing a free host from the pool does not change the host. |
-| Each kubelet patch file shows its content, or a Secret name and a key for which the command in [Kubelet Patch File](#kubernetes-1-35-kubelet-patch) prints the content | Continue. |
-| A kubelet patch file shows nothing, or its Secret or key does not exist | Contact technical support. |
+| Each kubelet patch file shows `encoding=[]`, then its content, or a Secret name and a key for which the command in [Kubelet Patch File](#kubernetes-1-35-kubelet-patch) prints the content | Continue. |
+| No `encoding=` line follows a name under `== Kubelet patch files`, a file shows a value inside `encoding=[]`, such as `encoding=[base64]`, or no content, or its Secret or key does not exist | Contact technical support. |
 | `cluster-api-provider-kubeadm` and `cluster-api-provider-baremetal` show `PHASE` `Running` | Continue. |
 | A provider is missing, or shows another `PHASE` | Contact technical support. |
+| Nothing is listed under `== Pods with hostPath volumes`, and nothing under `== Local and hostPath PersistentVolumes with a claim` | Continue. |
+| A Pod or a PersistentVolume is listed under either title | Move its data to CSI storage before the upgrade. If the data is on a declared data volume, or you cannot move it, contact technical support. |
 | `COS_STATE` is larger than 8 GiB, `Free (estimated)` is at least 4 GiB, and no snapshot shows `no` in `default` and `active` and `update-in-progress=yes` in `userdata` | Continue. |
 | `Free (estimated)` is less than 4 GiB, or a snapshot shows `no` in `default` and `active` and `update-in-progress=yes` in `userdata` | Run the steps in [Free Space on COS_STATE](./troubleshooting.mdx#check-cos-state-free-space). |
 | `COS_STATE` is 8 GiB or smaller | Reinstall the host with a larger partition, as described in [Size COS_STATE before the first install](../workload_clusters/alauda_os/bare-metal/create_cluster.mdx#size-cos-state), before the upgrade. The reinstall replaces the node. |
@@ -299,16 +323,24 @@ ac -n cpaas-system get hcsmachinetemplate \
   -o custom-columns='NAME:.metadata.name,DATA_VOLUMES:.spec.template.spec.dataVolumes[*].mountPath,POOL:.spec.template.spec.configPoolRef.name'
 ac -n cpaas-system get hcsmachineconfigpool \
   -o custom-columns='NAME:.metadata.name,AVAILABLE:.status.availableCount,DISKS:.spec.configs[*].persistentDisks[*].slot,HOSTNAMES:.spec.configs[*].hostname,USED:.status.usedConfigs[*].hostname'
-echo "== Kubelet patch files: the content, or a Secret name and key"
+echo "== Kubelet patch files: the encoding, then the content or a Secret name and key"
 echo "${KCP}:"
-ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{range .spec.kubeadmConfigSpec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
+ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{range .spec.kubeadmConfigSpec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
 for t in $(ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=global -o jsonpath='{.items[*].spec.template.spec.bootstrap.configRef.name}'); do
   echo "${t}:"
-  ac -n cpaas-system get kubeadmconfigtemplate "${t}" -o jsonpath='{range .spec.template.spec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
+  ac -n cpaas-system get kubeadmconfigtemplate "${t}" -o jsonpath='{range .spec.template.spec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
 done
 echo "== Providers"
 ac get moduleinfo -l cpaas.io/cluster-name=global \
   -o custom-columns='MODULE:.metadata.labels.cpaas\.io/module-name,PHASE:.status.phase' | grep -E '^MODULE|cluster-api-provider'
+echo "== Pods with hostPath volumes"
+ac get pods -A --no-headers \
+  -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,OWNER:.metadata.ownerReferences[*].kind,MIRROR:.metadata.annotations.kubernetes\.io/config\.mirror,PHASE:.status.phase,HOSTPATH:.spec.volumes[*].hostPath.path' \
+  | awk '$1 !~ /^(kube-system|kube-public|kube-node-lease|cpaas-system)$/ && $3 !~ /DaemonSet/ && $4 == "<none>" && $5 !~ /^(Succeeded|Failed)$/ && $6 != "<none>"'
+echo "== Local and hostPath PersistentVolumes with a claim"
+ac get pv --no-headers \
+  -o custom-columns='NAME:.metadata.name,CLAIM_NAMESPACE:.spec.claimRef.namespace,CLAIM:.spec.claimRef.name,LOCAL:.spec.local.path,HOSTPATH:.spec.hostPath.path' \
+  | awk '$2 !~ /^(<none>|kube-system|kube-public|kube-node-lease|cpaas-system)$/ && ($4 != "<none>" || $5 != "<none>")'
 # on the standby: unset KUBECONFIG
 ```
 
@@ -322,11 +354,13 @@ ac get moduleinfo -l cpaas.io/cluster-name=global \
 | Every pool in `POOL` whose `DISKS` lists slot numbers shows `AVAILABLE` empty, `<none>`, or `0` | Continue. |
 | Such a pool shows `AVAILABLE` greater than `0` | Remove its free configurations, the ones in `HOSTNAMES` that are not in `USED`, from `spec.configs` with `ac -n cpaas-system edit hcsmachineconfigpool <pool-name>`. |
 | The edit is rejected for a free configuration that was used before | Contact technical support. |
-| Each kubelet patch file shows its content, or a Secret name and a key for which the command in [Kubelet Patch File](#kubernetes-1-35-kubelet-patch) prints the content | Continue. |
-| A kubelet patch file shows nothing, or its Secret or key does not exist | Contact technical support. |
+| Each kubelet patch file shows `encoding=[]`, then its content, or a Secret name and a key for which the command in [Kubelet Patch File](#kubernetes-1-35-kubelet-patch) prints the content | Continue. |
+| No `encoding=` line follows a name under `== Kubelet patch files`, a file shows a value inside `encoding=[]`, such as `encoding=[base64]`, or no content, or its Secret or key does not exist | Contact technical support. |
 | A kubelet patch file lacks `"imagePullCredentialsVerificationPolicy": "NeverVerify"` | Continue. Add it in the Kubernetes upgrade, for each version 1.35 or later: see [Update the KubeadmControlPlane](./upgrade_kubernetes_hcs_vsphere.mdx#update-kcp) and [Create the Worker Templates](./upgrade_kubernetes_hcs_vsphere.mdx#create-worker-templates). |
 | `cluster-api-provider-kubeadm` and `cluster-api-provider-hcs` show `PHASE` `Running` | Continue. |
 | A provider is missing, or shows another `PHASE` | Contact technical support. |
+| Nothing is listed under `== Pods with hostPath volumes`, and nothing under `== Local and hostPath PersistentVolumes with a claim` | Continue. |
+| A Pod or a PersistentVolume is listed under either title | Move its data to CSI storage before the upgrade. If the data is on a pool-managed persistent disk, or you cannot move it, contact technical support. |
 
   </Tab>
   <Tab label="VMware vSphere">
@@ -344,16 +378,24 @@ ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=global
 echo "== Machine config pools"
 ac -n cpaas-system get vspheremachineconfigpool \
   -o custom-columns='NAME:.metadata.name,CLUSTER:.spec.clusterRef.name,READY:.status.conditions[?(@.type=="Ready")].status'
-echo "== Kubelet patch files: the content, or a Secret name and key"
+echo "== Kubelet patch files: the encoding, then the content or a Secret name and key"
 echo "${KCP}:"
-ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{range .spec.kubeadmConfigSpec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
+ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{range .spec.kubeadmConfigSpec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
 for t in $(ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=global -o jsonpath='{.items[*].spec.template.spec.bootstrap.configRef.name}'); do
   echo "${t}:"
-  ac -n cpaas-system get kubeadmconfigtemplate "${t}" -o jsonpath='{range .spec.template.spec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
+  ac -n cpaas-system get kubeadmconfigtemplate "${t}" -o jsonpath='{range .spec.template.spec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
 done
 echo "== Providers"
 ac get moduleinfo -l cpaas.io/cluster-name=global \
   -o custom-columns='MODULE:.metadata.labels.cpaas\.io/module-name,PHASE:.status.phase' | grep -E '^MODULE|cluster-api-provider'
+echo "== Pods with hostPath volumes"
+ac get pods -A --no-headers \
+  -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,OWNER:.metadata.ownerReferences[*].kind,MIRROR:.metadata.annotations.kubernetes\.io/config\.mirror,PHASE:.status.phase,HOSTPATH:.spec.volumes[*].hostPath.path' \
+  | awk '$1 !~ /^(kube-system|kube-public|kube-node-lease|cpaas-system)$/ && $3 !~ /DaemonSet/ && $4 == "<none>" && $5 !~ /^(Succeeded|Failed)$/ && $6 != "<none>"'
+echo "== Local and hostPath PersistentVolumes with a claim"
+ac get pv --no-headers \
+  -o custom-columns='NAME:.metadata.name,CLAIM_NAMESPACE:.spec.claimRef.namespace,CLAIM:.spec.claimRef.name,LOCAL:.spec.local.path,HOSTPATH:.spec.hostPath.path' \
+  | awk '$2 !~ /^(<none>|kube-system|kube-public|kube-node-lease|cpaas-system)$/ && ($4 != "<none>" || $5 != "<none>")'
 # on the standby: unset KUBECONFIG
 ```
 
@@ -364,11 +406,13 @@ ac get moduleinfo -l cpaas.io/cluster-name=global \
 | `replicas` is 3 or more and `maxSurge` is empty or not `0`, or a MachineDeployment shows `SURGE` empty, `<none>`, or not `0`, or `UNAVAILABLE` empty, `<none>`, or not `1` | Run the commands in [Set the Rollout Settings](#rollout-settings). |
 | Every pool whose `CLUSTER` is `global` shows `READY` `True` | Continue. |
 | Such a pool does not show `True` | Contact technical support. |
-| Each kubelet patch file shows its content, or a Secret name and a key for which the command in [Kubelet Patch File](#kubernetes-1-35-kubelet-patch) prints the content | Continue. |
-| A kubelet patch file shows nothing, or its Secret or key does not exist | Contact technical support. |
+| Each kubelet patch file shows `encoding=[]`, then its content, or a Secret name and a key for which the command in [Kubelet Patch File](#kubernetes-1-35-kubelet-patch) prints the content | Continue. |
+| No `encoding=` line follows a name under `== Kubelet patch files`, a file shows a value inside `encoding=[]`, such as `encoding=[base64]`, or no content, or its Secret or key does not exist | Contact technical support. |
 | A kubelet patch file lacks `"imagePullCredentialsVerificationPolicy": "NeverVerify"` | Continue. Add it in the Kubernetes upgrade, for each version 1.35 or later: see [Update the KubeadmControlPlane](./upgrade_kubernetes_hcs_vsphere.mdx#update-kcp) and [Create the Worker Templates](./upgrade_kubernetes_hcs_vsphere.mdx#create-worker-templates). |
 | `cluster-api-provider-kubeadm` and `cluster-api-provider-vsphere` show `PHASE` `Running` | Continue. |
 | A provider is missing, or shows another `PHASE` | Contact technical support. |
+| Nothing is listed under `== Pods with hostPath volumes`, and nothing under `== Local and hostPath PersistentVolumes with a claim` | Continue. |
+| A Pod or a PersistentVolume is listed under either title | Move its data to CSI storage before the upgrade. If the data is on a pool-managed persistent disk, or you cannot move it, contact technical support. |
 
   </Tab>
 </Tabs>

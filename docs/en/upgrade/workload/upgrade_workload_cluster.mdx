@@ -262,7 +262,7 @@ snapper --no-dbus --csvout list --columns number,default,active,userdata
   </Tab>
   <Tab label="Huawei Cloud Stack">
 
-On the `global` cluster, set `CLUSTER` on the first line to the cluster and run this block once. It only reads, and prints each part under its own `==` title:
+On the `global` cluster, set `CLUSTER` on the first line to the cluster and run this block once. It only reads, and prints each part under its own `==` title. The parts after `== Switch to the cluster` run on the cluster itself:
 
 ```bash
 CLUSTER="<cluster-name>"
@@ -280,17 +280,30 @@ ac -n cpaas-system get hcsmachinetemplate \
   -o custom-columns='NAME:.metadata.name,DATA_VOLUMES:.spec.template.spec.dataVolumes[*].mountPath,POOL:.spec.template.spec.configPoolRef.name'
 ac -n cpaas-system get hcsmachineconfigpool \
   -o custom-columns='NAME:.metadata.name,AVAILABLE:.status.availableCount,DISKS:.spec.configs[*].persistentDisks[*].slot,HOSTNAMES:.spec.configs[*].hostname,USED:.status.usedConfigs[*].hostname'
-echo "== Kubelet patch files: the content, or a Secret name and key"
+echo "== Kubelet patch files: the encoding, then the content or a Secret name and key"
 echo "${KCP}:"
-ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{range .spec.kubeadmConfigSpec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
+ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{range .spec.kubeadmConfigSpec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
 for t in $(ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name="${CLUSTER}" -o jsonpath='{.items[*].spec.template.spec.bootstrap.configRef.name}'); do
   echo "${t}:"
-  ac -n cpaas-system get kubeadmconfigtemplate "${t}" -o jsonpath='{range .spec.template.spec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
+  ac -n cpaas-system get kubeadmconfigtemplate "${t}" -o jsonpath='{range .spec.template.spec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
 done
 echo "== Provider"
 ac -n cpaas-system get apprelease \
   -o custom-columns='NAME:.metadata.name,CHART:.spec.source.charts[*].name,REQUESTED:.spec.source.charts[*].targetRevision,INSTALLED:.status.charts.*.installedRevision,SYNC:.status.conditions[?(@.type=="Sync")].status,HEALTH:.status.conditions[?(@.type=="Health")].status' \
   | grep -E '^NAME|chart-cluster-api-provider-hcs'
+echo "== Switch to the cluster"
+ac config use-cluster "${CLUSTER}"
+ac whoami --show-server
+echo "== Pods with hostPath volumes, on the cluster"
+ac get pods -A --no-headers \
+  -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,OWNER:.metadata.ownerReferences[*].kind,MIRROR:.metadata.annotations.kubernetes\.io/config\.mirror,PHASE:.status.phase,HOSTPATH:.spec.volumes[*].hostPath.path' \
+  | awk '$1 !~ /^(kube-system|kube-public|kube-node-lease|cpaas-system)$/ && $3 !~ /DaemonSet/ && $4 == "<none>" && $5 !~ /^(Succeeded|Failed)$/ && $6 != "<none>"'
+echo "== Local and hostPath PersistentVolumes with a claim, on the cluster"
+ac get pv --no-headers \
+  -o custom-columns='NAME:.metadata.name,CLAIM_NAMESPACE:.spec.claimRef.namespace,CLAIM:.spec.claimRef.name,LOCAL:.spec.local.path,HOSTPATH:.spec.hostPath.path' \
+  | awk '$2 !~ /^(<none>|kube-system|kube-public|kube-node-lease|cpaas-system)$/ && ($4 != "<none>" || $5 != "<none>")'
+echo "== Switch back to global"
+ac config use-cluster global
 ```
 
 When a kubelet patch file shows a Secret name and a key instead of the content, print the content from the Secret. Escape each `.` in `<secret-key>` as `\.`:
@@ -312,11 +325,15 @@ Also, in the HCS console, confirm that the image that you recorded for the targe
 | Every pool in `POOL` whose `DISKS` lists slot numbers shows `AVAILABLE` empty, `<none>`, or `0` | Continue. |
 | Such a pool shows `AVAILABLE` greater than `0` | Remove its free configurations, the ones in `HOSTNAMES` that are not in `USED`, from `spec.configs` with `ac -n cpaas-system edit hcsmachineconfigpool <pool-name>`. |
 | The edit is rejected for a free configuration that was used before | Contact technical support. |
-| Each kubelet patch file shows its content, or a Secret name and a key for which the Secret command above prints the content | Continue. |
-| A kubelet patch file shows nothing, or its Secret or key does not exist | Contact technical support. |
+| Each kubelet patch file shows `encoding=[]`, then its content, or a Secret name and a key for which the Secret command above prints the content | Continue. |
+| No `encoding=` line follows a name under `== Kubelet patch files`, a file shows a value inside `encoding=[]`, such as `encoding=[base64]`, or no content, or its Secret or key does not exist | Contact technical support. |
 | A kubelet patch file lacks `"imagePullCredentialsVerificationPolicy": "NeverVerify"` | Continue. You add it in [Upgrade Kubernetes on Huawei Cloud Stack or VMware vSphere](#upgrade-kubernetes-hcs-vsphere), for each version 1.35 or later. |
 | The provider shows `REQUESTED` equal to `INSTALLED`, with `SYNC` and `HEALTH` `True` | Continue. |
 | The provider shows `REQUESTED` different from `INSTALLED`, or `SYNC` or `HEALTH` is not `True` | Contact technical support. |
+| `ac whoami --show-server` under `== Switch to the cluster` ends with `/kubernetes/<cluster-name>/` | Continue. |
+| `ac whoami --show-server` ends otherwise | Check that `CLUSTER` on the first line is the cluster name, and run the block again. If it still ends otherwise, contact technical support. |
+| Nothing is listed under `== Pods with hostPath volumes, on the cluster`, and nothing under `== Local and hostPath PersistentVolumes with a claim, on the cluster` | Continue. |
+| A Pod or a PersistentVolume is listed under either title | Move its data to CSI storage before you upgrade the cluster. If the data is on a pool-managed persistent disk, or you cannot move it, contact technical support. |
 | The image of each version exists in the region and project of the cluster | Continue. |
 | An image is missing | Upload the `qcow2` image of that version to the HCS image service in that region and project before you upgrade the cluster. |
 
@@ -343,7 +360,7 @@ ac -n cpaas-system patch machinedeployment <md-name> --type merge \
   </Tab>
   <Tab label="VMware vSphere">
 
-On the `global` cluster, set `CLUSTER` on the first line to the cluster and run this block once. It only reads, and prints each part under its own `==` title:
+On the `global` cluster, set `CLUSTER` on the first line to the cluster and run this block once. It only reads, and prints each part under its own `==` title. The parts after `== Switch to the cluster` run on the cluster itself:
 
 ```bash
 CLUSTER="<cluster-name>"
@@ -357,17 +374,30 @@ ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name="${CLU
 echo "== Machine config pools"
 ac -n cpaas-system get vspheremachineconfigpool \
   -o custom-columns='NAME:.metadata.name,CLUSTER:.spec.clusterRef.name,READY:.status.conditions[?(@.type=="Ready")].status'
-echo "== Kubelet patch files: the content, or a Secret name and key"
+echo "== Kubelet patch files: the encoding, then the content or a Secret name and key"
 echo "${KCP}:"
-ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{range .spec.kubeadmConfigSpec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
+ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{range .spec.kubeadmConfigSpec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
 for t in $(ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name="${CLUSTER}" -o jsonpath='{.items[*].spec.template.spec.bootstrap.configRef.name}'); do
   echo "${t}:"
-  ac -n cpaas-system get kubeadmconfigtemplate "${t}" -o jsonpath='{range .spec.template.spec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
+  ac -n cpaas-system get kubeadmconfigtemplate "${t}" -o jsonpath='{range .spec.template.spec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
 done
 echo "== Provider"
 ac -n cpaas-system get apprelease \
   -o custom-columns='NAME:.metadata.name,CHART:.spec.source.charts[*].name,REQUESTED:.spec.source.charts[*].targetRevision,INSTALLED:.status.charts.*.installedRevision,SYNC:.status.conditions[?(@.type=="Sync")].status,HEALTH:.status.conditions[?(@.type=="Health")].status' \
   | grep -E '^NAME|chart-cluster-api-provider-vsphere'
+echo "== Switch to the cluster"
+ac config use-cluster "${CLUSTER}"
+ac whoami --show-server
+echo "== Pods with hostPath volumes, on the cluster"
+ac get pods -A --no-headers \
+  -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,OWNER:.metadata.ownerReferences[*].kind,MIRROR:.metadata.annotations.kubernetes\.io/config\.mirror,PHASE:.status.phase,HOSTPATH:.spec.volumes[*].hostPath.path' \
+  | awk '$1 !~ /^(kube-system|kube-public|kube-node-lease|cpaas-system)$/ && $3 !~ /DaemonSet/ && $4 == "<none>" && $5 !~ /^(Succeeded|Failed)$/ && $6 != "<none>"'
+echo "== Local and hostPath PersistentVolumes with a claim, on the cluster"
+ac get pv --no-headers \
+  -o custom-columns='NAME:.metadata.name,CLAIM_NAMESPACE:.spec.claimRef.namespace,CLAIM:.spec.claimRef.name,LOCAL:.spec.local.path,HOSTPATH:.spec.hostPath.path' \
+  | awk '$2 !~ /^(<none>|kube-system|kube-public|kube-node-lease|cpaas-system)$/ && ($4 != "<none>" || $5 != "<none>")'
+echo "== Switch back to global"
+ac config use-cluster global
 ```
 
 When a kubelet patch file shows a Secret name and a key instead of the content, print the content from the Secret. Escape each `.` in `<secret-key>` as `\.`:
@@ -386,11 +416,15 @@ Also, in vCenter, confirm that the VM template that you recorded for the target 
 | A MachineDeployment shows `SURGE` empty, `<none>`, or not `0`, or `UNAVAILABLE` empty, `<none>`, or not `1` | Run the `machinedeployment` block below for it. |
 | Every pool whose `CLUSTER` is the cluster shows `READY` `True` | Continue. |
 | Such a pool does not show `True` | Contact technical support. |
-| Each kubelet patch file shows its content, or a Secret name and a key for which the Secret command above prints the content | Continue. |
-| A kubelet patch file shows nothing, or its Secret or key does not exist | Contact technical support. |
+| Each kubelet patch file shows `encoding=[]`, then its content, or a Secret name and a key for which the Secret command above prints the content | Continue. |
+| No `encoding=` line follows a name under `== Kubelet patch files`, a file shows a value inside `encoding=[]`, such as `encoding=[base64]`, or no content, or its Secret or key does not exist | Contact technical support. |
 | A kubelet patch file lacks `"imagePullCredentialsVerificationPolicy": "NeverVerify"` | Continue. You add it in [Upgrade Kubernetes on Huawei Cloud Stack or VMware vSphere](#upgrade-kubernetes-hcs-vsphere), for each version 1.35 or later. |
 | The provider shows `REQUESTED` equal to `INSTALLED`, with `SYNC` and `HEALTH` `True` | Continue. |
 | The provider shows `REQUESTED` different from `INSTALLED`, or `SYNC` or `HEALTH` is not `True` | Contact technical support. |
+| `ac whoami --show-server` under `== Switch to the cluster` ends with `/kubernetes/<cluster-name>/` | Continue. |
+| `ac whoami --show-server` ends otherwise | Check that `CLUSTER` on the first line is the cluster name, and run the block again. If it still ends otherwise, contact technical support. |
+| Nothing is listed under `== Pods with hostPath volumes, on the cluster`, and nothing under `== Local and hostPath PersistentVolumes with a claim, on the cluster` | Continue. |
+| A Pod or a PersistentVolume is listed under either title | Move its data to CSI storage before you upgrade the cluster. If the data is on a pool-managed persistent disk, or you cannot move it, contact technical support. |
 | The VM template of each version exists in each datacenter that the cluster uses | Continue. |
 | A VM template is missing | Deploy the `ova` of that version in that datacenter and convert it to a VM template with the recorded name before you upgrade the cluster. |
 
