@@ -10,6 +10,8 @@ queries:
   - elemental operator installation
 ---
 
+import BareMetalImageCatalog /* eslint-disable-line no-unused-vars */ from '../../../../shared/components/BareMetalImageCatalog'
+
 # Install the Bare Metal Provider
 
 This document describes how to install the Infrastructure Provider for Bare Metal and the Cluster Bootstrap Provider on the `global` cluster, and how to prepare a `global` cluster installed on Bare Metal as a management cluster.
@@ -82,7 +84,7 @@ spec:
 
 If the plugin is already installed, add the same `valuesOverride` to its existing `ModuleInfo`: find it with `kubectl get moduleinfo -l cpaas.io/cluster-name=global,cpaas.io/module-name=cluster-api-provider-baremetal`, then run `kubectl edit moduleinfo <name>`. Do not edit the provider's `AppRelease`: the platform regenerates it from the `ModuleInfo`, so the change is lost.
 
-The umbrella chart installs both the bare-metal provider manager and `elemental-operator` in one step. It also creates the `elemental-image-catalog` ConfigMap, but with no entries, and the package contains no Alauda OS image. Before you create a cluster, import the Bare Metal OS images into the platform registry and add every Kubernetes version you deploy to the catalog; see [OS Images Imported and Image Catalog Populated](./create_cluster.mdx#os-images-and-image-catalog).
+The umbrella chart installs both the bare-metal provider manager and `elemental-operator` in one step. It also creates the `elemental-image-catalog` ConfigMap, but with no entries, and the package contains no Alauda OS image. Before you create a cluster, import the Bare Metal OS images into the platform registry, as described in [OS Images Imported and Image Catalog Populated](./create_cluster.mdx#os-images-and-image-catalog), and add every Kubernetes version you deploy to the catalog, as described in [Add Kubernetes Versions to the Image Catalog](#add-versions-to-image-catalog).
 
 ### Verify the installation \{#verify-the-installation}
 
@@ -231,7 +233,7 @@ Each response must list `${OS_IMAGE_TAG}`. After that, remove the local copies w
 If the images are no longer on the bootstrap node, import them from the OS archive instead, as
 described in [OS Images Imported and Image Catalog Populated](./create_cluster.mdx#os-images-and-image-catalog).
 
-### Create the elemental image catalog
+### Create the elemental image catalog \{#image-catalog-on-global}
 
 The provider maps a Kubernetes version to an elemental upgrade image through a ConfigMap located by
 `--image-catalog-namespace` and `--image-catalog-name`, which default to `cpaas-system` and
@@ -241,29 +243,20 @@ entry, the first `BaremetalMachine` of a workload cluster fails immediately:
 
 ```text
 ImageResolved=False  ImageCatalogMiss:
-  no elemental upgrade image mapped for Kubernetes version "<version>"
+  no OS image mapped for Kubernetes version "<version>" on <arch> for <os-id> (looked up key "<key>")
 ```
 
-Add one entry per Kubernetes version that this `global` cluster manages, including `${K8S_VERSION}`
-for its own nodes. Patch the existing ConfigMap rather than replacing it, so that entries added
-earlier are kept:
+Add the keys of every Kubernetes version that this `global` cluster manages, including
+`${K8S_VERSION}` for its own nodes. The generated command runs `kubectl` against the current
+kubeconfig, so first point it at the cluster you are preparing:
 
 ```shell
-kubectl --kubeconfig "${GLOBAL_KUBECONFIG}" -n cpaas-system \
-  patch configmap elemental-image-catalog --type merge \
-  -p "{\"data\":{\"${K8S_VERSION}\":\"${GLOBAL_REGISTRY_ADDRESS}/tkestack/baremetal-base-image:${OS_IMAGE_TAG}\"}}"
-
-kubectl --kubeconfig "${GLOBAL_KUBECONFIG}" -n cpaas-system \
-  get configmap elemental-image-catalog -o jsonpath='{.data}'
+export KUBECONFIG="${GLOBAL_KUBECONFIG}"
+kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}'
 ```
 
-<Directive type="warning" title="ImageCatalogMiss does not recover on its own">
-  A `BaremetalMachine` that hit `ImageCatalogMiss` stays `Failed` after you fix the catalog.
-  Re-reconciling the object and restarting the provider both leave it unchanged; the reconciler
-  deliberately treats a missing mapping as terminal rather than falling back to a default image.
-  Delete the `Machine` so that its owner, `KubeadmControlPlane` or the `MachineSet`, recreates it.
-  Populate the catalog before you apply the first workload cluster manifest to avoid this entirely.
-</Directive>
+Then generate and run the command in [Add Kubernetes Versions to the Image Catalog](#add-versions-to-image-catalog),
+with `${OS_IMAGE_TAG}` as the tag of the OS image.
 
 ### Workload registrations use the platform domain
 
@@ -273,6 +266,41 @@ A workload `MachineRegistration` must not carry the
 `system-agent-auth-scope: shared`. That shared identity, together with the shared ServiceAccount
 signing key, is what lets a workload host keep reporting through the platform domain after a
 failover.
+
+## Add Kubernetes Versions to the Image Catalog \{#add-versions-to-image-catalog}
+
+The `elemental-image-catalog` ConfigMap in `cpaas-system` of the `global` cluster maps `Machine.spec.version` to the `elemental upgrade` image used to (re)provision a node. The provider chart creates it with no entries, so no node can be provisioned until you add the version. Every value used as `Machine.spec.version` (for both the control plane and worker `MachineDeployment` resources) must have a key in this ConfigMap for the architecture and OS of the hosts, with the leading `v` preserved, that resolves to the imported OS image; see [OS Image Keys per Architecture and OS](#catalog-key-format). The provider resolves the image at reprovision time by substituting the platform registry address for the registry portion of the entry.
+
+Select the ACP version, the OS and the architecture of the hosts, and enter the tag of the imported OS image below. The command adds the OS image key and the etcd key of that version. It patches the ConfigMap rather than replacing it, so that existing entries are kept, and then shows the result.
+
+<BareMetalImageCatalog mode="single">
+  The command creates a `ResourcePatch` that records the change. Do not delete it. Before the next platform upgrade, exempt it for the target version as described in [Handle Preflight Blocks](../../../upgrade/troubleshooting.mdx#handle-preflight-blocks-when-needed); otherwise the `ResourcePatchUpgradeable` preflight check blocks that upgrade.
+</BareMetalImageCatalog>
+
+If the hosts use more than one architecture or OS, run the generated command for each combination.
+
+<Directive type="warning" title="ImageCatalogMiss does not recover on its own">
+  A `BaremetalMachine` that hit `ImageCatalogMiss` stays `Failed` after you fix the catalog.
+  Re-reconciling the object and restarting the provider both leave it unchanged; the reconciler
+  deliberately treats a missing mapping as terminal rather than falling back to a default image.
+  Delete the `Machine` so that its owner, `KubeadmControlPlane` or the `MachineSet`, recreates it.
+  Populate the catalog before you apply the first workload cluster manifest to avoid this entirely.
+</Directive>
+
+### OS Image Keys per Architecture and OS \{#catalog-key-format}
+
+The provider looks up the OS image of a host by the key `<kubernetes-version>_<arch>_<os-id>`, for example `v1.36.4-acp.3_amd64_alaudaos.k.25`. Both parts come from labels on the host's `MachineInventory`:
+
+- `<arch>` is the value of `os.baremetal.alauda.io/arch`, or `amd64` when the label is absent.
+- `<os-id>` is the value of `os.baremetal.alauda.io/id`, or `alaudaos.m.55` when the label is absent. Alauda OS M55 uses `alaudaos.m.55`, and Alauda OS KU uses `alaudaos.k.25`.
+
+Only hosts with the OS identifier `alaudaos.m.55` fall back to `<kubernetes-version>_<arch>`, and only `amd64` hosts with that identifier fall back further to the bare `<kubernetes-version>` key. The generator writes the bare key for `amd64` hosts with Alauda OS M55 and the full key for every other combination. If a pool contains hosts of another architecture or OS, add a key for every combination at every version.
+
+A new host gets both labels when it registers, from `MachineRegistration.spec.machineInventoryLabels`; see [Build the SeedImage and Register Hosts](./create_cluster.mdx#step-1-machineregistration-seedimage). A host registered without them resolves to `amd64` and `alaudaos.m.55`. That needs no action for `amd64` hosts with Alauda OS M55. For other hosts that are already registered without the labels, contact technical support.
+
+### Add the etcd Image for Each Version \{#catalog-etcd-key}
+
+For each Kubernetes version, the catalog also holds a `<kubernetes-version>_etcd` key whose value is the etcd image of the same ACP version, with the tag from the **etcd** column of [Version Mapping](../../../overview/alauda_os_support_matrix.mdx#version-mapping). The generator above adds this key. The platform upgrade reads the etcd tag from it when it upgrades the control plane to that version.
 
 ## Next Steps
 
