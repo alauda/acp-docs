@@ -13,13 +13,13 @@ Do not start another `global` upgrade while a workload cluster upgrade is runnin
 
 ## Before You Upgrade the Clusters \{#before-the-window}
 
-Complete these steps for every cluster that you plan to upgrade, and confirm that each of these clusters has a recent successful etcd backup. See [etcd Backup and Restore](../../configure/backup/etcd.mdx).
+Complete these steps for every cluster that you plan to upgrade, and confirm that each of these clusters has a recent successful etcd backup, as described in [Check the etcd Backup](../pre-upgrade.mdx#etcd-backup).
 
 <Steps>
 
 ### Confirm the `global` Clusters Are Upgraded \{#confirm-global}
 
-Check the ACP version of the `global` cluster, and continue when the address ends with `/kubernetes/global/`, `Current` shows the target ACP version, and the `Ready` condition is `True`:
+On the `global` cluster, where `ac whoami --show-server` prints an address that ends with `/kubernetes/global/`:
 
 ```bash
 ac config use-cluster global
@@ -27,16 +27,22 @@ ac whoami --show-server
 ac adm upgrade status --cluster=global
 ```
 
-In a DR environment, also check the standby; the first command prints the standby VIP, and the second must pass in the same way:
+In a DR environment, also on the standby, where `ac whoami --show-server` prints the standby VIP:
 
 ```bash
-ac --kubeconfig <standby-kubeconfig> whoami --show-server
-ac --kubeconfig <standby-kubeconfig> adm upgrade status --cluster=global
+export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
+ac adm upgrade status --cluster=global
+unset KUBECONFIG
 ```
+
+Continue when, on each `global` cluster, `Current` shows the target ACP version and the `Ready` condition is `True`; otherwise, finish the upgrade of the `global` clusters first.
 
 ### Make Operator Packages Available \{#operator-push-fallback}
 
-Extensions (Operators and Cluster Plugins) with the `Aligned` lifecycle upgrade with the cluster. An Aligned Operator needs its target package on every cluster where it is installed; Cluster Plugins published to `global` are available to every cluster. If a cluster did not receive its Operator packages during preparation, for example because it was added later, push the target package of each Aligned Operator installed on it. Packages of Operators that are not installed on the cluster do not block its upgrade. From the execution host:
+**Applies to**: a cluster that did not receive the target packages of its installed Operators with the `Aligned` lifecycle during preparation, for example a cluster added later. Skip it for other clusters.
+
+From the execution host, push the target package of each Aligned Operator installed on the cluster:
 
 ```bash
 read -rsp "Platform token: " PLATFORM_TOKEN; printf '\n'
@@ -46,7 +52,7 @@ violet push <operator-package>.tgz --platform-address "https://<platform-address
 
 ### Run Preflight Checks for the Cluster \{#run-preflight}
 
-Run this check only after the `global` clusters are upgraded; before that, it reports `Retry` with the reason `GlobalVersionPending`. In the `installer/` directory of the extracted target Core Package, run the script on the `global` cluster, the primary in a DR environment. Continue when the second command prints an address that ends with `/kubernetes/global/`:
+Run this block on the `global` cluster, the primary in a DR environment, in the `installer/` directory of the extracted target Core Package; `ac whoami --show-server` prints an address that ends with `/kubernetes/global/`:
 
 ```bash
 ac config use-cluster global
@@ -54,9 +60,16 @@ ac whoami --show-server
 bash upgrade.sh --preflight --cluster=<cluster-name>
 ```
 
-Continue when `Summary` shows `Passed` or `PassedWithWarnings`. Otherwise, fix each blocking check before you upgrade the cluster, as described in [Handle Preflight Blocks](../troubleshooting.mdx#handle-preflight-blocks-when-needed), and run the check again. The `ResourcePatch` objects that `ResourcePatchUpgradeable` names are on the workload cluster, so run the exemption commands on it after `ac config use-cluster <cluster-name>`, then switch back with `ac config use-cluster global`.
+| Result | Action |
+|---|---|
+| `Summary` shows `Passed` or `PassedWithWarnings` | Continue. |
+| `GlobalVersionReady` reports `Retry` with the reason `GlobalVersionPending` | Finish the upgrade of the `global` clusters, then run the check again. |
+| `InfraClusterVersionPreflight` reports `PreflightPending` (Huawei DCS and Bare Metal) | Run the check again after 5 minutes; if it does not change, contact technical support. |
+| `InfraClusterVersionPreflight` reports `PreflightUnconsumed` | Contact technical support. |
+| `InfraClusterVersionPreflight` fails for another reason | Run the commands below, fix each failed check as described in [Kubernetes Upgrade Checks](../troubleshooting.mdx#infra-preflight-checks), and run the check again. |
+| Another check fails | Fix it as described in [Handle Preflight Blocks](../troubleshooting.mdx#handle-preflight-blocks-when-needed), and run the check again. For `ResourcePatchUpgradeable`, use the workload cluster as `<cluster-name>`. |
 
-On Huawei DCS and Bare Metal, if `InfraClusterVersionPreflight` reports `PreflightPending`, the checks are not evaluated yet; run the preflight again after 5 minutes. If it reports `PreflightUnconsumed`, contact technical support. To read its individual checks, run the following on the `global` cluster; for the meaning of each check and what to do, see [Kubernetes Upgrade Checks](../troubleshooting.mdx#infra-preflight-checks).
+On the `global` cluster:
 
 ```bash
 ac config use-cluster global
@@ -67,14 +80,16 @@ ac -n cpaas-system get infraclusterversionpreflight <preflight-name> \
 
 ### Check Huawei Cloud Stack and VMware vSphere Clusters \{#check-vsphere}
 
-Only for clusters created with these providers. The platform does not check their Kubernetes upgrade in advance, so check the rollout settings, the pools, and the provider version before you upgrade them. For each such cluster, read its rollout settings on the `global` cluster:
+**Applies to**: clusters created with Huawei Cloud Stack or VMware vSphere. Skip it for other clusters.
+
+On the `global` cluster, for each such cluster, read the rollout settings:
 
 ```bash
 ac config use-cluster global
 KCP=$(ac -n cpaas-system get clusters.cluster.x-k8s.io <cluster-name> -o jsonpath='{.spec.controlPlaneRef.name}')
 ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='replicas={.spec.replicas} maxSurge={.spec.rolloutStrategy.rollingUpdate.maxSurge}{"\n"}'
 ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=<cluster-name> \
-  -o custom-columns='NAME:.metadata.name,TYPE:.spec.strategy.type,SURGE:.spec.strategy.rollingUpdate.maxSurge'
+  -o custom-columns='NAME:.metadata.name,SURGE:.spec.strategy.rollingUpdate.maxSurge,UNAVAILABLE:.spec.strategy.rollingUpdate.maxUnavailable'
 ```
 
 Then read the pools and the provider:
@@ -82,15 +97,18 @@ Then read the pools and the provider:
 <Tabs>
   <Tab label="Huawei Cloud Stack">
 
+The first two commands print the machine templates of the cluster. Run the third command for each of these templates, and the fourth for each pool in `POOL`:
+
 ```bash
-ac -n cpaas-system get hcsmachineconfigpool \
+ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{.spec.machineTemplate.infrastructureRef.name}{"\n"}'
+ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=<cluster-name> -o custom-columns='NAME:.metadata.name,TEMPLATE:.spec.template.spec.infrastructureRef.name'
+ac -n cpaas-system get hcsmachinetemplate <template-name> -o custom-columns='NAME:.metadata.name,POOL:.spec.template.spec.configPoolRef.name'
+ac -n cpaas-system get hcsmachineconfigpool <pool-name> \
   -o custom-columns='NAME:.metadata.name,TOTAL:.status.totalCount,AVAILABLE:.status.availableCount,DISKS:.spec.configs[*].persistentDisks[*].mountPath'
 ac -n cpaas-system get apprelease \
   -o custom-columns='NAME:.metadata.name,CHART:.spec.source.charts[*].name,REQUESTED:.spec.source.charts[*].targetRevision,INSTALLED:.status.charts.*.installedRevision,SYNC:.status.conditions[?(@.type=="Sync")].status,HEALTH:.status.conditions[?(@.type=="Health")].status' \
   | grep -E '^NAME|chart-cluster-api-provider-hcs'
 ```
-
-Every pool of the cluster that lists `DISKS` shows `AVAILABLE` empty or `0`, and the provider shows `REQUESTED` equal to `INSTALLED` with `SYNC` and `HEALTH` `True`.
 
   </Tab>
   <Tab label="VMware vSphere">
@@ -102,16 +120,33 @@ ac -n cpaas-system get apprelease \
   | grep -E '^NAME|chart-cluster-api-provider-vsphere'
 ```
 
-Every pool of the cluster reports `True`, and the provider shows `REQUESTED` equal to `INSTALLED` with `SYNC` and `HEALTH` `True`.
-
   </Tab>
 </Tabs>
 
-Continue when `replicas` is 3 or more, `maxSurge` and every `SURGE` are `0` (an empty value counts as `1`; a MachineDeployment of `TYPE` `OnDelete` needs none), and the pools and the provider pass the check of their tab. With fewer than three control-plane nodes, contact technical support. If the provider does not match, also contact technical support. If `maxSurge` or a pool differs, correct it before you upgrade the cluster, as described in [Prepare the Clusters](../pre-upgrade.mdx#prepare-alauda-os-clusters).
+| Result | Action |
+|---|---|
+| `replicas` is 3 or more and `maxSurge` is `0`, and every MachineDeployment shows `SURGE` `0` and `UNAVAILABLE` `1`; on Huawei Cloud Stack, every pool in `POOL` that lists `DISKS` shows `AVAILABLE` empty or `0`; on VMware vSphere, every pool of the cluster reports `True`; the provider shows `REQUESTED` equal to `INSTALLED`, with `SYNC` and `HEALTH` `True` | Continue. |
+| `replicas` is less than 3 | Contact technical support. |
+| `replicas` is 3 or more and `maxSurge` is empty or not `0` | Run the `kubeadmcontrolplane` command below. |
+| A MachineDeployment shows `SURGE` empty or not `0`, or `UNAVAILABLE` empty or not `1` | Run the `machinedeployment` command below for it. |
+| Huawei Cloud Stack: a pool in `POOL` that lists `DISKS` shows `AVAILABLE` greater than `0` | Remove the free configurations from the pool as described in [Check the Free Pool Entries](../pre-upgrade.mdx#persistent-disk-layout). |
+| VMware vSphere: a pool of the cluster does not report `True` | Contact technical support. |
+| The provider shows `REQUESTED` different from `INSTALLED`, or `SYNC` or `HEALTH` is not `True` | Contact technical support. |
+
+On the `global` cluster, with `KCP` from the first block:
+
+```bash
+ac -n cpaas-system patch kubeadmcontrolplane "${KCP}" --type merge \
+  -p '{"spec":{"rolloutStrategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":0}}}}'
+ac -n cpaas-system patch machinedeployment <md-name> --type merge \
+  -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":0,"maxUnavailable":1}}}}'
+```
 
 ### Check DR Synchronization \{#check-dr-sync}
 
-In a DR environment, check synchronization on a control plane node of the standby `global` cluster; the check address is reachable only from inside the cluster. This check is the only command on this page that runs on a node; then return to the execution host. Continue when the output lists no missed keys and no surplus keys; otherwise, restore synchronization before you upgrade the cluster. See [Global Cluster Disaster Recovery Does Not Synchronize](../troubleshooting.mdx#dr-sync-diagnostics).
+**Applies to**: DR environments. Skip it on a platform without a standby `global` cluster.
+
+Run the check on a control plane node of the standby `global` cluster, then return to the execution host:
 
 ```bash
 export KUBECONFIG=/etc/kubernetes/admin.conf
@@ -119,6 +154,12 @@ mirror_svc=$(kubectl get svc -n cpaas-system etcd-sync-monitor -o jsonpath='{.sp
 if [[ $mirror_svc =~ ^[0-9a-fA-F:]+$ ]]; then mirror_host="[$mirror_svc]"; else mirror_host="$mirror_svc"; fi
 curl -g "http://${mirror_host}/check"
 ```
+
+| Result | Action |
+|---|---|
+| `localMissedKeys [0]` and `localSurplusKeys [0]` | Continue. |
+| `check too frequent` | Wait one minute and run the check again; if it does not change, contact technical support. |
+| Any other value | Run the steps in [Global Cluster Disaster Recovery Does Not Synchronize](../troubleshooting.mdx#dr-sync-diagnostics), then run the check again. |
 
 </Steps>
 

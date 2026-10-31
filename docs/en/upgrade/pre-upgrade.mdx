@@ -8,27 +8,29 @@ import BareMetalImageCatalog /* eslint-disable-line no-unused-vars */ from '../.
 
 # Prepare for the Upgrade
 
-Complete these steps before you upgrade. Most of them do not change running clusters; the exceptions are marked in [Items to Resolve Before the Upgrade](#lead-time). Prepare again for every upgrade, including a patch upgrade of the ACP version (Distribution Version) and an upgrade of `global` before every workload cluster has caught up.
+Complete these steps before you upgrade. Prepare again for every upgrade, including a patch upgrade of the ACP version (Distribution Version) and an upgrade of `global` before every workload cluster has caught up.
 
-In a DR environment, do every step that names `global` on both `global` clusters: the Alauda Container Platform Global Cluster Disaster Recovery plugin does not synchronize packages, images, or the objects these steps create. If your clusters run on more than one provider, complete the steps for each of them, including the provider of the `global` cluster.
+In a DR environment with Alauda Container Platform Global Cluster Disaster Recovery, do every step that names `global` on both `global` clusters. If your clusters run on more than one provider, complete the steps for each of them, including the provider of the `global` cluster.
 
-## Items to Resolve Before the Upgrade \{#lead-time}
+## Checks at a Glance \{#lead-time}
 
-:::warning
-Some items change running clusters, `global` included: migrating to pool-managed persistent disks and reinstalling a host replace nodes, and updating the node OS restarts nodes. Complete them before you upgrade the cluster.
-:::
-
-| Item | Applies to | Where to check | What to do |
-| --- | --- | --- | --- |
-| ACP version earlier than v4.3.2 | Alauda OS clusters | [Check Workload Cluster Compatibility](#check-compatibility) | Contact technical support. |
-| Fewer than three control-plane nodes | Alauda OS clusters | [Check the Rollout Settings](#rollout-settings) | Contact technical support. |
-| Worker node pools created from a machine template that references another VM template than the control plane | Huawei DCS | [Check the Disks and Hosts](#persistent-disk-layout) | Contact technical support. |
-| `/var/cpaas` not on a pool-managed persistent disk | Huawei DCS, Huawei Cloud Stack | [Check the Disks and Hosts](#persistent-disk-layout) | [Migrate to Pool-Managed Persistent Disks](./persistent_disk_migration.mdx). The migration replaces nodes. |
-| A free entry in an IP pool, machine config pool, or host pool whose nodes keep data on persistent disks or data volumes, for control-plane and worker nodes alike | Huawei DCS, Huawei Cloud Stack, Bare Metal | [Check the Disks and Hosts](#persistent-disk-layout) | Remove the free entries from the pool, as described there. A replaced node may take a free entry and come up without the data of the node it replaces. |
-| `maxSurge` not `0`, or a vSphere pool not `Ready` | Alauda OS clusters | [Check the Rollout Settings](#rollout-settings) | Correct it as described there. |
-| System state partition (`COS_STATE`) of 8 GiB, the default size when the host installation does not set it | Bare Metal hosts with Alauda OS M55 | [Check the Disks and Hosts](#persistent-disk-layout) | Reinstall the host with a larger partition. The reinstall replaces the node. |
-| A recent successful etcd backup | Every cluster | [etcd Backup and Restore](../configure/backup/etcd.mdx) | Install Alauda Container Platform Cluster Enhancement on every cluster so that each cluster has a recent successful etcd backup before its upgrade. |
-| Linux kernel 5.8 or later and cgroup v2 | Every node of non-Alauda OS clusters, workload clusters included | [Check Kubernetes 1.35 or Later Node Readiness](#kubernetes-135-node-readiness) | Update the node OS. The update restarts the node. |
+| Check | Applies to |
+| --- | --- |
+| [Check Cluster Versions](#check-compatibility) | Every cluster |
+| [Check the Registry Storage](#registry-storage) | Non-Alauda OS `global` clusters with the platform built-in Registry |
+| [Check That No Machine Template Declares `/var/cpaas`](#var-cpaas-disk) | Huawei DCS, Huawei Cloud Stack |
+| [Check the Free Pool Entries](#persistent-disk-layout) | Pools of Huawei DCS, Huawei Cloud Stack, and Bare Metal clusters that keep data on persistent disks or data volumes |
+| [Check the VM Templates](#dcs-vm-template) | Huawei DCS |
+| [Check the Managed Storage](#bm-managed-storage) | Bare Metal hosts with a storage declaration |
+| [Check the `COS_STATE` Partition](#cos-state) | Bare Metal hosts with Alauda OS M55 |
+| [Check the Rollout Settings](#rollout-settings) | Alauda OS clusters |
+| [Check the Kubelet Patch File](#kubernetes-1-35-kubelet-patch) | Alauda OS clusters |
+| [Check the Providers and Images of `global`](#check-global-cluster) | Alauda OS `global` clusters |
+| [Check Kubernetes 1.35 or Later Node Readiness](#kubernetes-135-node-readiness) | Every node of non-Alauda OS clusters created by ACP |
+| [Check the etcd Backup](#etcd-backup) | Every cluster created by ACP |
+| [Check Module Stability](#module-stability-self-check) | Every cluster |
+| [Check DR Synchronization](#check-dr-sync) | DR environments |
+| [Run Preflight Checks](#run-preflight) | Every `global` cluster |
 
 ## Prepare the Execution Host \{#execution-host}
 
@@ -40,11 +42,7 @@ Run every upgrade command from one execution host. The few steps that run on a n
 - In DR, a kubeconfig of the standby `global` cluster that points to its VIP, `<standby-kubeconfig>`. For example, copy `/etc/kubernetes/admin.conf`, with any certificate files it references, from a control-plane node of the standby, and set its `server` to the VIP if it points elsewhere.
 - The extracted target Core Package, kept on this host until every cluster is upgraded.
 
-:::info
-On Alauda OS, do not use a node of any cluster as the execution host. The upgrade replaces the nodes, and files and sessions on a replaced node are lost.
-:::
-
-Log in to the platform with `ac` once, with `KUBECONFIG` unset, so that the session is saved in the default kubeconfig, `~/.kube/config`. After the login, `ac` commands run on `global`, the primary in DR. Before commands for a workload cluster, switch to it, and switch back afterwards. `ac whoami --show-server` prints the platform address followed by `/kubernetes/<cluster-name>/`:
+Log in once with the platform administrator account, with `KUBECONFIG` unset:
 
 ```bash
 ac login https://<platform-address> --name <session>
@@ -53,20 +51,15 @@ ac whoami --show-server
 ac config use-cluster global
 ```
 
-`upgrade.sh` uses `kubectl` with the kubeconfig that `ac login` saved, so the login must use the platform administrator account. Run `ac config use-cluster global` right before the script; `ac whoami --show-server` then prints an address that ends with `/kubernetes/global/`. The standby is reached only with its own kubeconfig: for its blocks, run `export KUBECONFIG=<standby-kubeconfig>` first, confirm that `ac whoami --show-server` prints the standby VIP, and run `unset KUBECONFIG` at the end to return to the login session. For a single command on the standby, `ac --kubeconfig <standby-kubeconfig> …` does the same.
+- The session is saved in `~/.kube/config`, and `ac` commands run on `global`, the primary in DR. For a workload cluster, run `ac config use-cluster <cluster-name>` first and `ac config use-cluster global` afterwards; `ac whoami --show-server` then ends with `/kubernetes/<cluster-name>/`.
+- `upgrade.sh` uses `kubectl` with this session. Run `ac config use-cluster global` right before the script.
+- For the standby, run `export KUBECONFIG=<standby-kubeconfig>` first, confirm that `ac whoami --show-server` prints the standby VIP, and run `unset KUBECONFIG` afterwards.
 
-## Check the Upgrade Path \{#check-upgrade-path}
+## Check Cluster Versions \{#check-compatibility}
 
-ACP 4.2, 4.3, and 4.4 are within the direct upgrade window of ACP 4.5. Not every source patch can reach every target patch: upgrade only to a target that the platform offers for the current version. Preflight checks this as `VersionUpgradePath` in [Run Preflight Checks](#run-preflight); do not bypass it with an explicit upgrade request. Request the version exactly as `ac adm upgrade` lists it, for example `4.5.0`. ACP 4.1 and earlier are outside the direct upgrade window: follow the intermediate upgrade chain that the platform offers, and check `VersionUpgradePath` at every step.
+**Applies to**: every cluster registered on `global`, `global` included, imported clusters included. In DR, run it on each `global` cluster; on the standby, read only its own version.
 
-## Check Workload Cluster Compatibility \{#check-compatibility}
-
-Before you upgrade `global`, every cluster registered on it must meet these rules. Upgrade a cluster that breaks one on the current `global` first.
-
-- Its ACP version is within the direct upgrade window of the target. This includes the ACP components on imported and registered clusters.
-- A cluster created by ACP runs a Kubernetes version within the target's Compatible Versions in the [Kubernetes Support Matrix](../overview/kubernetes-support-matrix.mdx). The Kubernetes version of an imported or registered third-party cluster is not covered by Compatible Versions and does not block the upgrade.
-
-On `global`, list the ACP version, the Kubernetes version, and the infrastructure provider of every cluster. `DCSCluster`, `BaremetalCluster`, `HCSCluster`, and `VSphereCluster` mark the provider of an Alauda OS cluster. `UserProvisionedCluster` marks a cluster that does not run Alauda OS, and an imported cluster shows `<none>`:
+On `global`, list the ACP version (the `CURRENT` column of the first list), the Kubernetes version, and the infrastructure provider of every cluster. In the last list, `DCSCluster`, `BaremetalCluster`, `HCSCluster`, and `VSphereCluster` mark an Alauda OS cluster, `UserProvisionedCluster` a cluster that does not run Alauda OS, and `<none>` an imported cluster:
 
 ```bash
 ac config use-cluster global
@@ -76,21 +69,41 @@ ac -n cpaas-system get clusters.clusterregistry.k8s.io -o custom-columns='NAME:.
 ac -n cpaas-system get clusters.cluster.x-k8s.io -o custom-columns='NAME:.metadata.name,INFRASTRUCTURE:.spec.infrastructureRef.kind'
 ```
 
+If `cvsh` reports `the server doesn't have a resource type`, or does not list a cluster, take the ACP version of that cluster from `VERSION`:
+
+```bash
+ac get clustermodule -o custom-columns='NAME:.metadata.name,VERSION:.spec.version'
+```
+
+In DR, read the version of the standby, from `CURRENT`, or from `VERSION` when `cvsh` is not available:
+
+```bash
+ac --kubeconfig <standby-kubeconfig> -n cpaas-system get cvsh global
+ac --kubeconfig <standby-kubeconfig> get clustermodule global -o custom-columns='NAME:.metadata.name,VERSION:.spec.version'
+```
+
+### Upgrade Path and Compatibility \{#check-upgrade-path}
+
+Compare each cluster with the table. Continue when every cluster matches a row whose action is Continue; otherwise, take the action of each row that matches.
+
+| Result for a cluster | Action |
+| --- | --- |
+| ACP 4.2, 4.3, or 4.4, on Alauda OS v4.3.2 or later; and, for a cluster created by ACP, a Kubernetes version within the Compatible Versions of the target in the [Kubernetes Support Matrix](../overview/kubernetes-support-matrix.mdx) | Continue. The preflight check `VersionUpgradePath` confirms the exact patch version. |
+| Already the target minor version: a patch upgrade, or `global` upgraded again | Continue. |
+| ACP 4.1 or earlier | Contact technical support. |
+| On Alauda OS, an ACP version earlier than v4.3.2 | Contact technical support. |
+| Created by ACP, with a Kubernetes version outside the Compatible Versions of the target | Upgrade the cluster on the current `global` first, as described in the documentation of its current ACP version. |
+| No version is shown for the cluster | Contact technical support. |
+
 ## Determine the Versions to Prepare \{#alauda-os-versions}
 
-On non-Alauda OS clusters, Kubernetes is upgraded in place to the target version: skip to [Download the Packages](#download-packages).
+**Applies to**: Alauda OS clusters. Skip it for non-Alauda OS clusters, and go to [Download the Packages](#download-packages).
 
-On Alauda OS, ACP Core goes straight to the target, while Kubernetes moves one minor version at a time: a cluster passes through an intermediate Kubernetes version for each ACP minor version in between, taken from the latest patch release of that minor. Select the current version of each cluster, and prepare the versions of all paths together:
+Select the current version of each cluster, and prepare every version that the calculator lists for all paths, in the Alauda OS variant that each cluster runs today:
 
 <AlaudaOsUpgradePath>
   The Kubernetes version and the etcd tag of every ACP version are listed in [Version Mapping](../overview/alauda_os_support_matrix.mdx#version-mapping).
 </AlaudaOsUpgradePath>
-
-For example, from v4.3.2 to v4.5.0 a cluster passes through the intermediate Kubernetes version v1.35.6-acp.9, taken from ACP v4.4.1, to Kubernetes v1.36.4-acp.3. From any v4.4.x to a v4.5.x version, there is no intermediate Kubernetes version. You use the ACP release of an intermediate Kubernetes version, such as v4.4.1, only to publish its images; you never request an upgrade to it.
-
-:::info
-Prepare every image in the Alauda OS variant that the cluster runs today. Bare Metal supports Alauda OS M55 and Alauda OS KU.
-:::
 
 ## Download the Packages \{#download-packages}
 
@@ -105,7 +118,7 @@ From the <Term name="company" /> Customer Portal, download the Core Package of t
 
 ### Download the Other Extension Packages \{#download-other-extensions}
 
-Export the Extensions installed on `global` to `apps.yaml`. Then let the Customer Portal check the file and download the target-version packages of the installed Extensions, including the infrastructure providers and the Cluster Bootstrap Provider. Set `<arch>` to `amd64`, `arm64`, or `hybrid` to match the Core Package, and `<target-version>` to the target ACP version, such as `4.5.0`. Violet versions earlier than v4.2.13 fail here with `failed to get user info from platform server`.
+Export the Extensions installed on `global` to `apps.yaml`. Then let the Customer Portal check the file and download the target-version packages of the installed Extensions, including the infrastructure providers and the Cluster Bootstrap Provider. Set `<arch>` to `amd64`, `arm64`, or `hybrid` to match the Core Package, and `<target-version>` to the target ACP version, such as `4.5.0`.
 
 ```bash
 read -rsp "Customer Portal token: " AC_TOKEN; printf '\n'
@@ -134,15 +147,35 @@ violet ac download-app --arch=<arch> --platformVersion=v<target-version> --scena
 
 </Steps>
 
+## Check the Registry Storage \{#registry-storage}
+
+**Applies to**: non-Alauda OS `global` clusters that use the platform built-in Registry. In DR, run it on each `global` cluster. Skip it for Alauda OS `global` clusters and for an external registry.
+
+On `global`, read the registry type: `false` is the platform built-in Registry, `true` an external registry. On the standby, run `unset KUBECONFIG` afterwards:
+
+```bash
+ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
+ac get productbase base -o jsonpath='{.spec.registry.external}{"\n"}'
+```
+
+With the built-in Registry, on each control-plane node of `global`:
+
+```bash
+df -h /cpaas/minio
+```
+
+Continue when at least 120 GB is available; otherwise, expand that disk, and if you cannot, contact technical support.
+
 ## Publish the Packages \{#sync-upgrade-artifacts}
 
-Publishing uploads images and packages; it does not change running applications. Run the steps from the `installer/` directory of the extracted target Core Package, against `global`, and complete them before you upgrade `global`.
+Run the steps from the `installer/` directory of the extracted target Core Package, against `global`, and complete them before you upgrade `global`.
 
 <Steps>
 
 ### Stage the Upgrade Scenario Packages \{#stage-plugins}
 
-Only when the source ACP version is 4.3 or earlier. Copy every package of [the upgrade scenario](#download-upgrade-scenario) into `plugins/`, then list the directory and compare it with the downloaded packages. Publishing checks the version of each package in `plugins/`, but not whether every package of the scenario is there.
+Only when the source ACP version is 4.3 or earlier. Copy every package of [the upgrade scenario](#download-upgrade-scenario) into `plugins/`, then list the directory and compare it with the downloaded packages.
 
 ```bash
 cp <path-to-scenario-package> ./plugins/
@@ -248,7 +281,7 @@ Publish the images to the registry of the standby: run the command from the `ins
 bash upgrade.sh --only-sync-image
 ```
 
-Then push the packages downloaded for `standby-apps.yaml` in [Download the Other Extension Packages](#download-other-extensions). Set `<registry-port>` to the port of the registry address printed above. Without `--platform-address` and `--dest-repo`, the packages go to the primary.
+Then push the packages downloaded for `standby-apps.yaml` in [Download the Other Extension Packages](#download-other-extensions). Set `<registry-port>` to the port of the registry address printed above. Always set `--platform-address` and `--dest-repo`; without them, the packages go to the primary.
 
 ```bash
 STANDBY_REGISTRY_USER=$(ac -n cpaas-system get secret registry-admin -o jsonpath='{.data.username}' | base64 -d)
@@ -270,7 +303,7 @@ Then push the packages downloaded for `standby-apps.yaml` with `violet push --pl
   </Tab>
 </Tabs>
 
-On the standby, confirm that each Cluster Plugin you pushed lists its target version, for example Global Cluster Disaster Recovery, then return to the login session:
+On the standby, list the versions of each Cluster Plugin you pushed, for example Global Cluster Disaster Recovery, then return to the login session:
 
 ```bash
 export KUBECONFIG=<standby-kubeconfig>
@@ -278,6 +311,8 @@ ac whoami --show-server
 ac get moduleconfigs -l cpaas.io/module-name=etcd-sync
 unset KUBECONFIG
 ```
+
+Continue when each Cluster Plugin you pushed lists its target version; otherwise, run `violet push` for it again as above.
 
 </Steps>
 
@@ -329,7 +364,7 @@ Add the keys of every version to the image catalog on `global` before you reques
   The command creates a `ResourcePatch` on `global`. Do not delete it. Exempt it for the target version before the `global` upgrade, and again for each later minor upgrade, as described in [Resolve Preflight Blocks](#resolve-preflight-blocks).
 </BareMetalImageCatalog>
 
-The key of a host combines the Kubernetes version with the architecture and OS labels of the host; see [OS Image Keys per Architecture and OS](../workload_clusters/alauda_os/bare-metal/install_provider.mdx#catalog-key-format). A host without the labels resolves to `amd64` and Alauda OS M55. That needs no action for `amd64` hosts with Alauda OS M55; for any other host without the labels, contact technical support. List the labels with `ac -n cpaas-system get machineinventories.elemental.cattle.io -L os.baremetal.alauda.io/arch,os.baremetal.alauda.io/id`.
+List the architecture and OS labels of the hosts with `ac -n cpaas-system get machineinventories.elemental.cattle.io -L os.baremetal.alauda.io/arch,os.baremetal.alauda.io/id`. The key of a host combines the Kubernetes version with these labels; see [OS Image Keys per Architecture and OS](../workload_clusters/alauda_os/bare-metal/install_provider.mdx#catalog-key-format). A host without the labels resolves to `amd64` and Alauda OS M55. That needs no action for `amd64` hosts with Alauda OS M55; for any other host without the labels, contact technical support.
 
   </Tab>
   <Tab label="Huawei Cloud Stack">
@@ -346,67 +381,151 @@ The key of a host combines the Kubernetes version with the architecture and OS l
   </Tab>
 </Tabs>
 
-## Prepare the Clusters \{#prepare-alauda-os-clusters}
+## Check the Clusters \{#prepare-alauda-os-clusters}
 
-On non-Alauda OS clusters, only the last step applies: go to [Check Kubernetes 1.35 or Later Node Readiness](#kubernetes-135-node-readiness).
-
-Run the other steps for each Alauda OS cluster, `global` included. Unless a step says otherwise, run the commands on `global` with `<cluster-name>` set to the cluster: the Cluster API objects of every cluster are in `cpaas-system` there. In DR, check workload clusters on the primary, and each `global` cluster on its own side. The checks only read; make the fixes they lead to before you upgrade the cluster, as listed in [Items to Resolve Before the Upgrade](#lead-time).
-
-```bash
-ac config use-cluster global
-ac whoami --show-server
-```
-
-<Steps>
-
-### Check the Disks and Hosts \{#persistent-disk-layout}
+Unless a check says otherwise, run its commands on `global`, with `<cluster-name>` set to the cluster that you check, `global` included. In DR, check workload clusters on the primary, and each `global` cluster on its own side: on the standby, run `export KUBECONFIG=<standby-kubeconfig>` instead of `ac config use-cluster global`, set `<cluster-name>` to `global`, and run `unset KUBECONFIG` afterwards.
 
 :::warning
-Data on a node's own disks, such as `hostPath` volumes and local PersistentVolumes, is not kept when the node is replaced, unless it is on a pool-managed persistent disk (Bare Metal: a declared data volume). Move it to CSI storage, or onto a pool-managed persistent disk, before the upgrade. On Huawei Cloud Stack and VMware vSphere, the platform does not check for it.
+On Alauda OS, data on a node's own disks, such as `hostPath` volumes and local PersistentVolumes, is not kept when the node is replaced, unless it is on a pool-managed persistent disk (Bare Metal: a declared data volume). Move it to CSI storage, or onto a pool-managed persistent disk, before the upgrade.
 :::
+
+### Check That No Machine Template Declares `/var/cpaas` \{#var-cpaas-disk}
+
+**Applies to**: Huawei DCS and Huawei Cloud Stack clusters. In DR, run it on each `global` cluster. Skip it for other clusters; on VMware vSphere, do not restructure the disk lists of the machine config pools as part of an upgrade.
+
+On `global`, list the machine templates that the cluster uses: the control-plane template, and the `TEMPLATE` of each MachineDeployment. On the standby, run `unset KUBECONFIG` at the end of this check:
+
+```bash
+ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
+KCP=$(ac -n cpaas-system get clusters.cluster.x-k8s.io <cluster-name> -o jsonpath='{.spec.controlPlaneRef.name}')
+ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{.spec.machineTemplate.infrastructureRef.name}{"\n"}'
+ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=<cluster-name> \
+  -o custom-columns='NAME:.metadata.name,TEMPLATE:.spec.template.spec.infrastructureRef.name'
+```
+
+Then read each of these templates, `<template-name>`:
 
 <Tabs>
   <Tab label="Huawei DCS">
 
-`/var/cpaas` must be a `persistentDisk` of the IP pool, and every machine must use the same VM template. Continue when the first command lists no `/var/cpaas` and the second shows one VM template. Otherwise, migrate the disks first, as listed in [Items to Resolve Before the Upgrade](#lead-time); for different VM templates, contact technical support.
-
 ```bash
-ac -n cpaas-system get dcsmachinetemplate -o custom-columns='NAME:.metadata.name,TEMPLATE_DISKS:.spec.template.spec.vmConfig.dcsMachineDiskSpec[*].path'
-ac -n cpaas-system get dcsmachine -l cluster.x-k8s.io/cluster-name=<cluster-name> -o custom-columns='NAME:.metadata.name,VM_TEMPLATE:.spec.vmTemplateName'
+ac -n cpaas-system get dcsmachinetemplate <template-name> -o custom-columns='NAME:.metadata.name,TEMPLATE_DISKS:.spec.template.spec.vmConfig.dcsMachineDiskSpec[*].path'
 ```
 
-A replaced node gets the IP address, hostname, and persistent disks of the node it replaces only when its IP pool has no free entry, for control-plane and worker pools alike. List the pools with their disks, and the IP addresses that the machines of the cluster use:
+Continue when no template lists `/var/cpaas`; otherwise, [migrate to pool-managed persistent disks](./persistent_disk_migration.mdx) before the upgrade. The migration replaces nodes.
+
+  </Tab>
+  <Tab label="Huawei Cloud Stack">
+
+```bash
+ac -n cpaas-system get hcsmachinetemplate <template-name> \
+  -o custom-columns='NAME:.metadata.name,DATA_VOLUMES:.spec.template.spec.dataVolumes[*].mountPath,POOL:.spec.template.spec.configPoolRef.name'
+```
+
+Continue when no template lists `/var/cpaas` in `DATA_VOLUMES`; otherwise, [migrate to pool-managed persistent disks](./persistent_disk_migration.mdx) before the upgrade. The migration replaces nodes. [Check the Free Pool Entries](#persistent-disk-layout) uses the `POOL` names.
+
+  </Tab>
+</Tabs>
+
+### Check the Free Pool Entries \{#persistent-disk-layout}
+
+**Applies to**: control-plane and worker pools of Huawei DCS, Huawei Cloud Stack, and Bare Metal clusters whose nodes keep data on persistent disks or data volumes. In DR, run it on each `global` cluster. Skip it for VMware vSphere and non-Alauda OS clusters.
+
+On `global`; on the standby, run `unset KUBECONFIG` at the end of this check:
+
+```bash
+ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
+```
+
+<Tabs>
+  <Tab label="Huawei DCS">
+
+The last command prints the type and the address of the control-plane load balancer of the cluster:
 
 ```bash
 ac -n cpaas-system get dcsiphostnamepool \
   -o custom-columns='NAME:.metadata.name,IPS:.spec.pool[*].ip,DISKS:.spec.pool[*].persistentDisk[*].path,KEPT_DISKS:.status.persistentDiskStatus[*].ip'
 ac -n cpaas-system get dcsmachine -l cluster.x-k8s.io/cluster-name=<cluster-name> -o custom-columns='NAME:.metadata.name,POOL:.spec.ipHostPoolRef.name,IP:.status.networkConfig.ip'
+ac -n cpaas-system get dcscluster <cluster-name> -o jsonpath='{.spec.controlPlaneLoadBalancer.type}{" "}{.spec.controlPlaneLoadBalancer.host}{"\n"}'
 ```
 
-Continue when every IP address of each pool that lists disks is used by a machine of the cluster, or is the address of its internal control-plane load balancer. Otherwise, remove the free entries from `spec.pool` before the upgrade, with `ac -n cpaas-system edit dcsiphostnamepool <pool-name>`. Keep the entry of the internal control-plane load balancer VIP. An address in `KEPT_DISKS` that no machine uses belonged to a node before: removing its entry also deletes the disks kept for it.
+Check each pool in the `POOL` column that lists disks. A free entry is an IP address of the pool that no machine of the cluster uses and that is not the load balancer address when the type is `internal`.
+
+| Result | Action |
+| --- | --- |
+| The pools have no free entry | Continue. |
+| A free entry is not in `KEPT_DISKS` | Remove it from `spec.pool` with `ac -n cpaas-system edit dcsiphostnamepool <pool-name>`. Keep the entry of the internal load balancer address. |
+| A free entry is in `KEPT_DISKS` | Contact technical support. Do not remove the entry. |
 
   </Tab>
   <Tab label="Bare Metal">
 
-Every inventory with a storage declaration must show `STORAGE` `Prepared`, or `Active` once it is allocated. Do not add a storage declaration to a host installed before managed storage was available. Record which inventory backs each machine and the filesystem UUIDs:
+```bash
+ac -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io -l cluster.x-k8s.io/cluster-name=<cluster-name> \
+  -o custom-columns='NAME:.metadata.name,INVENTORY:.status.machineInventoryRef.name'
+ac -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io \
+  -o custom-columns='NAME:.metadata.name,CLUSTER:.spec.clusterName,TOTAL:.status.total,ALLOCATED:.status.allocated,HOSTS:.spec.machineInventories[*].name'
+```
+
+Continue when `TOTAL` equals `ALLOCATED` for each pool whose hosts declare data volumes; otherwise, remove the free hosts, the ones in `HOSTS` that no machine uses as its `INVENTORY`, from `spec.machineInventories` with `ac -n cpaas-system edit machineinventorypools.infrastructure.cluster.x-k8s.io <pool-name>`. Removing a free host from the pool does not change the host.
+
+  </Tab>
+  <Tab label="Huawei Cloud Stack">
+
+Read each pool that the machine templates of the cluster use, `<pool-name>`: the `POOL` column in [Check That No Machine Template Declares `/var/cpaas`](#var-cpaas-disk).
 
 ```bash
+ac -n cpaas-system get hcsmachineconfigpool <pool-name> \
+  -o custom-columns='NAME:.metadata.name,TOTAL:.status.totalCount,AVAILABLE:.status.availableCount,DISKS:.spec.configs[*].persistentDisks[*].mountPath,HOSTNAMES:.spec.configs[*].hostname,USED:.status.usedConfigs[*].hostname'
+```
+
+| Result | Action |
+| --- | --- |
+| `AVAILABLE` is empty or `0` for each of these pools that lists disks | Continue. |
+| A pool has free configurations, the ones in `HOSTNAMES` that are not in `USED` | Remove them from `spec.configs` with `ac -n cpaas-system edit hcsmachineconfigpool <pool-name>`. |
+| The edit is rejected for a free configuration that was used before | Contact technical support. |
+
+  </Tab>
+</Tabs>
+
+### Check the VM Templates \{#dcs-vm-template}
+
+**Applies to**: Huawei DCS clusters. In DR, run it on each `global` cluster. Skip it for other clusters.
+
+On `global`; on the standby, run `unset KUBECONFIG` afterwards:
+
+```bash
+ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
+ac -n cpaas-system get dcsmachine -l cluster.x-k8s.io/cluster-name=<cluster-name> -o custom-columns='NAME:.metadata.name,VM_TEMPLATE:.spec.vmTemplateName'
+```
+
+Continue when every machine shows the same VM template; otherwise, contact technical support.
+
+### Check the Managed Storage \{#bm-managed-storage}
+
+**Applies to**: Bare Metal hosts with a storage declaration. In DR, run it on each `global` cluster. Skip it for other clusters. Do not add a storage declaration to a host installed before managed storage was available.
+
+On `global`, record which inventory backs each machine and the filesystem UUIDs; on the standby, run `unset KUBECONFIG` afterwards:
+
+```bash
+ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
 ac -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io -l cluster.x-k8s.io/cluster-name=<cluster-name> \
   -o custom-columns='NAME:.metadata.name,INVENTORY:.status.machineInventoryRef.name'
 ac -n cpaas-system get machineinventories.elemental.cattle.io \
   -o custom-columns='NAME:.metadata.name,STORAGE:.status.storage.phase,UUIDS:.status.storage.appliedVolumes[*].filesystemUUID'
 ```
 
-A replaced node comes back on the host of the node it replaces, with that host's data volumes, only when its host pool has no free host, for control-plane and worker pools alike. For each pool whose hosts declare data volumes, continue when `TOTAL` equals `ALLOCATED`:
+Continue when every inventory with a storage declaration shows `STORAGE` `Prepared`, or `Active` once it is allocated; otherwise, contact technical support.
 
-```bash
-ac -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io \
-  -o custom-columns='NAME:.metadata.name,CLUSTER:.spec.clusterName,TOTAL:.status.total,ALLOCATED:.status.allocated,HOSTS:.spec.machineInventories[*].name'
-```
+### Check the `COS_STATE` Partition \{#cos-state}
 
-Otherwise, remove the free hosts, the ones in `HOSTS` that no machine uses as its `INVENTORY`, from `spec.machineInventories` before the upgrade, with `ac -n cpaas-system edit machineinventorypools.infrastructure.cluster.x-k8s.io <pool-name>`. Removing a free host from the pool does not change the host.
+**Applies to**: every Bare Metal host with Alauda OS M55 in the pools of the cluster, spare hosts included. In DR, run it on each `global` cluster. Skip it for other clusters. On Alauda OS KU hosts, the upgrade uses `/persist` instead; ask technical support how much free space it needs. Every host must also reach the platform registry.
 
-On every Alauda OS M55 host in the pools of the cluster, spare hosts included, `COS_STATE` needs at least 4 GiB `Free (estimated)` and no snapshot left from a failed upgrade; if not, see [Free Space on COS_STATE](./troubleshooting.mdx#check-cos-state-free-space). If `COS_STATE` is 8 GiB, reinstall the host with a larger partition before the upgrade. On Alauda OS KU hosts, the upgrade uses `/persist` instead; ask technical support how much free space it needs. Every host must also reach the platform registry. The platform does not check these items. On each M55 host:
+On each Alauda OS M55 host:
 
 ```bash
 lsblk -o NAME,SIZE,LABEL | grep COS_STATE
@@ -414,44 +533,40 @@ btrfs filesystem usage -h /
 snapper --no-dbus list
 ```
 
-  </Tab>
-  <Tab label="Huawei Cloud Stack">
-
-`/var/cpaas` must be in `persistentDisks` of the `HCSMachineConfigPool`. Continue when no machine template lists it in `dataVolumes`; otherwise, migrate first, as listed in [Items to Resolve Before the Upgrade](#lead-time):
-
-```bash
-ac -n cpaas-system get hcsmachinetemplate -o custom-columns='NAME:.metadata.name,DATA_VOLUMES:.spec.template.spec.dataVolumes[*].mountPath'
-```
-
-A replaced node gets the hostname, IP address, and persistent disks of the node it replaces only when its `HCSMachineConfigPool` has no free configuration, for control-plane and worker pools alike. For each pool that lists disks, continue when `AVAILABLE` is empty or `0`:
-
-```bash
-ac -n cpaas-system get hcsmachineconfigpool \
-  -o custom-columns='NAME:.metadata.name,TOTAL:.status.totalCount,AVAILABLE:.status.availableCount,DISKS:.spec.configs[*].persistentDisks[*].mountPath,HOSTNAMES:.spec.configs[*].hostname,USED:.status.usedConfigs[*].hostname'
-```
-
-Otherwise, remove the free configurations, the ones in `HOSTNAMES` that are not in `USED`, from `spec.configs` before the upgrade, with `ac -n cpaas-system edit hcsmachineconfigpool <pool-name>`. A configuration that was used before cannot be removed; contact technical support for it.
-
-  </Tab>
-  <Tab label="VMware vSphere">
-
-No action is needed on this provider: a replaced node takes over the released slot of its machine config pool. Do not restructure the disk lists of the machine config pools as part of an upgrade.
-
-  </Tab>
-</Tabs>
+| Result | Action |
+| --- | --- |
+| `COS_STATE` is larger than 8 GiB, `Free (estimated)` is at least 4 GiB, and no snapshot is left from a failed upgrade | Continue. |
+| `Free (estimated)` is less than 4 GiB, or a snapshot is left from a failed upgrade | Run the steps in [Free Space on COS_STATE](./troubleshooting.mdx#check-cos-state-free-space). |
+| `COS_STATE` is 8 GiB or smaller | Reinstall the host with a larger partition before the upgrade. The reinstall replaces the node. |
 
 ### Check the Rollout Settings \{#rollout-settings}
 
-Nodes are replaced one at a time, which needs `maxSurge: 0` on the `KubeadmControlPlane` and on every `MachineDeployment`. Read the current values; an empty value is unset, which counts as `1`:
+**Applies to**: Alauda OS clusters. In DR, run it on each `global` cluster. Skip it for non-Alauda OS clusters.
+
+On `global`; on the standby, run `unset KUBECONFIG` at the end of this check:
 
 ```bash
+ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
 KCP=$(ac -n cpaas-system get clusters.cluster.x-k8s.io <cluster-name> -o jsonpath='{.spec.controlPlaneRef.name}')
 ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='replicas={.spec.replicas} maxSurge={.spec.rolloutStrategy.rollingUpdate.maxSurge}{"\n"}'
 ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=<cluster-name> \
   -o custom-columns='NAME:.metadata.name,SURGE:.spec.strategy.rollingUpdate.maxSurge,UNAVAILABLE:.spec.strategy.rollingUpdate.maxUnavailable,BOOTSTRAP:.spec.template.spec.bootstrap.configRef.name'
 ```
 
-Continue when `replicas` is 3 or more and every `maxSurge` is `0`. With fewer than three control-plane nodes, contact technical support. Correct `maxSurge` before the upgrade:
+On VMware vSphere, also read the machine config pools:
+
+```bash
+ac -n cpaas-system get vspheremachineconfigpool -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status'
+```
+
+| Result | Action |
+| --- | --- |
+| `replicas` is 3 or more and `maxSurge` is `0`, and every MachineDeployment shows `SURGE` `0` and `UNAVAILABLE` `1`; every vSphere pool is `True` | Continue. |
+| `replicas` is less than 3 | Contact technical support. |
+| `replicas` is 3 or more and `maxSurge` is empty or not `0` | Run the `kubeadmcontrolplane` command below. |
+| A MachineDeployment shows `SURGE` empty or not `0`, or `UNAVAILABLE` empty or not `1` | Run the `machinedeployment` command below for it. |
+| A vSphere pool is not `True` | Contact technical support. |
 
 ```bash
 ac -n cpaas-system patch kubeadmcontrolplane "${KCP}" --type merge \
@@ -460,28 +575,41 @@ ac -n cpaas-system patch machinedeployment <md-name> --type merge \
   -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":0,"maxUnavailable":1}}}}'
 ```
 
-On Bare Metal, a node pool with a single host has no worker while that host is reinstalled; make sure its workloads can run on other nodes, or accept the interruption. On Huawei Cloud Stack, the platform does not check these values; set them anyway, because with a larger `maxSurge` every additional machine needs a free hostname and IP address in the `HCSMachineConfigPool`.
-
-On VMware vSphere, the platform does not check the cluster before the upgrade, and the admission webhook rejects the version change of a control plane whose `maxSurge` is not `0`. Also check that every machine config pool is ready. If a pool is not `True`, read its `MembersValid`, `MembersUnique`, and `PersistentDisksReady` conditions and correct the pool:
-
-```bash
-ac -n cpaas-system get vspheremachineconfigpool -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status'
-```
+:::warning
+On Bare Metal, a node pool with a single host has no worker while that host is reinstalled. Make sure its workloads can run on other nodes, or accept the interruption.
+:::
 
 ### Check the Kubelet Patch File \{#kubernetes-1-35-kubelet-patch}
 
-From Kubernetes 1.35, the bootstrap configuration of every new node needs the kubelet patch file `/etc/kubernetes/patches/kubeletconfiguration0+strategic.json`. With `KCP` from the previous step, print it from the control plane and from each `BOOTSTRAP` template listed there:
+**Applies to**: Alauda OS clusters. In DR, run it on each `global` cluster. Skip it for non-Alauda OS clusters.
+
+On `global`, print `/etc/kubernetes/patches/kubeletconfiguration0+strategic.json` from the control plane and from each template in the `BOOTSTRAP` column of [Check the Rollout Settings](#rollout-settings). On the standby, run `unset KUBECONFIG` at the end of this check:
 
 ```bash
-ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{range .spec.kubeadmConfigSpec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{.content}{.contentFrom.secret.name}{"\n"}{end}'
-ac -n cpaas-system get kubeadmconfigtemplate <bootstrap-template> -o jsonpath='{range .spec.template.spec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{.content}{.contentFrom.secret.name}{"\n"}{end}'
+ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
+KCP=$(ac -n cpaas-system get clusters.cluster.x-k8s.io <cluster-name> -o jsonpath='{.spec.controlPlaneRef.name}')
+ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{range .spec.kubeadmConfigSpec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
+ac -n cpaas-system get kubeadmconfigtemplate <bootstrap-template> -o jsonpath='{range .spec.template.spec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
 ```
 
-Continue when each command prints the file content, or the name of a Secret in `cpaas-system` that holds it. If a file is missing, contact technical support. On Kubernetes 1.35 or later, the file must contain `"imagePullCredentialsVerificationPolicy": "NeverVerify"`; do not add it for Kubernetes 1.34 or earlier. On Huawei DCS and Bare Metal, the platform adds the setting when the upgrade reaches 1.35. On Huawei Cloud Stack and VMware vSphere, add it in the same edit that moves the cluster to 1.35; on a cluster that already runs 1.35 or later, confirm that it is there.
+When a command prints a Secret name and a key instead of the content, print the content from the Secret. Escape each `.` in `<secret-key>` as `\.`:
 
-### Check the global Cluster Yourself \{#check-global-cluster}
+```bash
+ac -n cpaas-system get secret <secret-name> -o jsonpath='{.data.<secret-key>}' | base64 -d
+```
 
-Run the previous steps with `<cluster-name>` set to `global`, on each `global` cluster. Then confirm on each `global` cluster that the Cluster Bootstrap Provider and the infrastructure provider of the IaaS that it runs on are installed. Continue when the list shows `cluster-api-provider-kubeadm` and that provider, such as `cluster-api-provider-dcs`, with `PHASE` `Running`:
+| Result | Action |
+| --- | --- |
+| Each file prints its content, directly or from its Secret | Continue. |
+| A command prints nothing, or the Secret or its key does not exist | Contact technical support. |
+| On Huawei Cloud Stack or VMware vSphere, the file lacks `"imagePullCredentialsVerificationPolicy": "NeverVerify"` | Continue. Add it in the Kubernetes upgrade, for each version 1.35 or later: see [Update the KubeadmControlPlane](./upgrade_kubernetes_hcs_vsphere.mdx#update-kcp) and [Create the Worker Templates](./upgrade_kubernetes_hcs_vsphere.mdx#create-worker-templates). |
+
+### Check the Providers and Images of `global` \{#check-global-cluster}
+
+**Applies to**: Alauda OS `global` clusters; the tabs only to Huawei DCS and Bare Metal. In DR, run it on each `global` cluster. Skip it for non-Alauda OS `global` clusters.
+
+On each `global` cluster; on the standby, run `unset KUBECONFIG` at the end of this check:
 
 ```bash
 ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
@@ -490,12 +618,12 @@ ac get moduleinfo -l cpaas.io/cluster-name=global \
   -o custom-columns='MODULE:.metadata.labels.cpaas\.io/module-name,PHASE:.status.phase' | grep -E '^MODULE|cluster-api-provider'
 ```
 
-For a `global` cluster on Huawei DCS or Bare Metal, the platform checks the Kubernetes upgrade of `global` only during the upgrade, after the provider of the target version is installed. Until then, preflight reports `InfraClusterVersionPreflight` with `ProviderCapabilityNotDeclared`; this is expected. Check these items yourself on each `global` cluster, and on the standby run `unset KUBECONFIG` afterwards:
+Continue when the list shows `cluster-api-provider-kubeadm` and the infrastructure provider of `global`, such as `cluster-api-provider-dcs`, with `PHASE` `Running`; otherwise, contact technical support.
+
+On Huawei DCS and Bare Metal, also read what the Kubernetes upgrade of `global` uses:
 
 <Tabs>
   <Tab label="Huawei DCS">
-
-Continue when there is a ConfigMap for every version on the path, its VM template exists on every DCS site that `global` uses (check it on each site), and the Secrets that the `DCSCluster` references exist:
 
 ```bash
 ac -n cpaas-system get configmap -l cpaas.io/dcs-vm-template -L cpaas.io/dcs-vm-template,cpaas.io/distribution-version
@@ -503,48 +631,85 @@ ac -n cpaas-system get dcscluster global -o jsonpath='{.spec.credentialSecretRef
 ac -n cpaas-system get secret <credential-secret-name> <encryption-secret-name>
 ```
 
+The second command prints the names of the Secrets that the `DCSCluster` references; the second name is empty when none is referenced, and you then omit `<encryption-secret-name>`.
+
+| Result | Action |
+| --- | --- |
+| There is a ConfigMap for every version on the path; in the DCS console of every site that `global` uses, a VM template has the name in its `DCS-VM-TEMPLATE` column; and each Secret that the `DCSCluster` references exists | Continue. |
+| A ConfigMap, or its VM template on a site, is missing | Run the Huawei DCS steps of [Stage the Alauda OS Images](#stage-alauda-os-images) for that version. |
+| A Secret is missing | Contact technical support. |
+
   </Tab>
   <Tab label="Bare Metal">
-
-Continue when the catalog has the OS image key and the `_etcd` key of every version on the path, for every architecture and OS of the `global` hosts:
 
 ```bash
 ac -n cpaas-system get configmap elemental-image-catalog -o yaml
 ```
+
+Continue when the catalog has the OS image key and the `_etcd` key of every version on the path, for every architecture and OS of the `global` hosts; otherwise, run the Bare Metal steps of [Stage the Alauda OS Images](#stage-alauda-os-images) for the missing keys.
 
   </Tab>
 </Tabs>
 
 ### Check Kubernetes 1.35 or Later Node Readiness \{#kubernetes-135-node-readiness}
 
-On non-Alauda OS clusters only; Alauda OS nodes are replaced with the target image during the upgrade. Kubernetes 1.35 and later need Linux kernel 5.8 or later and cgroup v2, and the preflight of a `global` cluster on ACP 4.4 or earlier asks you to confirm it. Check every node of every non-Alauda OS cluster, workload clusters included. On each node, the kernel must be `5.8` or later and within the supported OS matrix, and the second command must print `cgroup2fs`:
+**Applies to**: every node of non-Alauda OS clusters created by ACP, `global` and workload clusters included. In DR, run it on each `global` cluster. Skip it for Alauda OS clusters and imported clusters.
+
+On each node:
 
 ```bash
 uname -r
 stat -fc %T /sys/fs/cgroup/
 ```
 
-Update the OS of a node that fails before you upgrade its cluster; the update restarts the node.
+Continue when the kernel is `5.8` or later and within [Supported OS and Kernel Versions](../install/non_alauda_os/node_preprocessing.mdx#supported_os_and_kernels), and the second command prints `cgroup2fs`; otherwise, update the OS of the node before you upgrade its cluster, and if you cannot, contact technical support. The update restarts the node.
 
-</Steps>
+### Check the etcd Backup \{#etcd-backup}
 
-## Check Module Stability \{#module-stability-self-check}
+**Applies to**: every cluster created by ACP, `global` included. Skip it for imported and registered clusters. In DR, run it on each `global` cluster.
 
-Preflight blocks the upgrade while a Core or Aligned module of the cluster is installing, upgrading, or failed, for example during a separate plugin upgrade. On `global`, for each cluster, confirm that every module is `Running` and that `deployStatus` is not `Upgrading`, `DeployFailed`, or `UpgradeFailed`; in DR, also check `global` on the standby, with `--kubeconfig <standby-kubeconfig>` after `ac`. Wait for a module that is still upgrading; resolve a module that is `Failed` or `Blocked` before you upgrade the cluster.
+On the cluster, list its backup records; on the standby, run `unset KUBECONFIG` instead of the last command:
 
 ```bash
+ac config use-cluster <cluster-name>        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
+ac get etcdbackupconfiguration etcd-backup-default \
+  -o jsonpath='{range .status.records[*]}{.backupTimestamp}{"\t"}{.result}{"\n"}{end}'
 ac config use-cluster global
+```
+
+| Result | Action |
+| --- | --- |
+| The record with the latest time shows `Success` | Continue. |
+| The command reports `NotFound` or `the server doesn't have a resource type` | Install Alauda Container Platform Cluster Enhancement on the cluster, as described in [etcd Backup and Restore](../configure/backup/etcd.mdx), and run the command again after its first backup. If you cannot install it, contact technical support. |
+| The record with the latest time does not show `Success`, or there is no record | Contact technical support. |
+
+### Check Module Stability \{#module-stability-self-check}
+
+**Applies to**: every cluster, `global` included. In DR, run it on each `global` cluster.
+
+On `global`. For `global` on the standby, set `<cluster-name>` to `global`, and run `unset KUBECONFIG` afterwards:
+
+```bash
+ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
 ac whoami --show-server
 ac get moduleinfo -l cpaas.io/cluster-name=<cluster-name> \
   -o custom-columns='MODULE:.metadata.labels.cpaas\.io/module-name,CURRENT:.status.version,TARGET:.spec.version,PHASE:.status.phase'
 ac get clustermodule <cluster-name> -o jsonpath='{.status.base.deployStatus}{"\n"}'
 ```
 
-On a non-Alauda OS `global` cluster that uses the platform built-in Registry, also confirm on each control-plane node that `/cpaas/minio` has at least 120 GB free, with `df -h /cpaas/minio`.
+| Result | Action |
+| --- | --- |
+| Every module shows `PHASE` `Running` and `CURRENT` equal to `TARGET`, and `deployStatus` is not `Upgrading`, `DeployFailed`, or `UpgradeFailed` | Continue. |
+| A module shows `CURRENT` different from `TARGET`, or `deployStatus` is `Upgrading` | Run the commands again later. If the output does not change, contact technical support. |
+| A module shows `PHASE` `Failed` or `Blocked`, or `deployStatus` is `DeployFailed` or `UpgradeFailed` | Run the steps in [Diagnose a Module That Does Not Advance](./troubleshooting.mdx#module-not-advancing). If the module does not recover, contact technical support. |
+| A module shows any other `PHASE` | Contact technical support. |
 
 ## Check DR Synchronization \{#check-dr-sync}
 
-In a DR environment only. Log in to a control-plane node of the standby `global` cluster, where the Service address is reachable, run the check there, and then return to the execution host:
+**Applies to**: DR environments. Skip it for a single `global` cluster.
+
+Log in to a control-plane node of the standby `global` cluster, run the check there, and then return to the execution host:
 
 ```bash
 export KUBECONFIG=/etc/kubernetes/admin.conf
@@ -553,37 +718,54 @@ if [[ $mirror_svc =~ ^[0-9a-fA-F:]+$ ]]; then mirror_host="[$mirror_svc]"; else 
 curl -g "http://${mirror_host}/check"
 ```
 
-Continue when the output shows `localMissedKeys [0]` and `localSurplusKeys [0]`. If it reports `check too frequent`, wait one minute and run it again. Otherwise, restore synchronization before you upgrade; see [Global Cluster Disaster Recovery Does Not Synchronize](./troubleshooting.mdx#dr-sync-diagnostics).
+| Result | Action |
+| --- | --- |
+| `localMissedKeys [0]` and `localSurplusKeys [0]` | Continue. |
+| `check too frequent` | Wait one minute and run the check again; if it does not change, contact technical support. |
+| Any other value | Run the steps in [Global Cluster Disaster Recovery Does Not Synchronize](./troubleshooting.mdx#dr-sync-diagnostics), then run the check again. |
 
 ## Run Preflight Checks \{#run-preflight}
 
-Run preflight on `global` from the `installer/` directory of the target Core Package. In DR, repeat the block on the standby, with `export KUBECONFIG=<standby-kubeconfig>` instead of `ac config use-cluster global`, and run `unset KUBECONFIG` afterwards. If `ac get productmanifests` reports `the server doesn't have a resource type`, the cluster has never been upgraded with the Cluster Version Operator (CVO): preflight runs during the upgrade of `global`, after you deploy CVO.
+**Applies to**: every `global` cluster. In DR, run it on each `global` cluster. Skip it for workload clusters.
+
+From the `installer/` directory of the target Core Package, on each `global` cluster; on the standby, run `unset KUBECONFIG` afterwards:
 
 ```bash
-ac config use-cluster global
+ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
 ac whoami --show-server
-unset REGISTRY_USERNAME REGISTRY_PASSWORD        # preflight stops while either is set
+unset REGISTRY_USERNAME REGISTRY_PASSWORD
 ac get productmanifests
 bash upgrade.sh --preflight
 ```
 
-Continue when the summary is `Passed` or `PassedWithWarnings`. On the standby, `DRSplitUpgradeWindow` fails while the Global Cluster Disaster Recovery plugin is installed; this is expected. Resolve every other check: `DRSplitUpgradeWindow` passes after you uninstall the plugin during the upgrade, as described in [Upgrade `global` Clusters in a DR Environment](./global/upgrade_global_dr.mdx#uninstall-dr-plugin). Workload clusters are checked later, after `global` runs the target version; in DR, after both `global` clusters do.
+| Result | Action |
+| --- | --- |
+| `Summary` shows `Passed` or `PassedWithWarnings` | Continue. |
+| `ac get productmanifests` reports `the server doesn't have a resource type` | Continue without `bash upgrade.sh --preflight`. You run it in [Run the Final Preflight Check](./global/upgrade_global_cluster.mdx#final-preflight), after you deploy the Cluster Version Operator (CVO). |
+| On the standby, `DRSplitUpgradeWindow` fails | Continue. |
+| On a `global` cluster on Huawei DCS or Bare Metal, `InfraClusterVersionPreflight` reports `ProviderCapabilityNotDeclared` | Continue after [Check the Providers and Images of `global`](#check-global-cluster). |
+| `ResourcePatchUpgradeable` fails | Run the exemption commands in [Resolve Preflight Blocks](#resolve-preflight-blocks). |
+| `AdminAckRequired` fails | Run the acknowledgement commands in [Resolve Preflight Blocks](#resolve-preflight-blocks). |
+| `VersionUpgradePath` fails | Follow [Resolve Other Preflight Blocks](./troubleshooting.mdx#resolve-other-preflight-blocks). Do not bypass the check with an explicit upgrade request. |
+| Any other check fails | Follow [Resolve Other Preflight Blocks](./troubleshooting.mdx#resolve-other-preflight-blocks). If the check is not listed there, contact technical support. |
 
 ### Resolve Preflight Blocks \{#resolve-preflight-blocks}
 
-For blocks not described here, see [Handle Preflight Blocks](./troubleshooting.mdx#handle-preflight-blocks-when-needed). `ResourcePatchUpgradeable` lists customizations that need an exemption. Review each patch with technical support, then exempt it on the cluster that is upgraded, with the target version as the value; do not use `*`. The value compares the major and minor version only, so the exemption covers every patch of the target minor version. In DR, do it on each side; on the standby, add `--kubeconfig <standby-kubeconfig>` after `ac`. Requests made with `ac adm upgrade` do not add the exemption:
+For `ResourcePatchUpgradeable`, review each listed patch with technical support, then exempt it on the `global` cluster, with the target version as the value; do not use `*`. In DR, do it on each side; on the standby, run `unset KUBECONFIG` afterwards:
 
 ```bash
+ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
 ac get resourcepatches \
   -o custom-columns='NAME:.metadata.name,EXEMPT:.metadata.annotations.config\.cpaas\.io/exempt-for-ver'
 ac get resourcepatches <rp-name> -o yaml
 ac annotate resourcepatches <rp-name> config.cpaas.io/exempt-for-ver=<target-version> --overwrite
 ```
 
-`AdminAckRequired` asks for an administrator acknowledgement on every `global` cluster upgraded from v4.4 or earlier, on each side in DR. Complete [Check Kubernetes 1.35 or Later Node Readiness](#kubernetes-135-node-readiness), which has nothing to check on Alauda OS, then copy the key from `admin-gates`, record it, and run preflight again. On the standby, run `export KUBECONFIG=<standby-kubeconfig>` instead of `ac config use-cluster global`, and `unset KUBECONFIG` afterwards:
+For `AdminAckRequired`, complete [Check Kubernetes 1.35 or Later Node Readiness](#kubernetes-135-node-readiness) on non-Alauda OS clusters. Then copy the key from `admin-gates`, record the acknowledgement, and run preflight again. In DR, do it on each side; on the standby, run `unset KUBECONFIG` afterwards:
 
 ```bash
-ac config use-cluster global
+ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
 ac whoami --show-server
 ac -n cpaas-system get configmap admin-gates -o yaml
 ACK_KEY='<key-from-admin-gates>'

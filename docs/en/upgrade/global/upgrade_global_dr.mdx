@@ -9,14 +9,14 @@ Use this page when the platform has a primary and a standby `global` cluster con
 
 ## Before You Begin \{#before-you-begin}
 
-- [Prepare for the Upgrade](../pre-upgrade.mdx) is complete on both `global` clusters. These items are not synchronized between them, so each side has its own: published packages, including the Global Cluster Disaster Recovery package on the standby; Alauda OS image ConfigMaps or catalog entries; the administrator acknowledgement; `ResourcePatch` exemptions; and a passed preflight check. On the standby, every check passes except `DRSplitUpgradeWindow`, which passes after you uninstall the plugin below.
-- Each `global` cluster has a recent successful etcd backup. See [etcd Backup and Restore](../../configure/backup/etcd.mdx).
+- [Prepare for the Upgrade](../pre-upgrade.mdx) is complete on both `global` clusters. These items are not synchronized between them, so each side has its own: published packages, including the Global Cluster Disaster Recovery package on the standby; Alauda OS image ConfigMaps or catalog entries; the administrator acknowledgement; `ResourcePatch` exemptions; and a preflight result that lets you continue. On the standby, every check passes except `DRSplitUpgradeWindow`, which passes after you uninstall the plugin below.
+- Each `global` cluster has a recent successful etcd backup, as described in [Check the etcd Backup](../pre-upgrade.mdx#etcd-backup).
 - You are on the execution host, logged in with `ac login` as a platform administrator, in the `installer/` directory of the extracted target Core Package, with a kubeconfig of the standby that points to its VIP: `<standby-kubeconfig>`.
 
 On the primary, `ac` commands use the `ac login` session, and `upgrade.sh` uses `kubectl` with the kubeconfig that `ac login` saved, after `ac config use-cluster global`; `ac whoami --show-server` prints `https://<platform-address>/kubernetes/global/`. Each command block for the standby starts with `export KUBECONFIG=<standby-kubeconfig>` and ends with `unset KUBECONFIG`, and `ac whoami --show-server` prints the standby VIP. Confirm the printed address before you continue with a block.
 
 :::info
-On Alauda OS, run the upgrade commands from the execution host, not from a node of either `global` cluster. The upgrade replaces the nodes, and files and sessions on a replaced node are lost.
+On Alauda OS, run the upgrade commands from the execution host, not from a node of either `global` cluster: the upgrade replaces the nodes.
 :::
 
 ## Upgrade Procedure \{#global-dr-procedure}
@@ -26,10 +26,10 @@ On Alauda OS, run the upgrade commands from the execution host, not from a node 
 ### Verify Data Consistency \{#verify-dr-consistency}
 
 :::warning
-If the standby is not consistent with the primary, do not uninstall the plugin; contact technical support. Uninstalling it while the standby misses data lets the standby providers act on workload cluster `Machine` objects with incomplete data and, on Alauda OS, on the nodes behind them.
+Do not uninstall the plugin until this check passes.
 :::
 
-Check synchronization on a control plane node of the standby `global` cluster; the check address is reachable only from inside the cluster. This check, here and after the reinstall, is the only command on this page that runs on a node; then return to the execution host.
+Run the check on a control plane node of the standby `global` cluster, then return to the execution host:
 
 ```bash
 export KUBECONFIG=/etc/kubernetes/admin.conf
@@ -38,7 +38,15 @@ if [[ $mirror_svc =~ ^[0-9a-fA-F:]+$ ]]; then mirror_host="[$mirror_svc]"; else 
 curl -g "http://${mirror_host}/check"
 ```
 
-Continue when the output shows `localMissedKeys [0]` and `localSurplusKeys [0]`. If it reports `check too frequent`, wait one minute and run it again. Then, from the execution host, check on the primary that every machine is `Running` and that no workload cluster upgrade is running; the platform does not block a `global` upgrade while one runs:
+| Result | Action |
+|---|---|
+| `localMissedKeys [0]` and `localSurplusKeys [0]` | Continue. |
+| `check too frequent` | Wait one minute and run the check again; if it does not change, contact technical support. |
+| Any other value | Run the steps in [Global Cluster Disaster Recovery Does Not Synchronize](../troubleshooting.mdx#dr-sync-diagnostics), then run the check again. |
+
+### Check the Machines and Ongoing Upgrades \{#check-machines-before-uninstall}
+
+On the primary:
 
 ```bash
 ac config use-cluster global
@@ -49,7 +57,7 @@ ac -n cpaas-system get cvsh \
   -o custom-columns='CLUSTER:.metadata.name,REQUESTED:.spec.desiredUpdate.version,CURRENT:.status.current.version'
 ```
 
-Continue when every machine is `Running` and, on every row of the last command, `REQUESTED` is empty or equal to `CURRENT`; otherwise, resolve the machine or wait until that upgrade completes. If the last command reports `the server doesn't have a resource type`, no upgrade has used the Cluster Version Operator yet; continue. Then check the machines of the standby, and resolve every machine that is not `Running` before you continue:
+On the standby:
 
 ```bash
 export KUBECONFIG=<standby-kubeconfig>
@@ -58,6 +66,13 @@ ac get machines.platform.tkestack.io
 ac get machines.cluster.x-k8s.io -A   # Alauda OS
 unset KUBECONFIG
 ```
+
+| Result | Action |
+|---|---|
+| Every machine on both `global` clusters is `Running`, and on every row of the `cvsh` list `REQUESTED` is empty or equal to `CURRENT` | Continue. |
+| The `cvsh` command reports `the server doesn't have a resource type`, and every machine on both `global` clusters is `Running` | Continue. |
+| On a row of the `cvsh` list, `REQUESTED` differs from `CURRENT` | Run the block on the primary again after that workload cluster upgrade completes. If that upgrade does not advance, see [Inspect Upgrade State](../troubleshooting.mdx#inspect-upgrade-state). |
+| A machine is not `Running` | Contact technical support. |
 
 ### Uninstall the Global Cluster Disaster Recovery Plugin from the Standby \{#uninstall-dr-plugin}
 
@@ -81,7 +96,7 @@ detail: {.spec.config.detail}
 unset KUBECONFIG
 ```
 
-Continue when `active_cluster_vip` shows the primary VIP. Keep the file until the reinstall. Then uninstall the plugin, and continue when the last two commands return nothing:
+Continue when `active_cluster_vip` shows the primary VIP; otherwise, do not uninstall the plugin, and contact technical support. Keep the file until the reinstall. Then uninstall the plugin:
 
 ```bash
 export KUBECONFIG=<standby-kubeconfig>
@@ -91,6 +106,8 @@ ac get moduleinfo -l cpaas.io/module-name=etcd-sync
 ac -n cpaas-system get pod -l 'app in (etcd-sync,etcd-sync-monitor)'
 unset KUBECONFIG
 ```
+
+Continue when the last two commands return nothing; otherwise, run them again after one minute, and if they still list objects, contact technical support.
 
 ### Upgrade the Standby `global` Cluster \{#upgrade-standby}
 
@@ -108,7 +125,13 @@ ac get productmanifest v<target-version>
 unset KUBECONFIG
 ```
 
-Continue when the script completes without an error and `READY` is `True`. Otherwise, see [Recover a Missing Aligned Extension Package](../troubleshooting.mdx#recover-missing-aligned-package). Then **run the final preflight check**:
+| Result | Action |
+|---|---|
+| The script completes without an error, and `READY` is `True` | Continue. |
+| The script reports that the product manifest did not become ready, or `READY` is not `True` | Follow [Recover a Missing Aligned Extension Package](../troubleshooting.mdx#recover-missing-aligned-package). |
+| The script fails with another error | Contact technical support. |
+
+Then **run the final preflight check**:
 
 ```bash
 export KUBECONFIG=<standby-kubeconfig>
@@ -140,6 +163,8 @@ Then, on Huawei Cloud Stack or VMware vSphere, upgrade Kubernetes right after th
 
 ### Check the Standby Before Upgrading the Primary \{#go-no-go}
 
+On the standby:
+
 ```bash
 export KUBECONFIG=<standby-kubeconfig>
 ac whoami --show-server   # the standby VIP
@@ -149,7 +174,7 @@ ac get moduleinfo -l cpaas.io/module-name=etcd-sync
 unset KUBECONFIG
 ```
 
-Upgrade the primary only when all three checks pass: `Current` shows the target version and `Ready` is `True`; on Alauda OS, every node is `Ready` and shows the target Kubernetes version in `VERSION`; the last command returns nothing, because the plugin is not reinstalled yet. If any check fails, do not upgrade the primary; contact technical support.
+Continue with the primary when `Current` shows the target version and `Ready` is `True`, on Alauda OS every node is `Ready` and shows the target Kubernetes version in `VERSION`, and the last command returns nothing; otherwise, do not upgrade the primary, and contact technical support.
 
 ### Upgrade the Primary `global` Cluster \{#upgrade-primary}
 
@@ -166,7 +191,13 @@ bash upgrade.sh --skip-sync-image
 ac get productmanifest v<target-version>
 ```
 
-Continue when the script completes without an error and `READY` is `True`. Otherwise, see [Recover a Missing Aligned Extension Package](../troubleshooting.mdx#recover-missing-aligned-package). Then **run the final preflight check**:
+| Result | Action |
+|---|---|
+| The script completes without an error, and `READY` is `True` | Continue. |
+| The script reports that the product manifest did not become ready, or `READY` is not `True` | Follow [Recover a Missing Aligned Extension Package](../troubleshooting.mdx#recover-missing-aligned-package). |
+| The script fails with another error | Contact technical support. |
+
+Then **run the final preflight check**:
 
 ```bash
 ac config use-cluster global
@@ -240,7 +271,7 @@ ac -n cpaas-system get pod -l 'app in (etcd-sync,etcd-sync-monitor)'
 unset KUBECONFIG
 ```
 
-Continue when the `ModuleInfo` shows `STATUS` `Running` and `CURRENT_VERSION` equal to the version you set, every Pod is `Running`, and the `/check` command from [Verify Data Consistency](#verify-dr-consistency), run again on a standby control plane node, shows `localMissedKeys [0]` and `localSurplusKeys [0]`. Otherwise, see [Global Cluster Disaster Recovery Does Not Synchronize](../troubleshooting.mdx#dr-sync-diagnostics).
+Continue when the `ModuleInfo` shows `STATUS` `Running` and `CURRENT_VERSION` equal to the version you set, every Pod is `Running`, and the `/check` command from [Verify Data Consistency](#verify-dr-consistency), run again on a standby control plane node, shows `localMissedKeys [0]` and `localSurplusKeys [0]`. Otherwise, run the steps in [Global Cluster Disaster Recovery Does Not Synchronize](../troubleshooting.mdx#dr-sync-diagnostics); if they do not resolve it, contact technical support.
 
 ### Upgrade the Agnostic Extensions and Validate \{#upgrade-agnostic-extensions}
 

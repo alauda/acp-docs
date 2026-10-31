@@ -13,7 +13,7 @@ queries:
 Use this page for a Huawei DCS or Huawei Cloud Stack cluster that still keeps platform data, such as `/var/cpaas`, on disks declared in its machine template. After the migration, these disks are declared in the machine pool, and the upgrade keeps them when it replaces the nodes. Migrate every affected cluster, the `global` cluster included.
 
 :::warning
-Complete the migration before you upgrade the cluster. It replaces every node of the cluster with a new VM, one at a time. With fewer than three control-plane nodes, contact technical support.
+Complete the migration before you upgrade the cluster. It replaces every node of the cluster with a new VM, one at a time.
 :::
 
 Run the commands from the execution host, after `ac login`, on the `global` cluster that manages the cluster: the `global` cluster itself, with `global` as `<cluster-name>`, or the primary `global` cluster for a workload cluster. In a DR environment, migrate each `global` cluster; for the standby, use its kubeconfig instead of `ac login`. All objects are in the `cpaas-system` namespace.
@@ -29,24 +29,67 @@ ac whoami --show-server
 
 For the standby `global` cluster in a DR environment, replace the first command with `export KUBECONFIG=<standby-kubeconfig>`; the second command then prints the VIP of the standby, and every later `ac` command on this page uses this kubeconfig. Run `unset KUBECONFIG` when the migration of the standby is complete.
 
-Confirm the following:
+Also confirm that all nodes of the cluster are `Ready`, and that the cluster has a recent successful etcd backup, as described in [Check the etcd Backup](./pre-upgrade.mdx#etcd-backup).
 
-- All nodes of the cluster are `Ready`, and the cluster has a recent successful etcd backup. See [etcd Backup and Restore](../configure/backup/etcd.mdx).
-- The control plane has three or more nodes, `maxSurge` is `0` on the KubeadmControlPlane and on every MachineDeployment, and `maxUnavailable` is `1` on every MachineDeployment. The commands below also list the machine templates in use; the procedure works on each of them.
-- Each IP pool or machine config pool that the cluster uses has no free entry, for control-plane and worker pools alike: a replacement node takes over the disks of the node it replaces only then. Find the free entries as described in [Check the Disks and Hosts](./pre-upgrade.mdx#persistent-disk-layout), and remove them from the pool before the migration, with the cautions for the provider below.
+Then run the following checks on the same cluster.
 
-Read the rollout settings and templates on the same cluster:
+### Check the Provider Requirements \{#migration-provider-requirements}
+
+<Tabs>
+<Tab label="Huawei DCS">
+
+- The cluster runs ACP v4.2.1 or later, as read in [Check Cluster Versions](./pre-upgrade.mdx#check-compatibility), and its VM templates are v4.2.1 or later.
+- Guest tools (`vmtools`) run inside the VMs.
+- Each node has a fixed IP entry in a `DCSIpHostnamePool`.
+- You can read the disks of each VM, with their `sequenceNum`, from the DCS platform or the DCS API (`QueryVmInfo`).
+
+Then confirm that the provider supports the field:
+
+```bash
+ac explain dcsiphostnamepools.spec.pool.persistentDisk
+```
+
+Continue when every item above holds and the command describes the field; otherwise, contact technical support.
+
+</Tab>
+<Tab label="Huawei Cloud Stack">
+
+- The cluster runs ACP v4.3.1 or later, as read in [Check Cluster Versions](./pre-upgrade.mdx#check-compatibility).
+- The cluster assigns fixed hostnames and IP addresses through `HCSMachineConfigPool`.
+- Every disk to keep has a non-empty `mountPath` in `HCSMachineTemplate.spec.template.spec.dataVolumes[]`.
+
+Then confirm that the provider supports the field:
+
+```bash
+ac explain hcsmachineconfigpools.spec.configs.persistentDisks
+```
+
+Continue when every item above holds and the command describes the field; otherwise, contact technical support.
+
+</Tab>
+</Tabs>
+
+### Check the Rollout Settings \{#migration-rollout-settings}
 
 ```bash
 ac -n cpaas-system get clusters.cluster.x-k8s.io <cluster-name> \
   -o jsonpath='{.spec.controlPlaneRef.name}{"\n"}'
 ac -n cpaas-system get kubeadmcontrolplane <kcp-name> \
-  -o custom-columns='NAME:.metadata.name,REPLICAS:.spec.replicas,SURGE:.spec.rolloutStrategy.rollingUpdate.maxSurge,TEMPLATE:.spec.machineTemplate.infrastructureRef.name'
+  -o jsonpath='replicas={.spec.replicas} maxSurge={.spec.rolloutStrategy.rollingUpdate.maxSurge}{"\n"}'
+ac -n cpaas-system get kubeadmcontrolplane <kcp-name> \
+  -o custom-columns='NAME:.metadata.name,TEMPLATE:.spec.machineTemplate.infrastructureRef.name'
 ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=<cluster-name> \
   -o custom-columns='NAME:.metadata.name,SURGE:.spec.strategy.rollingUpdate.maxSurge,UNAVAILABLE:.spec.strategy.rollingUpdate.maxUnavailable,TEMPLATE:.spec.template.spec.infrastructureRef.name'
 ```
 
-The first command prints the KubeadmControlPlane name, `<kcp-name>`. An empty `SURGE` is unset, which counts as `1`. If a `SURGE` value is not `0`, or a MachineDeployment `UNAVAILABLE` value is not `1`, set them before you continue:
+The first command prints the KubeadmControlPlane name, `<kcp-name>`. The `TEMPLATE` columns list the machine templates in use; the procedure works on each of them.
+
+| Result | Action |
+|---|---|
+| `replicas` is 3 or more and `maxSurge` is `0`, and every MachineDeployment shows `SURGE` `0` and `UNAVAILABLE` `1` | Continue. |
+| `replicas` is less than 3 | Contact technical support. |
+| `replicas` is 3 or more and `maxSurge` is empty or not `0` | Run the `kubeadmcontrolplane` command below. |
+| A MachineDeployment shows `SURGE` empty or not `0`, or `UNAVAILABLE` empty or not `1` | Run the `machinedeployment` command below for it. |
 
 ```bash
 ac -n cpaas-system patch kubeadmcontrolplane <kcp-name> --type=merge \
@@ -55,29 +98,45 @@ ac -n cpaas-system patch machinedeployment <machinedeployment-name> --type=merge
   -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":0,"maxUnavailable":1}}}}'
 ```
 
-Also confirm the conditions for the provider:
+### Check the Pools for Free Entries \{#migration-free-entries}
+
+Check each pool that the cluster uses, control-plane and worker pools alike:
 
 <Tabs>
 <Tab label="Huawei DCS">
 
-- The cluster runs ACP v4.2.1 or later, and its VM templates are v4.2.1 or later.
-- Guest tools (`vmtools`) run inside the VMs, so that a VM can be shut down safely and its disks detached.
-- Each node has a fixed IP entry in a `DCSIpHostnamePool`.
-- You can read the disks of each VM, with their `sequenceNum`, from the DCS platform or the DCS API (`QueryVmInfo`).
-- `ac explain dcsiphostnamepools.spec.pool.persistentDisk` describes the field. If it reports that the field does not exist, stop and contact technical support.
-- When you remove free entries from a `DCSIpHostnamePool`, keep the entry of the internal control-plane load balancer VIP. Removing an entry that a node used before also deletes the disks kept for it.
+The last command prints the type and the address of the control-plane load balancer of the cluster:
+
+```bash
+ac -n cpaas-system get dcsiphostnamepool \
+  -o custom-columns='NAME:.metadata.name,IPS:.spec.pool[*].ip,DISKS:.spec.pool[*].persistentDisk[*].path,KEPT_DISKS:.status.persistentDiskStatus[*].ip'
+ac -n cpaas-system get dcsmachine -l cluster.x-k8s.io/cluster-name=<cluster-name> -o custom-columns='NAME:.metadata.name,POOL:.spec.ipHostPoolRef.name,IP:.status.networkConfig.ip'
+ac -n cpaas-system get dcscluster <cluster-name> -o jsonpath='{.spec.controlPlaneLoadBalancer.type}{" "}{.spec.controlPlaneLoadBalancer.host}{"\n"}'
+```
+
+Check each pool in the `POOL` column. A free entry is an IP address of the pool that no machine of the cluster uses and that is not the load balancer address when the type is `internal`.
 
 </Tab>
 <Tab label="Huawei Cloud Stack">
 
-- The cluster runs ACP v4.3.1 or later.
-- The cluster assigns fixed hostnames and IP addresses through `HCSMachineConfigPool`.
-- Every disk to keep has a non-empty `mountPath` in `HCSMachineTemplate.spec.template.spec.dataVolumes[]`. For a disk without one, contact technical support.
-- `ac explain hcsmachineconfigpools.spec.configs.persistentDisks` describes the field. If it reports that the field does not exist, stop and contact technical support.
-- A free configuration of an `HCSMachineConfigPool` that was used before cannot be removed; contact technical support for it.
+Read the pool of each template in the `TEMPLATE` columns, then each pool in `POOL`:
+
+```bash
+ac -n cpaas-system get hcsmachinetemplate <template-name> -o custom-columns='NAME:.metadata.name,POOL:.spec.template.spec.configPoolRef.name'
+ac -n cpaas-system get hcsmachineconfigpool <pool-name> \
+  -o custom-columns='NAME:.metadata.name,TOTAL:.status.totalCount,AVAILABLE:.status.availableCount,DISKS:.spec.configs[*].persistentDisks[*].mountPath,HOSTNAMES:.spec.configs[*].hostname,USED:.status.usedConfigs[*].hostname'
+```
 
 </Tab>
 </Tabs>
+
+| Result | Action |
+|---|---|
+| Huawei DCS: the pools have no free entry. Huawei Cloud Stack: each pool in `POOL` shows `AVAILABLE` empty or `0` | Continue. |
+| Huawei DCS: a free entry is not in `KEPT_DISKS` | Remove it from `spec.pool` with `ac -n cpaas-system edit dcsiphostnamepool <pool-name>`. Keep the entry of the internal load balancer address. |
+| Huawei DCS: a free entry is in `KEPT_DISKS` | Contact technical support. Do not remove the entry. |
+| Huawei Cloud Stack: a pool in `POOL` shows `AVAILABLE` greater than `0` | Run `ac -n cpaas-system edit hcsmachineconfigpool <pool-name>` and remove the free configurations, the ones in `HOSTNAMES` that are not in `USED`, from `spec.configs`. |
+| Huawei Cloud Stack: the edit is rejected for a free configuration that was used before | Contact technical support. |
 
 ## Migration Procedure \{#migration-procedure}
 
@@ -247,7 +306,7 @@ Under the hostname of each node, add one `persistentDisks` entry for each disk t
 
 ### Confirm the Disks Are Claimed \{#confirm-claimed}
 
-Before you start the replacement, confirm that the provider has claimed every disk to keep on the running VMs. Read the disk states of each pool:
+Before you start the replacement, read the disk states of each pool:
 
 <Tabs>
 <Tab label="Huawei DCS">
@@ -257,8 +316,6 @@ ac -n cpaas-system get dcsiphostnamepool <pool-name> \
   -o jsonpath='{range .status.persistentDiskStatus[*]}{.ip}{"\t"}{.slot}{"\t"}{.path}{"\t"}{.phase}{"\t"}{.volumeUrn}{"\t"}{.lastError}{"\n"}{end}'
 ```
 
-Continue when every disk to keep is `Attached` and its `volumeUrn` is the volume URN that you recorded for that disk.
-
 </Tab>
 <Tab label="Huawei Cloud Stack">
 
@@ -267,12 +324,17 @@ ac -n cpaas-system get hcsmachineconfigpool <pool-name> \
   -o jsonpath='{range .status.persistentDiskStatus[*]}{.hostname}{"\t"}{.slot}{"\t"}{.phase}{"\t"}{.volumeID}{"\t"}{.lastError}{"\n"}{end}'
 ```
 
-Continue when every disk to keep is `Attached` with a `volumeID`.
-
 </Tab>
 </Tabs>
 
-If a disk is missing from the output or a column is empty, read the pool with `-o yaml`. For a disk in `Error`, see [If a Disk Reports an Error](#disk-errors). A disk in `Creating` is a new, empty disk: do not start the replacement, and contact technical support.
+| Result | Action |
+|---|---|
+| Every disk to keep is `Attached`. Huawei DCS: its `volumeUrn` is the volume URN that you recorded for that disk. Huawei Cloud Stack: it has a `volumeID` | Continue. |
+| A disk is `Attaching` or `Available`, or is missing from the output | Read the states again after one minute; if they do not change, contact technical support. |
+| A disk is in `Error` | Fix it as described in [If a Disk Reports an Error](#disk-errors). |
+| Huawei DCS: a disk is `Attached` with another `volumeUrn` than the one you recorded | Do not start the replacement; contact technical support. |
+| A disk is in `Creating` or another phase | Do not start the replacement; contact technical support. |
+| A column is empty | Read the pool with `-o yaml` and handle the status of the disk as in the rows above. |
 
 ### Trigger the Rolling Replacement \{#trigger-replacement}
 
