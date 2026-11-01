@@ -228,7 +228,7 @@ Then, on Huawei Cloud Stack or VMware vSphere, upgrade Kubernetes right after th
 
 ### Reinstall the Global Cluster Disaster Recovery Plugin \{#reinstall-dr-plugin}
 
-Reinstall the plugin on the standby after both `global` clusters run the target ACP version. The standby reads the primary etcd on port `2379`, through the primary VIP or, when the VIP does not forward that port, directly from the primary control plane nodes; `etcd-sync-settings.txt` shows which one the plugin used before. Create the token Secret on the standby from the primary token without printing it. Then list the plugin versions on the standby and, on Bare Metal, confirm that the `baremetal-dr-rules` ConfigMap exists; if it is missing, do not install the plugin, and contact technical support:
+Reinstall the plugin on the standby after both `global` clusters run the target ACP version. The standby reads the primary etcd on port `2379`, through the primary VIP or, when the VIP does not forward that port, directly from the primary control plane nodes; `etcd-sync-settings.txt` shows which one the plugin used before. Create the token Secret on the standby from the primary token without printing it. Then list the plugin versions on the standby:
 
 ```bash
 ac config use-cluster global
@@ -240,9 +240,46 @@ ac -n cpaas-system create secret generic etcd-sync-active-cluster-token \
   --from-literal=token="${ACTIVE_CLUSTER_TOKEN}" --dry-run=client -o yaml | ac apply -f -
 unset ACTIVE_CLUSTER_TOKEN
 ac get moduleconfigs -l cpaas.io/module-name=etcd-sync -o custom-columns='NAME:.metadata.name,VERSION:.spec.version'
-ac -n cpaas-system get configmap baremetal-dr-rules   # Bare Metal
 unset KUBECONFIG
 ```
+
+**Bare Metal only: check the rules before you install the plugin.** Skip this on Huawei DCS, Huawei Cloud Stack, and VMware vSphere.
+
+:::warning
+The first synchronization after the plugin starts overwrites the `global` plan Secrets of the standby with those of the primary, unless `baremetal-dr-rules` lists them. The standby `global` hosts then receive plans that belong to the primary. Do not install the plugin before both checks pass.
+:::
+
+1. Check that `baremetal-dr-rules` lists every plan Secret of the `global` hosts of both clusters. Run the commands on the primary, then on the standby:
+
+   ```bash
+   ac config use-cluster global   # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
+   ac whoami --show-server
+   ac -n cpaas-system get machineinventories.elemental.cattle.io -o json | jq -r '.items[]
+     | select(.metadata.annotations["baremetal.cluster.io/system-agent-auth-scope"]=="global")
+     | .status.plan.secretRef.name // empty | "/registry/secrets/cpaas-system/" + .'
+   ac -n cpaas-system get configmap baremetal-dr-rules -o jsonpath='{.data.ignore-equal\.txt}'
+   unset KUBECONFIG   # on the standby only
+   ```
+
+   Continue when every path that the first command prints, on either cluster, is listed by the last command on **both** clusters. Otherwise, add the missing paths to `baremetal-dr-rules` on both clusters. If the ConfigMap does not exist, do not install the plugin, and contact technical support.
+
+2. Check that the provider on the standby still treats the shared agent identity as read-only:
+
+   ```bash
+   export KUBECONFIG=<standby-kubeconfig>
+   ac whoami --show-server   # the standby VIP
+   ac -n cpaas-system get deploy elemental-operator -o yaml | grep -- --system-agent-shared-auth-read-only
+   unset KUBECONFIG
+   ```
+
+   Continue when the last command prints `--system-agent-shared-auth-read-only`. Otherwise, set `sharedAuthReadOnly` to `true`, change no other `elemental` value, and run the check again; if the patch is rejected, contact technical support:
+
+   ```bash
+   export KUBECONFIG=<standby-kubeconfig>
+   ac get moduleinfo -l cpaas.io/cluster-name=global,cpaas.io/module-name=cluster-api-provider-baremetal
+   ac patch moduleinfo <name> --type=json -p '[{"op":"replace","path":"/spec/valuesOverride/acp~1chart-cluster-api-provider-baremetal/elemental/systemAgent/sharedAuthReadOnly","value":true}]'
+   unset KUBECONFIG
+   ```
 
 Install the plugin on the standby. Set `version` to the version that you pushed to the standby in [Publish to the Standby global Cluster](../pre-upgrade.mdx#publish-standby), the highest `VERSION` in the previous output. For `active_cluster_vip`, `active_cluster_etcd_endpoints`, `dest_etcd_endpoints`, `monitor_check_interval`, and `detail`, use the values recorded in `etcd-sync-settings.txt` instead of the example values:
 
@@ -273,6 +310,17 @@ ac get moduleinfo -l cpaas.io/module-name=etcd-sync
 ac -n cpaas-system get pod -l 'app in (etcd-sync,etcd-sync-monitor)'
 unset KUBECONFIG
 ```
+
+**Bare Metal only:** before the synchronization check, check the rule source on the standby:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server   # the standby VIP
+ac -n cpaas-system get configmap baremetal-dr-rules -o jsonpath='{.metadata.annotations.etcd-sync\.cpaas\.io/status}{"\n"}'
+unset KUBECONFIG
+```
+
+Continue when it prints `accepted`. Otherwise, run the steps in [Global Cluster Disaster Recovery Does Not Synchronize](../troubleshooting.mdx#dr-sync-diagnostics); if they do not resolve it, contact technical support.
 
 Continue when the `ModuleInfo` shows `STATUS` `Running` and `CURRENT_VERSION` equal to the version you set, every Pod is `Running`, and the `/check` command from [Verify Data Consistency](#verify-dr-consistency), run again on a standby control plane node, shows `localMissedKeys [0]` and `localSurplusKeys [0]`. Otherwise, run the steps in [Global Cluster Disaster Recovery Does Not Synchronize](../troubleshooting.mdx#dr-sync-diagnostics); if they do not resolve it, contact technical support.
 
