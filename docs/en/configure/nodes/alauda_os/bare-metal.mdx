@@ -54,7 +54,7 @@ Managed data disks are not part of `BaremetalMachineTemplate`. Their declaration
 To add another worker node group, follow [Add or Change Node Groups](../../../workload_clusters/alauda_os/bare-metal/create_cluster.mdx#worker-node-deployment) on the cluster creation page.
 
 <Directive type="warning" title="Clusters created with ac">
-  `ac` renders these objects from `install-config.yaml`, and running `ac adm alpha cluster create` again applies the rendered objects: a `MachineDeployment` that you pointed at a new template with `kubectl` is pointed back at the rendered one. To keep a change, make it in `install-config.yaml` where the field exists. `ac adm alpha cluster destroy` deletes only the objects that `ac` rendered, so delete the templates that you created yourself.
+  `ac` renders these objects from `install-config.yaml`. Make a change there when the field exists. `ac adm alpha cluster create` does not overwrite a field that you changed with `ac patch` or `ac edit`: when the rendered value differs, such as after you point a `MachineDeployment` at a new template, `create` reports that the fields are owned by another manager and stops. Do not delete the object that the error names. `ac adm alpha cluster destroy` deletes only the objects that `ac` rendered, so delete the templates that you created yourself.
 </Directive>
 
 ---
@@ -76,9 +76,10 @@ To add another worker node group, follow [Add or Change Node Groups](../../../wo
 1. **Check current state**
 
    ```bash
-   kubectl -n cpaas-system get machines.cluster.x-k8s.io \
+   ac config use-cluster global
+   ac -n cpaas-system get machines.cluster.x-k8s.io \
      -l cluster.x-k8s.io/deployment-name=<cluster-name>-worker
-   kubectl -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io \
+   ac -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io \
      <cluster-name>-worker-pool
    ```
 
@@ -87,7 +88,8 @@ To add another worker node group, follow [Add or Change Node Groups](../../../wo
 2. **Extend the worker pool when more inventories are needed**
 
    ```bash
-   kubectl -n cpaas-system edit machineinventorypool <cluster-name>-worker-pool
+   ac config use-cluster global
+   ac -n cpaas-system edit machineinventorypool <cluster-name>-worker-pool
    ```
 
    Append the new `MachineInventory` names — they must already be registered and Ready. Inventories with managed volumes must also be Prepared; otherwise they increase `status.total` but remain unavailable for allocation. Save and exit, then confirm the expected increase in `status.available`.
@@ -95,15 +97,20 @@ To add another worker node group, follow [Add or Change Node Groups](../../../wo
 3. **Scale up the `MachineDeployment`**
 
    ```bash
-   kubectl -n cpaas-system patch machinedeployment <cluster-name>-worker \
+   ac config use-cluster global
+   ac -n cpaas-system patch machinedeployment <cluster-name>-worker \
      --type='json' -p='[{"op":"replace","path":"/spec/replicas","value":<new-replica-count>}]'
    ```
 
 4. **Monitor**
 
    ```bash
-   kubectl -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io -w
-   kubectl get nodes                # workload cluster
+   ac config use-cluster global
+   ac -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io -w
+   ac config sync
+   ac config use-cluster <cluster-name>
+   ac get nodes
+   ac config use-cluster global
    ```
 
    New `BaremetalMachine` objects advance `Pending → Allocated → Reprovisioning → Running`; the pool's `available` counter decreases as new nodes are bound.
@@ -126,7 +133,8 @@ A `clean` plan stops kubelet, deactivates declared storage mounts, clears CRI wo
 ##### Random Removal
 
 ```bash
-kubectl -n cpaas-system patch machinedeployment <cluster-name>-worker \
+ac config use-cluster global
+ac -n cpaas-system patch machinedeployment <cluster-name>-worker \
   --type='json' -p='[{"op":"replace","path":"/spec/replicas","value":<new-replica-count>}]'
 ```
 
@@ -137,14 +145,16 @@ CAPI selects machines for deletion in its standard order. Each selected `Baremet
 1. **Identify the machines**
 
    ```bash
-   kubectl -n cpaas-system get machines.cluster.x-k8s.io \
+   ac config use-cluster global
+   ac -n cpaas-system get machines.cluster.x-k8s.io \
      -l cluster.x-k8s.io/deployment-name=<cluster-name>-worker
    ```
 
 2. **Annotate the target machines**
 
    ```bash
-   kubectl -n cpaas-system patch machine <machine-name> \
+   ac config use-cluster global
+   ac -n cpaas-system patch machine <machine-name> \
      --type='merge' -p='{"metadata":{"annotations":{"cluster.x-k8s.io/delete-machine":"true"}}}'
    ```
 
@@ -153,7 +163,8 @@ CAPI selects machines for deletion in its standard order. Each selected `Baremet
 3. **Scale down by exactly the number of annotated machines**
 
    ```bash
-   kubectl -n cpaas-system patch machinedeployment <cluster-name>-worker \
+   ac config use-cluster global
+   ac -n cpaas-system patch machinedeployment <cluster-name>-worker \
      --type='json' -p='[{"op":"replace","path":"/spec/replicas","value":<new-replica-count>}]'
    ```
 
@@ -162,8 +173,9 @@ CAPI selects machines for deletion in its standard order. Each selected `Baremet
 4. **Verify cleanup**
 
    ```bash
-   kubectl -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io
-   kubectl -n cpaas-system get machineinventories.elemental.cattle.io <inventory-name> -o yaml
+   ac config use-cluster global
+   ac -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io
+   ac -n cpaas-system get machineinventories.elemental.cattle.io <inventory-name> -o yaml
    ```
 
    The released inventory must show `baremetal.alauda.io/allocation-state=Available`, the `baremetal.alauda.io/owner-*` annotations must be cleared, and the pool annotation must remain. `MachineInventory` itself is **not** deleted. If it declares managed volumes, it must return to `status.storage.phase=Prepared` with `StorageActive=False/Inactive`; its business mount paths must be inactive while filesystem UUIDs and data remain unchanged.
@@ -173,8 +185,9 @@ CAPI selects machines for deletion in its standard order. Each selected `Baremet
 If a `BaremetalMachine` lands in `Failed`, the safest recovery is to delete the failed `Machine`. CAPI immediately creates a replacement `Machine` (because `replicas` did not change), and the bare-metal provider picks an `Available` inventory from the same pool. Most often the replacement is a different `MachineInventory`; the provider does not guarantee that the freshly released inventory will be re-picked. Host-local managed data does not follow the replacement Machine. If the application must reuse a specific inventory's data, use a dedicated or deliberately ordered pool and verify `BaremetalMachine.status.machineInventoryRef` before relying on that data.
 
 ```bash
-kubectl -n cpaas-system delete machine <machine-name>
-kubectl -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io -w
+ac config use-cluster global
+ac -n cpaas-system delete machine <machine-name>
+ac -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io -w
 ```
 
 Investigate the original failure separately: read `BaremetalMachine.status.conditions`, `MachineInventory.status.plan.state`, and the failing plan secret's `failed-output` key on the host that ran the plan. Common root causes are documented in the [Common Failure Modes](#common-failure-modes) section below.
@@ -191,7 +204,8 @@ Investigate the original failure separately: read `BaremetalMachine.status.condi
 - The target pool has at least as many `Available` inventories as the `MachineDeployment` has replicas. Each moved node uses one host of the target pool; hosts released by the old nodes return to the old pool and do not join the target pool. Read the count from `status.available`:
 
   ```bash
-  kubectl -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io <target-pool-name>
+  ac config use-cluster global
+  ac -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io <target-pool-name>
   ```
 
 - The new hosts meet the same prerequisites as the current ones: registered and ready, managed data disks prepared if you use them, the target Kubernetes version and CPU architecture in the image catalog, and the CNI network device present. See [Confirm the Worker Pool Capacity](../../../workload_clusters/alauda_os/bare-metal/create_cluster.mdx#worker-pool-capacity).
@@ -204,7 +218,8 @@ Investigate the original failure separately: read `BaremetalMachine.status.condi
 3. Patch the `MachineDeployment`:
 
    ```bash
-   kubectl -n cpaas-system patch machinedeployment <cluster-name>-worker \
+   ac config use-cluster global
+   ac -n cpaas-system patch machinedeployment <cluster-name>-worker \
      --type='merge' \
      -p='{"spec":{"template":{"spec":{"infrastructureRef":{"name":"<new-template-name>"}}}}}'
    ```
@@ -212,8 +227,9 @@ Investigate the original failure separately: read `BaremetalMachine.status.condi
 4. Watch the rolling replacement (`maxSurge: 0`, one node at a time) and the target pool's `status.available`:
 
    ```bash
-   kubectl -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io -w
-   kubectl -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io <target-pool-name>
+   ac config use-cluster global
+   ac -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io -w
+   ac -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io <target-pool-name>
    ```
 
 **What to expect**:
@@ -241,7 +257,8 @@ To roll out a bootstrap change:
 1. Export the existing template:
 
    ```bash
-   kubectl -n cpaas-system get kubeadmconfigtemplate <cluster-name>-worker-config -o yaml \
+   ac config use-cluster global
+   ac -n cpaas-system get kubeadmconfigtemplate <cluster-name>-worker-config -o yaml \
      > new-worker-bootstrap.yaml
    ```
 
@@ -249,13 +266,15 @@ To roll out a bootstrap change:
 3. Apply the new template:
 
    ```bash
-   kubectl apply -f new-worker-bootstrap.yaml
+   ac config use-cluster global
+   ac apply -f new-worker-bootstrap.yaml
    ```
 
 4. Patch the `MachineDeployment` to reference the new template:
 
    ```bash
-   kubectl -n cpaas-system patch machinedeployment <cluster-name>-worker \
+   ac config use-cluster global
+   ac -n cpaas-system patch machinedeployment <cluster-name>-worker \
      --type='merge' \
      -p='{"spec":{"template":{"spec":{"bootstrap":{"configRef":{"name":"<new-template-name>"}}}}}}'
    ```

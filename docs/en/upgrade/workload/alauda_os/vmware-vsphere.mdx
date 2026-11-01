@@ -41,6 +41,10 @@ Upgrade VMware vSphere clusters in the following order:
 6. Upgrade the control plane Kubernetes version.
 7. Upgrade worker nodes to the target Kubernetes version.
 
+:::warning
+On a cluster created with `ac`, do not run `ac adm alpha cluster create --reuse-manifests=false` or answer `n` to its prompt from step 1 until step 7 completes. Rendering again takes the Kubernetes version from the platform and starts a rolling replacement with the old image. See [Add or Change Node Groups](../../../workload_clusters/alauda_os/vmware-vsphere/create_cluster.mdx#create-the-worker-objects).
+:::
+
 ## Prerequisites
 
 Before you begin, ensure the following conditions are met:
@@ -67,7 +71,7 @@ The `KubeadmControlPlane` rules apply to `UPDATE` as well as `CREATE`, so an exi
 - a `KubeadmControlPlane` with `3` or more replicas whose `rolloutStrategy.rollingUpdate.maxSurge` is unset — the Cluster API default is `1`;
 - a `KubeadmControlPlane` with `replicas: 2`.
 
-The rejection lands on the version bump itself, so the upgrade stops before anything is replaced. Correct these values in a separate, earlier edit. A `KubeadmControlPlane` at `replicas: 1` is accepted, but on a pool-backed template it cannot be upgraded until it is scaled to `3`: its rollout creates the replacement first, and a full pool has no slot for it. Scaling it is a two-part change: add two more slots to the control-plane `VSphereMachineConfigPool` — hostnames, static addresses, and the required persistent disks — and then raise `replicas` and set `maxSurge` in one patch, because both rules are checked on the same update. See [Check the manifests against the admission rules](#preflight-admission-rules).
+The rejection lands on the version bump itself, so the upgrade stops before anything is replaced. Correct these values in a separate, earlier edit.
 
 A `MachineDeployment` is also rejected unless it sets `strategy.rollingUpdate.maxSurge: 0` and a `maxUnavailable` of at least `1`; `strategy.type: OnDelete` needs neither. Correct it in the same earlier edit.
 :::
@@ -136,37 +140,32 @@ The etcd image tag is control-plane-only because `clusterConfiguration` is a `Ku
 Read the current values before you change anything:
 
 ```bash
-kubectl -n <namespace> get kubeadmcontrolplane <cluster_name>-control-plane \
+ac config use-cluster global
+ac -n <namespace> get kubeadmcontrolplane <cluster_name>-control-plane \
   -o jsonpath='replicas={.spec.replicas} maxSurge={.spec.rolloutStrategy.rollingUpdate.maxSurge}{"\n"}'
 
-kubectl -n <namespace> get machinedeployment -o custom-columns='NAME:.metadata.name,TYPE:.spec.strategy.type,SURGE:.spec.strategy.rollingUpdate.maxSurge,UNAVAIL:.spec.strategy.rollingUpdate.maxUnavailable'
+ac -n <namespace> get machinedeployment -o custom-columns='NAME:.metadata.name,TYPE:.spec.strategy.type,SURGE:.spec.strategy.rollingUpdate.maxSurge,UNAVAIL:.spec.strategy.rollingUpdate.maxUnavailable'
 ```
 
 An empty `maxSurge` value means the field is unset, and unset means the Cluster API default `1`, which is not valid for a pool-backed controller other than a single-replica control plane. A `MachineDeployment` also needs a `maxUnavailable` of at least `1`. Correct the values before the version bump:
 
 ```bash
-# replicas is already 3 or more: correct maxSurge on its own.
-kubectl -n <namespace> patch kubeadmcontrolplane <cluster_name>-control-plane --type='merge' \
+ac config use-cluster global
+ac -n <namespace> patch kubeadmcontrolplane <cluster_name>-control-plane --type='merge' \
   -p='{"spec":{"rolloutStrategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":0}}}}'
 
-# replicas is 1: set replicas and maxSurge in the same patch. Declare the two extra
-# control-plane slots first.
-kubectl -n <namespace> patch kubeadmcontrolplane <cluster_name>-control-plane --type='merge' \
-  -p='{"spec":{"replicas":3,"rolloutStrategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":0}}}}'
-
-kubectl -n <namespace> patch machinedeployment <cluster_name>-worker --type='merge' \
+ac -n <namespace> patch machinedeployment <cluster_name>-worker --type='merge' \
   -p='{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":0,"maxUnavailable":1}}}}'
 ```
-
-On a `replicas: 1` cluster, raise `replicas` and set `maxSurge` in one patch: at `3` replicas the webhook requires `maxSurge: 0`, and Cluster API rejects `maxSurge: 0` below `3`. Never patch `replicas` on a control plane that already has three or more; the value above is a floor, not a target.
 
 A `MachineDeployment` that uses `strategy.type: OnDelete` needs no surge setting, because `OnDelete` already replaces machines delete-first.
 
 Verify that the pools are healthy before you start:
 
 ```bash
-kubectl -n <namespace> get vspheremachineconfigpool
-kubectl -n <namespace> get vspheremachineconfigpool <cluster_name>-control-plane \
+ac config use-cluster global
+ac -n <namespace> get vspheremachineconfigpool
+ac -n <namespace> get vspheremachineconfigpool <cluster_name>-control-plane \
   -o jsonpath='{range .status.conditions[*]}{.type}={.status} ({.reason}){"\n"}{end}'
 ```
 
@@ -183,7 +182,8 @@ Before you start the rolling upgrade, create new `VSphereMachineTemplate` resour
 1. **Export the existing control plane template**
 
    ```bash
-   kubectl get vspheremachinetemplate <cluster_name>-control-plane -n <namespace> -o yaml > new-cp-template.yaml
+   ac config use-cluster global
+   ac get vspheremachinetemplate <cluster_name>-control-plane -n <namespace> -o yaml > new-cp-template.yaml
    ```
 
 2. **Modify the control plane template**
@@ -198,7 +198,8 @@ Before you start the rolling upgrade, create new `VSphereMachineTemplate` resour
 3. **Export and modify the worker template**
 
    ```bash
-   kubectl get vspheremachinetemplate <cluster_name>-worker -n <namespace> -o yaml > new-worker-template.yaml
+   ac config use-cluster global
+   ac get vspheremachinetemplate <cluster_name>-worker -n <namespace> -o yaml > new-worker-template.yaml
    ```
 
    Edit `new-worker-template.yaml`:
@@ -210,8 +211,9 @@ Before you start the rolling upgrade, create new `VSphereMachineTemplate` resour
 4. **Apply both new templates**
 
    ```bash
-   kubectl apply -f new-cp-template.yaml
-   kubectl apply -f new-worker-template.yaml
+   ac config use-cluster global
+   ac apply -f new-cp-template.yaml
+   ac apply -f new-worker-template.yaml
    ```
 
 ### Upgrade the control plane
@@ -228,7 +230,8 @@ Before you start, complete the shared [Upgrade Kube-OVN Before the Control Plane
    - When the target is Kubernetes 1.35 or later, update `/etc/kubernetes/patches/kubeletconfiguration0+strategic.json` in `spec.kubeadmConfigSpec.files` in this same edit, as described in [Required kubelet patch for Kubernetes 1.35](./index.mdx#kubernetes-1-35-kubelet-patch)
 
      ```bash
-     kubectl edit kubeadmcontrolplane <cluster_name>-control-plane -n <namespace>
+     ac config use-cluster global
+     ac edit kubeadmcontrolplane <cluster_name>-control-plane -n <namespace>
      ```
 
    Updating only `spec.version` is not sufficient. The etcd image tag must move together with the Kubernetes version because they are built from the same release; leaving it at the previous value can result in etcd pods that do not match the new Kubernetes minor version. CoreDNS needs no tag: the platform manages it.
@@ -242,8 +245,9 @@ Before you start, complete the shared [Upgrade Kube-OVN Before the Control Plane
 2. **Monitor the control plane rollout**
 
    ```bash
-   kubectl -n <namespace> get kubeadmcontrolplane <cluster_name>-control-plane -w
-   kubectl -n <namespace> get machine -l cluster.x-k8s.io/control-plane
+   ac config use-cluster global
+   ac -n <namespace> get kubeadmcontrolplane <cluster_name>-control-plane -w
+   ac -n <namespace> get machine -l cluster.x-k8s.io/control-plane
    ```
 
 ### Upgrade the worker nodes
@@ -263,7 +267,8 @@ Apply the changes:
 The following command includes the bootstrap reference required for Kubernetes 1.35 or later. For an earlier target with no bootstrap change, omit the `bootstrap` object.
 
 ```bash
-kubectl patch machinedeployment <cluster_name>-worker -n <namespace> \
+ac config use-cluster global
+ac patch machinedeployment <cluster_name>-worker -n <namespace> \
   --type='merge' -p='{
     "spec": {
       "template": {
@@ -286,9 +291,13 @@ kubectl patch machinedeployment <cluster_name>-worker -n <namespace> \
 Monitor the worker rollout:
 
 ```bash
-kubectl -n <namespace> get machinedeployment <cluster_name>-worker -w
-kubectl -n <namespace> get machine
-kubectl --kubeconfig=/tmp/<cluster_name>.kubeconfig get nodes -o wide
+ac config use-cluster global
+ac -n <namespace> get machinedeployment <cluster_name>-worker -w
+ac -n <namespace> get machine
+ac config sync
+ac config use-cluster <cluster_name>
+ac get nodes -o wide
+ac config use-cluster global
 ```
 
 </Steps>
@@ -316,9 +325,10 @@ Some rollout pauses are the provider protecting data. Do not clear them by hand.
 Read the current state:
 
 ```bash
-kubectl -n <namespace> get vspheremachineconfigpool <pool_name> \
+ac config use-cluster global
+ac -n <namespace> get vspheremachineconfigpool <pool_name> \
   -o jsonpath='{range .status.persistentDiskStatuses[*]}{.hostname}{" "}{.name}{" "}{.phase}{" owner="}{.ownerMachineName}{" err="}{.lastError}{"\n"}{end}'
-kubectl -n <namespace> get vspherevm -o custom-columns='NAME:.metadata.name,DELETED:.metadata.deletionTimestamp,FINALIZERS:.metadata.finalizers'
+ac -n <namespace> get vspherevm -o custom-columns='NAME:.metadata.name,DELETED:.metadata.deletionTimestamp,FINALIZERS:.metadata.finalizers'
 ```
 
 The normal handoff is `Attached`, then `Available` once the old VM is gone, then `Attached` again on the replacement. `ownerMachineName` and `ownerMachineUID` are preserved across the delete and recreate so the replacement reattaches the same disks.
@@ -356,8 +366,9 @@ The `KubeadmControlPlane` controller can block replacement while etcd is unhealt
 Read the pool state back after the upgrade:
 
 ```bash
-kubectl -n <namespace> get vspheremachineconfigpool
-kubectl -n <namespace> get vspheremachineconfigpool <pool_name> \
+ac config use-cluster global
+ac -n <namespace> get vspheremachineconfigpool
+ac -n <namespace> get vspheremachineconfigpool <pool_name> \
   -o jsonpath='{range .status.persistentDiskStatuses[*]}{.hostname}{" "}{.name}{" "}{.phase}{"\n"}{end}'
 ```
 
@@ -374,7 +385,7 @@ Confirm the following results:
 
 | Issue | What to check |
 |---|---|
-| The `kubectl edit` or `kubectl patch` on `KubeadmControlPlane` is rejected | Run [the pre-flight check](#preflight-admission-rules). For the full message-to-cause map, see [Admission rejections](../../../workload_clusters/alauda_os/vmware-vsphere/troubleshooting.mdx#admission-rejections). |
+| The `ac edit` or `ac patch` on `KubeadmControlPlane` is rejected | Run [the pre-flight check](#preflight-admission-rules). For the full message-to-cause map, see [Admission rejections](../../../workload_clusters/alauda_os/vmware-vsphere/troubleshooting.mdx#admission-rejections). |
 | The rollout stalls after the first machine is deleted | Usually the attachment-safety hold rather than a defect. See [Rollout Holds That Are Not Failures](#rollout-holds). |
 | The pool reports `Ready=True` but `SlotAvailable=False` | Normal on a fully allocated pool during a `maxSurge: 0` rollout. `SlotAvailable` is excluded from the `Ready` summary. |
 | A replaced node's disks are empty | Confirm which list the disk is declared in. On a cluster created on `v1.0.17` or later, `/var/lib/kubelet`, `/var/lib/containerd`, and `/var/lib/etcd` are ephemeral by design and start empty on every replacement. On an older cluster they are persistent disks, so also check `wipeFilesystem`, which is `true` on the etcd disk by design. |

@@ -204,47 +204,48 @@ Size each pool to at least the `replicas` of its node group: an upgrade replaces
 
 ### 6. Write `install-config.yaml` \{#write-install-config}
 
-Create an installation directory for the cluster and write `install-config.yaml` in it. `ac` writes `manifests/` and `logs/ac.log` next to it. The hosts supply the CPU, memory, network, and disks, so the node groups only name their pools. The fields are described in [Parameters](./reference/install-config-parameters.mdx).
+Create an installation directory for the cluster and write `install-config.yaml` in it. `ac` writes `manifests/` and `logs/ac.log` next to it. The hosts supply the CPU, memory, network, and disks, so the node groups only name their pools.
+
+Copy the following template, fill in the placeholders, and delete the comment blocks you do not use; for the fields, see [Parameters](./reference/install-config-parameters.mdx).
 
 ```yaml title="install-config.yaml"
 cluster:
-  clusterName: <cluster-name> # [!code callout]
-  sshKeys: # [!code callout]
+  # Required: a DNS-1123 subdomain of at most 63 characters, not global and not starting with global-.
+  clusterName: <cluster-name>
+  sshKeys:                                  # Required: the SSH public keys installed on every node.
     - <ssh-public-key>
-  # registrySecretRef: # [!code callout]
-  #   name: <registry-secret-name>
-  #   namespace: cpaas-system
+  # Use the following block only for a registry other than the platform's. It requires platform v4.4.0 or later.
+  # registrySecretRef:
+  #   name: <registry-secret-name>          # Required: at most 63 characters.
+  #   namespace: cpaas-system               # Default: cpaas-system, the only accepted value.
+  # encryptionProviderConfig: <encryption-key>  # Optional: the base64 of a 16, 24, or 32 byte aescbc key. Empty generates a key.
   network:
-    loadBalancer:
-      type: internal # [!code callout]
-      address: <control-plane-vip> # [!code callout]
-      port: 6443
-      vrid: <vrid> # [!code callout]
+    podCIDR: 10.199.0.0/16                  # Default: 10.199.0.0/16.
+    serviceCIDR: 10.96.0.0/12               # Default: 10.96.0.0/12.
+    kubeOVN:
+      joinCIDR: 100.64.0.0/16               # Default: 100.64.0.0/16. The Pod, Service, and join CIDRs must not overlap.
+    loadBalancer:                           # Required: the control plane endpoint.
+      type: internal                        # Default: internal. Set external for an external load balancer.
+      # Required: the VIP, or the load balancer address with type: external. An IPv4 address that is not a node address and is outside the CIDRs above.
+      address: <control-plane-endpoint>
+      port: 6443                            # Default: 6443.
+      # Required with type: internal: 0 to 255, unique in the control plane Layer 2 domain. Delete this line with type: external.
+      vrid: <vrid>
 
+# Required: the control plane node group. Do not add cpuCore, memoryGiB, network, disks, or hosts: the hosts supply them.
 controlPlane:
-  replicas: 3 # [!code callout]
+  # Required: an odd number, 1 or 3 or more. A single replica cannot be upgraded.
+  replicas: 3
   baremetal:
-    machineInventoryPool: <cluster-name>-control-plane-pool
+    machineInventoryPool: <cluster-name>-control-plane-pool  # Required: the MachineInventoryPool this node group draws from.
 
-computes: # [!code callout]
-  - name: worker
-    replicas: 3
+computes:                                   # Optional: the worker node groups. Delete this section to run on the control plane nodes alone.
+  - name: worker                            # Required: a DNS-1123 label, unique per group. control-plane is reserved.
+    replicas: 3                             # Required: the number of nodes in this group.
     baremetal:
+      # Required: the MachineInventoryPool of this node group. Each node group has its own pool.
       machineInventoryPool: <cluster-name>-worker-pool
 ```
-
-<Callouts>
-
-1. `clusterName`: required. It must not be `global` or start with `global-`.
-2. `sshKeys`: required. The SSH public keys for the nodes.
-3. `registrySecretRef`: optional. A registry other than the platform's.
-4. `type`: `internal`, the default, or `external`.
-5. `address`: required. The control plane VIP, or the load balancer address for `external`.
-6. `vrid`: required for `internal`, from 0 to 255. Omit it for `external`.
-7. `replicas`: an odd number, `1` or `3` or more. With fewer than three control plane nodes, contact technical support before you upgrade the cluster.
-8. `computes`: optional.
-
-</Callouts>
 
 You do not set the Kubernetes version: `ac` installs the latest version that the platform supports, which the image catalog must map; see [OS Images and Image Catalog](./prerequisites.mdx#os-images-and-image-catalog).
 
@@ -257,7 +258,7 @@ ac config use-cluster global
 ac adm alpha cluster create --dir <install-dir> --provider baremetal
 ```
 
-`ac` first checks the provider CRDs on the `global` cluster, the pools and their size, and the registry. If a check fails, nothing is changed and the error names the item. `ac` does not check how many hosts of a pool are available; see [Pool Capacity](#worker-pool-capacity).
+`ac` first checks the provider CRDs on the `global` cluster, the pools and their size, and the registry. If a check fails, nothing is changed and the error names the item. Make sure that each pool has enough available hosts; see [Pool Capacity](#worker-pool-capacity).
 
 `create` returns once the objects are applied, and the cluster keeps building. Add `--wait` to wait until all stages are ready; `--timeout` (default `2h`) limits only the wait. To render without applying, run `ac adm alpha cluster manifests` with the same flags.
 
@@ -335,7 +336,7 @@ On the load balancer, check the frontend and every backend against [the External
 
 ## Run `create` Again \{#rerun-create}
 
-If `create` stops, run the same command again; completed work is skipped. Running `create` again on the same directory puts back anything that has drifted, except Secrets, which `ac` creates once and then leaves as they are. When `manifests/` already exists, `create` asks whether to reuse it: press Enter to reuse it, or answer `n` to render again after you change `install-config.yaml`. When standard input is not a terminal, pass `--reuse-manifests=true` or `--reuse-manifests=false`. Reusing `manifests/` ignores `install-config.yaml` and skips every check.
+If `create` stops, run the same command again; completed work is skipped. Running `create` again on the same directory recreates objects that were deleted, except that `ac` creates Secrets once and then leaves them as they are. It does not overwrite a field changed with another tool: when the rendered value differs, `create` reports that the fields are owned by another manager and stops. Do not delete the object that the error names. When `manifests/` already exists, `create` asks whether to reuse it: press Enter to reuse it, or answer `n` to render again after you change `install-config.yaml`. When standard input is not a terminal, pass `--reuse-manifests=true` or `--reuse-manifests=false`. Reusing `manifests/` ignores `install-config.yaml` and skips every check.
 
 Do not edit the files in `manifests/`.
 
@@ -350,6 +351,11 @@ Keep `<install-dir>/manifests/`, or set `cluster.encryptionProviderConfig`: a ge
 3. Run `create --reuse-manifests=false` on the same directory.
 
 Changing `replicas` works the same way; the pool must hold at least the new replica count.
+
+:::warning
+- Do not render again from the time you upgrade the platform on the `global` cluster until the Kubernetes upgrade of this cluster completes. Rendering again takes the Kubernetes version from the platform, so the cluster starts a rolling replacement before Kube-OVN and the image catalog are ready for that version.
+- After you point a `KubeadmControlPlane` or `MachineDeployment` at another template with `ac patch` or `ac edit`, as moving nodes to another pool, changing a bootstrap template, and every upgrade to Kubernetes 1.35 or later do, `create` stops as described in [Run `create` Again](#rerun-create). To add a node group to such a cluster, contact technical support.
+:::
 
 ### Pool Capacity \{#worker-pool-capacity}
 

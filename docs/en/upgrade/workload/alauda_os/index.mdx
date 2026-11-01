@@ -34,7 +34,7 @@ For how the Distribution Version relates to the Kubernetes and OS baseline, see 
 - Verify that all nodes are in the `Ready` state.
 - Take and verify the backups required by the provider-specific procedure.
 - Confirm sufficient IP or machine-slot capacity for rolling replacement.
-- The control plane has `3` or more replicas. A cluster created with a single control plane node cannot be upgraded.
+- The control plane has `3` or more replicas. A single control plane node cannot be upgraded.
 
 ---
 
@@ -67,20 +67,21 @@ After the Distribution Version upgrade completes:
 
 After upgrading the Distribution Version, upgrade Kubernetes and the Alauda OS image through the provider-specific Cluster API procedure.
 
-For Huawei DCS, Huawei Cloud Stack, VMware vSphere, and bare-metal clusters, upgrade the Kube-OVN chart for the current upgrade hop **before** changing `KubeadmControlPlane`. Wait until the workload cluster's `cni-kube-ovn` `AppRelease` reports the target installed revision and `phase=Success`, then upgrade the control plane, followed by worker nodes. Repeat this Kube-OVN-first ordering for every intermediate Kubernetes minor in a cross-version upgrade.
+For Huawei DCS, Huawei Cloud Stack, VMware vSphere, and bare-metal clusters, upgrade the Kube-OVN chart for the current upgrade hop **before** changing `KubeadmControlPlane`. Wait until the workload cluster's `cni-kube-ovn` `AppRelease` reports the target installed revision and `phase=Success`, then upgrade the control plane, followed by worker nodes. Repeat this Kube-OVN-first ordering for every intermediate Kubernetes minor in a cross-version upgrade. When the platform manages Kube-OVN and CoreDNS on [Huawei DCS](#dcs-platform-managed-add-ons), [Huawei Cloud Stack](#hcs-platform-managed-add-ons), or [Bare Metal](#bare-metal-platform-managed-add-ons), do not change the chart, but keep the same wait before you change `KubeadmControlPlane`.
 
 ### Upgrade Kube-OVN Before the Control Plane \{#upgrade-kube-ovn-before-the-control-plane}
 
 Use this section as the authoritative Kube-OVN procedure for workload and `global` clusters. For every Kubernetes and OS hop, read the **kube-ovn (chart)** version from the matching [OS Support Matrix](../../../overview/alauda_os_support_matrix.mdx) row, complete the provider-version-specific procedure below, and verify the resulting `AppRelease` before changing `KubeadmControlPlane`.
 
-Run provider-version checks and `Cluster` or infrastructure-cluster commands against the management cluster. Run `cni-kube-ovn` `AppRelease` commands against the cluster being upgraded. When upgrading the `global` cluster, both resources are on the `global` cluster, so use the `global` kubeconfig for all commands.
+Run provider-version checks and `Cluster` or infrastructure-cluster commands against the management cluster. Run `cni-kube-ovn` `AppRelease` commands against the cluster being upgraded. When upgrading the `global` cluster, both resources are on the `global` cluster, so run all commands there.
 
 #### Identify the Installed Provider Version \{#identify-the-installed-provider-version}
 
 Do not infer the provider version from the ACP Distribution Version. Inspect the provider `AppRelease` on the management cluster. The resource name can vary, so the following command finds the provider by chart name and prints the requested and installed revisions:
 
 ```bash
-kubectl -n cpaas-system get apprelease \
+ac config use-cluster global
+ac -n cpaas-system get apprelease \
   -o custom-columns='APPRELEASE:.metadata.name,CHART:.spec.source.charts[*].name,REQUESTED:.spec.source.charts[*].targetRevision,INSTALLED:.status.charts[*].installedRevision,PHASE:.status.charts[*].phase'
 ```
 
@@ -104,12 +105,28 @@ If the target OS Support Matrix row uses Kube-OVN chart `v4.4` or later, upgrade
 
 #### Apply the Provider-Version-Specific Procedure
 
-##### Huawei DCS
+##### Huawei DCS \{#dcs-platform-managed-add-ons}
+
+From ACP v4.5, the platform manages Kube-OVN and CoreDNS on Huawei DCS clusters and upgrades them. Check whether the platform has taken them over:
+
+```bash
+ac config use-cluster global
+ac -n cpaas-system get dcscluster <cluster-name> \
+  -o jsonpath='{range .status.conditions[?(@.type=="CoreAddonsHandedOff")]}{.status}{" "}{.reason}{" "}{.message}{"\n"}{end}'
+```
+
+| Result | Action |
+|---|---|
+| `True` | Do not set `cpaas.io/kube-ovn-version` or the CoreDNS image tag, and skip the provider steps below. The upgrade of Kube-OVN may still be in progress: continue with the control plane only after [Verify the Kube-OVN AppRelease](#verify-the-kube-ovn-apprelease) passes. |
+| `False CoreAddonsHandoffNotApplicable`, or no output | Continue with the steps below. |
+| `False CoreAddonsHandoffPending` | Read the message and wait for the operation it names to finish, then run the check again. If it does not finish, contact technical support. |
+| `False CoreAddonsHandoffBlocked` | Do not start Phase 2. Read the message and contact technical support. |
 
 Verify that the DCS infrastructure cluster uses Kube-OVN:
 
 ```bash
-kubectl get dcscluster <cluster-name> -n cpaas-system \
+ac config use-cluster global
+ac get dcscluster <cluster-name> -n cpaas-system \
   -o jsonpath='{.spec.networkType}{"\n"}'
 # Expected output: kube-ovn
 ```
@@ -120,7 +137,8 @@ kubectl get dcscluster <cluster-name> -n cpaas-system \
 Update the target chart version on the CAPI `Cluster`. The provider selects the chart name from the target version and reconciles the complete `AppRelease` source and specification.
 
 ```bash
-kubectl annotate cluster <cluster-name> -n cpaas-system \
+ac config use-cluster global
+ac annotate clusters.cluster.x-k8s.io <cluster-name> -n cpaas-system \
   cpaas.io/kube-ovn-version=<kube-ovn-version-from-matrix> --overwrite
 ```
 
@@ -136,11 +154,15 @@ This legacy flow is valid only when the target Kube-OVN chart is earlier than `v
 The legacy provider updates `spec.values` but preserves the existing source. Record the target on the `Cluster`, then patch only the existing legacy chart revision on the cluster being upgraded:
 
 ```bash
-kubectl annotate cluster <cluster-name> -n cpaas-system \
+ac config use-cluster global
+ac annotate clusters.cluster.x-k8s.io <cluster-name> -n cpaas-system \
   cpaas.io/kube-ovn-version=<kube-ovn-version-from-matrix> --overwrite
 
-kubectl patch apprelease cni-kube-ovn -n cpaas-system --type='json' \
+ac config sync
+ac config use-cluster <cluster-name>
+ac patch apprelease cni-kube-ovn -n cpaas-system --type='json' \
   -p='[{"op":"replace","path":"/spec/source/charts/0/targetRevision","value":"<kube-ovn-version-from-matrix>"}]'
+ac config use-cluster global
 ```
 
 Keep the legacy chart name `acp/chart-cpaas-kube-ovn`. Do not use this patch to move an old provider to chart `v4.4` or later.
@@ -148,12 +170,28 @@ Keep the legacy chart name `acp/chart-cpaas-kube-ovn`. Do not use this patch to 
   </Tab>
 </Tabs>
 
-##### Huawei Cloud Stack
+##### Huawei Cloud Stack \{#hcs-platform-managed-add-ons}
+
+From ACP v4.5, the platform manages Kube-OVN and CoreDNS on Huawei Cloud Stack clusters and upgrades them. Check whether the platform has taken them over:
+
+```bash
+ac config use-cluster global
+ac -n cpaas-system get hcscluster <cluster-name> \
+  -o jsonpath='{range .status.conditions[?(@.type=="CoreAddonsHandedOff")]}{.status}{" "}{.reason}{" "}{.message}{"\n"}{end}'
+```
+
+| Result | Action |
+|---|---|
+| `True` | Do not set `cpaas.io/kube-ovn-version` or the CoreDNS image tag, and skip the provider steps below. The upgrade of Kube-OVN may still be in progress: continue with the control plane only after [Verify the Kube-OVN AppRelease](#verify-the-kube-ovn-apprelease) passes. |
+| `False CoreAddonsHandoffNotApplicable`, or no output | Continue with the steps below. |
+| `False CoreAddonsHandoffPending` | Read the message and wait for the operation it names to finish, then run the check again. If it does not finish, contact technical support. |
+| `False CoreAddonsHandoffBlocked` | Do not start Phase 2. Read the message and contact technical support. |
 
 Verify that the HCS infrastructure cluster uses Kube-OVN:
 
 ```bash
-kubectl get hcscluster <cluster-name> -n cpaas-system \
+ac config use-cluster global
+ac get hcscluster <cluster-name> -n cpaas-system \
   -o jsonpath='{.spec.networkType}{"\n"}'
 # Expected output: kube-ovn
 ```
@@ -164,7 +202,8 @@ kubectl get hcscluster <cluster-name> -n cpaas-system \
 Update the target chart version on the CAPI `Cluster`. The provider selects the chart name from the target version and reconciles the complete `AppRelease` source and specification.
 
 ```bash
-kubectl annotate cluster <cluster-name> -n cpaas-system \
+ac config use-cluster global
+ac annotate clusters.cluster.x-k8s.io <cluster-name> -n cpaas-system \
   cpaas.io/kube-ovn-version=<kube-ovn-version-from-matrix> --overwrite
 ```
 
@@ -180,11 +219,15 @@ This legacy flow is valid only when the target Kube-OVN chart is earlier than `v
 The legacy provider updates `spec.values` but preserves the existing source. Record the target on the `Cluster`, then patch only the existing legacy chart revision on the cluster being upgraded:
 
 ```bash
-kubectl annotate cluster <cluster-name> -n cpaas-system \
+ac config use-cluster global
+ac annotate clusters.cluster.x-k8s.io <cluster-name> -n cpaas-system \
   cpaas.io/kube-ovn-version=<kube-ovn-version-from-matrix> --overwrite
 
-kubectl patch apprelease cni-kube-ovn -n cpaas-system --type='json' \
+ac config sync
+ac config use-cluster <cluster-name>
+ac patch apprelease cni-kube-ovn -n cpaas-system --type='json' \
   -p='[{"op":"replace","path":"/spec/source/charts/0/targetRevision","value":"<kube-ovn-version-from-matrix>"}]'
+ac config use-cluster global
 ```
 
 Keep the legacy chart name `acp/chart-cpaas-kube-ovn`. Do not use this patch to move an old provider to chart `v4.4` or later.
@@ -197,7 +240,8 @@ Keep the legacy chart name `acp/chart-cpaas-kube-ovn`. Do not use this patch to 
 Verify that the CAPI `Cluster` enables Kube-OVN reconciliation:
 
 ```bash
-kubectl get cluster <cluster-name> -n cpaas-system \
+ac config use-cluster global
+ac get clusters.cluster.x-k8s.io <cluster-name> -n cpaas-system \
   -o jsonpath='{.metadata.annotations.cpaas\.io/network-type}{"\n"}'
 # Expected output: kube-ovn
 ```
@@ -208,7 +252,8 @@ kubectl get cluster <cluster-name> -n cpaas-system \
 Update the target chart version on the CAPI `Cluster`. The provider selects the chart name from the target version and reconciles the complete `AppRelease` source and specification.
 
 ```bash
-kubectl annotate cluster <cluster-name> -n cpaas-system \
+ac config use-cluster global
+ac annotate clusters.cluster.x-k8s.io <cluster-name> -n cpaas-system \
   cpaas.io/kube-ovn-version=<kube-ovn-version-from-matrix> --overwrite
 ```
 
@@ -224,25 +269,42 @@ This legacy flow is valid only when the target Kube-OVN chart is earlier than `v
 For an earlier target chart, update the annotation only. The legacy provider reconciles the complete specification but keeps the legacy chart name.
 
 ```bash
-kubectl annotate cluster <cluster-name> -n cpaas-system \
+ac config use-cluster global
+ac annotate clusters.cluster.x-k8s.io <cluster-name> -n cpaas-system \
   cpaas.io/kube-ovn-version=<kube-ovn-version-from-matrix> --overwrite
 ```
 
   </Tab>
 </Tabs>
 
-##### Bare Metal
+##### Bare Metal \{#bare-metal-platform-managed-add-ons}
+
+From ACP v4.5, the platform manages Kube-OVN and CoreDNS on Bare Metal clusters and upgrades them. Check whether the platform has taken them over:
+
+```bash
+ac config use-cluster global
+ac -n cpaas-system get baremetalcluster <cluster-name> \
+  -o jsonpath='{range .status.conditions[?(@.type=="CoreAddonsHandedOff")]}{.status}{" "}{.reason}{" "}{.message}{"\n"}{end}'
+```
+
+| Result | Action |
+|---|---|
+| `True CoreAddonsHandedOff` | Do not set `cpaas.io/kube-ovn-version` or the CoreDNS image tag, and skip the provider steps below. The upgrade of Kube-OVN may still be in progress: continue with the control plane only after [Verify the Kube-OVN AppRelease](#verify-the-kube-ovn-apprelease) passes. |
+| `False CoreAddonsHandoffNotApplicable`, or no output | Continue with the steps below. |
+| `False CoreAddonsHandoffPending` | Read the message and wait for the operation it names to finish, then run the check again. If it does not finish, contact technical support. |
+| `False CoreAddonsHandoffBlocked` | Do not start Phase 2. Read the message and contact technical support. |
 
 This procedure applies to Bare Metal provider `v1.0.0` and later. There is no earlier supported release flow to select.
 
 Verify that the infrastructure cluster uses Kube-OVN, then update the target chart version on the CAPI `Cluster`:
 
 ```bash
-kubectl get baremetalcluster <cluster-name> -n cpaas-system \
+ac config use-cluster global
+ac get baremetalcluster <cluster-name> -n cpaas-system \
   -o jsonpath='{.spec.networkType}{"\n"}'
 # Expected output: kube-ovn
 
-kubectl annotate cluster <cluster-name> -n cpaas-system \
+ac annotate clusters.cluster.x-k8s.io <cluster-name> -n cpaas-system \
   cpaas.io/kube-ovn-version=<kube-ovn-version-from-matrix> --overwrite
 ```
 
@@ -253,34 +315,41 @@ The provider selects the chart name from the target version and reconciles the c
 Run these commands against the cluster being upgraded:
 
 ```bash
-kubectl get apprelease cni-kube-ovn -n cpaas-system \
+ac config sync
+ac config use-cluster <cluster-name>
+ac get apprelease cni-kube-ovn -n cpaas-system \
   -o jsonpath='Chart: {.spec.source.charts[0].name}{"\n"}Target: {.spec.source.charts[0].targetRevision}{"\n"}Installed: {.status.charts.*.installedRevision}{"\n"}Phase: {.status.charts.*.phase}{"\n"}'
 
-kubectl get apprelease cni-kube-ovn -n cpaas-system \
+ac get apprelease cni-kube-ovn -n cpaas-system \
   -o jsonpath='{range .status.conditions[*]}{.type}={.status} ({.reason}){"\n"}{end}'
+ac config use-cluster global
 ```
 
 Before changing the control plane, verify all of the following:
 
 - `spec.source.charts[0].name` matches the chart-name boundary above.
-- `targetRevision` and `installedRevision` both match the OS Support Matrix row.
+- `targetRevision` and `installedRevision` both match the OS Support Matrix row. When the platform manages Kube-OVN, they match the row of the cluster's Distribution Version, including on an intermediate Kubernetes hop.
 - `phase` is `Success`.
 - The `Sync` and `Health` conditions are `True`.
 
 The normal phase sequence is `Upgrading → HealthChecking → Success`. Do not continue based on `installedRevision` alone: it can change during `HealthChecking`, before Kube-OVN pods have been verified Ready. If the `AppRelease` reaches `DownloadFailed`, `DeployFailed`, or `NotReady`, stop and inspect its condition messages:
 
 ```bash
-kubectl describe apprelease cni-kube-ovn -n cpaas-system
+ac config sync
+ac config use-cluster <cluster-name>
+ac describe apprelease cni-kube-ovn -n cpaas-system
+ac config use-cluster global
 ```
 
 #### Restore Kube-OVN During Stage-1 Recovery \{#restore-kube-ovn-during-stage-1-recovery}
 
-Use this recovery only when no control-plane `Machine` on the target Kubernetes minor has been created. If a target-minor control-plane machine has joined, keep the target Kube-OVN baseline and use forward recovery or the supported backup or DR restore procedure.
+Skip this section when the platform manages Kube-OVN on [Huawei DCS](#dcs-platform-managed-add-ons), [Huawei Cloud Stack](#hcs-platform-managed-add-ons), or [Bare Metal](#bare-metal-platform-managed-add-ons). Use this recovery only when no control-plane `Machine` on the target Kubernetes minor has been created. If a target-minor control-plane machine has joined, keep the target Kube-OVN baseline and use forward recovery or the supported backup or DR restore procedure.
 
 Restore the previous chart version on the CAPI `Cluster` in the management cluster:
 
 ```bash
-kubectl annotate cluster <cluster-name> -n cpaas-system \
+ac config use-cluster global
+ac annotate clusters.cluster.x-k8s.io <cluster-name> -n cpaas-system \
   cpaas.io/kube-ovn-version=<previous-kube-ovn-version> --overwrite
 ```
 
@@ -288,8 +357,11 @@ kubectl annotate cluster <cluster-name> -n cpaas-system \
 - **DCS `v1.0.21` and earlier or HCS `v1.0.3` and earlier, with a target earlier than chart `v4.4`**: after restoring the annotation, patch the existing `targetRevision` back to the previous chart revision on the cluster being recovered:
 
   ```bash
-  kubectl patch apprelease cni-kube-ovn -n cpaas-system --type='json' \
+  ac config sync
+  ac config use-cluster <cluster-name>
+  ac patch apprelease cni-kube-ovn -n cpaas-system --type='json' \
     -p='[{"op":"replace","path":"/spec/source/charts/0/targetRevision","value":"<previous-kube-ovn-version>"}]'
+  ac config use-cluster global
   ```
 
 - **vSphere `v1.0.15` and earlier, with a target earlier than chart `v4.4`**: restore the previous annotation only; the provider reconciles the complete legacy specification.
@@ -359,7 +431,7 @@ The control plane and worker rollouts then step through the intermediate OS imag
 
 ### Step 3 — Apply the platform-specific procedure for each intermediate Kubernetes/OS row
 
-Repeat the platform-specific Phase 2 procedure for each intermediate Kubernetes/OS row in turn, using that row in [OS Support Matrix](../../../overview/alauda_os_support_matrix.mdx) for Kube-OVN, `KubeadmControlPlane`, and `MachineDeployment` values. For each hop, upgrade Kube-OVN first and wait for `phase=Success`, then upgrade the control plane, followed by workers. On the hop to Kubernetes 1.35, also apply the [required kubelet patch](#kubernetes-1-35-kubelet-patch) to the control-plane and worker bootstrap configurations. Complete the whole hop before starting the next one. After all intermediate hops succeed, apply the same procedure once more for the target row.
+Repeat the platform-specific Phase 2 procedure for each intermediate Kubernetes/OS row in turn, using that row in [OS Support Matrix](../../../overview/alauda_os_support_matrix.mdx) for Kube-OVN, `KubeadmControlPlane`, and `MachineDeployment` values. For each hop, upgrade Kube-OVN first and wait for `phase=Success` (when the platform manages Kube-OVN on [Huawei DCS](#dcs-platform-managed-add-ons), [Huawei Cloud Stack](#hcs-platform-managed-add-ons), or [Bare Metal](#bare-metal-platform-managed-add-ons), do not change the chart, but still wait), then upgrade the control plane, followed by workers. On the hop to Kubernetes 1.35, also apply the [required kubelet patch](#kubernetes-1-35-kubelet-patch) to the control-plane and worker bootstrap configurations. Complete the whole hop before starting the next one. After all intermediate hops succeed, apply the same procedure once more for the target row.
 
 ---
 

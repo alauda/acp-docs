@@ -23,111 +23,158 @@ ACP CLI (ac) renders the Cluster API, vSphere, and CPI objects from one `install
 
 ### 1. Write `install-config.yaml` \{#write-install-config}
 
-Create an installation directory for the cluster and write `install-config.yaml` in it. `ac` writes `manifests/` and `logs/ac.log` next to it. The template holds the required fields. The optional fields, such as the Self-built VIP, a second NIC, and data disks, are in [Parameters](./reference/install-config-parameters.mdx#optional-fields).
+Create an installation directory for the cluster and write `install-config.yaml` in it. `ac` writes `manifests/` and `logs/ac.log` next to it.
+
+Copy the following template, fill in the placeholders, and delete the comment blocks you do not use; for the fields, see [Parameters](./reference/install-config-parameters.mdx).
 
 ```yaml title="install-config.yaml"
-cluster:
-  clusterName: <cluster-name> # [!code callout]
-  sshKeys: # [!code callout]
+cluster:                                    # Do not add registrySecretRef: the cluster inherits the registry of the global cluster.
+  # Required: a DNS-1123 subdomain of at most 63 characters, not global and not starting with global-.
+  clusterName: <cluster-name>
+  sshKeys:                                  # Required: the SSH public keys installed on every node.
     - <ssh-public-key>
+  # encryptionProviderConfig: <encryption-key>  # Optional: the base64 of a 16, 24, or 32 byte aescbc key. Empty generates a key.
   network:
-    loadBalancer:
-      type: external # [!code callout]
-      address: <control-plane-endpoint> # [!code callout]
-      port: 6443
-
-credentialRef: # [!code callout]
-  name: <cluster-name>-credential
-  namespace: cpaas-system
+    podCIDR: 10.199.0.0/16                  # Default: 10.199.0.0/16.
+    serviceCIDR: 10.96.0.0/12               # Default: 10.96.0.0/12.
+    kubeOVN:
+      joinCIDR: 100.64.0.0/16               # Default: 100.64.0.0/16. The Pod, Service, and join CIDRs must not overlap.
+    loadBalancer:                           # Required: the control plane endpoint.
+      type: external                        # Default: external. Set internal for a Self-built VIP.
+      # Required: the load balancer address, or the VIP with type: internal. An IPv4 address that is not a node address and is outside the CIDRs above.
+      address: <control-plane-endpoint>
+      port: 6443                            # Default: 6443.
+      # Use the following two fields only with type: internal:
+      # vrid: <vrid>                        # Required: 1 to 255, unique in the control plane Layer 2 domain.
+      # interface: <nic-name>               # Optional: the NIC that carries the VIP. Empty uses the NIC that carries the node IP.
 
 provider:
   vsphere:
-    server: <vcenter-address> # [!code callout]
-    datacenter: <datacenter> # [!code callout]
-    template: <template-name-or-path> # [!code callout]
-    datastore: <datastore> # [!code callout]
-    computeResource: <cluster-or-host> # [!code callout]
-    releaseDelayHours: 24 # [!code callout]
-    network:
-      name: <portgroup-name> # [!code callout]
+    server: <vcenter-address>               # Required: the vCenter address.
+    # Required: the datacenter name. Use an inventory path, such as /folder/dc, only without computeResource.
+    datacenter: <datacenter>
+    template: <template-name-or-path>       # Required: the VM template every node is cloned from, by name or inventory path.
+    datastore: <datastore>                  # Required: the datastore for the VMs and, by default, their disks.
+    # folder: <folder-path>                 # Optional: the VM folder. Empty uses the datacenter's VM folder.
+    # Required when the datacenter has several: the DRS cluster or standalone host, by name. Otherwise delete this line.
+    computeResource: <cluster-or-host>
+    # rootDisk:                             # Optional: the system disk. Empty keeps the template's size.
+    #   sizeGiB: <root-disk-gib>            # Required: not smaller than the template's. It takes effect only on a full clone.
+    releaseDelayHours: 24                   # Default: 24. How many hours a released pool slot keeps its persistent disks.
+    network:                                # Required: the primary NIC of every node.
+      name: <portgroup-name>                # Required: the port group or distributed port group.
+      # deviceName: <nic-name>              # Optional: the NIC name in the guest. Empty names the NICs eth0, eth1, and so on.
 
-controlPlane:
-  replicas: 3 # [!code callout]
-  network:
-    gateway: <cp-gateway> # [!code callout]
-    dns: [<dns-ip>] # [!code callout]
-    mask: <prefix-length> # [!code callout]
-  disks:
-    ephemeral: # [!code callout]
+controlPlane:                               # Required: the control plane node group.
+  # Required: an odd number, 1 or 3 or more. A single replica cannot be upgraded.
+  replicas: 3
+  # cpuCore: <cpu-core>                     # Optional: empty keeps the template's size.
+  # memoryGiB: <memory-gib>                 # Optional: empty keeps the template's size.
+  # Use the following block only when this node group differs from provider.vsphere:
+  # vsphere:
+  #   datastore: <datastore>                # Optional: overrides provider.vsphere.datastore.
+  #   folder: <folder-path>                 # Optional: overrides provider.vsphere.folder.
+  #   computeResource: <cluster-or-host>    # Optional: overrides provider.vsphere.computeResource.
+  #   rootDisk:                             # Optional: overrides provider.vsphere.rootDisk.
+  #     sizeGiB: <root-disk-gib>
+  network:                                  # Required: the primary NIC network of this node group.
+    gateway: <cp-gateway>                   # Required: the primary NIC gateway.
+    dns: [<dns-ip>]                         # Required: every entry is used.
+    mask: <prefix-length>                   # Required: a prefix length from 1 to 32.
+    additions: []                           # Default: []. The additional NICs, matched in order to hosts[].additionalIps.
+    # To add NICs, replace "additions: []" with the following block:
+    # additions:
+    #   - mask: <prefix-length>             # Optional: 1 to 32. Empty takes network.mask.
+    #     vsphere:                          # Optional: set it when this NIC differs from the primary NIC.
+    #       name: <portgroup-name>          # Optional: empty takes provider.vsphere.network.name.
+    #       deviceName: <nic-name>          # Optional: the NIC name in the guest.
+  disks:                                    # Required: keep the standard disk names and set sizeGiB.
+    ephemeral:                              # Required: disks recreated with the VM.
       - name: var-lib-containerd
         sizeGiB: 100
       - name: var-lib-kubelet
         sizeGiB: 100
-      - name: var-lib-etcd # [!code callout]
+      - name: var-lib-etcd                  # Control plane only.
         sizeGiB: 20
-    persistent: # [!code callout]
+    persistent:                             # Required: disks kept when the VM is replaced.
       - name: var-cpaas
         sizeGiB: 100
-  hosts: # [!code callout]
-    - hostname: <cp-0-hostname>
-      ip: <cp-0-ip>
+    rawDisks: []                            # Default: []. Raw block volumes for TopoLVM.
+    # To add raw disks, replace "rawDisks: []" with the following block:
+    # rawDisks:
+    #   - name: data-001                    # Required: a name of your choice.
+    #     sizeGiB: 50                       # Required: greater than 0.
+    # Use the following block only to place the data disks of this node group:
+    # vsphere:
+    #   datastore: <datastore>              # Optional: empty takes the group's datastore.
+    #   storagePolicy: <storage-policy>     # Optional: the storage policy of the data disks.
+  hosts:                                    # Required: at least replicas entries.
+    - hostname: <cp-0-hostname>             # Required.
+      ip: <cp-0-ip>                         # Required: the primary NIC address, IPv4.
+      additionalIps: []                     # Default: []. One IPv4 address per network.additions entry, in order.
     - hostname: <cp-1-hostname>
       ip: <cp-1-ip>
+      additionalIps: []
     - hostname: <cp-2-hostname>
       ip: <cp-2-ip>
+      additionalIps: []
 
-computes: # [!code callout]
-  - name: worker
-    replicas: 3
-    network:
-      gateway: <worker-gateway>
-      dns: [<dns-ip>]
-      mask: <prefix-length>
-    disks:
-      ephemeral: # [!code callout]
+computes:                                   # Optional: the worker node groups. Delete this section to run on the control plane nodes alone.
+  - name: worker                            # Required: a DNS-1123 label, unique per group. control-plane is reserved.
+    replicas: 3                             # Required: the number of nodes in this group.
+    # cpuCore: <cpu-core>                   # Optional: empty keeps the template's size.
+    # memoryGiB: <memory-gib>               # Optional: empty keeps the template's size.
+    # Use the following block only when this node group differs from provider.vsphere:
+    # vsphere:
+    #   datastore: <datastore>              # Optional: overrides provider.vsphere.datastore.
+    #   folder: <folder-path>               # Optional: overrides provider.vsphere.folder.
+    #   computeResource: <cluster-or-host>  # Optional: overrides provider.vsphere.computeResource.
+    #   rootDisk:                           # Optional: overrides provider.vsphere.rootDisk.
+    #     sizeGiB: <root-disk-gib>
+    network:                                # Required: the primary NIC network of this node group.
+      gateway: <worker-gateway>             # Required: the primary NIC gateway.
+      dns: [<dns-ip>]                       # Required: every entry is used.
+      mask: <prefix-length>                 # Required: a prefix length from 1 to 32.
+      additions: []                         # Default: []. The additional NICs, matched in order to hosts[].additionalIps.
+      # To add NICs, replace "additions: []" with the following block:
+      # additions:
+      #   - mask: <prefix-length>           # Optional: 1 to 32. Empty takes network.mask.
+      #     vsphere:                        # Optional: set it when this NIC differs from the primary NIC.
+      #       name: <portgroup-name>        # Optional: empty takes provider.vsphere.network.name.
+      #       deviceName: <nic-name>        # Optional: the NIC name in the guest.
+    disks:                                  # Required: keep the standard disk names and set sizeGiB.
+      ephemeral:                            # Required: disks recreated with the VM. Workers have no var-lib-etcd.
         - name: var-lib-containerd
           sizeGiB: 100
         - name: var-lib-kubelet
           sizeGiB: 100
-      persistent:
+      persistent:                           # Required: disks kept when the VM is replaced.
         - name: var-cpaas
           sizeGiB: 100
-    hosts:
-      - hostname: <worker-0-hostname>
-        ip: <worker-0-ip>
+      rawDisks: []                          # Default: []. Raw block volumes for TopoLVM.
+      # To add raw disks, replace "rawDisks: []" with the following block:
+      # rawDisks:
+      #   - name: data-001                  # Required: a name of your choice.
+      #     sizeGiB: 50                     # Required: greater than 0.
+      # Use the following block only to place the data disks of this node group:
+      # vsphere:
+      #   datastore: <datastore>            # Optional: empty takes the group's datastore.
+      #   storagePolicy: <storage-policy>   # Optional: the storage policy of the data disks.
+    hosts:                                  # Required: at least replicas entries.
+      - hostname: <worker-0-hostname>       # Required.
+        ip: <worker-0-ip>                   # Required: the primary NIC address, IPv4.
+        additionalIps: []                   # Default: []. One IPv4 address per network.additions entry, in order.
       - hostname: <worker-1-hostname>
         ip: <worker-1-ip>
+        additionalIps: []
       - hostname: <worker-2-hostname>
         ip: <worker-2-ip>
+        additionalIps: []
+
+credentialRef:                              # Required: the vCenter credential Secret.
+  name: <cluster-name>-credential           # Required: the Secret name.
+  namespace: cpaas-system                   # Default: cpaas-system, the only accepted value.
 ```
-
-
-<Callouts>
-
-1. `clusterName`: required. It must not be `global` or start with `global-`.
-2. `sshKeys`: required. The SSH public keys installed on every node.
-3. `type`: `external`, the default, or `internal`. It cannot be changed later. `internal` also needs `vrid`; see [Optional Fields](./reference/install-config-parameters.mdx#optional-fields).
-4. `address`: required. The control plane endpoint, an IPv4 address.
-5. `credentialRef`: required. The credential Secret.
-6. `server`: required. The vCenter address.
-7. `datacenter`: required. The datacenter name. Use an inventory path, such as `/folder/dc`, only when you do not set `computeResource`.
-8. `template`: required. The VM template every node is cloned from.
-9. `datastore`: required.
-10. `computeResource`: the name of the DRS cluster or host, not a path. Set it when the datacenter has more than one.
-11. `releaseDelayHours`: how long a released slot keeps its persistent disks before the provider deletes them.
-12. `network.name`: required. The port group of the primary NIC.
-13. `replicas`: an odd number, `1` or `3` or more. With fewer than three control plane nodes, contact technical support before you upgrade the cluster.
-14. `gateway`: required.
-15. `dns`: required.
-16. `mask`: required. A prefix length from 1 to 32.
-17. `ephemeral`: disks recreated with the VM.
-18. `var-lib-etcd`: control plane only.
-19. `persistent`: disks kept when the VM is replaced.
-20. `hosts`: required. At least `replicas` entries.
-21. `computes`: optional.
-22. Workers have no `var-lib-etcd`.
-
-</Callouts>
 
 ### 2. Create the Cluster \{#create-with-ac}
 
@@ -234,7 +281,7 @@ Continue when it prints `ok`; otherwise see [Troubleshooting](./troubleshooting.
 
 ## Run `create` Again \{#rerun-create}
 
-If `create` stops, run the same command again; completed work is skipped. Running `create` again on the same directory puts back anything that has drifted, except the credential Secret, which `ac` does not render. When `manifests/` already exists, `create` asks whether to reuse it: press Enter to reuse it, or answer `n` to render again after you change `install-config.yaml`. When standard input is not a terminal, pass `--reuse-manifests=true` or `--reuse-manifests=false`. Reusing `manifests/` ignores `install-config.yaml` and skips every check.
+If `create` stops, run the same command again; completed work is skipped. Running `create` again on the same directory recreates objects that were deleted, except the credential Secret, which `ac` does not render. It does not overwrite a field changed with another tool: when the rendered value differs, `create` reports that the fields are owned by another manager and stops. Do not delete the object that the error names. When `manifests/` already exists, `create` asks whether to reuse it: press Enter to reuse it, or answer `n` to render again after you change `install-config.yaml`. When standard input is not a terminal, pass `--reuse-manifests=true` or `--reuse-manifests=false`. Reusing `manifests/` ignores `install-config.yaml` and skips every check.
 
 Do not edit the files in `manifests/`.
 
@@ -247,6 +294,11 @@ Keep `<install-dir>/manifests/`, or set `cluster.encryptionProviderConfig`: a ge
 To add a worker node group, add it to `computes` with its own `hosts`, then run `create --reuse-manifests=false` on the same directory. `ac` renders a new pool, template, bootstrap template, and `MachineDeployment` for it. To scale a group, change `replicas` and keep at least `replicas` entries in `hosts`. Slots that machines already hold are frozen; see [Allocated slot restrictions](./reference/install-config-parameters.mdx#create-the-machine-config-pools).
 
 For worker scale-out and later template or runtime-topology changes, see [Manage Nodes on VMware vSphere](../../../configure/nodes/alauda_os/vmware-vsphere.mdx). Apply one change at a time and validate the result before you combine changes.
+
+:::warning
+- Do not render again from the time you upgrade the platform on the `global` cluster until the Kubernetes upgrade of this cluster completes. Rendering again takes the Kubernetes version from the platform, so the cluster starts a rolling replacement with an image that does not match.
+- After you replace a template with `ac patch` or `ac edit`, as every Kubernetes upgrade does, `create` stops as described in [Run `create` Again](#rerun-create). To add a node group to such a cluster, contact technical support.
+:::
 
 ## Next Steps
 

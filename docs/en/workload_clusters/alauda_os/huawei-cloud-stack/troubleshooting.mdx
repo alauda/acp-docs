@@ -7,9 +7,7 @@ queries:
   - troubleshoot hcs workload cluster
   - hcs cluster creation stuck
   - hcs kubeadm init never completes
-  - hcs cluster stuck in provisioned hostname
-  - hcs hostname posix dots kubeadm
-  - hcs cluster api hostname fqdn issue
+  - hcs node hostname contains a dot
 ---
 
 # Troubleshooting Huawei Cloud Stack Workload Clusters
@@ -20,13 +18,13 @@ Start from the preflight error or the stage that `ac adm alpha cluster status` r
 
 | Symptom | Action |
 |---|---|
-| Preflight cannot reach the IAM endpoint | Check `externalGlobalDomain` and `schema` in the credential Secret, and that the machine that runs `ac` resolves and reaches `iam-apigateway-proxy.<externalGlobalDomain>`. |
+| Preflight cannot reach the IAM endpoint | Check `externalGlobalDomain` and `schema` in the credential Secret, and that the machine that runs `ac` resolves and reaches `iam-apigateway-proxy.<externalGlobalDomain>` on `TCP/443`, or `TCP/80` for `http`. Then run `create` again. |
 | `[1/4] CAPI Cluster` stays `NotFound` | Check the cluster name: `ac get clusters.cluster.x-k8s.io -n cpaas-system`. |
-| `[2/4] KubeadmControlPlane` or `[3/4] MachineDeployment` does not become ready | Run `ac -n cpaas-system describe hcsmachine <name>` and check the access key; the image, flavor, availability zone, VPC, subnet, and security group names; the free addresses; and quota. A hostname error is set on the owning `Machine`. |
-| The control plane does not come up | Run `ac -n cpaas-system get hcscluster <cluster-name> -o yaml` and check that the ELB was created and `controlPlaneEndpoint` is set. |
+| `[2/4] KubeadmControlPlane` or `[3/4] MachineDeployment` does not become ready | Read the provider log: `ac -n cpaas-system logs deployment/cluster-api-provider-hcs-manager --tail=50`. If it names quota or an address that is in use, free it in HCS. Otherwise, contact technical support with the log. A hostname error is set on the owning `Machine`. |
 | `ControlPlaneHAReady` is not `True` | See [Control Plane HA](#control-plane-ha). |
 | `[4/4] ClusterView` does not become ready, or the cluster stays `Provisioned` with nodes `NotReady` | See [Troubleshoot a Workload Cluster Stuck in Provisioned](../troubleshooting/troubleshoot-cluster-not-ready.mdx). |
-| `kubeadm init` never completes and a node hostname contains a dot | See [kubeadm init Never Completes Because the Hostname Is Wrong](#kubeadm-init-hostname). |
+| Nodes stay `NotReady` because Kube-OVN is not installed, and the provider logs no `sentry` error | See [Kube-OVN Is Not Installed](#kube-ovn-not-installed). |
+| `[2/4] KubeadmControlPlane` does not become ready, the instance is `ACTIVE`, and a pool hostname contains a dot | On the node, run `hostname`. If it returns the full dotted name, the provider on the `global` cluster is older than v1.0.1: upgrade it, then see [Configure FQDN Hostname on Existing HCS Clusters](../../../configure/nodes/alauda_os/migrate-hcs-node-fqdn-hostname.mdx). If that page's prerequisites are not met, contact technical support. |
 | The `Cluster` stays in `Deleting` | See [Troubleshoot a Cluster Stuck in Deleting](../troubleshooting/troubleshoot-cluster-stuck-deleting.mdx). |
 
 ## Control Plane HA \{#control-plane-ha}
@@ -36,52 +34,19 @@ The [Control Plane HA check](./create_cluster.mdx#verify-control-plane-ha) print
 | Result | Action |
 |---|---|
 | `True ControlPlaneHAReady` | None. |
-| `False ControlPlaneHAPending` | Read the message and wait for the control plane machine or ECS operation it names to finish. If it does not finish, contact technical support. |
+| `False ControlPlaneHAPending` | Read the message and wait for the control plane machine or ECS operation it names to finish. If you enabled `controlPlaneHA` on an existing cluster or changed its policy, see [Control Plane HA Placement](./reference/install-config-parameters.mdx#control-plane-ha-placement). If it does not finish, contact technical support. |
 | `False ControlPlaneHAFailed` | Read the message, then check HCS capacity and the policy: with `anti-affinity`, ECS creation fails when HCS has too few hosts for the rule. If they are correct, contact technical support. |
 
-## kubeadm init Never Completes Because the Hostname Is Wrong \{#kubeadm-init-hostname}
+## Kube-OVN Is Not Installed \{#kube-ovn-not-installed}
 
-Symptoms — all true at the same time:
-
-- `Cluster.status.phase=Provisioned`, `HCSCluster.status.ready=true`, the ELB is up.
-- `HCSMachine.status.instanceState=ACTIVE` with an `InternalIP` populated, but `Machine.status.nodeRef` never becomes set.
-- `KubeadmControlPlane.status.initialized` stays empty and `status.readyReplicas` stays `0`.
-- The `cluster-api-provider-hcs` controller logs (in `cpaas-system`) repeatedly print `connect: connection refused` against the control plane ELB VIP on port 6443.
-- The `HCSMachineConfigPool.spec.configs[].hostname` value chosen for the node contains a dot (FQDN style, for example `master-1.example.org`).
-
-In `cluster-api-provider-hcs` releases earlier than v1.0.1, a dotted `HCSMachineConfigPool.spec.configs[].hostname` is rendered into cloud-init as the full FQDN string in the `hostname` field, with `prefer_fqdn_over_hostname: true`. The resulting node has a POSIX hostname that contains dots, which kubeadm init does not handle, so kube-apiserver never starts.
-
-### Diagnose
-
-If you can reach the node (HCS console, jump host, or an in-cluster debug pod):
+The platform installs Kube-OVN and CoreDNS after the provider hands the cluster over:
 
 ```bash
-# On the affected node
-hostname
-hostname -f
-cat /etc/hosts
-sudo cat /var/lib/cloud/instance/user-data.txt | head -40
-sudo journalctl -u cloud-init -b 0 | grep -E "hostname|fqdn|update_etc_hosts"
+ac -n cpaas-system get hcscluster <cluster-name> \
+  -o jsonpath='{range .status.conditions[?(@.type=="CoreAddonsHandedOff")]}{.status}{" "}{.reason}{" "}{.message}{"\n"}{end}'
 ```
 
-Indicators that you are hitting this pattern:
-
-- `hostname` returns the full dotted string instead of just the short label.
-- `hostname -f` returns `Name or service not known` or `Temporary failure in name resolution`.
-- `/etc/hosts` does **not** contain a line of the form `<node-ip> <fqdn> <short>`.
-- The cloud-init user-data on the node shows `prefer_fqdn_over_hostname: true` and does not set `manage_etc_hosts`.
-
-### Mitigate
-
-Upgrade the `cluster-api-provider-hcs` plugin on the `global` cluster to the version delivered with this release, then trigger a rolling replacement of the affected control plane and worker machines so the new cloud-init runs on freshly booted VMs. The step-by-step procedure is documented in [Configure FQDN Hostname on Existing HCS Clusters](../../../configure/nodes/alauda_os/migrate-hcs-node-fqdn-hostname.mdx).
-
-Manual edits to `/etc/hostname` and `/etc/hosts` on an existing Alauda OS node do not persist: cloud-init re-renders these files on every boot, including reboots triggered by `transactional-update`, OS patching, or `systemctl reboot`. Rolling replacement is the supported migration path.
-
-### Prevent
-
-Creating the cluster with the `cluster-api-provider-hcs` plugin delivered with this release avoids the pattern entirely. New manifests for HCS should follow [Hostname behavior on the node](./reference/install-config-parameters.mdx#hostname-behavior-on-the-node) when picking dotted versus short hostnames in `HCSMachineConfigPool`.
-
-## Related
-
-- [Troubleshoot a Workload Cluster Stuck in Provisioned](../troubleshooting/troubleshoot-cluster-not-ready.mdx) — the provider-agnostic import-controller diagnostic flow, which applies before any HCS-specific pattern on this page.
-- [Configure FQDN Hostname on Existing HCS Clusters](../../../configure/nodes/alauda_os/migrate-hcs-node-fqdn-hostname.mdx) — the rolling-replacement migration for clusters created before `cluster-api-provider-hcs` v1.0.1.
+| Result | Action |
+|---|---|
+| `False CoreAddonsHandoffPending` or `False CoreDNSSkipPhasePending` | Read the message and wait for the operation it names to finish. If it does not finish, contact technical support. |
+| `False CoreAddonsHandoffBlocked`, or `True` with Kube-OVN still not installed | Contact technical support with the message. |
