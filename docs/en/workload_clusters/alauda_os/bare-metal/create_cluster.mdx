@@ -68,16 +68,7 @@ The last command removes the local copies after both pushes succeed. For the reg
 
 After the import, `<base-image>` is `<registry-address>/tkestack/baremetal-base-image:<os-image-tag>` and `<base-image-iso>` is `<registry-address>/tkestack/baremetal-base-image-iso:<os-image-tag>`. Take both images from the same archive. Do not point cluster resources at a build registry, pair images from different archives, or substitute an independently built image.
 
-**Populate the image catalog.** The `elemental-image-catalog` ConfigMap in `cpaas-system` maps `Machine.spec.version` to the `elemental upgrade` image used to (re)provision a node. The provider chart creates it with no entries, so no node can be provisioned until you add the target version. Patch the ConfigMap rather than replacing it, so that existing entries are kept, then check the result:
-
-```bash
-kubectl -n cpaas-system patch configmap elemental-image-catalog --type merge \
-  -p '{"data":{"<kubernetes-version>":"<base-image>"}}'
-
-kubectl -n cpaas-system get configmap elemental-image-catalog -o yaml
-```
-
-Every value used as `Machine.spec.version` (for both the control plane and worker `MachineDeployment` resources) must appear as a key in this ConfigMap, with the leading `v` preserved, and resolve to the imported `base-image`. The provider resolves the image at reprovision time by substituting the platform registry address for the registry portion of the entry. If a target version is missing, no `reprovision` plan is written and `BaremetalMachine` ends up in `Failed / Reason=ImageCatalogMiss`. Adding the entry afterwards does not clear that state; delete the affected `Machine` so that its owner recreates it.
+**Populate the image catalog.** Make sure that the image catalog has the key for the cluster's Kubernetes version, architecture and OS; see [Add Kubernetes Versions to the Image Catalog](./install_provider.mdx#add-versions-to-image-catalog).
 
 ### 3. Network Connectivity \{#network-connectivity}
 
@@ -234,10 +225,10 @@ The example manifests below use `<placeholder>` syntax for environment-specific 
 | `<control-plane-vip>` / `<control-plane-port>` | Operator-supplied stable endpoint. For `Internal`, use an unused IPv4 VIP in the control-plane Layer-2 domain. For `External`, use the load balancer frontend address. | n/a |
 | `<vrid>` | Operator-supplied VRID for `Internal` only. It must be unique in the control-plane Layer-2 domain. Remove the field for `External`. | n/a |
 | `<install-device>` | Whole-disk target for `elemental install`. A direct kernel path is suitable only when its identity is stable and unambiguous. For multi-disk bare-metal hosts that reuse one ISO, use `/dev/elemental-install-target`. | Confirm the disk by WWN from the host console. See [Select a Fixed System Disk on Multi-Disk Bare-Metal Hosts](./configure-fixed-install-disk.mdx). |
-| `<dns-image-tag>` / `<etcd-image-tag>` | Component versions baked into the bare-metal base image for `<kubernetes-version>`. | See the `coredns` and `etcd` columns in the [OS Support Matrix](../../../overview/alauda_os_support_matrix.mdx). |
-| `<kube-ovn-version>` | Kube-OVN chart version matching the selected ACP and Kubernetes release. | Use the **kube-ovn (chart)** value from the [OS Support Matrix](../../../overview/alauda_os_support_matrix.mdx), not the Kube-OVN component version, and confirm it against the installed plugin: `kubectl get moduleplugins.cluster.alauda.io kube-ovn -o jsonpath='{.spec.mainChart}{" "}{.status.latestVersion}'`. |
+| `<etcd-image-tag>` | etcd version baked into the bare-metal base image for `<kubernetes-version>`. | See the `etcd` column in the [OS Support Matrix](../../../overview/alauda_os_support_matrix.mdx). |
 | `<dns-server>` | Operator-supplied when the first-boot registration path needs an explicit resolver. | Prefer `MachineRegistration.config.cloud-config` or later `KubeadmControlPlane` bootstrap data (`format: cloud-config`). Do not write `/etc/resolv.conf` from `SeedImage.cloud-config`. |
 | `<ssh-authorized-keys>` | Operator-supplied OpenSSH public key — required for any interactive debugging on the node. | n/a |
+| `<os-id>` | OS identifier of the image that the registration installs: `alaudaos.m.55` for Alauda OS M55, `alaudaos.k.25` for Alauda OS KU. | See [OS Image Keys per Architecture and OS](./install_provider.mdx#catalog-key-format). |
 | `<inventory-name>` | Allocated by `elemental-operator` after the host boots the ISO and registers. Cannot be predicted before registration. | `kubectl -n cpaas-system get machineinventories.elemental.cattle.io` |
 | `<pool-name>` | Name of the `MachineInventoryPool` that claims an inventory. | Use `<cluster-name>-control-plane-pool` or `<cluster-name>-worker-pool` in the examples below. |
 | `<control-plane-inventory-1/2/3>` / `<worker-inventory-1/2/3>` | Exact `MachineInventory` names selected for each role. | Use the names from `kubectl -n cpaas-system get machineinventories.elemental.cattle.io`. |
@@ -254,6 +245,8 @@ The example manifests below use `<placeholder>` syntax for environment-specific 
 Create a `MachineRegistration` that describes the registration URL and first-install cloud-config, and a `SeedImage` that points `elemental-operator` at the matching ISO base image.
 
 Set `SeedImage.spec.baseImage` to the final target-platform registry reference of the imported `base-image-iso`. It must be paired with the imported `base-image` used by the image catalog for later reprovisioning: take both images from the same OS archive, never from different archives.
+
+Keep the `os.baremetal.alauda.io/arch` and `os.baremetal.alauda.io/id` labels in `machineInventoryLabels`. The provider uses them to find the image catalog key of each host; see [OS Image Keys per Architecture and OS](./install_provider.mdx#catalog-key-format).
 
 ```yaml title="01-machineregistration-seedimage.yaml"
 apiVersion: elemental.cattle.io/v1beta1
@@ -272,6 +265,10 @@ spec:
     app.kubernetes.io/part-of: cluster-api-provider-baremetal
     pool.baremetal.alauda.io/eligible: "true"
     elemental.cattle.io/serial-number: "${System Information/Serial Number}"
+    # Architecture of the host, reported by elemental-register. Keep the value as is.
+    os.baremetal.alauda.io/arch: "${Runtime/Architecture}"
+    # OS identifier of the image this registration installs.
+    os.baremetal.alauda.io/id: <os-id>
   machineInventoryAnnotations:
     elemental.cattle.io/machine-uuid: "${System Information/UUID}"
   config:
@@ -471,7 +468,7 @@ Select the mode with `<control-plane-load-balancer-type>` in the manifest below.
 :::warning
 **Use the Kubernetes images built into the OS image**
 
-The supported bare-metal OS image preloads the kubeadm control-plane, CoreDNS, and etcd images under `cloud.alauda.io/alauda`. Keep that repository in the KCP configuration and use the component tags from the OS Support Matrix. Do not replace it with `<registry-address>/tkestack`: that produces image references that do not match the images preloaded in the OS. The OS configures its built-in pause image through containerd; do not add `pod-infra-container-image` to the KCP kubelet arguments.
+The supported bare-metal OS image preloads the kubeadm control-plane and etcd images under `cloud.alauda.io/alauda`. Keep that repository in the KCP configuration and use the etcd tag from the OS Support Matrix. Do not replace it with `<registry-address>/tkestack`: that produces image references that do not match the images preloaded in the OS. The OS configures its built-in pause image through containerd; do not add `pod-infra-container-image` to the KCP kubelet arguments.
 :::
 
 :::tip
@@ -534,8 +531,6 @@ spec:
           - "<ssh-authorized-keys>"
     clusterConfiguration:
       imageRepository: cloud.alauda.io/alauda
-      dns:
-        imageTag: <dns-image-tag>
       etcd:
         local:
           imageTag: <etcd-image-tag>
@@ -569,7 +564,6 @@ metadata:
     capi.cpaas.io/resource-group-version: infrastructure.cluster.x-k8s.io/v1beta1
     capi.cpaas.io/resource-kind: BaremetalCluster
     cpaas.io/kube-ovn-join-cidr: <kube-ovn-join-cidr>
-    cpaas.io/kube-ovn-version: <kube-ovn-version>
     cpaas.io/sentry-deploy-type: Baremetal
     cpaas.io/alb-address-type: ClusterAddress
   labels:
@@ -599,7 +593,6 @@ spec:
 | `capi.cpaas.io/resource-group-version` | Yes | Literal `infrastructure.cluster.x-k8s.io/v1beta1` | CAPI infrastructure binding. |
 | `capi.cpaas.io/resource-kind` | Yes | Literal `BaremetalCluster` | CAPI infrastructure binding. |
 | `cpaas.io/kube-ovn-join-cidr` | Yes | Operator-chosen `/16` CIDR that does not overlap with pods/services or any other cluster. | Kube-OVN inter-node tunnel. |
-| `cpaas.io/kube-ovn-version` | Recommended | **kube-ovn (chart)** value from the [OS Support Matrix](../../../overview/alauda_os_support_matrix.mdx). | Pins the chart version used when the provider creates `cni-kube-ovn`. If omitted, the provider falls back to the `kube-ovn` `ModulePlugin` version. |
 | `cpaas.io/sentry-deploy-type` | Yes | Literal `Baremetal`. | Marks the cluster for the bare-metal deploy profile. |
 | `cpaas.io/alb-address-type` | Yes | Literal `ClusterAddress`. | ALB address mode used on bare-metal clusters. |
 
@@ -852,7 +845,7 @@ A successfully created cluster shows:
 | `BaremetalMachine` stuck in `Pending`, `InventoryAllocated=False / Reason=PoolMissing` | `BaremetalMachineTemplate.spec.template.spec.machineInventoryPoolRef.name` points at a non-existent pool. | Pool name + namespace. |
 | `BaremetalMachine` stuck in `Pending`, `InventoryAllocated=False / Reason=PoolExhausted` | Pool has no `Available` inventory left. | `MachineInventoryPool.status.available`; allocation annotations on each member. |
 | `BaremetalMachine` stuck after allocation, `BootstrapReady=False / Reason=BootstrapWaiting` | KubeadmConfig has not produced a bootstrap data secret yet. | `Machine.spec.bootstrap.dataSecretName`. |
-| `BaremetalMachine` in `Failed`, `ImageResolved=False / Reason=ImageCatalogMiss` | The target `Machine.spec.version` is not a key in `elemental-image-catalog`. The chart creates the catalog with no entries. | `kubectl -n cpaas-system get cm elemental-image-catalog -o yaml`. Add the key as in [OS Images Imported and Image Catalog Populated](#os-images-and-image-catalog), then delete the affected `Machine`; the `BaremetalMachine` does not leave `Failed` on its own. |
+| `BaremetalMachine` in `Failed`, `ImageResolved=False / Reason=ImageCatalogMiss` | The target `Machine.spec.version` is not a key in `elemental-image-catalog`. The chart creates the catalog with no entries. | `kubectl -n cpaas-system get cm elemental-image-catalog -o yaml`. Add the key as in [Add Kubernetes Versions to the Image Catalog](./install_provider.mdx#add-versions-to-image-catalog), then delete the affected `Machine`; the `BaremetalMachine` does not leave `Failed` on its own. |
 | `ImageResolved=False / Reason=ImageRegistryMissing` | Neither the optional `cpaas.io/registry-address` annotation nor the platform registry-credential Secret resolves a registry address. | Cluster annotations; platform registry-credential Secret. |
 | Inventory is registered but not counted as `Available` | Its managed storage declaration has not reached `StoragePrepared=True`, or the host storage observation is missing or stale. | `MachineInventory.status.storage`, `status.observedStorage`, `elemental-storage-observer.service`, and the `storage-prepare` plan output. |
 | `BaremetalMachine` waits with `StorageReady=False` | A required managed volume did not activate or no fresh post-reboot observation confirms its mount. | `BaremetalMachine.status.conditions[StorageReady]`, `MachineInventory.status.storage`, and host mount units. |
@@ -870,7 +863,7 @@ After creating a cluster:
 
 - [Manage Nodes](../../../configure/nodes/alauda_os/bare-metal.mdx)
 - [Manage Data Disks](../../../configure/nodes/alauda_os/manage-bare-metal-storage.mdx)
-- [Upgrade Cluster](../../../upgrade/workload/alauda_os/bare-metal.mdx)
+- [Upgrade Overview](../../../upgrade/overview.mdx#upgrade-steps-by-node-os)
 
 ---
 
@@ -1006,8 +999,6 @@ spec:
       - chmod 600 /var/lib/kubelet/config.yaml
     clusterConfiguration:
       imageRepository: cloud.alauda.io/alauda
-      dns:
-        imageTag: <dns-image-tag>
       etcd:
         local:
           imageTag: <etcd-image-tag>
