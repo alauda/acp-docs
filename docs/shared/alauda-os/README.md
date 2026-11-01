@@ -3,7 +3,7 @@
 `version-mapping.json` lists the component versions included in the Alauda OS images of each ACP release. The following pages read it, so update this file instead of editing their content:
 
 - The **Version Mapping** table in `docs/en/overview/alauda_os_support_matrix.mdx`, rendered by `docs/shared/components/VersionMappingTable.tsx`.
-- The VM template ConfigMap generator, rendered by `docs/shared/components/DcsVmTemplateConfigMap.tsx`: the **Huawei DCS** tab of **Stage the Alauda OS Images** in `docs/en/upgrade/pre-upgrade.mdx`, and `docs/en/workload_clusters/alauda_os/huawei-dcs/prerequisites.mdx`.
+- The VM template and image ConfigMap generator, rendered by `docs/shared/components/VmTemplateConfigMap.tsx` (`DcsVmTemplateConfigMap.tsx` wraps it for Huawei DCS): the **Huawei DCS** tab of **Stage the Alauda OS Images** in `docs/en/upgrade/pre-upgrade.mdx`, and the prerequisites pages of Huawei DCS, Huawei Cloud Stack, and VMware vSphere in `docs/en/workload_clusters/alauda_os/`.
 - The image catalog generator, rendered by `docs/shared/components/BareMetalImageCatalog.tsx`: the **Bare Metal** tab of **Stage the Alauda OS Images** in `docs/en/upgrade/pre-upgrade.mdx`, and `docs/en/workload_clusters/alauda_os/bare-metal/prerequisites.mdx`.
 - The upgrade path calculator in **Determine the Versions to Prepare** in `docs/en/upgrade/pre-upgrade.mdx`, rendered by `docs/shared/components/AlaudaOsUpgradePath.tsx`.
 
