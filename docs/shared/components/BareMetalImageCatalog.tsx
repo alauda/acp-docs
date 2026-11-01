@@ -66,7 +66,7 @@ type CatalogEntry = [key: string, value: string]
 // page, which exists whether or not the `global` cluster runs Alauda OS.
 const READ_REGISTRY = [
   'REGISTRY=$(ac get productbase.product.alauda.io base \\',
-  "  -o jsonpath='{.spec.registry.address}')",
+  "  -o jsonpath='{.spec.registry.address}') && test -n \"${REGISTRY}\" && \\",
 ]
 
 // `registry` is empty when the command reads the address itself. Only then is
