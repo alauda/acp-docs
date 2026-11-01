@@ -14,7 +14,7 @@ queries:
 
 This document explains how to manage worker nodes on VMware vSphere after the baseline cluster is running. Node lifecycle operations are managed through `VSphereMachineConfigPool`, `VSphereMachineTemplate`, `KubeadmConfigTemplate`, and `MachineDeployment` resources.
 
-To add another worker node group, follow [Add or Change Node Groups](../../../workload_clusters/alauda_os/vmware-vsphere/create_cluster.mdx#create-the-worker-objects) on the cluster creation page.
+To add another worker node group to a workload cluster, see [Add a worker node group](#add-worker-node-group).
 
 :::info
 To upgrade the Kubernetes version of the nodes, see [Upgrade Kubernetes on VMware vSphere](../../../upgrade/workload/alauda_os/vmware-vsphere.mdx).
@@ -44,7 +44,7 @@ Match a rejection message against [Admission rejections](../../../workload_clust
 :::
 
 <Directive type="warning" title="Clusters created with ac">
-  `ac` renders these objects from `install-config.yaml`. Make a change there when the field exists. `ac adm alpha cluster create` does not overwrite a field that you changed with `ac patch` or `ac edit`: when the rendered value differs, such as after you point a `MachineDeployment` at a new template, `create` reports that the fields are owned by another manager and stops. Do not delete the object that the error names. `ac adm alpha cluster destroy` deletes only the objects that `ac` rendered, so delete the templates that you created yourself.
+  `ac adm alpha cluster create` and `ac adm alpha global create` only create a cluster. To change a running cluster, change its objects as described on this page; do not change `install-config.yaml` and run `create` again. `ac adm alpha cluster destroy` deletes only the objects that `ac` rendered, so delete the templates that you created yourself.
 </Directive>
 
 ## Steps
@@ -55,10 +55,6 @@ Match a rejection message against [Admission rejections](../../../workload_clust
 When you add more worker nodes, update the worker machine config pool before you increase the replica count.
 
 Worker scale-out depends on the relationship between `MachineDeployment.spec.replicas` and the available node slots in `VSphereMachineConfigPool.spec.configs[]`. The number of slots can be greater than `replicas`, and idle slots do not affect a running cluster. If `replicas` exceeds the number of available slots, CAPV cannot assign the new workers correctly.
-
-For a cluster created with `ac`, add the new hosts to the group's `hosts` in `install-config.yaml`, raise its `replicas`, and run `ac adm alpha cluster create --dir <install-dir> --provider vsphere --reuse-manifests=false`. See [Add or Change Node Groups](../../../workload_clusters/alauda_os/vmware-vsphere/create_cluster.mdx#create-the-worker-objects).
-
-To edit the objects directly instead:
 
 1. Add one or more new node slots to the worker `VSphereMachineConfigPool`, `<cluster_name>-<group>` for a cluster created with `ac`.
 2. Update `replicas` in the `MachineDeployment` of the same name.
@@ -120,6 +116,245 @@ ac -n cpaas-system scale machinedeployment <cluster_name>-<group> --replicas=<wo
 ```
 
 **Note:** Keep the same existing `VSphereMachineConfigPool.metadata.name` when scale-out or replacement must preserve the logical pool. Slots and VMDKs are not reused across differently named pool objects. `releaseDelayHours` is the reclaim grace period for an unused `Released` slot, not a delay before same-pool reuse.
+
+### Add a worker node group \{#add-worker-node-group}
+
+Add workers that have their own slots, VM specification, or placement. The `global` cluster does not support adding a worker node group.
+
+In the following steps, `<group>` is an existing worker node group and `<new_group>` is the new one, a DNS-1123 label that no other group uses. `control-plane` is reserved.
+
+1. Read the values of an existing group:
+
+   ```bash
+   ac config use-cluster global
+   ac -n cpaas-system get machinedeployment <cluster_name>-<group> \
+     -o jsonpath='{.spec.template.spec.version}{"\n"}{.spec.template.spec.infrastructureRef.name}{"\n"}{.spec.template.spec.bootstrap.configRef.name}{"\n"}'
+   ac -n cpaas-system get vspheremachinetemplate <machine_template_name> -o yaml
+   ac -n cpaas-system get kubeadmconfigtemplate <bootstrap_template_name> -o yaml
+   ```
+
+   The first command prints `<k8s_version>`, `<machine_template_name>`, and `<bootstrap_template_name>`.
+
+2. Write the worker objects:
+
+   ```yaml title="new-worker-group.yaml"
+   apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+   kind: VSphereMachineConfigPool
+   metadata:
+     labels:
+       cluster.x-k8s.io/cluster-name: <cluster_name>
+     name: <cluster_name>-<new_group>
+     namespace: cpaas-system
+   spec:
+     clusterRef:
+       apiVersion: cluster.x-k8s.io/v1beta1
+       kind: Cluster
+       name: <cluster_name>
+     datacenter: <datacenter>
+     releaseDelayHours: 24
+     configs:
+     - hostname: <worker_node_name_1>
+       datacenter: <datacenter>
+       network:
+         primary:
+           deviceName: eth0
+           networkName: <nic1_network_name>
+           ip: <worker_01_nic1_ip>/<nic1_prefix>
+           gateway: <nic1_gateway>
+           dns:
+           - <nic1_dns_1>
+       persistentDisks:
+       - name: var-cpaas
+         datastore: <worker_data_datastore>
+         sizeGiB: <worker_var_cpaas_size_gib>
+         mountPath: /var/cpaas
+         fsFormat: xfs
+       ephemeralDisks:
+       - name: var-lib-containerd
+         datastore: <worker_data_datastore>
+         sizeGiB: <worker_var_lib_containerd_size_gib>
+         mountPath: /var/lib/containerd
+         fsFormat: xfs
+       - name: var-lib-kubelet
+         datastore: <worker_data_datastore>
+         sizeGiB: <worker_var_lib_kubelet_size_gib>
+         mountPath: /var/lib/kubelet
+         fsFormat: xfs
+   ---
+   apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+   kind: VSphereMachineTemplate
+   metadata:
+     labels:
+       cluster.x-k8s.io/cluster-name: <cluster_name>
+     name: <cluster_name>-<new_group>
+     namespace: cpaas-system
+   spec:
+     template:
+       spec:
+         server: <vsphere_server>
+         datacenter: <datacenter>
+         template: <template_name>
+         cloneMode: linkedClone
+         folder: <vm_folder>
+         resourcePool: <resource_pool>
+         datastore: <worker_system_datastore>
+         diskGiB: <worker_system_disk_gib>
+         memoryMiB: <worker_memory_mib>
+         numCPUs: <worker_num_cpus>
+         os: Linux
+         powerOffMode: trySoft
+         network:
+           devices:
+           - networkName: <nic1_network_name>
+         machineConfigPoolRef:
+           apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+           kind: VSphereMachineConfigPool
+           name: <cluster_name>-<new_group>
+           namespace: cpaas-system
+   ---
+   apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+   kind: KubeadmConfigTemplate
+   metadata:
+     labels:
+       cluster.x-k8s.io/cluster-name: <cluster_name>
+     name: <cluster_name>-<new_group>-config
+     namespace: cpaas-system
+   spec:
+     template:
+       spec:
+         files:
+         - content: |
+             {
+               "apiVersion": "kubelet.config.k8s.io/v1beta1",
+               "kind": "KubeletConfiguration",
+               "protectKernelDefaults": true,
+               "staticPodPath": null,
+               "streamingConnectionIdleTimeout": "5m",
+               "tlsCertFile": "/etc/kubernetes/pki/kubelet.crt",
+               "tlsPrivateKeyFile": "/etc/kubernetes/pki/kubelet.key"
+             }
+           owner: root:root
+           path: /etc/kubernetes/patches/kubeletconfiguration0+strategic.json
+           permissions: "0644"
+         - content: |
+             #!/bin/bash
+             set -euo pipefail
+             until mountpoint -q /var/lib/containerd; do
+               echo "waiting for /var/lib/containerd mount"
+               sleep 1
+             done
+             systemctl restart containerd
+             until systemctl is-active --quiet containerd; do
+               echo "waiting for containerd"
+               sleep 1
+             done
+             if [ ! -d "/root/images" ]; then
+               echo "ERROR: /root/images directory not found" >&2
+               exit 1
+             fi
+             image_count=0
+             for image_file in /root/images/*.tar; do
+               if [ -f "$image_file" ]; then
+                 echo "importing image: $image_file"
+                 ctr -n k8s.io images import "$image_file"
+                 image_count=$((image_count + 1))
+               fi
+             done
+             if [ "$image_count" -eq 0 ]; then
+               echo "ERROR: no tar files found in /root/images" >&2
+               exit 1
+             fi
+             echo "imported $image_count images"
+           owner: root:root
+           path: /usr/local/bin/capv-load-local-images.sh
+           permissions: "0755"
+         - content: |
+             nameserver <nic1_dns_1>
+           owner: root:root
+           path: /etc/resolv.conf
+           permissions: "0644"
+         joinConfiguration:
+           nodeRegistration:
+             criSocket: /var/run/containerd/containerd.sock
+             ignorePreflightErrors:
+             - ImagePull
+             kubeletExtraArgs:
+               cloud-provider: external
+               volume-plugin-dir: /opt/libexec/kubernetes/kubelet-plugins/volume/exec/
+             name: '{{ local_hostname }}'
+           patches:
+             directory: /etc/kubernetes/patches
+         postKubeadmCommands:
+         - chmod 600 /var/lib/kubelet/config.yaml
+         preKubeadmCommands:
+         - hostnamectl set-hostname "{{ ds.meta_data.hostname }}"
+         - echo "::1         ipv6-localhost ipv6-loopback localhost6 localhost6.localdomain6" >/etc/hosts
+         - echo "127.0.0.1   {{ ds.meta_data.hostname }} {{ local_hostname }} localhost localhost.localdomain localhost4 localhost4.localdomain4" >>/etc/hosts
+         - while ! ip route | grep -q "default via"; do sleep 1; done; echo "NetworkManager started"
+         - /usr/local/bin/capv-load-local-images.sh
+         users:
+         - name: boot
+           sshAuthorizedKeys:
+           - <ssh_public_key>
+           sudo: ALL=(ALL) NOPASSWD:ALL
+   ---
+   apiVersion: cluster.x-k8s.io/v1beta1
+   kind: MachineDeployment
+   metadata:
+     labels:
+       cluster.x-k8s.io/cluster-name: <cluster_name>
+     name: <cluster_name>-<new_group>
+     namespace: cpaas-system
+   spec:
+     clusterName: <cluster_name>
+     replicas: <worker_replicas>
+     selector:
+       matchLabels:
+         cluster.x-k8s.io/cluster-name: <cluster_name>
+         pool.name: <cluster_name>-<new_group>
+     strategy:
+       type: RollingUpdate
+       rollingUpdate:
+         maxSurge: 0
+         maxUnavailable: 1
+     template:
+       metadata:
+         labels:
+           cluster.x-k8s.io/cluster-name: <cluster_name>
+           pool.name: <cluster_name>-<new_group>
+       spec:
+         clusterName: <cluster_name>
+         version: <k8s_version>
+         nodeDeletionTimeout: 5m
+         nodeDrainTimeout: 1m
+         bootstrap:
+           configRef:
+             apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+             kind: KubeadmConfigTemplate
+             name: <cluster_name>-<new_group>-config
+             namespace: cpaas-system
+         infrastructureRef:
+           apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+           kind: VSphereMachineTemplate
+           name: <cluster_name>-<new_group>
+           namespace: cpaas-system
+   ```
+
+   - Give the pool at least `replicas` slots. Hostnames and primary IP addresses must be unique across every pool of the cluster, and each `MachineDeployment` needs its own pool; see [Provider Requirements](../../../workload_clusters/alauda_os/vmware-vsphere/reference/install-config-parameters.mdx#provider-requirements).
+   - Take `template` from `<machine_template_name>`, so that the VM template matches `<k8s_version>`. Take `server`, `folder`, and `resourcePool` from it as well.
+   - Keep `maxSurge: 0`: a rollout with the Cluster API default stalls on a full pool.
+   - When an existing object has fields that differ from the example, use its values: for example, `fsFormat` and the disks of a slot, a second NIC, or a failure domain. When `<bootstrap_template_name>` differs from `spec.template.spec` above, use its values too. For example, on Kubernetes 1.35 and later the kubelet configuration patch needs `"imagePullCredentialsVerificationPolicy": "NeverVerify"`; earlier versions do not accept this field.
+
+3. Apply the objects and monitor the group:
+
+   ```bash
+   ac config use-cluster global
+   ac apply -f new-worker-group.yaml
+   ac -n cpaas-system get machines.cluster.x-k8s.io \
+     -l cluster.x-k8s.io/deployment-name=<cluster_name>-<new_group> -w
+   ```
+
+   Continue when every `Machine` of the group is `Running`; then confirm that the nodes are `Ready` on the cluster. Match a rejection message against [Admission rejections](../../../workload_clusters/alauda_os/vmware-vsphere/troubleshooting.mdx#admission-rejections).
 
 ### Roll out updated worker node configuration \{#roll-out-updated-worker-node-configuration}
 

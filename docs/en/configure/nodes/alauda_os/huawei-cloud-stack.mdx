@@ -43,7 +43,7 @@ Worker nodes are managed through Cluster API `Machine` resources, providing decl
 You can manage these resources through the web UI or with YAML manifests. The web UI provides a guided experience and requires Fleet Essentials; YAML works without it.
 
 <Directive type="warning" title="Clusters created with ac">
-  `ac` renders these objects from `install-config.yaml`. Make a change there when the field exists. `ac adm alpha cluster create` does not overwrite a field that you changed with another command, such as `ac patch`: when the rendered value differs, such as after you point a `MachineDeployment` at a new template, `create` reports that the fields are owned by another manager and stops. Do not delete the object that the error names. `ac adm alpha cluster destroy` deletes only the objects that `ac` rendered, so delete the templates that you created yourself.
+  `ac adm alpha cluster create` and `ac adm alpha global create` only create a cluster. To change a running cluster, change its objects as described on this page; do not change `install-config.yaml` and run `create` again. `ac adm alpha cluster destroy` deletes only the objects that `ac` rendered, so delete the templates that you created yourself.
 </Directive>
 
 ## Using the Web UI \{#managing-node-pools-using-the-web-ui}
@@ -98,15 +98,11 @@ Deleting a worker node pool permanently removes all of its nodes and the underly
 
 ## Using YAML \{#using-yaml}
 
-Manage worker nodes with Cluster API manifests. To add another worker node pool on a cluster created with `ac`, add an entry to `computes` in `install-config.yaml` and run `create` again, within the limits described in [Add or Change Node Groups](../../../workload_clusters/alauda_os/huawei-cloud-stack/create_cluster.mdx#deploy-worker-nodes).
+Manage worker nodes with Cluster API manifests. To add another worker node pool to a workload cluster, see [Adding a Worker Node Group](#add-worker-node-group).
 
 ### Scaling Worker Nodes
 
 Worker node scaling allows you to adjust cluster capacity based on workload demands.
-
-On a cluster created with `ac` whose templates were never replaced, change `replicas` and `hosts` in `install-config.yaml` as described in [Add or Change Node Groups](../../../workload_clusters/alauda_os/huawei-cloud-stack/create_cluster.mdx#deploy-worker-nodes). On any other cluster, including one that has completed a Kubernetes upgrade, use the procedures below.
-
-If you scale a cluster created with `ac` with these procedures, set `replicas` and `hosts` in `install-config.yaml` to match before you run `create` again.
 
 #### Adding Worker Nodes
 
@@ -197,6 +193,187 @@ Scaling down removes worker nodes and their ECS instances. Template-owned `dataV
    ```
 
    Continue when the machine count matches the new replica count; otherwise see [Troubleshooting](#troubleshooting).
+
+### Adding a Worker Node Group \{#add-worker-node-group}
+
+Add workers that have their own addresses, flavor, or availability zone. The `global` cluster does not support adding a worker node group.
+
+In the following steps, `<group>` is an existing worker node group and `<new-group>` is the new one, a DNS-1123 label that no other group uses. `control-plane` is reserved.
+
+**Procedure**:
+
+1. **Prepare the subnet**
+
+   Every subnet that a worker uses must be listed in `HCSCluster.spec.network.subnets`. To use a subnet that is not listed, create it in the VPC of the cluster first, then add it:
+
+   ```bash
+   ac config use-cluster global
+   ac -n cpaas-system patch hcscluster <cluster-name> --type=json \
+     -p='[{"op":"add","path":"/spec/network/subnets/-","value":{"name":"<subnet-name>"}}]'
+   ac -n cpaas-system get hcscluster <cluster-name> \
+     -o jsonpath='{.status.conditions[?(@.type=="SubnetReady")].status}{"\n"}{.spec.network.subnets[*].id}{"\n"}'
+   ```
+
+   Continue when the status is `True` and the output lists one ID per subnet.
+
+2. **Read the values of an existing group**
+
+   ```bash
+   ac config use-cluster global
+   ac -n cpaas-system get machinedeployment <cluster-name>-<group> \
+     -o jsonpath='{.spec.template.spec.version}{"\n"}{.spec.template.spec.infrastructureRef.name}{"\n"}{.spec.template.spec.bootstrap.configRef.name}{"\n"}'
+   ac -n cpaas-system get hcsmachinetemplate <machine-template-name> -o yaml
+   ac -n cpaas-system get kubeadmconfigtemplate <bootstrap-template-name> -o yaml
+   ```
+
+   The first command prints `<kubernetes-version>`, `<machine-template-name>`, and `<bootstrap-template-name>`.
+
+3. **Write the worker objects**
+
+   ```yaml title="new-worker-group.yaml"
+   apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+   kind: HCSMachineConfigPool
+   metadata:
+     labels:
+       cluster.x-k8s.io/cluster-name: <cluster-name>
+     name: <cluster-name>-<new-group>
+     namespace: cpaas-system
+   spec:
+     configs:
+     - hostname: <worker-hostname-1>
+       networks:
+       - subnetName: <subnet-name>
+         ipAddress: <worker-ip-1>
+       persistentDisks:
+       - slot: 0
+         size: 100
+         type: <disk-type>
+         mountPath: /var/cpaas
+         format: xfs
+   ---
+   apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+   kind: HCSMachineTemplate
+   metadata:
+     labels:
+       cluster.x-k8s.io/cluster-name: <cluster-name>
+     name: <cluster-name>-<new-group>
+     namespace: cpaas-system
+   spec:
+     template:
+       spec:
+         imageName: <vm-image-name>
+         flavorName: <instance-flavor>
+         availabilityZone: <availability-zone>
+         configPoolRef:
+           name: <cluster-name>-<new-group>
+         rootVolume:
+           type: <disk-type>
+           size: 100
+         dataVolumes:
+         - size: 100
+           type: <disk-type>
+           mountPath: /var/lib/containerd
+           format: xfs
+         - size: 100
+           type: <disk-type>
+           mountPath: /var/lib/kubelet
+           format: xfs
+   ---
+   apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+   kind: KubeadmConfigTemplate
+   metadata:
+     labels:
+       cluster.x-k8s.io/cluster-name: <cluster-name>
+     name: <cluster-name>-<new-group>-config
+     namespace: cpaas-system
+   spec:
+     template:
+       spec:
+         files:
+         - content: |
+             {
+               "apiVersion": "kubelet.config.k8s.io/v1beta1",
+               "kind": "KubeletConfiguration",
+               "protectKernelDefaults": true,
+               "staticPodPath": null,
+               "streamingConnectionIdleTimeout": "5m",
+               "tlsCertFile": "/etc/kubernetes/pki/kubelet.crt",
+               "tlsPrivateKeyFile": "/etc/kubernetes/pki/kubelet.key"
+             }
+           owner: root:root
+           path: /etc/kubernetes/patches/kubeletconfiguration0+strategic.json
+           permissions: "0644"
+         joinConfiguration:
+           nodeRegistration:
+             kubeletExtraArgs:
+               protect-kernel-defaults: "true"
+               volume-plugin-dir: /opt/libexec/kubernetes/kubelet-plugins/volume/exec/
+           patches:
+             directory: /etc/kubernetes/patches
+         postKubeadmCommands:
+         - chmod 600 /var/lib/kubelet/config.yaml
+         users:
+         - name: boot
+           sshAuthorizedKeys:
+           - <ssh-public-key>
+   ---
+   apiVersion: cluster.x-k8s.io/v1beta1
+   kind: MachineDeployment
+   metadata:
+     labels:
+       cluster.x-k8s.io/cluster-name: <cluster-name>
+     name: <cluster-name>-<new-group>
+     namespace: cpaas-system
+   spec:
+     clusterName: <cluster-name>
+     replicas: <replicas>
+     selector:
+       matchLabels:
+         cluster.x-k8s.io/cluster-name: <cluster-name>
+         pool.name: <cluster-name>-<new-group>
+     strategy:
+       type: RollingUpdate
+       rollingUpdate:
+         maxSurge: 0
+         maxUnavailable: 1
+     template:
+       metadata:
+         labels:
+           cluster.x-k8s.io/cluster-name: <cluster-name>
+           pool.name: <cluster-name>-<new-group>
+       spec:
+         clusterName: <cluster-name>
+         version: <kubernetes-version>
+         nodeDeletionTimeout: 5m
+         nodeDrainTimeout: 1m
+         bootstrap:
+           configRef:
+             apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+             kind: KubeadmConfigTemplate
+             name: <cluster-name>-<new-group>-config
+             namespace: cpaas-system
+         infrastructureRef:
+           apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+           kind: HCSMachineTemplate
+           name: <cluster-name>-<new-group>
+           namespace: cpaas-system
+   ```
+
+   - Give the pool at least `replicas` entries, one per node, with hostnames and addresses that no other pool uses. Repeat the `persistentDisks` entry for each host, and plan it before the node is created; see [Change Rendered Objects Later](../../../workload_clusters/alauda_os/huawei-cloud-stack/reference/install-config-parameters.mdx#change-rendered-objects).
+   - Take `imageName` from `<machine-template-name>`, so that the image matches `<kubernetes-version>`. `flavorName` and `availabilityZone` are provider-recognized API values, not the tenant UI display names; every worker of the group uses the selected zone.
+   - Do not set `providerID` or `serverId`. Put `/var/cpaas` in `persistentDisks[]`, not in `dataVolumes[]`.
+   - When `<bootstrap-template-name>` has fields that differ from `spec.template.spec` above, use its values. For example, on Kubernetes 1.35 and later the kubelet configuration patch needs `"imagePullCredentialsVerificationPolicy": "NeverVerify"`; earlier versions do not accept this field.
+
+4. **Apply the objects and monitor the group**
+
+   ```bash
+   ac config use-cluster global
+   ac apply -f new-worker-group.yaml
+   ac -n cpaas-system get machines.cluster.x-k8s.io \
+     -l cluster.x-k8s.io/deployment-name=<cluster-name>-<new-group> -w
+   ```
+
+   Continue when every `Machine` of the group is `Running`; then confirm that the nodes are `Ready` on the cluster.
 
 ### Changing Machine Infrastructure \{#changing-machine-infrastructure}
 

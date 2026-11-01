@@ -39,10 +39,10 @@ Worker nodes are managed through Cluster API `Machine` resources, providing decl
 4. **Machine Deployment** - Orchestration of node creation and management
 
 <Directive type="warning" title="Clusters created with ac">
-  `ac` renders these objects from `install-config.yaml`. Make a change there when the field exists. `ac adm alpha cluster create` does not overwrite a field that you changed with `ac patch` or `ac edit`: when the rendered value differs, such as after you point a `MachineDeployment` at a new template, `create` reports that the fields are owned by another manager and stops. Do not delete the object that the error names. `ac adm alpha cluster destroy` deletes only the objects that `ac` rendered, so delete the templates that you created yourself.
+  `ac adm alpha cluster create` and `ac adm alpha global create` only create a cluster. To change a running cluster, change its objects as described on this page; do not change `install-config.yaml` and run `create` again. `ac adm alpha cluster destroy` deletes only the objects that `ac` rendered, so delete the templates that you created yourself.
 </Directive>
 
-To add another worker node group, follow [Add or Change Node Groups](../../../workload_clusters/alauda_os/huawei-dcs/create_cluster.mdx#worker-node-deployment) on the cluster creation page.
+To add another worker node group to a workload cluster, see [Adding a Worker Node Group](#add-worker-node-group) or use the web UI.
 
 ## Node Management Operations
 
@@ -521,6 +521,191 @@ Declared persistent disks in `DCSIpHostnamePool.spec.pool[].persistentDisk` are 
     ```
 
     The removed nodes should no longer appear in the list.
+
+### Adding a Worker Node Group \{#add-worker-node-group}
+
+Add workers that have their own IP pool, VM specification, or placement. The `global` cluster does not support adding a worker node group.
+
+In the following steps, `<group>` is an existing worker node group and `<new-group>` is the new one, a DNS-1123 label that no other group uses. `control-plane` is reserved.
+
+**Procedure**:
+
+1. **Read the values of an existing group**
+
+   ```bash
+   ac config use-cluster global
+   ac -n cpaas-system get machinedeployment <cluster-name>-<group> \
+     -o jsonpath='{.spec.template.spec.version}{"\n"}{.spec.template.spec.infrastructureRef.name}{"\n"}{.spec.template.spec.bootstrap.configRef.name}{"\n"}'
+   ac -n cpaas-system get dcsmachinetemplate <machine-template-name> -o yaml
+   ac -n cpaas-system get kubeadmconfigtemplate <bootstrap-template-name> -o yaml
+   ```
+
+   The first command prints `<kubernetes-version>`, `<machine-template-name>`, and `<bootstrap-template-name>`.
+
+2. **Write the worker objects**
+
+   ```yaml title="new-worker-group.yaml"
+   apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+   kind: DCSIpHostnamePool
+   metadata:
+     labels:
+       cluster.x-k8s.io/cluster-name: <cluster-name>
+     name: <cluster-name>-<new-group>
+     namespace: cpaas-system
+   spec:
+     pool:
+     - hostname: <worker-hostname-1>
+       ip: <worker-ip-1>
+       mask: "<worker-cidr-prefix-length>"
+       gateway: <worker-gateway>
+       dns: <worker-dns>
+       persistentDisk:
+       - path: /var/cpaas
+         quantityGB: 100
+         slot: 0
+         datastoreName: <datastore-name>
+         format: xfs
+         isThin: false
+         pciType: VIRTIO
+   ---
+   apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+   kind: DCSMachineTemplate
+   metadata:
+     labels:
+       cluster.x-k8s.io/cluster-name: <cluster-name>
+     name: <cluster-name>-<new-group>
+     namespace: cpaas-system
+   spec:
+     template:
+       spec:
+         vmTemplateName: <vm-template-name>
+         ipHostPoolRef:
+           name: <cluster-name>-<new-group>
+         location:
+           type: folder
+           name: <folder-name>
+         resource:
+           type: <resource-type>
+           name: <resource-name>
+         vmConfig:
+           dvSwitchName: <dv-switch-name>
+           portGroupName: <port-group-name>
+           cdRomDatastoreName: <cd-rom-datastore-name>
+           dcsMachineCpuSpec:
+             quantity: <worker-cpu>
+           dcsMachineMemorySpec: # MB
+             quantity: <worker-memory>
+           dcsMachineDiskSpec: # GB
+           - quantity: <worker-system-disk-size>
+             datastoreName: <datastore-name>
+             systemVolume: true
+           - quantity: 100
+             datastoreName: <datastore-name>
+             path: /var/lib/containerd
+             format: xfs
+           - quantity: 100
+             datastoreName: <datastore-name>
+             path: /var/lib/kubelet
+             format: xfs
+   ---
+   apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+   kind: KubeadmConfigTemplate
+   metadata:
+     labels:
+       cluster.x-k8s.io/cluster-name: <cluster-name>
+     name: <cluster-name>-<new-group>-config
+     namespace: cpaas-system
+   spec:
+     template:
+       spec:
+         format: ignition
+         files:
+         - content: |
+             {
+               "apiVersion": "kubelet.config.k8s.io/v1beta1",
+               "kind": "KubeletConfiguration",
+               "protectKernelDefaults": true,
+               "staticPodPath": null,
+               "streamingConnectionIdleTimeout": "5m",
+               "tlsCertFile": "/etc/kubernetes/pki/kubelet.crt",
+               "tlsPrivateKeyFile": "/etc/kubernetes/pki/kubelet.key"
+             }
+           owner: root:root
+           path: /etc/kubernetes/patches/kubeletconfiguration0+strategic.json
+           permissions: "0644"
+         joinConfiguration:
+           nodeRegistration:
+             kubeletExtraArgs:
+               node-ip: NODE_IP
+               protect-kernel-defaults: "true"
+               provider-id: PROVIDER_ID
+               volume-plugin-dir: /opt/libexec/kubernetes/kubelet-plugins/volume/exec/
+           patches:
+             directory: /etc/kubernetes/patches
+         postKubeadmCommands:
+         - chmod 600 /var/lib/kubelet/config.yaml
+         preKubeadmCommands:
+         - while ! ip route | grep -q "default via"; do sleep 1; done; echo "NetworkManager started"
+         - mkdir -p /run/cluster-api && restorecon -Rv /run/cluster-api
+         - if [ -f /etc/disk-setup.sh ]; then bash /etc/disk-setup.sh; fi
+         users:
+         - name: boot
+           sshAuthorizedKeys:
+           - <ssh-public-key>
+   ---
+   apiVersion: cluster.x-k8s.io/v1beta1
+   kind: MachineDeployment
+   metadata:
+     labels:
+       cluster.x-k8s.io/cluster-name: <cluster-name>
+     name: <cluster-name>-<new-group>
+     namespace: cpaas-system
+   spec:
+     clusterName: <cluster-name>
+     replicas: <replicas>
+     selector: {}
+     strategy:
+       type: RollingUpdate
+       rollingUpdate:
+         maxSurge: 0
+         maxUnavailable: 1
+     template:
+       metadata:
+         labels:
+           cluster.x-k8s.io/cluster-name: <cluster-name>
+           pool.name: <cluster-name>-<new-group>
+       spec:
+         clusterName: <cluster-name>
+         version: <kubernetes-version>
+         nodeDeletionTimeout: 5m
+         nodeDrainTimeout: 1m
+         bootstrap:
+           configRef:
+             apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+             kind: KubeadmConfigTemplate
+             name: <cluster-name>-<new-group>-config
+             namespace: cpaas-system
+         infrastructureRef:
+           apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+           kind: DCSMachineTemplate
+           name: <cluster-name>-<new-group>
+           namespace: cpaas-system
+   ```
+
+   - Give the pool at least `replicas` entries, one per node, with hostnames and addresses that no other pool uses. Repeat the `persistentDisk` entry for each host.
+   - Take `vmTemplateName` from `<machine-template-name>`, so that the VM template matches `<kubernetes-version>`. Take `resource`, `dvSwitchName`, `portGroupName`, and `cdRomDatastoreName` from it as well, and leave out the ones it does not set. For the disk fields, see [Disks](../../../workload_clusters/alauda_os/huawei-dcs/reference/install-config-parameters.mdx#disks).
+   - When `<bootstrap-template-name>` has fields that differ from `spec.template.spec` above, use its values. For example, on Kubernetes 1.35 and later the kubelet configuration patch needs `"imagePullCredentialsVerificationPolicy": "NeverVerify"`; earlier versions do not accept this field.
+
+3. **Apply the objects and monitor the group**
+
+   ```bash
+   ac config use-cluster global
+   ac apply -f new-worker-group.yaml
+   ac -n cpaas-system get machines.cluster.x-k8s.io \
+     -l cluster.x-k8s.io/deployment-name=<cluster-name>-<new-group> -w
+   ```
+
+   Continue when every `Machine` of the group is `Running`; then confirm that the nodes are `Ready` on the cluster.
 
 ### Changing Machine Infrastructure \{#changing-machine-infrastructure}
 

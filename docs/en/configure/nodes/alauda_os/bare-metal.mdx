@@ -51,10 +51,10 @@ The four resources that compose a worker node group:
 
 Managed data disks are not part of `BaremetalMachineTemplate`. Their declaration and retained data belong to each long-lived `MachineInventory`, so two members of the same worker pool may expose different host-local datasets unless operators standardize and verify their storage declarations. Managed storage is changed separately on an unallocated, inactive `MachineInventory`; see [Manage Data Disks on Bare-Metal Hosts](./manage-bare-metal-storage.mdx).
 
-To add another worker node group, follow [Add or Change Node Groups](../../../workload_clusters/alauda_os/bare-metal/create_cluster.mdx#worker-node-deployment) on the cluster creation page.
+To add another worker node group to a workload cluster, see [Adding a Worker Node Group](#add-worker-node-group).
 
 <Directive type="warning" title="Clusters created with ac">
-  `ac` renders these objects from `install-config.yaml`. Make a change there when the field exists. `ac adm alpha cluster create` does not overwrite a field that you changed with `ac patch` or `ac edit`: when the rendered value differs, such as after you point a `MachineDeployment` at a new template, `create` reports that the fields are owned by another manager and stops. Do not delete the object that the error names. `ac adm alpha cluster destroy` deletes only the objects that `ac` rendered, so delete the templates that you created yourself.
+  `ac adm alpha cluster create` and `ac adm alpha global create` only create a cluster. To change a running cluster, change its objects as described on this page; do not change `install-config.yaml` and run `create` again. `ac adm alpha cluster destroy` deletes only the objects that `ac` rendered, so delete the templates that you created yourself.
 </Directive>
 
 ---
@@ -179,6 +179,142 @@ CAPI selects machines for deletion in its standard order. Each selected `Baremet
    ```
 
    The released inventory must show `baremetal.alauda.io/allocation-state=Available`, the `baremetal.alauda.io/owner-*` annotations must be cleared, and the pool annotation must remain. `MachineInventory` itself is **not** deleted. If it declares managed volumes, it must return to `status.storage.phase=Prepared` with `StorageActive=False/Inactive`; its business mount paths must be inactive while filesystem UUIDs and data remain unchanged.
+
+### Adding a Worker Node Group \{#add-worker-node-group}
+
+**Use Case**: Add workers that draw from their own pool. The `global` cluster does not support adding a worker node group.
+
+In the following steps, `<group>` is an existing worker node group and `<new-group>` is the new one, a DNS-1123 label that no other group uses. `control-plane` is reserved.
+
+**Procedure**:
+
+1. **Register the hosts and create the pool**
+
+   Follow steps 1 to 5 of [Create a Cluster](../../../workload_clusters/alauda_os/bare-metal/create_cluster.mdx#step-1-machineregistration-seedimage), and name the pool `<cluster-name>-<new-group>-pool`. Each node group has its own pool, and the pool must hold at least `replicas` hosts. Confirm the [network paths](../../../workload_clusters/alauda_os/bare-metal/prerequisites.mdx#network-connectivity) and the [clock](../../../workload_clusters/alauda_os/bare-metal/prerequisites.mdx#host-time-synchronization) of each new host.
+
+2. **Read the values of an existing group**
+
+   ```bash
+   ac config use-cluster global
+   ac -n cpaas-system get machinedeployment <cluster-name>-<group> \
+     -o jsonpath='{.spec.template.spec.version}{"\n"}{.spec.template.spec.bootstrap.configRef.name}{"\n"}'
+   ac -n cpaas-system get kubeadmconfigtemplate <bootstrap-template-name> -o yaml
+   ```
+
+   The first command prints `<kubernetes-version>` and `<bootstrap-template-name>`.
+
+3. **Write the worker objects**
+
+   ```yaml title="new-worker-group.yaml"
+   apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+   kind: BaremetalMachineTemplate
+   metadata:
+     labels:
+       cluster.x-k8s.io/cluster-name: <cluster-name>
+     name: <cluster-name>-<new-group>
+     namespace: cpaas-system
+   spec:
+     template:
+       spec:
+         machineInventoryPoolRef:
+           name: <cluster-name>-<new-group>-pool
+   ---
+   apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+   kind: KubeadmConfigTemplate
+   metadata:
+     labels:
+       cluster.x-k8s.io/cluster-name: <cluster-name>
+     name: <cluster-name>-<new-group>-config
+     namespace: cpaas-system
+   spec:
+     template:
+       spec:
+         files:
+         - content: |
+             {
+               "apiVersion": "kubelet.config.k8s.io/v1beta1",
+               "kind": "KubeletConfiguration",
+               "protectKernelDefaults": true,
+               "staticPodPath": null,
+               "streamingConnectionIdleTimeout": "5m",
+               "tlsCertFile": "/etc/kubernetes/pki/kubelet.crt",
+               "tlsPrivateKeyFile": "/etc/kubernetes/pki/kubelet.key"
+             }
+           owner: root:root
+           path: /etc/kubernetes/patches/kubeletconfiguration0+strategic.json
+           permissions: "0644"
+         joinConfiguration:
+           nodeRegistration:
+             kubeletExtraArgs:
+               volume-plugin-dir: /opt/libexec/kubernetes/kubelet-plugins/volume/exec/
+           patches:
+             directory: /etc/kubernetes/patches
+         postKubeadmCommands:
+         - chmod 600 /var/lib/kubelet/config.yaml
+         users:
+         - name: boot
+           shell: /bin/bash
+           sshAuthorizedKeys:
+           - <ssh-public-key>
+           sudo: ALL=(ALL) NOPASSWD:ALL
+   ---
+   apiVersion: cluster.x-k8s.io/v1beta1
+   kind: MachineDeployment
+   metadata:
+     labels:
+       cluster.x-k8s.io/cluster-name: <cluster-name>
+     name: <cluster-name>-<new-group>
+     namespace: cpaas-system
+   spec:
+     clusterName: <cluster-name>
+     replicas: <replicas>
+     selector:
+       matchLabels:
+         cluster.x-k8s.io/cluster-name: <cluster-name>
+         pool.name: <cluster-name>-<new-group>
+     strategy:
+       type: RollingUpdate
+       rollingUpdate:
+         maxSurge: 0
+         maxUnavailable: 1
+     template:
+       metadata:
+         labels:
+           cluster.x-k8s.io/cluster-name: <cluster-name>
+           pool.name: <cluster-name>-<new-group>
+       spec:
+         clusterName: <cluster-name>
+         version: <kubernetes-version>
+         nodeDrainTimeout: 5m
+         bootstrap:
+           configRef:
+             apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+             kind: KubeadmConfigTemplate
+             name: <cluster-name>-<new-group>-config
+             namespace: cpaas-system
+         infrastructureRef:
+           apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+           kind: BaremetalMachineTemplate
+           name: <cluster-name>-<new-group>
+           namespace: cpaas-system
+   ```
+
+   - `version` must be the version of the existing group, and a key in the `elemental-image-catalog` ConfigMap.
+   - Keep `maxSurge: 0`: a pool cannot over-provision physical hosts.
+   - When `<bootstrap-template-name>` has fields that differ from `spec.template.spec` above, use its values. For example, on Kubernetes 1.35 and later the kubelet configuration patch needs `"imagePullCredentialsVerificationPolicy": "NeverVerify"`; earlier versions do not accept this field.
+   - Leave out the provider-normalized fields: the hostname, `kubeletExtraArgs.provider-id`, and `nodeRegistration.criSocket`.
+
+4. **Apply the objects and monitor the group**
+
+   ```bash
+   ac config use-cluster global
+   ac apply -f new-worker-group.yaml
+   ac -n cpaas-system get machines.cluster.x-k8s.io \
+     -l cluster.x-k8s.io/deployment-name=<cluster-name>-<new-group>
+   ac -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io -w
+   ```
+
+   Continue when every `Machine` of the group is `Running`; then confirm that the nodes are `Ready` on the cluster. Otherwise see [Provider Conditions](../../../workload_clusters/alauda_os/bare-metal/troubleshooting.mdx#provider-conditions).
 
 ### Replacing a Single Failed Node \{#replacing-a-node}
 
