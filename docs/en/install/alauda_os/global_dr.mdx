@@ -1,0 +1,161 @@
+---
+weight: 8
+title: Global Cluster Disaster Recovery
+queries:
+  - plan global cluster disaster recovery on alauda os
+  - primary and standby global cluster install-config.yaml differences
+  - generate dr encryption key and serviceAccountSigningKey before install
+  - bare metal global dr endpoint and identity
+---
+
+# Global Cluster Disaster Recovery
+
+This page is the plan for a disaster recovery (DR) pair of `global` clusters. Read it before you write the first `install-config.yaml` of either side.
+
+| You are | Page |
+|---|---|
+| Planning, or installing the two sides | This page |
+| You already installed a single `global` cluster | [Decide Before You Install](#decide-before-you-install) |
+| Both sides are installed | [Start Global Cluster Disaster Recovery Synchronization](./disaster_recovery_sync.mdx) |
+| The primary has failed, or you switch over on purpose | [Fail Over to the Standby global Cluster](./disaster_recovery_failover.mdx) |
+
+## What a DR Pair Is \{#what-a-dr-pair-is}
+
+A DR pair is two `global` clusters: a primary and a standby. The primary is the `global` cluster that serves the platform access address, a domain name: in normal operation the domain points to it, except while you install the standby and during a failover. The other is the standby. After a failover, the former standby is the new primary.
+
+Each side is an ordinary installation with ACP CLI (`ac`), run from its own bootstrap node with its own `install-config.yaml`. After both sides are installed, **<Term name="product" /> Global Cluster Disaster Recovery** (`etcd-sync`) on the standby copies the primary's etcd data to it. `ac` prepares every `global` cluster for DR, so a DR pair needs no manifest edits. Each side's infrastructure credentials are not synchronized, so the two sides can use different accounts.
+
+This page applies to every provider. Steps that only Bare Metal needs are marked **Bare Metal only**.
+
+## Decide Before You Install \{#decide-before-you-install}
+
+Decide before you write the first `install-config.yaml` of either side. The standby can decrypt the primary's Secrets only with the primary's encryption key, and an installed cluster keeps the key it was installed with. If a `global` cluster is already installed as a single cluster, contact technical support before you install a standby. Do not install a standby with a key of its own: it cannot decrypt the primary's Secrets.
+
+## Prepare for DR \{#prepare-for-dr}
+
+Each side has its own:
+
+- Bootstrap node.
+- Infrastructure.
+- External registry.
+- Control plane VIP.
+
+Each side meets the [common prerequisites](./prerequisites.mdx) and the prerequisites of its provider.
+
+Also prepare:
+
+- **The platform domain name.** It is the platform access address. During normal operation it resolves only to the primary VIP, and the standby reaches the primary's platform through it. You point it at a VIP three times during the installation, see [Install the Primary and the Standby](#install-primary-and-standby-clusters), and once more at a failover. Book those changes in advance.
+- **A third-party certificate and its private key** for the domain, as the same files on both bootstrap nodes.
+- **The shared keys**, generated once; see [Generate the Shared Keys](#generate-the-shared-keys).
+- **A copy of each side's installation directory**, in particular `output/kubeconfig`, kept where you can reach it when a site is down.
+- **The `etcd-sync` package** from the Customer Portal, and **Violet v4.2.13 or later** on a machine that reaches the standby VIP and the standby registry. You upload the package after both sides are installed; see [Install etcd-sync](./disaster_recovery_sync.mdx#install-etcd-sync).
+
+### Generate the Shared Keys \{#generate-the-shared-keys}
+
+Generate each key once and write the same value in both `install-config.yaml` files. A key file holds a secret: run `chmod 600` on it and keep it private.
+
+Run the commands on a Linux machine with OpenSSL. Encryption key for Secrets at rest:
+
+```bash
+openssl rand -base64 32 > dr-encryption.key
+chmod 600 dr-encryption.key
+```
+
+`ac` uses the value as it is and checks it before it changes anything: it must be the base64 of a 16, 24, or 32 byte key, as the command above produces.
+
+**Bare Metal only:** the key that signs ServiceAccount tokens:
+
+```bash
+openssl genrsa -out sa.key 2048
+base64 -w0 sa.key > sa.key.b64
+chmod 600 sa.key sa.key.b64
+```
+
+The signing key cannot be changed after installation: if the cluster already holds a different `global-sa`, `ac` stops rather than overwrite it.
+
+## Network \{#network-requirements}
+
+Before you install either cluster, ask your network administrator for the flows that the communication matrix marks **Global DR**, allowed in both directions between the two sides' networks and, for a VIP on a load balancer, forwarded on both VIPs. See [Platform Access Address and `global` VIP](../prepare/communication_matrix.mdx#global_vip) and [Global Disaster Recovery](../prepare/communication_matrix.mdx#global_dr).
+
+Each side pulls its images from its own external registry, so no registry port crosses the sites.
+
+## Write the Two install-config.yaml Files \{#configure-install-config}
+
+Write each side's `install-config.yaml` as for a single `global` cluster, following the Create the global Cluster page of your provider, with these values: [Bare Metal](./bare-metal/create_cluster.mdx), [Huawei DCS](./huawei-dcs/create_cluster.mdx), [VMware vSphere](./vmware-vsphere/create_cluster.mdx), or [Huawei Cloud Stack](./huawei-cloud-stack/create_cluster.mdx).
+
+| Field | Primary | Standby |
+|---|---|---|
+| `global.platform.address` | The platform domain | The same domain |
+| `global.platform.cert` | A third-party certificate and key whose SANs cover the domain | The same certificate and key files |
+| `global.platform.extraAddresses` | `[<primary-vip>]` | `[<standby-vip>]` |
+| `cluster.network.loadBalancer.address` (`provider.hcs.elb.vipAddress` on Huawei Cloud Stack) | The primary VIP | The standby VIP |
+| `global.registry` | The primary's external registry | The standby's external registry |
+| `cluster.encryptionProviderConfig` | The encryption key from [Generate the Shared Keys](#generate-the-shared-keys) | The same value |
+| `provider.baremetal.serviceAccountSigningKey` (Bare Metal only) | The content of `sa.key.b64` | The same value |
+
+- **Platform address**: use a domain name, not an IP address. `ac` accepts an IP address here, but `etcd-sync` refuses to run when the platform address is not a domain name.
+- **Certificate**: do not omit `global.platform.cert`. Self-signed certificates are not supported for DR: without the field, each side generates its own self-signed certificate, and after a failover clients reject the other side's certificate; on Bare Metal this includes the agents of the workload hosts. For the accepted formats, see [Common `install-config.yaml` Fields](./reference.mdx#install-config).
+- **`extraAddresses`**: each side's own VIP, which you use to reach that side while the domain points at the other one. `ac` does not add it.
+- **Keys**: write them before the first `manifests` or `create` run on each side. A key that you change afterward does not change what an installed cluster uses; see [Rendered Manifests](./reference.mdx#render-manifests).
+- **VM folder** (VMware vSphere): when both sides share a vCenter, you can set a different `provider.vsphere.folder` on each side to keep their VMs apart. The same folder also works.
+
+**Applies to**: every DR pair, before the first `manifests` or `create` run. Skip the second command unless the provider is Bare Metal.
+
+Run on each bootstrap node, in the installation directory:
+
+```bash
+v=$(awk '$1=="encryptionProviderConfig:"{gsub(/[\r"\047]/,"",$2);print $2}' install-config.yaml); [ -n "$v" ] && printf '%s' "$v" | sha256sum
+v=$(awk '$1=="serviceAccountSigningKey:"{gsub(/[\r"\047]/,"",$2);print $2}' install-config.yaml); [ -n "$v" ] && printf '%s' "$v" | sha256sum
+```
+
+Continue when each command prints a hash and both sides print the same hash; otherwise, set or correct the value in the file that prints nothing or a different hash.
+
+## Install the Primary and the Standby \{#install-primary-and-standby-clusters}
+
+The platform domain must point to the side being installed. While the domain points at one side, reach the other side through its VIP with the kubeconfig in its installation directory.
+
+| Step | What you do |
+|---|---|
+| 1 | Point the domain at the primary VIP. On the primary bootstrap node, install the cluster as described on the Create the global Cluster page of your provider. |
+| 2 | When the primary is installed, point the domain at the standby VIP. On the standby bootstrap node, install the standby the same way. |
+| 3 | When the standby is installed, point the domain back at the primary VIP. |
+
+When both sides are installed and the domain points at the primary, go to [Start Global Cluster Disaster Recovery Synchronization](./disaster_recovery_sync.mdx).
+
+## Observability Placement \{#observability-placement}
+
+DR replicates only the `global` cluster's etcd data. Metrics and logs are stored outside etcd, so they are never copied to the standby. Plan observability before you install either cluster:
+
+- Each `global` cluster collects, stores, and queries its own metrics and logs, so the standby can observe itself immediately after a failover.
+- Do not write workload cluster monitoring and logging to either `global` cluster. Aggregate them in a dedicated workload cluster that runs the VictoriaMetrics Center and the log storage. A network zone that cannot reach it gets its own aggregation cluster.
+
+For the synchronized and excluded scope, see [Global Cluster Disaster Recovery](../non_alauda_os/global_dr.mdx).
+
+## Bare Metal: Later Changes to global Hosts \{#bare-metal-dr}
+
+**Bare Metal only.** The two sides keep their own `global` hosts apart and share the workload hosts:
+
+| Host | Endpoint | Identity | Sync |
+| --- | --- | --- | --- |
+| Local `Cluster/global` host | `https://<local-control-plane-vip>:6443` | `baremetal-global-system-agent` | Local only |
+| Non-`global` workload host | `https://<platform-domain>/kubernetes/global` | `baremetal-system-agent` | Primary to standby |
+
+The workload row is the standard registration path; see [Network Connectivity](../../workload_clusters/alauda_os/bare-metal/prerequisites.mdx#network-connectivity).
+
+After the handover, every `global` registration uses the local API server. A registration that you create later on a `global` cluster, for example to replace a `global` host, needs these annotations:
+
+```yaml
+metadata:
+  annotations:
+    baremetal.cluster.io/system-agent-auth-scope: global
+    baremetal.cluster.io/system-agent-server-url: https://<local-control-plane-vip>:6443
+    baremetal.cluster.io/system-agent-endpoint-mode: direct-apiserver
+```
+
+Do not reuse a bootstrap Global ISO after the handover; create a new Global registration and `SeedImage` on the `global` cluster that the host belongs to.
+
+## Next
+
+- [Start Global Cluster Disaster Recovery Synchronization](./disaster_recovery_sync.mdx)
+- [Fail Over to the Standby global Cluster](./disaster_recovery_failover.mdx)
+- [Upgrade `global` Clusters in a DR Environment](../../upgrade/global/upgrade_global_dr.mdx)
