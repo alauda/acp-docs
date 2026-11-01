@@ -17,17 +17,11 @@ Complete these steps for each cluster that you plan to upgrade, before you reque
 
 <Steps>
 
-### Confirm the `global` Clusters Are Upgraded \{#confirm-global}
+### Confirm the Standby `global` Cluster Is Upgraded \{#confirm-global}
 
-On the `global` cluster, where `ac whoami --show-server` prints an address that ends with `/kubernetes/global/`:
+**Applies to**: DR environments. Skip it while synchronization is paused. [Run Preflight Checks for the Cluster](#run-preflight) checks the primary.
 
-```bash
-ac config use-cluster global
-ac whoami --show-server
-ac adm upgrade status --cluster=global
-```
-
-In a DR environment, also on the standby, where `ac whoami --show-server` prints the standby VIP; skip this block while synchronization is paused:
+On the standby, where `ac whoami --show-server` prints the standby VIP:
 
 ```bash
 export KUBECONFIG=<standby-kubeconfig>
@@ -36,7 +30,7 @@ ac adm upgrade status --cluster=global
 unset KUBECONFIG
 ```
 
-Continue when, on each `global` cluster, `Current` shows the target ACP version and the `Ready` condition is `True`; otherwise, finish the upgrade of the `global` clusters first.
+Continue when `Current` shows the target ACP version and the `Ready` condition is `True`; otherwise, finish the upgrade of the standby first.
 
 ### Make Operator Packages Available \{#operator-push-fallback}
 
@@ -141,21 +135,30 @@ ac -n cpaas-system get infraclusterversionpreflight <preflight-name> \
   -o jsonpath='{range .status.checks[*]}{.name}{"\t"}{.severity}{"\t"}{.state}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
 ```
 
-Then, also on the `global` cluster, set `CLUSTER` on the first line to the cluster and run this block once. It only reads; the last command prints the type and the address of the control-plane load balancer of the cluster:
+Then save this script as `check-cluster-dcs.sh`. It only reads, on the `global` cluster; the last command prints the type and the address of the control-plane load balancer of the cluster:
 
 ```bash
-CLUSTER="<cluster-name>"
+#!/usr/bin/env bash
+CLUSTER="${1:?Usage: bash check-cluster-dcs.sh <cluster-name>}"
 ac config use-cluster global
 ac whoami --show-server
+
 echo "== MachineDeployments"
 ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name="${CLUSTER}" \
   -o custom-columns='NAME:.metadata.name,UNAVAILABLE:.spec.strategy.rollingUpdate.maxUnavailable'
+
 echo "== Machines, IP pools, and the type and address of the control-plane load balancer"
 ac -n cpaas-system get dcsmachine -l cluster.x-k8s.io/cluster-name="${CLUSTER}" \
   -o custom-columns='NAME:.metadata.name,POOL:.spec.ipHostPoolRef.name,IP:.status.networkConfig.ip'
 ac -n cpaas-system get dcsiphostnamepool \
   -o custom-columns='NAME:.metadata.name,IPS:.spec.pool[*].ip,DISKS:.spec.pool[*].persistentDisk[*].slot,KEPT_DISKS:.status.persistentDiskStatus[*].ip'
 ac -n cpaas-system get dcscluster "${CLUSTER}" -o jsonpath='{.spec.controlPlaneLoadBalancer.type}{" "}{.spec.controlPlaneLoadBalancer.host}{"\n"}'
+```
+
+Then run it:
+
+```bash
+bash check-cluster-dcs.sh <cluster-name>
 ```
 
 A free entry is an IP address of a pool in `POOL` whose `DISKS` lists slot numbers, that no machine uses, and that is not the load balancer address when the type is `internal`.
@@ -204,17 +207,20 @@ ac -n cpaas-system get infraclusterversionpreflight <preflight-name> \
 A node pool with a single host has no worker while that host is reinstalled. Make sure its workloads can run on other nodes, or accept the interruption.
 :::
 
-Then, also on the `global` cluster, set `CLUSTER` on the first line to the cluster and run this block once. It only reads. Keep the output; after the upgrade, [Upgrade Validation](../validation.mdx#check-provider-resources) compares the `INVENTORY` values with it.
+Then save this script as `check-cluster-baremetal.sh`. It only reads, on the `global` cluster. Keep the output; after the upgrade, [Upgrade Validation](../validation.mdx#check-provider-resources) compares the `INVENTORY` values with it.
 
 ```bash
-CLUSTER="<cluster-name>"
+#!/usr/bin/env bash
+CLUSTER="${1:?Usage: bash check-cluster-baremetal.sh <cluster-name>}"
 ac config use-cluster global
 ac whoami --show-server
 KCP=$(ac -n cpaas-system get clusters.cluster.x-k8s.io "${CLUSTER}" -o jsonpath='{.spec.controlPlaneRef.name}')
+
 echo "== Control plane and MachineDeployments"
 ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='replicas={.spec.replicas}{"\n"}'
 ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name="${CLUSTER}" \
   -o custom-columns='NAME:.metadata.name,UNAVAILABLE:.spec.strategy.rollingUpdate.maxUnavailable'
+
 echo "== Machines, host pools, and hosts"
 ac -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io -l cluster.x-k8s.io/cluster-name="${CLUSTER}" \
   -o custom-columns='NAME:.metadata.name,INVENTORY:.status.machineInventoryRef.name'
@@ -222,6 +228,12 @@ ac -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io \
   -o custom-columns='NAME:.metadata.name,CLUSTER:.spec.clusterName,TOTAL:.status.total,ALLOCATED:.status.allocated,HOSTS:.spec.machineInventories[*].name'
 ac -n cpaas-system get machineinventories.elemental.cattle.io \
   -o custom-columns='NAME:.metadata.name,OS:.metadata.labels.os\.baremetal\.alauda\.io/id,STORAGE:.status.storage.phase'
+```
+
+Then run it:
+
+```bash
+bash check-cluster-baremetal.sh <cluster-name> | tee <output-file>
 ```
 
 The hosts of the cluster are the ones in `HOSTS` of the pools whose `CLUSTER` is the cluster, spare hosts included.
@@ -262,17 +274,20 @@ snapper --no-dbus --csvout list --columns number,default,active,userdata
   </Tab>
   <Tab label="Huawei Cloud Stack">
 
-On the `global` cluster, set `CLUSTER` on the first line to the cluster and run this block once. It only reads, and prints each part under its own `==` title. The parts after `== Switch to the cluster` run on the cluster itself:
+Save this script as `check-cluster-hcs.sh`. It only reads, and prints each part under its own `==` title. The parts after `== Switch to the cluster` run on the cluster itself:
 
 ```bash
-CLUSTER="<cluster-name>"
+#!/usr/bin/env bash
+CLUSTER="${1:?Usage: bash check-cluster-hcs.sh <cluster-name>}"
 ac config use-cluster global
 ac whoami --show-server
 KCP=$(ac -n cpaas-system get clusters.cluster.x-k8s.io "${CLUSTER}" -o jsonpath='{.spec.controlPlaneRef.name}')
+
 echo "== Rollout settings"
 ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='replicas={.spec.replicas} maxSurge={.spec.rolloutStrategy.rollingUpdate.maxSurge}{"\n"}'
 ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name="${CLUSTER}" \
   -o custom-columns='NAME:.metadata.name,SURGE:.spec.strategy.rollingUpdate.maxSurge,UNAVAILABLE:.spec.strategy.rollingUpdate.maxUnavailable'
+
 echo "== Machine templates in use, and the pools"
 ac -n cpaas-system get hcsmachinetemplate \
   $(ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{.spec.machineTemplate.infrastructureRef.name}') \
@@ -280,6 +295,7 @@ ac -n cpaas-system get hcsmachinetemplate \
   -o custom-columns='NAME:.metadata.name,DATA_VOLUMES:.spec.template.spec.dataVolumes[*].mountPath,POOL:.spec.template.spec.configPoolRef.name'
 ac -n cpaas-system get hcsmachineconfigpool \
   -o custom-columns='NAME:.metadata.name,AVAILABLE:.status.availableCount,DISKS:.spec.configs[*].persistentDisks[*].slot,HOSTNAMES:.spec.configs[*].hostname,USED:.status.usedConfigs[*].hostname'
+
 echo "== Kubelet patch files: the encoding, then the content or a Secret name and key"
 echo "${KCP}:"
 ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{range .spec.kubeadmConfigSpec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
@@ -287,23 +303,34 @@ for t in $(ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-
   echo "${t}:"
   ac -n cpaas-system get kubeadmconfigtemplate "${t}" -o jsonpath='{range .spec.template.spec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
 done
+
 echo "== Provider"
 ac -n cpaas-system get apprelease \
   -o custom-columns='NAME:.metadata.name,CHART:.spec.source.charts[*].name,REQUESTED:.spec.source.charts[*].targetRevision,INSTALLED:.status.charts.*.installedRevision,SYNC:.status.conditions[?(@.type=="Sync")].status,HEALTH:.status.conditions[?(@.type=="Health")].status' \
   | grep -E '^NAME|chart-cluster-api-provider-hcs'
+
 echo "== Switch to the cluster"
 ac config use-cluster "${CLUSTER}"
 ac whoami --show-server
+
 echo "== Pods with hostPath volumes, on the cluster"
 ac get pods -A --no-headers \
   -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,OWNER:.metadata.ownerReferences[*].kind,MIRROR:.metadata.annotations.kubernetes\.io/config\.mirror,PHASE:.status.phase,HOSTPATH:.spec.volumes[*].hostPath.path' \
   | awk '$1 !~ /^(kube-system|kube-public|kube-node-lease|cpaas-system)$/ && $3 !~ /DaemonSet/ && $4 == "<none>" && $5 !~ /^(Succeeded|Failed)$/ && $6 != "<none>"'
+
 echo "== Local and hostPath PersistentVolumes with a claim, on the cluster"
 ac get pv --no-headers \
   -o custom-columns='NAME:.metadata.name,CLAIM_NAMESPACE:.spec.claimRef.namespace,CLAIM:.spec.claimRef.name,LOCAL:.spec.local.path,HOSTPATH:.spec.hostPath.path' \
   | awk '$2 !~ /^(<none>|kube-system|kube-public|kube-node-lease|cpaas-system)$/ && ($4 != "<none>" || $5 != "<none>")'
+
 echo "== Switch back to global"
 ac config use-cluster global
+```
+
+Then run it:
+
+```bash
+bash check-cluster-hcs.sh <cluster-name>
 ```
 
 When a kubelet patch file shows a Secret name and a key instead of the content, print the content from the Secret. Escape each `.` in `<secret-key>` as `\.`:
@@ -331,7 +358,7 @@ Also, in the HCS console, confirm that the image that you recorded for the targe
 | The provider shows `REQUESTED` equal to `INSTALLED`, with `SYNC` and `HEALTH` `True` | Continue. |
 | The provider shows `REQUESTED` different from `INSTALLED`, or `SYNC` or `HEALTH` is not `True` | Contact technical support. |
 | `ac whoami --show-server` under `== Switch to the cluster` ends with `/kubernetes/<cluster-name>/` | Continue. |
-| `ac whoami --show-server` ends otherwise | Check that `CLUSTER` on the first line is the cluster name, and run the block again. If it still ends otherwise, contact technical support. |
+| `ac whoami --show-server` ends otherwise | Check that the argument of the script is the cluster name, and run the script again. If it still ends otherwise, contact technical support. |
 | Nothing is listed under `== Pods with hostPath volumes, on the cluster`, and nothing under `== Local and hostPath PersistentVolumes with a claim, on the cluster` | Continue. |
 | A Pod or a PersistentVolume is listed under either title | Move its data to CSI storage before you upgrade the cluster. If the data is on a pool-managed persistent disk, or you cannot move it, contact technical support. |
 | The image of each version exists in the region and project of the cluster | Continue. |
@@ -360,20 +387,24 @@ ac -n cpaas-system patch machinedeployment <md-name> --type merge \
   </Tab>
   <Tab label="VMware vSphere">
 
-On the `global` cluster, set `CLUSTER` on the first line to the cluster and run this block once. It only reads, and prints each part under its own `==` title. The parts after `== Switch to the cluster` run on the cluster itself:
+Save this script as `check-cluster-vsphere.sh`. It only reads, and prints each part under its own `==` title. The parts after `== Switch to the cluster` run on the cluster itself:
 
 ```bash
-CLUSTER="<cluster-name>"
+#!/usr/bin/env bash
+CLUSTER="${1:?Usage: bash check-cluster-vsphere.sh <cluster-name>}"
 ac config use-cluster global
 ac whoami --show-server
 KCP=$(ac -n cpaas-system get clusters.cluster.x-k8s.io "${CLUSTER}" -o jsonpath='{.spec.controlPlaneRef.name}')
+
 echo "== Rollout settings"
 ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='replicas={.spec.replicas} maxSurge={.spec.rolloutStrategy.rollingUpdate.maxSurge}{"\n"}'
 ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name="${CLUSTER}" \
   -o custom-columns='NAME:.metadata.name,SURGE:.spec.strategy.rollingUpdate.maxSurge,UNAVAILABLE:.spec.strategy.rollingUpdate.maxUnavailable'
+
 echo "== Machine config pools"
 ac -n cpaas-system get vspheremachineconfigpool \
   -o custom-columns='NAME:.metadata.name,CLUSTER:.spec.clusterRef.name,READY:.status.conditions[?(@.type=="Ready")].status'
+
 echo "== Kubelet patch files: the encoding, then the content or a Secret name and key"
 echo "${KCP}:"
 ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{range .spec.kubeadmConfigSpec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
@@ -381,23 +412,34 @@ for t in $(ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-
   echo "${t}:"
   ac -n cpaas-system get kubeadmconfigtemplate "${t}" -o jsonpath='{range .spec.template.spec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
 done
+
 echo "== Provider"
 ac -n cpaas-system get apprelease \
   -o custom-columns='NAME:.metadata.name,CHART:.spec.source.charts[*].name,REQUESTED:.spec.source.charts[*].targetRevision,INSTALLED:.status.charts.*.installedRevision,SYNC:.status.conditions[?(@.type=="Sync")].status,HEALTH:.status.conditions[?(@.type=="Health")].status' \
   | grep -E '^NAME|chart-cluster-api-provider-vsphere'
+
 echo "== Switch to the cluster"
 ac config use-cluster "${CLUSTER}"
 ac whoami --show-server
+
 echo "== Pods with hostPath volumes, on the cluster"
 ac get pods -A --no-headers \
   -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,OWNER:.metadata.ownerReferences[*].kind,MIRROR:.metadata.annotations.kubernetes\.io/config\.mirror,PHASE:.status.phase,HOSTPATH:.spec.volumes[*].hostPath.path' \
   | awk '$1 !~ /^(kube-system|kube-public|kube-node-lease|cpaas-system)$/ && $3 !~ /DaemonSet/ && $4 == "<none>" && $5 !~ /^(Succeeded|Failed)$/ && $6 != "<none>"'
+
 echo "== Local and hostPath PersistentVolumes with a claim, on the cluster"
 ac get pv --no-headers \
   -o custom-columns='NAME:.metadata.name,CLAIM_NAMESPACE:.spec.claimRef.namespace,CLAIM:.spec.claimRef.name,LOCAL:.spec.local.path,HOSTPATH:.spec.hostPath.path' \
   | awk '$2 !~ /^(<none>|kube-system|kube-public|kube-node-lease|cpaas-system)$/ && ($4 != "<none>" || $5 != "<none>")'
+
 echo "== Switch back to global"
 ac config use-cluster global
+```
+
+Then run it:
+
+```bash
+bash check-cluster-vsphere.sh <cluster-name>
 ```
 
 When a kubelet patch file shows a Secret name and a key instead of the content, print the content from the Secret. Escape each `.` in `<secret-key>` as `\.`:
@@ -422,7 +464,7 @@ Also, in vCenter, confirm that the VM template that you recorded for the target 
 | The provider shows `REQUESTED` equal to `INSTALLED`, with `SYNC` and `HEALTH` `True` | Continue. |
 | The provider shows `REQUESTED` different from `INSTALLED`, or `SYNC` or `HEALTH` is not `True` | Contact technical support. |
 | `ac whoami --show-server` under `== Switch to the cluster` ends with `/kubernetes/<cluster-name>/` | Continue. |
-| `ac whoami --show-server` ends otherwise | Check that `CLUSTER` on the first line is the cluster name, and run the block again. If it still ends otherwise, contact technical support. |
+| `ac whoami --show-server` ends otherwise | Check that the argument of the script is the cluster name, and run the script again. If it still ends otherwise, contact technical support. |
 | Nothing is listed under `== Pods with hostPath volumes, on the cluster`, and nothing under `== Local and hostPath PersistentVolumes with a claim, on the cluster` | Continue. |
 | A Pod or a PersistentVolume is listed under either title | Move its data to CSI storage before you upgrade the cluster. If the data is on a pool-managed persistent disk, or you cannot move it, contact technical support. |
 | The VM template of each version exists in each datacenter that the cluster uses | Continue. |
