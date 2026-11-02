@@ -22,7 +22,7 @@ Decide before you create the cluster: an existing cluster cannot be moved to ano
 | Registry of the `global` cluster | Nothing in `install-config.yaml`. | The workload cluster reaches the registry of the `global` cluster with acceptable throughput and availability. |
 | Dedicated registry | A RegistryCredential Secret in `cpaas-system` on the `global` cluster, named in `cluster.registrySecretRef` of `install-config.yaml`. | The workload cluster is in a different region or network segment and should pull from a registry close to it. |
 
-A dedicated registry is available on Bare Metal, Huawei DCS, and Huawei Cloud Stack. A VMware vSphere cluster always uses the registry of the `global` cluster.
+A dedicated registry requires platform v4.4.0 or later, on every provider.
 
 ## What the Binding Covers \{#coverage}
 
@@ -30,7 +30,7 @@ The binding applies to the platform components that Alauda Container Platform in
 
 | Not covered | Where it comes from instead |
 | --- | --- |
-| Images kubeadm manages: kube-apiserver, kube-controller-manager, kube-scheduler, etcd, CoreDNS, and kube-proxy | `ac` sets the kubeadm image repository to `cloud.alauda.io/alauda` on every provider, whatever the binding. |
+| Images kubeadm manages: kube-apiserver, kube-controller-manager, kube-scheduler, etcd, CoreDNS, and kube-proxy | The Alauda OS image, which preloads them. `ac` sets the kubeadm image repository to `cpaas-registry.cpaas-system/acp/k8s` on every provider, whatever the binding. Use the Alauda OS image published for the platform release: an image from an earlier release cannot start the control plane, even with the same Kubernetes version. |
 | The pause (sandbox) image | The container runtime configuration in the Alauda OS image. |
 | Bare-metal operating system images | Hosts pull `base-image` and `base-image-iso` from the platform registry during `elemental install` and every reprovision. |
 | Application workload images | The image references and pull Secrets that each workload declares. |
@@ -83,33 +83,60 @@ Confirm in the administration interface or API of the registry that the uploaded
 
 ### Step 2 — Create the RegistryCredential Secret \{#create-the-secret}
 
-Write the credential file with an editor, not at a shell prompt: a shell keeps the password in its history. Do not quote the values: quote characters are stored as part of the value. Do not include a scheme or the `/v2/` path in `registry`.
+Write the Secret manifest with an editor, not at a shell prompt: a shell keeps the password in its history. Quote values that contain YAML special characters. Use one of the two manifests below.
 
-```text title="registry-credential.env"
-registry=<registry-host>:<port>
-username=<username>
-password=<password>
+**Without a private CA**: the system trust store of the nodes verifies the registry certificate. For an anonymous registry, leave out `username` and `password`.
+
+```yaml title="registry-credential.yaml"
+apiVersion: v1
+kind: Secret
+metadata:
+  name: <registry-credential-name>
+  namespace: cpaas-system
+  labels:
+    capi.cpaas.io/provider: registry-credential
+    cpaas.io/registry-credential-format: direct
+type: CloudCredential
+stringData:
+  registry: <registry-host>:<port>
+  username: <username>
+  password: <password>
 ```
 
-For an anonymous registry, keep only the `registry` line.
+**With a private CA**: the registry certificate is self-signed or issued by a private CA. `registry`, `username`, and `password` are all required.
 
-Keep the file private (`chmod 600 registry-credential.env`); it holds the password. Create the Secret in `cpaas-system` on the `global` cluster, label it, and then remove the file:
+```yaml title="registry-credential.yaml"
+apiVersion: v1
+kind: Secret
+metadata:
+  name: <registry-credential-name>
+  namespace: cpaas-system
+  labels:
+    capi.cpaas.io/provider: registry-credential
+    cpaas.io/registry-credential-format: direct
+type: CloudCredential
+stringData:
+  registry: <registry-host>:<port>
+  username: <username>
+  password: <password>
+  config.json: |
+    {
+      "mode": "mirror",
+      "endpoints": ["<registry-host>:<port>"],
+      "ca": "<base64-encoded-ca>",
+      "tlsPolicy": {
+        "endpointInsecureSkipVerify": false
+      }
+    }
+```
+
+Keep the file private (`chmod 600 registry-credential.yaml`); it holds the password. Create the Secret on the `global` cluster, and then remove the file:
 
 ```bash
-chmod 600 registry-credential.env
+chmod 600 registry-credential.yaml
 ac config use-cluster global
-
-REGISTRY_CREDENTIAL_NAME="<registry-credential-name>"
-
-ac create secret generic "${REGISTRY_CREDENTIAL_NAME}" \
-  --namespace cpaas-system \
-  --from-env-file=registry-credential.env
-
-ac label secret "${REGISTRY_CREDENTIAL_NAME}" --namespace cpaas-system --overwrite \
-  capi.cpaas.io/provider=registry-credential \
-  cpaas.io/registry-credential-format=direct
-
-rm -f registry-credential.env
+ac create -f registry-credential.yaml
+rm -f registry-credential.yaml
 ```
 
 :::warning
@@ -119,10 +146,24 @@ Do not create or update a credential Secret with `ac apply`: client-side apply s
 | Key | Required | Notes |
 | --- | --- | --- |
 | Namespace | Yes | Must be `cpaas-system`. |
+| Name | Yes | At most 63 characters. |
+| Type | Yes | `CloudCredential`. |
 | `capi.cpaas.io/provider` label | Yes | Must be `registry-credential`. `ac` rejects a Secret without this label. |
-| `cpaas.io/registry-credential-format` label | Yes, for this procedure | Set it to `direct`. Without it, the platform expects the legacy encrypted format instead of the keys below. |
-| `registry` | Yes | `<host>[:<port>]` only. No scheme, no path. |
-| `username`, `password` | Together | Set both or neither. Omit both for an anonymous registry. |
+| `cpaas.io/registry-credential-format` label | Yes | Must be `direct`. Without it, the platform expects the legacy encrypted format instead of the keys below. |
+| `registry` | Yes | `<host>[:<port>]` only. No scheme, no path, no trailing `/`. |
+| `username`, `password` | Together | Set both or neither. Omit both for an anonymous registry. Both are required with `config.json`. |
+| `config.json` | Only for a private CA | See the fields below. |
+
+The fields of `config.json`:
+
+| Field | Value |
+| --- | --- |
+| `mode` | `mirror`. |
+| `endpoints` | One entry, exactly the value of `registry`. |
+| `ca` | The output of `base64 -w0 <ca-file>`, not the PEM text. Omit it when `endpointInsecureSkipVerify` is `true`. |
+| `tlsPolicy.endpointInsecureSkipVerify` | `false` verifies the registry certificate against `ca`. `true` skips the verification. |
+
+Keep the other fields as shown. Put the account in `username` and `password`, not in `config.json`. `ac` does not check `config.json`: a mistake in it surfaces only while the cluster is being created.
 
 ### Step 3 — Reference the Credential When You Create the Cluster \{#reference-the-credential}
 
@@ -166,6 +207,16 @@ ac config use-cluster global
 
 Continue when the platform component images use the dedicated registry. Images kubeadm manages and the pause image come from elsewhere; see [What the Binding Covers](#coverage). If every platform component image still uses another registry, see [Troubleshooting](#troubleshooting).
 
+#### Check the Registry Configuration of the Nodes
+
+```bash
+ac config use-cluster <cluster-name>
+ac -n cpaas-system get registry cpaas-registry -o yaml
+ac config use-cluster global
+```
+
+Continue when `spec.endpoints` lists the address in the Secret and, with a [private CA](#create-the-secret), `spec.tlsSecretRef.name` is `acp-registry-ca`.
+
 ## Operate an Existing Binding \{#operate}
 
 | Task | Supported | How |
@@ -189,7 +240,7 @@ Keep the file private (`chmod 600 registry-credential-patch.yaml`); it holds the
 ```bash
 chmod 600 registry-credential-patch.yaml
 ac config use-cluster global
-ac patch secret "${REGISTRY_CREDENTIAL_NAME}" --namespace cpaas-system \
+ac patch secret <registry-credential-name> --namespace cpaas-system \
   --type=merge --patch-file=registry-credential-patch.yaml
 
 rm -f registry-credential-patch.yaml
