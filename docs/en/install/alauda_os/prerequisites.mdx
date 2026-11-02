@@ -21,7 +21,7 @@ This path applies when the `global` cluster runs on Alauda OS, on Bare Metal, Hu
 - **ACP Common Aligned Extensions** for the same version and architecture. See [Download](../prepare/download.mdx).
 - **An external platform image registry**, reachable from the bootstrap node and every `global` node. You upload the payload to it in [Prepare the Core Package and the Registry](#prepare-core-package); `ac` does not. This path does not support the platform built-in Registry. See [Prepare an External Platform Image Registry](../prepare/external-platform-image-registry.mdx).
 - **The registry CA**, in PEM, on the bootstrap node: at `/root/registry.ca`, or at the absolute path that `global.registry.certificateFile` names. The nodes trust only this CA. If you do not verify the registry certificate, set `global.registry.insecureSkipVerify: true` instead, and the CA is not needed. With neither, `ac` stops before it changes anything. A file at that path must hold a PEM certificate in either case.
-- **Addresses for the `global` nodes and a stable control plane endpoint**, an external load balancer or a Self-built VIP (`type: internal`), on port `6443`. See [Plan the Control Plane Endpoint](../../workload_clusters/alauda_os/prepare/control-plane-endpoint.mdx). On Huawei Cloud Stack, the provider creates an ELB; see [its prerequisites](./huawei-cloud-stack/prerequisites.mdx).
+- **Addresses for the `global` nodes and a stable control plane endpoint**, an external load balancer or a Self-built VIP (`type: internal`), on port `6443`. See [Plan the Control Plane Endpoint](#control-plane-endpoint). On Huawei Cloud Stack, the provider creates an ELB; see [its prerequisites](./huawei-cloud-stack/prerequisites.mdx).
 - **A platform access address**: a domain name or an IP address. Disaster recovery requires a domain name and a third-party certificate that covers it, the same on both sides; self-signed certificates are not supported.
 - **Pod, Service, and Kube-OVN join CIDR ranges** that overlap neither each other nor the node network.
 - **For x86_64 nodes**, CPUs that support the `x86-64-v2` ISA baseline. See [OS Support Matrix](../../overview/alauda_os_support_matrix.mdx).
@@ -77,6 +77,70 @@ Run these steps on the bootstrap node. For a disaster recovery pair, run them on
    For a registry that allows anonymous push, set both variables to empty values. For upload errors, see [Prepare an External Platform Image Registry](../prepare/external-platform-image-registry.mdx#troubleshooting).
 
 Run `ac` from the extracted Core Package as `<extract-dir>/res/<arch>/ac`, where `<arch>` is `amd64` or `arm64`; it is not on the `PATH`. If you run a copy of `ac` from outside the package, add `--core-package <extract-dir>`. You do not install the providers yourself: `ac` installs them during the installation.
+
+## Plan the Control Plane Endpoint \{#control-plane-endpoint}
+
+Every cluster needs a stable endpoint for the Kubernetes API. Select the endpoint mode before you create the cluster.
+
+:::warning
+Do not change the control plane endpoint after the cluster is created. The endpoint is part of the API server certificates, the kubeconfigs, and the connection from the `global` cluster.
+:::
+
+### Endpoint Modes by Provider \{#endpoint-modes-by-provider}
+
+| Provider | Endpoint modes | What you prepare |
+|---|---|---|
+| Huawei DCS | External load balancer (default), or a Self-built VIP (`type: internal`). | External: the load balancer, before you create the cluster. Self-built VIP: an IPv4 VIP in the control plane Layer 2 network and a `vrid` unique in that Layer 2 domain. |
+| VMware vSphere | External load balancer (default), or a Self-built VIP (`type: internal`). | External: the load balancer, before you create the cluster. Self-built VIP: an IPv4 VIP, a port (typically `6443`), and a `vrid` unique in the control plane Layer 2 domain. |
+| Bare Metal | Self-built VIP (default, `type: internal`), or an external load balancer. | Self-built VIP: a free VIP, a port (typically `6443`), and a `vrid` unique in the control plane Layer 2 domain. External: the load balancer, before you create the cluster. |
+| Huawei Cloud Stack | An HCS ELB that the provider creates. | The ELB addresses: the VIP and two L4 and two L7 addresses. See [Control Plane ELB Addresses](../../workload_clusters/alauda_os/huawei-cloud-stack/prerequisites.mdx#control-plane-elb-addresses). |
+
+The default applies when `cluster.network.loadBalancer.type` is omitted from `install-config.yaml`. The fields are in the parameters page of your provider: [Bare Metal](./bare-metal/reference/install-config-parameters.mdx#fields), [Huawei DCS](./huawei-dcs/reference/install-config-parameters.mdx#fields), and [VMware vSphere](./vmware-vsphere/reference/install-config-parameters.mdx#fields).
+
+On VMware vSphere, only a cluster created with `type: internal` can use the Self-built VIP; a cluster whose provider was upgraded from an earlier release keeps its external load balancer. See [Control Plane Endpoint Modes](../../workload_clusters/alauda_os/vmware-vsphere/prerequisites.mdx#control-plane-endpoint-modes).
+
+### External Load Balancer \{#external-load-balancer}
+
+Provision the load balancer before you create the cluster, so that it meets the [External Load Balancer requirements](../prepare/communication_matrix.mdx#external_load_balancer).
+
+#### Check the Listener Before Creation \{#check-the-listener}
+
+Run on a node of the `global` cluster, or on the bootstrap node for a `global` installation:
+
+```bash
+nc -vz <control-plane-endpoint> 6443
+```
+
+| Result | Action |
+|---|---|
+| `succeeded` or `open` | Continue. |
+| Connection refused or timed out | Confirm in the management interface of the load balancer that the TCP listener on `<control-plane-endpoint>:6443` exists, then continue. Some load balancers accept connections only after a backend is healthy. |
+
+#### Check the Health Check After the First Control Plane Node Starts \{#check-the-health-check}
+
+Run on a host in the network from which the load balancer sends its health checks:
+
+```bash
+curl -kfsS https://<control-plane-node-ip>:6443/healthz
+```
+
+Continue when the output is `ok`; otherwise, correct the network path or firewall rules between that network and the control plane node.
+
+### Self-built VIP \{#self-built-vip}
+
+- Reserve an unused IPv4 address in the same Layer 2 network as the control plane interface that will hold the VIP.
+- Use a VRID that is unique in that Layer 2 domain.
+- Allow VRRP traffic and gratuitous ARP updates between the control plane nodes and the surrounding network; see [Self-built VIP](../prepare/communication_matrix.mdx#self_built_vip).
+- Use at least three control plane nodes for high availability.
+- Use an IP address, not a domain name, for the Self-built VIP.
+- Do not maintain a second, manual backend list for the same VIP: the provider updates it when control plane nodes are replaced.
+
+On VMware vSphere the following additional rules apply:
+
+- The VIP must be IPv4. IPv6 and dual-stack endpoints are not accepted.
+- `vrid` must be between `1` and `255`.
+- The VIP must not equal any slot address (`network.primary.ip` or `network.additional[].ip`) in the machine config pools of the cluster, and must be outside every external IPAM pool range: the provider does not detect a conflict with an external IPAM pool.
+- On nodes with more than one NIC, set `interface` explicitly: it cannot be changed after the cluster is created.
 
 ## Next Steps
 
