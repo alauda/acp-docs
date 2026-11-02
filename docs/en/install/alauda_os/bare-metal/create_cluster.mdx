@@ -1,0 +1,213 @@
+---
+weight: 20
+title: Create the global Cluster
+queries:
+  - install global cluster on bare metal
+  - ac adm alpha global create --provider baremetal
+  - register bare metal hosts for the global cluster iso
+  - machineinventorypool for the global cluster
+---
+
+# Create the global Cluster on Bare Metal
+
+On Bare Metal, `create` runs twice: the first run builds the installation ISO and stops, you register the hosts with it and assign them to pools, and the second run installs the cluster.
+
+## Prerequisites \{#prerequisites}
+
+- You completed the [common prerequisites](../prerequisites.mdx) and the [Bare Metal prerequisites](./prerequisites.mdx).
+- The Core Package is extracted on the bootstrap node and its payload is in the external registry; see [Prepare the Core Package and the Registry](../prerequisites.mdx#prepare-core-package).
+- For a disaster recovery pair, write both files as described in [Create a Global Cluster Disaster Recovery Pair](../global_dr.mdx#configure-install-config), then run this procedure on each side.
+
+## Procedure
+
+### 1. Write `install-config.yaml` \{#install-config}
+
+Create an installation directory on the bootstrap node and write `install-config.yaml` in it. Keep the file private (`chmod 600 install-config.yaml`); it holds the passwords. The node groups name only their pools; the hosts supply the CPU, memory, network, and disks.
+
+Copy the following template, fill in the placeholders, and delete the comment blocks you do not use; for the fields, see [Parameters](./reference/install-config-parameters.mdx).
+
+```yaml title="install-config.yaml"
+global:                                     # Required: the registry and the platform identity.
+  bootstrapIP: <bootstrap-node-ip>          # Required: the IPv4 address of the bootstrap node that the hosts route to.
+  registry:                                 # Required: the external registry that holds all installation artifacts.
+    address: <host>:<port>                  # Required: <host>[:<port>], without a scheme or /v2/.
+    # Use the following two fields only when the registry requires authentication:
+    # username: <user>                      # Required: set together with password.
+    # password: <password>                  # Required: set together with username.
+    insecureSkipVerify: false               # Default: false. true skips verifying the registry certificate.
+    # Default: /root/registry.ca. The registry CA in PEM, an absolute path. It must exist unless insecureSkipVerify is true.
+    certificateFile: /root/registry.ca
+  platform:                                 # Required: the platform identity and access addresses.
+    address: <platform-domain-or-ip>        # Required: without a scheme or port. Disaster recovery requires a domain name.
+    username: admin@cpaas.io                # Default: admin@cpaas.io.
+    # Required: 8 to 32 characters mixing letters, digits, and symbols. Quote a value that starts with a YAML special character, such as !, *, or &.
+    password: <password>
+    # Default: []. Other console addresses, without a port. List the control plane VIP to open the console on it. Disaster recovery requires this side's VIP here.
+    extraAddresses: []
+    # Use the following block only for a third-party console certificate, in one of the two forms. Omit it for a self-signed certificate. Disaster recovery requires it.
+    # cert:
+    #   # PEM form, with absolute paths:
+    #   certificateFile: /root/console.crt
+    #   privateKeyFile: /root/console.key
+    #   # PKCS#12 form, with an absolute path:
+    #   pkcs12CertificateFile: /root/console.pfx
+    #   pkcs12Password: <password>
+
+cluster:                                    # Do not add clusterName: ac names the cluster global.
+  sshKeys:                                  # Required: the SSH public keys installed on every node.
+    - <ssh-public-key>
+  # encryptionProviderConfig: <encryption-key>  # Optional: the base64 of a 16, 24, or 32 byte aescbc key. Empty generates a key; a DR pair needs the same value on both sides.
+  ntpServers: []                            # Default: []. The NTP servers of the nodes. Empty keeps the image's time configuration.
+  network:
+    podCIDR: 10.199.0.0/16                  # Default: 10.199.0.0/16.
+    serviceCIDR: 10.96.0.0/12               # Default: 10.96.0.0/12.
+    kubeOVN:
+      joinCIDR: 100.64.0.0/16               # Default: 100.64.0.0/16. The Pod, Service, and join CIDRs must not overlap.
+    loadBalancer:                           # Required: the control plane endpoint.
+      type: internal                        # Default: internal. Set external for an external load balancer.
+      # Required: the VIP, or the load balancer address with type: external. An IPv4 address that is not a node address and is outside the CIDRs above.
+      address: <control-plane-endpoint>
+      port: 6443                            # Default: 6443.
+      # Required with type: internal: 0 to 255, unique in the control plane Layer 2 domain. Delete this line with type: external.
+      vrid: <vrid>
+
+provider:
+  baremetal:                                # Required: the OS images and the host registration settings.
+    isoImageTag: <iso-image-tag>            # Required: the tag of tkestack/baremetal-base-image-iso, without a registry or repository.
+    rootImageTag: <root-image-tag>          # Required: the tag of tkestack/baremetal-base-image. It may differ from isoImageTag.
+    emulateTPM: true                        # Default: true. Set false only to use a hardware TPM (/dev/tpm0).
+    # Optional: the base64 of the PEM private key that signs ServiceAccount tokens. Empty generates a key; a DR pair needs the same value on both sides.
+    # serviceAccountSigningKey: <base64-pem-key>
+
+# Required: the control plane node group. Do not add cpuCore, memoryGiB, network, disks, or hosts: the hosts supply them.
+controlPlane:
+  # Required: an odd number, 1 or 3 or more. A cluster with a single control plane node is for testing and cannot be upgraded.
+  replicas: 3
+  deployMode: normal                        # Default: normal. base dedicates this node group to the platform.
+  baremetal:
+    machineInventoryPool: global-control-plane-pool  # Required: the MachineInventoryPool this node group draws from.
+
+computes:                                   # Optional: the worker node groups. Delete this section to run on the control plane nodes alone.
+  - name: worker                            # Required: a DNS-1123 label, unique per group. control-plane is reserved.
+    replicas: 3                             # Required: the number of nodes in this group.
+    deployMode: normal                      # Default: normal. base dedicates this node group to the platform.
+    baremetal:
+      machineInventoryPool: global-worker-pool  # Required: the MachineInventoryPool of this node group. Each node group has its own pool.
+```
+
+For the values of each side of a disaster recovery pair, see [Create a Global Cluster Disaster Recovery Pair](../global_dr.mdx#configure-install-config); for `deployMode: base`, see [Platform Node Groups](../reference.mdx#deploy-mode).
+
+### 2. Build the Installation ISO \{#build-iso}
+
+On the bootstrap node:
+
+```bash
+<extract-dir>/res/<arch>/ac adm alpha global create --dir <install-dir> --provider baremetal
+```
+
+The first run prepares the bootstrap cluster, builds the installation ISO, and prints its download and checksum URLs:
+
+```text
+The installation ISO is built. Boot every host of the global cluster from it:
+  download: https://<bootstrapIP>:12443/...
+  checksum: https://<bootstrapIP>:12443/...
+```
+
+The run then stops with a failed registration check, because no host has registered yet. This is expected: nothing of the `global` cluster has been applied.
+
+### 3. Register the Hosts \{#register-hosts}
+
+1. Boot every host from the ISO. Each host registers, installs Alauda OS to its disk, and reboots. The download URL expires 120 minutes after the ISO is built; hosts that have already booted keep registering. If it has expired before a host downloads it, run `create` again to rebuild the ISO. Use this ISO only for this installation; do not reuse it after the handover.
+2. List the registered hosts on the bootstrap node:
+
+   ```bash
+   <extract-dir>/res/<arch>/ac --kubeconfig /var/cpaas/data/alauda.kubeconfig \
+     -n cpaas-system get machineinventories.elemental.cattle.io -o yaml
+   ```
+
+   Each host registers as a `MachineInventory` named `global-<system-uuid>`. Use a host when its `MachineInventory` reports `Ready=True` and has a non-empty `status.plan.secretRef.name`; otherwise see [Troubleshooting on Bare Metal](./troubleshooting.mdx).
+
+### 4. Create the Pools \{#create-pools}
+
+Create one `MachineInventoryPool` per node group, named as in `install-config.yaml`, with `spec.clusterName: global` and at least as many hosts as the replicas of the node groups that draw from it. A host can belong to only one pool.
+
+```yaml title="pools.yaml"
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: MachineInventoryPool
+metadata:
+  name: global-control-plane-pool
+  namespace: cpaas-system
+spec:
+  clusterName: global
+  machineInventories:
+    - name: <inventory-1>
+      hostname: <hostname-1> # [!code callout]
+    - name: <inventory-2>
+    - name: <inventory-3>
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: MachineInventoryPool
+metadata:
+  name: global-worker-pool
+  namespace: cpaas-system
+spec:
+  clusterName: global
+  machineInventories:
+    - name: <inventory-4>
+    - name: <inventory-5>
+    - name: <inventory-6>
+```
+
+<Callouts>
+
+1. `hostname`: optional. Defaults to the inventory name.
+
+</Callouts>
+
+On the bootstrap node:
+
+```bash
+<extract-dir>/res/<arch>/ac --kubeconfig /var/cpaas/data/alauda.kubeconfig apply -f pools.yaml
+```
+
+### 5. Install the Cluster \{#create}
+
+On the bootstrap node, run the same `create` command again:
+
+```bash
+<extract-dir>/res/<arch>/ac adm alpha global create --dir <install-dir> --provider baremetal
+```
+
+`ac` first checks the pools named in `install-config.yaml`, their members and size, and the ISO URL. If a check fails, nothing of the `global` cluster is applied and the error names the item. Make sure that an `external` load balancer is ready before you run `create`.
+
+`create` returns when the installation is complete. If `create` stops, run the same command again; completed work is skipped. See [The `create` Command](../reference.mdx#create-command).
+
+### 6. Monitor the Installation \{#monitor}
+
+From another terminal on the bootstrap node:
+
+```bash
+<extract-dir>/res/<arch>/ac adm alpha global status
+```
+
+For the stages and common failures, see [Troubleshooting](../troubleshooting.mdx); for Bare Metal failures, see [Troubleshooting on Bare Metal](./troubleshooting.mdx).
+
+## Verification
+
+When `create` returns, the installation is complete. Verify the platform as described in [Validation](../../validation.mdx), including its [checks for Alauda OS](../../validation.mdx#alauda-os-checks).
+
+**Applies to**: a Self-built VIP (`cluster.network.loadBalancer.type: internal`). Skip it with an `external` load balancer.
+
+On a control plane node of the `global` cluster:
+
+```bash
+curl --cacert /etc/kubernetes/pki/ca.crt https://<control-plane-vip>:6443/healthz
+```
+
+Continue when it prints `ok`; otherwise see [Troubleshooting on Bare Metal](./troubleshooting.mdx).
+
+## Next Steps
+
+- A disaster recovery pair: continue with [Install the Primary and the Standby](../global_dr.mdx#install-primary-and-standby-clusters).
+- [Create a Cluster on Bare Metal](../../../workload_clusters/alauda_os/bare-metal/create_cluster.mdx). The `global` cluster already runs the Bare Metal provider, and its image catalog maps the installed Kubernetes version to the OS image for hosts that run Alauda OS M55 on amd64. For hosts of another architecture or OS, add their keys first; see [Add Kubernetes Versions to the Image Catalog](../../../workload_clusters/alauda_os/bare-metal/prerequisites.mdx#add-versions-to-image-catalog).
+- To create workload clusters on other infrastructure, install that provider as described in [Prepare](../../../workload_clusters/alauda_os/prepare/index.mdx).
