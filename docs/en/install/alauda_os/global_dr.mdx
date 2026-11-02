@@ -1,22 +1,24 @@
 ---
-weight: 8
-title: Global Cluster Disaster Recovery
+weight: 20
+title: Create a Global Cluster Disaster Recovery Pair
 queries:
-  - plan global cluster disaster recovery on alauda os
+  - create a global cluster disaster recovery pair on alauda os
   - primary and standby global cluster install-config.yaml differences
   - generate dr encryption key and serviceAccountSigningKey before install
+  - install etcd-sync on the standby global cluster
+  - start global cluster disaster recovery synchronization
   - bare metal global dr endpoint and identity
 ---
 
-# Global Cluster Disaster Recovery
+# Create a Global Cluster Disaster Recovery Pair
 
-This page is the plan for a disaster recovery (DR) pair of `global` clusters. Read it before you write the first `install-config.yaml` of either side.
+This page creates a disaster recovery (DR) pair of `global` clusters, from planning to the first synchronization. Read it before you write the first `install-config.yaml` of either side.
 
-| You are | Page |
+| You are | Go to |
 |---|---|
-| Planning, or installing the two sides | This page |
+| Planning, or installing the two sides | The sections below, from the top |
 | You already installed a single `global` cluster | [Decide Before You Install](#decide-before-you-install) |
-| Both sides are installed | [Start Global Cluster Disaster Recovery Synchronization](./disaster_recovery_sync.mdx) |
+| Both sides are installed | [Start Synchronization](#start-synchronization) |
 | The primary has failed, or you switch over on purpose | [Fail Over to the Standby global Cluster](./disaster_recovery_failover.mdx) |
 
 ## What a DR Pair Is \{#what-a-dr-pair-is}
@@ -49,7 +51,7 @@ Also prepare:
 - **A third-party certificate and its private key** for the domain, as the same files on both bootstrap nodes.
 - **The shared keys**, generated once; see [Generate the Shared Keys](#generate-the-shared-keys).
 - **A copy of each side's installation directory**, in particular `output/kubeconfig`, kept where you can reach it when a site is down.
-- **Violet v4.2.13 or later** on a machine that reaches the standby VIP and the standby registry. The `etcd-sync` package is a component of **<Term name="product" /> Global Cluster Disaster Recovery** and is in **ACP Common Aligned Extensions**; see [Install etcd-sync](./disaster_recovery_sync.mdx#install-etcd-sync).
+- **Violet v4.2.13 or later** on a machine that reaches the standby VIP and the standby registry. The `etcd-sync` package is a component of **<Term name="product" /> Global Cluster Disaster Recovery** and is in **ACP Common Aligned Extensions**; see [Install etcd-sync](#install-etcd-sync).
 
 ### Generate the Shared Keys \{#generate-the-shared-keys}
 
@@ -79,6 +81,15 @@ The signing key cannot be changed after installation: if the cluster already hol
 Before you install either cluster, ask your network administrator for the flows that the communication matrix marks **Global DR**, allowed in both directions between the two sides' networks and, for a VIP on a load balancer, forwarded on both VIPs. See [Platform Access Address and `global` VIP](../prepare/communication_matrix.mdx#global_vip) and [Global Disaster Recovery](../prepare/communication_matrix.mdx#global_dr).
 
 The nodes of each side pull their images from the registry in `global.registry`; the flows to it are in [Image Registry](../prepare/communication_matrix.mdx#image_registry).
+
+## Observability Placement \{#observability-placement}
+
+DR replicates only the `global` cluster's etcd data. Metrics and logs are stored outside etcd, so they are never copied to the standby. Plan observability before you install either cluster:
+
+- Each `global` cluster collects, stores, and queries its own metrics and logs, so the standby can observe itself immediately after a failover.
+- Do not write workload cluster monitoring and logging to either `global` cluster. Aggregate them in a dedicated workload cluster that runs the VictoriaMetrics Center and the log storage. A network zone that cannot reach it gets its own aggregation cluster.
+
+For the synchronized and excluded scope, see [Global Cluster Disaster Recovery](../non_alauda_os/global_dr.mdx).
 
 ## Write the Two install-config.yaml Files \{#configure-install-config}
 
@@ -129,16 +140,155 @@ The platform domain must point to the side being installed. While the domain poi
 | 2 | When the primary is installed, point the domain at the standby VIP. On the standby bootstrap node, install the standby the same way. |
 | 3 | When the standby is installed, point the domain back at the primary VIP. |
 
-When both sides are installed and the domain points at the primary, go to [Start Global Cluster Disaster Recovery Synchronization](./disaster_recovery_sync.mdx).
+When both sides are installed and the domain points at the primary, continue with [Start Synchronization](#start-synchronization).
 
-## Observability Placement \{#observability-placement}
+## Start Synchronization \{#start-synchronization}
 
-DR replicates only the `global` cluster's etcd data. Metrics and logs are stored outside etcd, so they are never copied to the standby. Plan observability before you install either cluster:
+After both sides are installed, you install **<Term name="product" /> Global Cluster Disaster Recovery** (`etcd-sync`) on the standby, which then copies the primary's etcd data to it, and you verify the synchronization.
 
-- Each `global` cluster collects, stores, and queries its own metrics and logs, so the standby can observe itself immediately after a failover.
-- Do not write workload cluster monitoring and logging to either `global` cluster. Aggregate them in a dedicated workload cluster that runs the VictoriaMetrics Center and the log storage. A network zone that cannot reach it gets its own aggregation cluster.
+Before you start:
 
-For the synchronized and excluded scope, see [Global Cluster Disaster Recovery](../non_alauda_os/global_dr.mdx).
+- The platform domain points at the primary VIP.
+- Both sides were installed with the same `cluster.encryptionProviderConfig`; see [Generate the Shared Keys](#generate-the-shared-keys). If they were not, contact technical support before you continue.
+- **Applies to** workload clusters on infrastructure other than the `global` cluster's own: install that provider on **both** `global` clusters, so that the standby can reconcile the same workload clusters after a failover. See [Prepare](../../workload_clusters/alauda_os/prepare/index.mdx). Upload to the standby with the standby's `--platform-address` and `--dest-repo`, as in [step 1](#install-etcd-sync). Skip it otherwise: `ac` has installed the provider of its own platform on each side.
+
+### Conventions \{#conventions}
+
+Run the commands on a machine with `ac` that reaches both sides:
+
+- **Primary**: log in once with `ac login https://<platform-domain>` as the platform administrator while the domain points at the primary. Commands for the primary start with `ac config use-cluster global`.
+- **Standby**: use the standby's kubeconfig, `output/kubeconfig` in its installation directory, here `<standby-kubeconfig>`. Commands for the standby start with `export KUBECONFIG=<standby-kubeconfig>` and end with `unset KUBECONFIG`.
+- To show which cluster a command talks to, run `ac whoami --show-server`.
+- In the plugin's parameter names, **Active** means the primary.
+
+The step marked **Bare Metal only** is not numbered.
+
+### 1. Install etcd-sync \{#install-etcd-sync}
+
+Install **<Term name="product" /> Global Cluster Disaster Recovery** (`etcd-sync`) on the standby `global` cluster only, after both sides have completed `create`. It must never be installed on both sides. Use the version released with <Term name="productShort" /> 4.5.
+
+Reach the standby through its VIP.
+
+1. Get the plugin package from **ACP Common Aligned Extensions** and upload it to the standby with **Violet v4.2.13 or later**. Create the token on the standby Web Console (`https://<standby-vip>`): **Profile** → **API Tokens**. Set both `--platform-address` and `--dest-repo` to the standby: otherwise the package goes to the primary. `--dest-repo` is the platform image registry of the standby, the same address as the primary's when both sides share a registry. Use `--no-auth` instead of the registry credentials when the standby registry needs none. For the flags, see [Upload Packages](../../extend/upload_package.mdx#violet_push_usage).
+
+   ```bash
+   read -rsp "Standby platform token: " STANDBY_TOKEN; printf '\n'
+   read -rsp "Standby registry password: " STANDBY_REGISTRY_PASSWORD; printf '\n'
+   violet push <etcd-sync-package>.tgz \
+     --platform-address "https://<standby-vip>" --platform-token "${STANDBY_TOKEN}" \
+     --dest-repo "<standby-registry-address>" --username "<registry-username>" --password "${STANDBY_REGISTRY_PASSWORD}"
+   unset STANDBY_TOKEN STANDBY_REGISTRY_PASSWORD
+   ```
+
+2. Create the token Secret on the standby. The value is the bearer token of the primary's `cpaas-system/k8sadmin` ServiceAccount; the commands do not print it:
+
+   ```bash
+   ac config use-cluster global
+   ac whoami --show-server   # the primary
+   PRIMARY_TOKEN=$(ac -n cpaas-system get secret k8sadmin -o jsonpath='{.data.token}' | base64 -d)
+   export KUBECONFIG=<standby-kubeconfig>
+   ac whoami --show-server   # the standby VIP
+   printf '%s' "${PRIMARY_TOKEN}" | ac -n cpaas-system create secret generic etcd-sync-active-cluster-token \
+     --from-file=token=/dev/stdin --dry-run=client -o yaml | ac apply -f -
+   unset PRIMARY_TOKEN
+   unset KUBECONFIG
+   ```
+
+3. Open the standby Web Console at `https://<standby-vip>`, go to **Marketplace** → **Cluster Plugins**, select the `global` cluster, and install **<Term name="product" /> Global Cluster Disaster Recovery** with these parameters.
+
+   | Parameter | Value |
+   |-----------|-------|
+   | Active Global Cluster VIP | Control plane VIP of the primary `global` cluster |
+   | Active Global Cluster ETCD Endpoints | Optional. `https://<primary-control-plane-vip>:2379`; separate several addresses with commas |
+   | Standby Cluster ETCD Endpoints | Default value |
+   | Active Global Cluster Token Secret | `etcd-sync-active-cluster-token` |
+   | Data Check Interval (unit: hour) | Default value |
+   | Print detail logs | Disabled unless troubleshooting |
+
+### 2. Start and Verify Synchronization \{#start-and-verify-synchronization}
+
+First check that the plugin is running on the standby:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac get moduleinfo -l cpaas.io/module-name=etcd-sync
+ac -n cpaas-system get pod -l 'app in (etcd-sync,etcd-sync-monitor)'
+unset KUBECONFIG
+```
+
+Continue when the `ModuleInfo` shows `STATUS` `Running` and every Pod is `Running`; otherwise, wait and run the commands again. If they do not change, run the steps in [Global Cluster Disaster Recovery Does Not Synchronize](../../upgrade/troubleshooting.mdx#dr-sync-diagnostics).
+
+The mirror copies the primary's data after its start delay. Wait until the initial synchronization has finished:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+leader_pod=$(ac -n cpaas-system get lease etcd-sync-mirror -o jsonpath='{.spec.holderIdentity}')
+ac -n cpaas-system logs "$leader_pod" | grep "Start Sync update"
+unset KUBECONFIG
+```
+
+Continue when the output contains `Start Sync update`; otherwise, wait and run it again.
+
+Then check the synchronization. Read the monitor's address on your machine:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac -n cpaas-system get svc etcd-sync-monitor -o jsonpath='{.spec.clusterIP}{"\n"}'
+unset KUBECONFIG
+```
+
+Run the check on a standby control plane node; put an IPv6 address in brackets, for example `[fd00::10]`:
+
+```bash
+curl -g "http://<monitor-cluster-ip>/check"
+```
+
+| Result | Action |
+|---|---|
+| Zero missed and zero surplus keys (`localMissedKeys [0]` and `localSurplusKeys [0]`) | Continue. |
+| HTTP `425` (`check too frequent`) | Wait, then run the check again. |
+| Missed keys are listed (`localMissedKeys`) | Wait until the log of the current leader shows `Start Sync update`, then run the check again. If missed keys remain, restart the leader Pod with the commands below, wait for `Start Sync update` again, and run the check again. |
+| Surplus keys are listed (`localSurplusKeys`) | Contact technical support. |
+| `paused: true` | Synchronization is paused for an upgrade. Contact technical support. |
+| The command fails or prints anything else | Run the steps in [Global Cluster Disaster Recovery Does Not Synchronize](../../upgrade/troubleshooting.mdx#dr-sync-diagnostics), then run the check again. |
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+leader_pod=$(ac -n cpaas-system get lease etcd-sync-mirror -o jsonpath='{.spec.holderIdentity}')
+ac -n cpaas-system delete pod "$leader_pod"
+unset KUBECONFIG
+```
+
+### Bare Metal Only: Check the Shared Agent Identity \{#check-the-shared-agent-identity}
+
+Check the shared workload agent identity on each side:
+
+```bash
+# Primary: ac config use-cluster global
+# Standby: export KUBECONFIG=<standby-kubeconfig>, and unset KUBECONFIG afterwards
+ac -n cpaas-system get sa/baremetal-system-agent secret/baremetal-system-agent-token \
+  role/baremetal-system-agent rolebinding/baremetal-system-agent
+```
+
+Continue when all four objects exist on both sides, or none exists on either side; otherwise, contact technical support.
+
+### 3. Restart the Dependent Pods \{#restart-the-dependent-pods}
+
+On each side, restart the Pods that must reload the DR and endpoint configuration, where installed:
+
+```bash
+# Primary: ac config use-cluster global
+# Standby: export KUBECONFIG=<standby-kubeconfig>, and unset KUBECONFIG afterwards
+ac delete po -n cpaas-system -l 'service_name in (alertmanager,vmselect,vminsert)'
+ac delete po -n cpaas-system -l service_name=cpaas-elasticsearch
+ac delete po -n cpaas-system -l service_name=cluster-transformer
+```
+
+## Keep It Healthy \{#keep-it-healthy}
+
+- Run the check in [step 2](#start-and-verify-synchronization) regularly. The plugin also checks by itself, by default every hour, and reports the results as the metrics `local_missed_keys_count` and `local_surplus_keys_count`.
+- After each change to your workload clusters, save the output of `ac get clusters.cluster.x-k8s.io -A` and `ac get machines.cluster.x-k8s.io -A` from the primary. After a failover you compare against it; see [Fail Over](./disaster_recovery_failover.mdx#check-the-new-primary).
+- A DR-aware upgrade of the `global` clusters uninstalls the plugin and has its own consistency check; see [Upgrade `global` Clusters in a DR Environment](../../upgrade/global/upgrade_global_dr.mdx).
 
 ## Bare Metal: Agents and the Platform Address \{#bare-metal-dr}
 
@@ -158,6 +308,5 @@ Do not reuse a bootstrap Global ISO after the handover; create a new Global regi
 
 ## Next
 
-- [Start Global Cluster Disaster Recovery Synchronization](./disaster_recovery_sync.mdx)
 - [Fail Over to the Standby global Cluster](./disaster_recovery_failover.mdx)
 - [Upgrade `global` Clusters in a DR Environment](../../upgrade/global/upgrade_global_dr.mdx)
