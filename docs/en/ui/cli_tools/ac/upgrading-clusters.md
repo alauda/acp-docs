@@ -282,13 +282,14 @@ When `ac adm upgrade status --cluster=<cluster>` shows `AdminAckRequired` in `Fa
    kubectl -n cpaas-system get configmap admin-gates -o yaml
    ```
 
-2. For ACP 4.4 upgrades to Kubernetes 1.35, complete the [ACP 4.4 Kubernetes 1.35 node readiness checks](/upgrade/pre-upgrade.mdx#kubernetes-135-node-readiness) on every production node in the target cluster.
+2. If the target release is ACP 4.4 or later, upgrades the cluster to Kubernetes 1.35 or later, and `admin-gates` reports a node-readiness acknowledgement key, complete the [Kubernetes 1.35 or later node readiness checks](/upgrade/pre-upgrade.mdx#kubernetes-135-node-readiness) on every production node in the target cluster. The first gate introduced for this requirement is `ack-4.4-kubernetes-1.35-kernel-update`; treat it as an example because a later target release can provide a different key.
 
-3. Write the acknowledgement to the global-side `admin-acks` ConfigMap:
+3. After completing the gate requirements, copy the applicable key from `admin-gates` and write it to the global-side `admin-acks` ConfigMap:
 
    ```bash
+   ACK_KEY='<key-from-admin-gates>'
    kubectl -n cpaas-system patch configmap admin-acks --type merge \
-     -p '{"data":{"ack-4.4-kubernetes-1.35-kernel-update":"true"}}'
+     -p "{\"data\":{\"${ACK_KEY}\":\"true\"}}"
    ```
 
 4. Confirm that the preflight check passes:
