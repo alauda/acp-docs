@@ -15,6 +15,9 @@ const previousRelease = upgradeReleases[Math.max(upgradeReleases.length - 2, 0)]
 
 const OTHER_OS = 'other'
 
+// Values of the optional `architecture` data key. An empty value omits the key.
+const ARCHITECTURES = ['x86_64', 'aarch64'] as const
+
 export type Provider = 'dcs' | 'hcs' | 'vsphere'
 
 // What each provider registers, and where it is registered. The ConfigMap name
@@ -48,10 +51,11 @@ interface ConfigMapValues {
   acpVersion: string
   kubernetesVersion: string
   etcdTag: string
+  architecture?: string
 }
 
 const renderConfigMap = (
-  { configMapName, templateName, acpVersion, kubernetesVersion, etcdTag }: ConfigMapValues,
+  { configMapName, templateName, acpVersion, kubernetesVersion, etcdTag, architecture }: ConfigMapValues,
   provider: Provider,
 ) =>
   [
@@ -66,6 +70,7 @@ const renderConfigMap = (
     'data:',
     `  kubernetesVersion: ${quote(kubernetesVersion)}`,
     `  etcdTag: ${quote(etcdTag)}`,
+    ...(architecture ? [`  architecture: ${quote(architecture)}`] : []),
   ].join('\n')
 
 const renderCommand = (configMaps: ConfigMapValues[], provider: Provider) =>
@@ -86,12 +91,14 @@ const releaseValues = (
   templateName: string,
   osPart: string,
   provider: Provider,
+  architecture: string,
 ): ConfigMapValues => ({
   configMapName: `${provider}-vm-template-${osPart || '<os>'}-${toNamePart(release.acp)}`,
   templateName,
   acpVersion: release.acp,
   kubernetesVersion: release.kubernetes,
   etcdTag: release.etcd,
+  architecture,
 })
 
 function Note({ provider }: { provider: Provider }) {
@@ -174,6 +181,31 @@ function useOsField(id: string) {
   return { osPart: toNamePart(os === OTHER_OS ? customOs : os), fields }
 }
 
+function useArchitectureField(id: string) {
+  const [architecture, setArchitecture] = useState('')
+
+  const field = (
+    <label htmlFor={`${id}-architecture`} style={fieldStyle}>
+      Architecture
+      <select
+        id={`${id}-architecture`}
+        value={architecture}
+        onChange={event => setArchitecture(event.target.value)}
+        style={controlStyle}
+      >
+        <option value="">Not set</option>
+        {ARCHITECTURES.map(item => (
+          <option key={item} value={item}>
+            {item}
+          </option>
+        ))}
+      </select>
+    </label>
+  )
+
+  return { architecture, field }
+}
+
 interface TemplateNameFieldProps {
   id: string
   label: string
@@ -206,12 +238,16 @@ function SingleVersionForm({ provider }: { provider: Provider }) {
   const { noun, slug, place } = PROVIDERS[provider]
   const id = useId()
   const os = useOsField(id)
+  const arch = useArchitectureField(id)
   const [templateName, setTemplateName] = useState('')
   const [acpVersion, setAcpVersion] = useState(latestRelease.acp)
 
   const release = upgradeReleases.find(item => item.acp === acpVersion) ?? latestRelease
   const trimmedName = templateName.trim()
-  const command = renderCommand([releaseValues(release, trimmedName || `<${slug}-name>`, os.osPart, provider)], provider)
+  const command = renderCommand(
+    [releaseValues(release, trimmedName || `<${slug}-name>`, os.osPart, provider, arch.architecture)],
+    provider,
+  )
 
   return (
     <>
@@ -225,6 +261,7 @@ function SingleVersionForm({ provider }: { provider: Provider }) {
         />
         <AcpVersionField id={`${id}-acp`} label="ACP version" value={release.acp} onChange={setAcpVersion} />
         {os.fields}
+        {arch.field}
       </div>
       <InvalidNamesAlert names={invalidNames([trimmedName])} provider={provider} />
       <CommandBlock command={command} />
@@ -236,6 +273,7 @@ function UpgradePathForm({ provider }: { provider: Provider }) {
   const { noun, slug, place } = PROVIDERS[provider]
   const id = useId()
   const os = useOsField(id)
+  const arch = useArchitectureField(id)
   const [currentAcp, setCurrentAcp] = useState(previousRelease.acp)
   const [targetAcp, setTargetAcp] = useState(latestRelease.acp)
   // Keyed by ACP version, so that a name survives a change of the path.
@@ -256,6 +294,7 @@ function UpgradePathForm({ provider }: { provider: Provider }) {
         />
         <AcpVersionField id={`${id}-target`} label="Target ACP version" value={targetAcp} onChange={setTargetAcp} />
         {os.fields}
+        {arch.field}
       </div>
       {path.error === undefined ? (
         <>
@@ -275,7 +314,13 @@ function UpgradePathForm({ provider }: { provider: Provider }) {
           <CommandBlock
             command={renderCommand(
               rows.map(release =>
-                releaseValues(release, nameOf(release) || `<${slug}-name-for-${release.acp}>`, os.osPart, provider),
+                releaseValues(
+                  release,
+                  nameOf(release) || `<${slug}-name-for-${release.acp}>`,
+                  os.osPart,
+                  provider,
+                  arch.architecture,
+                ),
               ),
               provider,
             )}
