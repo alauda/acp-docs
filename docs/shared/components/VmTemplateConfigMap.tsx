@@ -102,19 +102,19 @@ const releaseValues = (
 })
 
 function Note({ provider }: { provider: Provider }) {
+  const nouns = `${PROVIDERS[provider].noun}s`
   return (
     <>
       <p>
         Run the command on the <code>global</code> cluster. In a DR environment, run it on both{' '}
         <code>global</code> clusters: the ConfigMaps are not synchronized between them.
       </p>
-      {provider === 'dcs' ? (
-        <p>
-          For each ACP version, register VM templates of only one OS on a <code>global</code> cluster. When
-          VM templates of different OSes have the same Kubernetes version, an upgrade can move a cluster to
-          the other OS.
-        </p>
-      ) : null}
+      <p>
+        For each ACP version, register {nouns} of only one OS per architecture on a <code>global</code>{' '}
+        cluster, and set <code>architecture</code> on each of them when you register more than one
+        architecture. When {nouns} of different OSes have the same Kubernetes version and architecture, an
+        upgrade can move a cluster to the other OS.
+      </p>
     </>
   )
 }
