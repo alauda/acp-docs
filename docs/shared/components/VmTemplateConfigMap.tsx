@@ -179,6 +179,35 @@ const invalidNames = (names: string[]) => [
   ...new Set(names.filter(name => name !== '' && !LABEL_VALUE.test(name))),
 ]
 
+function SharedNamesAlert({ names, provider }: { names: string[]; provider: Provider }) {
+  if (names.length === 0) {
+    return null
+  }
+  return (
+    <p role="alert" style={alertStyle}>
+      Each architecture needs its own {PROVIDERS[provider].noun}.{' '}
+      {names.map((name, index) => (
+        <span key={name}>
+          {index > 0 ? ', ' : null}
+          <code>{name}</code>
+        </span>
+      ))}{' '}
+      {names.length === 1 ? 'is' : 'are'} entered for more than one architecture.
+    </p>
+  )
+}
+
+// A VM template or image has exactly one architecture.
+const sharedNames = (entries: { name: string; architecture: Architecture | undefined }[]) => {
+  const architecturesByName = new Map<string, Set<Architecture | undefined>>()
+  for (const { name, architecture } of entries) {
+    if (name !== '') {
+      architecturesByName.set(name, (architecturesByName.get(name) ?? new Set()).add(architecture))
+    }
+  }
+  return [...architecturesByName].filter(([, architectures]) => architectures.size > 1).map(([name]) => name)
+}
+
 // The OS select, with a free-text identifier for an OS that is not listed.
 function useOsField(id: string) {
   const [os, setOs] = useState(OS_VARIANTS[0].value)
@@ -262,10 +291,11 @@ interface TemplateNameFieldProps {
   label: string
   value: string
   placeholder?: string
+  shared?: boolean
   onChange: (value: string) => void
 }
 
-function TemplateNameField({ id, label, value, placeholder, onChange }: TemplateNameFieldProps) {
+function TemplateNameField({ id, label, value, placeholder, shared = false, onChange }: TemplateNameFieldProps) {
   const trimmed = value.trim()
   return (
     <label htmlFor={id} style={fieldStyle}>
@@ -277,7 +307,7 @@ function TemplateNameField({ id, label, value, placeholder, onChange }: Template
         placeholder={placeholder}
         spellCheck={false}
         autoComplete="off"
-        aria-invalid={trimmed !== '' && !LABEL_VALUE.test(trimmed)}
+        aria-invalid={shared || (trimmed !== '' && !LABEL_VALUE.test(trimmed))}
         onChange={event => onChange(event.target.value)}
         style={controlStyle}
       />
@@ -297,6 +327,7 @@ function SingleVersionForm({ provider }: { provider: Provider }) {
   const release = upgradeReleases.find(item => item.acp === acpVersion) ?? latestRelease
   const keyOf = (architecture: Architecture | undefined) => architecture ?? ''
   const nameOf = (architecture: Architecture | undefined) => (templateNames[keyOf(architecture)] ?? '').trim()
+  const shared = sharedNames(arch.architectures.map(architecture => ({ name: nameOf(architecture), architecture })))
   const command = renderCommand(
     arch.architectures.map(architecture =>
       releaseValues(
@@ -320,6 +351,7 @@ function SingleVersionForm({ provider }: { provider: Provider }) {
             label={`${capitalize(noun)} name${architecture ? ` (${architecture})` : ''}`}
             value={templateNames[keyOf(architecture)] ?? ''}
             placeholder={`Name registered on ${place}`}
+            shared={shared.includes(nameOf(architecture))}
             onChange={value => setTemplateNames(names => ({ ...names, [keyOf(architecture)]: value }))}
           />
         ))}
@@ -328,6 +360,7 @@ function SingleVersionForm({ provider }: { provider: Provider }) {
         {arch.field}
       </div>
       <InvalidNamesAlert names={invalidNames(arch.architectures.map(nameOf))} provider={provider} />
+      <SharedNamesAlert names={shared} provider={provider} />
       <CommandBlock command={command} />
     </>
   )
@@ -354,6 +387,7 @@ function UpgradePathForm({ provider }: { provider: Provider }) {
     })),
   )
   const nameOf = (row: (typeof rows)[number]) => (templateNames[row.key] ?? '').trim()
+  const shared = sharedNames(rows.map(row => ({ name: nameOf(row), architecture: row.architecture })))
 
   return (
     <>
@@ -371,20 +405,22 @@ function UpgradePathForm({ provider }: { provider: Provider }) {
       {path.error === undefined ? (
         <>
           <div style={{ display: 'grid', gap: '0.75rem', marginBottom: '0.75rem' }}>
-            {rows.map(({ release, architecture, key }) => (
+            {rows.map(row => (
               <TemplateNameField
-                key={key}
-                id={`${id}-name-${release.acp}${architecture ? `-${architecture}` : ''}`}
-                label={`${capitalize(noun)} name for ${release.acp} (Kubernetes ${release.kubernetes}${
-                  architecture ? `, ${architecture}` : ''
+                key={row.key}
+                id={`${id}-name-${row.release.acp}${row.architecture ? `-${row.architecture}` : ''}`}
+                label={`${capitalize(noun)} name for ${row.release.acp} (Kubernetes ${row.release.kubernetes}${
+                  row.architecture ? `, ${row.architecture}` : ''
                 })`}
-                value={templateNames[key] ?? ''}
+                value={templateNames[row.key] ?? ''}
                 placeholder={`Name registered on ${place}`}
-                onChange={value => setTemplateNames(names => ({ ...names, [key]: value }))}
+                shared={shared.includes(nameOf(row))}
+                onChange={value => setTemplateNames(names => ({ ...names, [row.key]: value }))}
               />
             ))}
           </div>
           <InvalidNamesAlert names={invalidNames(rows.map(nameOf))} provider={provider} />
+          <SharedNamesAlert names={shared} provider={provider} />
           <CommandBlock
             command={renderCommand(
               rows.map(row =>
