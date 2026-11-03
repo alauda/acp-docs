@@ -15,18 +15,34 @@ const previousRelease = upgradeReleases[Math.max(upgradeReleases.length - 2, 0)]
 
 const OTHER_OS = 'other'
 
-// Values of the optional `architecture` data key. An empty value omits the key.
-const ARCHITECTURES = ['x86_64', 'aarch64'] as const
+// The upgrade controllers accept only these values of the `architecture` data key.
+type Architecture = 'x86_64' | 'aarch64'
+
+const ARCHITECTURE_LABELS: Record<Architecture, string> = {
+  x86_64: 'x86_64 (amd64)',
+  aarch64: 'aarch64 (arm64)',
+}
 
 export type Provider = 'dcs' | 'hcs' | 'vsphere'
 
+interface ProviderInfo {
+  noun: string
+  slug: string
+  place: string
+  // A provider with a single architecture gets no selector and no
+  // `architecture` key, so its ConfigMaps keep their original form.
+  architectures: readonly Architecture[]
+}
+
 // What each provider registers, and where it is registered. The ConfigMap name
 // and the label follow the Huawei DCS pattern: `<provider>-vm-template`.
-const PROVIDERS: Record<Provider, { noun: string; slug: string; place: string }> = {
-  dcs: { noun: 'VM template', slug: 'vm-template', place: 'DCS' },
-  hcs: { noun: 'image', slug: 'image', place: 'HCS' },
-  vsphere: { noun: 'VM template', slug: 'vm-template', place: 'vCenter' },
+const PROVIDERS: Record<Provider, ProviderInfo> = {
+  dcs: { noun: 'VM template', slug: 'vm-template', place: 'DCS', architectures: ['x86_64', 'aarch64'] },
+  hcs: { noun: 'image', slug: 'image', place: 'HCS', architectures: ['x86_64', 'aarch64'] },
+  vsphere: { noun: 'VM template', slug: 'vm-template', place: 'vCenter', architectures: ['x86_64'] },
 }
+
+const selectsArchitecture = (provider: Provider) => PROVIDERS[provider].architectures.length > 1
 
 const capitalize = (value: string) => value.charAt(0).toUpperCase() + value.slice(1)
 
@@ -78,22 +94,35 @@ const renderCommand = (configMaps: ConfigMapValues[], provider: Provider) =>
 
 // `prefix` tells the ConfigMaps of a multi-version example apart, such as
 // `intermediate-` and `target-`.
-const placeholderValues = (provider: Provider, prefix = ''): ConfigMapValues => ({
-  configMapName: `${provider}-vm-template-<os>-<${prefix}acp-version>`,
-  templateName: `<${prefix}${PROVIDERS[provider].slug}-name>`,
-  acpVersion: `<${prefix}acp-version>`,
-  kubernetesVersion: `<${prefix}kubernetes-version>`,
-  etcdTag: `<${prefix}etcd-tag>`,
-})
+const placeholderValues = (provider: Provider, prefix = ''): ConfigMapValues => {
+  const architecture = selectsArchitecture(provider) ? '<architecture>' : undefined
+  return {
+    configMapName: [`${provider}-vm-template-<os>`, architecture, `<${prefix}acp-version>`]
+      .filter(Boolean)
+      .join('-'),
+    templateName: `<${prefix}${PROVIDERS[provider].slug}-name>`,
+    acpVersion: `<${prefix}acp-version>`,
+    kubernetesVersion: `<${prefix}kubernetes-version>`,
+    etcdTag: `<${prefix}etcd-tag>`,
+    architecture,
+  }
+}
 
 const releaseValues = (
   release: Release,
   templateName: string,
   osPart: string,
   provider: Provider,
-  architecture: string,
+  architecture: Architecture | undefined,
 ): ConfigMapValues => ({
-  configMapName: `${provider}-vm-template-${osPart || '<os>'}-${toNamePart(release.acp)}`,
+  // The architecture keeps apart the ConfigMaps of one ACP version and OS.
+  configMapName: [
+    `${provider}-vm-template-${osPart || '<os>'}`,
+    architecture && toNamePart(architecture),
+    toNamePart(release.acp),
+  ]
+    .filter(Boolean)
+    .join('-'),
   templateName,
   acpVersion: release.acp,
   kubernetesVersion: release.kubernetes,
@@ -109,12 +138,19 @@ function Note({ provider }: { provider: Provider }) {
         Run the command on the <code>global</code> cluster. In a DR environment, run it on both{' '}
         <code>global</code> clusters: the ConfigMaps are not synchronized between them.
       </p>
-      <p>
-        For each ACP version, register {nouns} of only one OS per architecture on a <code>global</code>{' '}
-        cluster, and set <code>architecture</code> on each of them when you register more than one
-        architecture. When {nouns} of different OSes have the same Kubernetes version and architecture, an
-        upgrade can move a cluster to the other OS.
-      </p>
+      {selectsArchitecture(provider) ? (
+        <p>
+          For each ACP version, register {nouns} of only one OS per architecture on a <code>global</code>{' '}
+          cluster. When {nouns} of different OSes have the same Kubernetes version and architecture, an
+          upgrade can move a cluster to the other OS.
+        </p>
+      ) : (
+        <p>
+          For each ACP version, register {nouns} of only one OS on a <code>global</code> cluster. When{' '}
+          {nouns} of different OSes have the same Kubernetes version, an upgrade can move a cluster to the
+          other OS.
+        </p>
+      )}
     </>
   )
 }
@@ -181,29 +217,44 @@ function useOsField(id: string) {
   return { osPart: toNamePart(os === OTHER_OS ? customOs : os), fields }
 }
 
-function useArchitectureField(id: string) {
-  const [architecture, setArchitecture] = useState('')
+// The architectures to generate ConfigMaps for, in the order of the provider
+// table. `undefined` stands for a provider without a selector, whose
+// ConfigMaps carry no `architecture` key.
+function useArchitectureField(id: string, provider: Provider) {
+  const supported = PROVIDERS[provider].architectures
+  const [selected, setSelected] = useState<readonly Architecture[]>([supported[0]])
+
+  if (!selectsArchitecture(provider)) {
+    return { architectures: [undefined], field: null }
+  }
+
+  const architectures = supported.filter(item => selected.includes(item))
+  const toggle = (item: Architecture, checked: boolean) =>
+    setSelected(current => (checked ? [...current, item] : current.filter(other => other !== item)))
 
   const field = (
-    <label htmlFor={`${id}-architecture`} style={fieldStyle}>
-      Architecture
-      <select
-        id={`${id}-architecture`}
-        value={architecture}
-        onChange={event => setArchitecture(event.target.value)}
-        style={controlStyle}
-      >
-        <option value="">Not set</option>
-        {ARCHITECTURES.map(item => (
-          <option key={item} value={item}>
-            {item}
-          </option>
-        ))}
-      </select>
-    </label>
+    <fieldset style={{ ...fieldStyle, border: 0, margin: 0, padding: 0, minWidth: 0 }}>
+      <legend style={{ padding: 0, marginBottom: '0.25rem' }}>Architectures</legend>
+      {supported.map(item => {
+        const checked = architectures.includes(item)
+        return (
+          <label key={item} htmlFor={`${id}-architecture-${item}`} style={{ display: 'flex', gap: '0.375rem' }}>
+            <input
+              id={`${id}-architecture-${item}`}
+              type="checkbox"
+              checked={checked}
+              // At least one architecture stays selected.
+              disabled={checked && architectures.length === 1}
+              onChange={event => toggle(item, event.target.checked)}
+            />
+            {ARCHITECTURE_LABELS[item]}
+          </label>
+        )
+      })}
+    </fieldset>
   )
 
-  return { architecture, field }
+  return { architectures, field }
 }
 
 interface TemplateNameFieldProps {
@@ -238,32 +289,45 @@ function SingleVersionForm({ provider }: { provider: Provider }) {
   const { noun, slug, place } = PROVIDERS[provider]
   const id = useId()
   const os = useOsField(id)
-  const arch = useArchitectureField(id)
-  const [templateName, setTemplateName] = useState('')
+  const arch = useArchitectureField(id, provider)
+  // Keyed by architecture, so that a name survives a change of the selection.
+  const [templateNames, setTemplateNames] = useState<Partial<Record<string, string>>>({})
   const [acpVersion, setAcpVersion] = useState(latestRelease.acp)
 
   const release = upgradeReleases.find(item => item.acp === acpVersion) ?? latestRelease
-  const trimmedName = templateName.trim()
+  const keyOf = (architecture: Architecture | undefined) => architecture ?? ''
+  const nameOf = (architecture: Architecture | undefined) => (templateNames[keyOf(architecture)] ?? '').trim()
   const command = renderCommand(
-    [releaseValues(release, trimmedName || `<${slug}-name>`, os.osPart, provider, arch.architecture)],
+    arch.architectures.map(architecture =>
+      releaseValues(
+        release,
+        nameOf(architecture) || (architecture ? `<${slug}-name-for-${architecture}>` : `<${slug}-name>`),
+        os.osPart,
+        provider,
+        architecture,
+      ),
+    ),
     provider,
   )
 
   return (
     <>
       <div style={fieldRowStyle}>
-        <TemplateNameField
-          id={`${id}-name`}
-          label={`${capitalize(noun)} name`}
-          value={templateName}
-          placeholder={`Name registered on ${place}`}
-          onChange={setTemplateName}
-        />
+        {arch.architectures.map(architecture => (
+          <TemplateNameField
+            key={keyOf(architecture)}
+            id={`${id}-name${architecture ? `-${architecture}` : ''}`}
+            label={`${capitalize(noun)} name${architecture ? ` (${architecture})` : ''}`}
+            value={templateNames[keyOf(architecture)] ?? ''}
+            placeholder={`Name registered on ${place}`}
+            onChange={value => setTemplateNames(names => ({ ...names, [keyOf(architecture)]: value }))}
+          />
+        ))}
         <AcpVersionField id={`${id}-acp`} label="ACP version" value={release.acp} onChange={setAcpVersion} />
         {os.fields}
         {arch.field}
       </div>
-      <InvalidNamesAlert names={invalidNames([trimmedName])} provider={provider} />
+      <InvalidNamesAlert names={invalidNames(arch.architectures.map(nameOf))} provider={provider} />
       <CommandBlock command={command} />
     </>
   )
@@ -273,15 +337,23 @@ function UpgradePathForm({ provider }: { provider: Provider }) {
   const { noun, slug, place } = PROVIDERS[provider]
   const id = useId()
   const os = useOsField(id)
-  const arch = useArchitectureField(id)
+  const arch = useArchitectureField(id, provider)
   const [currentAcp, setCurrentAcp] = useState(previousRelease.acp)
   const [targetAcp, setTargetAcp] = useState(latestRelease.acp)
-  // Keyed by ACP version, so that a name survives a change of the path.
+  // Keyed by ACP version and architecture, so that a name survives a change of
+  // the path or of the selection.
   const [templateNames, setTemplateNames] = useState<Partial<Record<string, string>>>({})
 
   const path = planUpgradePath(currentAcp, targetAcp)
-  const rows = path.hops.map(hop => hop.release)
-  const nameOf = (release: Release) => (templateNames[release.acp] ?? '').trim()
+  // One ConfigMap per version on the path and per selected architecture.
+  const rows = path.hops.flatMap(hop =>
+    arch.architectures.map(architecture => ({
+      release: hop.release,
+      architecture,
+      key: architecture ? `${hop.release.acp}/${architecture}` : hop.release.acp,
+    })),
+  )
+  const nameOf = (row: (typeof rows)[number]) => (templateNames[row.key] ?? '').trim()
 
   return (
     <>
@@ -299,27 +371,29 @@ function UpgradePathForm({ provider }: { provider: Provider }) {
       {path.error === undefined ? (
         <>
           <div style={{ display: 'grid', gap: '0.75rem', marginBottom: '0.75rem' }}>
-            {rows.map(release => (
+            {rows.map(({ release, architecture, key }) => (
               <TemplateNameField
-                key={release.acp}
-                id={`${id}-name-${release.acp}`}
-                label={`${capitalize(noun)} name for ${release.acp} (Kubernetes ${release.kubernetes})`}
-                value={templateNames[release.acp] ?? ''}
+                key={key}
+                id={`${id}-name-${release.acp}${architecture ? `-${architecture}` : ''}`}
+                label={`${capitalize(noun)} name for ${release.acp} (Kubernetes ${release.kubernetes}${
+                  architecture ? `, ${architecture}` : ''
+                })`}
+                value={templateNames[key] ?? ''}
                 placeholder={`Name registered on ${place}`}
-                onChange={value => setTemplateNames(names => ({ ...names, [release.acp]: value }))}
+                onChange={value => setTemplateNames(names => ({ ...names, [key]: value }))}
               />
             ))}
           </div>
           <InvalidNamesAlert names={invalidNames(rows.map(nameOf))} provider={provider} />
           <CommandBlock
             command={renderCommand(
-              rows.map(release =>
+              rows.map(row =>
                 releaseValues(
-                  release,
-                  nameOf(release) || `<${slug}-name-for-${release.acp}>`,
+                  row.release,
+                  nameOf(row) || `<${slug}-name-for-${row.release.acp}${row.architecture ? `-${row.architecture}` : ''}>`,
                   os.osPart,
                   provider,
-                  arch.architecture,
+                  row.architecture,
                 ),
               ),
               provider,
