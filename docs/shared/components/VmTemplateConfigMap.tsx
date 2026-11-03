@@ -4,7 +4,7 @@
 // every version on an upgrade path. The Kubernetes version and etcd tag of each ACP version come
 // from ../alauda-os/version-mapping.json: to add a release, append an entry
 // there (see ../alauda-os/README.md), not here.
-import { useId, useState, type ReactNode } from 'react'
+import { useId, useState, type CSSProperties, type ReactNode } from 'react'
 
 import { OS_VARIANTS, planUpgradePath, upgradeReleases, type Release } from './alauda-os.js'
 import CommandBlock from './CommandBlock.js'
@@ -286,27 +286,71 @@ function useArchitectureField(id: string, provider: Provider) {
   return { architectures, field }
 }
 
+const nameGroupsStyle: CSSProperties = { display: 'grid', gap: '0.75rem', marginBottom: '0.75rem' }
+
+const nameGroupStyle: CSSProperties = {
+  margin: 0,
+  padding: '0.5rem 0.75rem 0.75rem',
+  minWidth: 0,
+  border: '1px solid var(--rp-c-divider)',
+  borderRadius: 'var(--rp-radius-small)',
+}
+
+// The template or image names of one ACP version.
+function TemplateNameGroup({ release, children }: { release: Release; children: ReactNode }) {
+  return (
+    <fieldset style={nameGroupStyle}>
+      <legend style={{ padding: '0 0.25rem', fontSize: '0.875rem', fontWeight: 600 }}>
+        {release.acp} · Kubernetes {release.kubernetes}
+      </legend>
+      <div style={{ ...fieldRowStyle, marginBottom: 0 }}>{children}</div>
+    </fieldset>
+  )
+}
+
 interface TemplateNameFieldProps {
   id: string
-  label: string
+  provider: Provider
+  release: Release
+  architecture: Architecture | undefined
   value: string
-  placeholder?: string
   shared?: boolean
   onChange: (value: string) => void
 }
 
-function TemplateNameField({ id, label, value, placeholder, shared = false, onChange }: TemplateNameFieldProps) {
+function TemplateNameField({
+  id,
+  provider,
+  release,
+  architecture,
+  value,
+  shared = false,
+  onChange,
+}: TemplateNameFieldProps) {
+  const { noun, place } = PROVIDERS[provider]
   const trimmed = value.trim()
+  const label = architecture ? `${architecture} ${noun} name` : `${capitalize(noun)} name`
   return (
     <label htmlFor={id} style={fieldStyle}>
-      {label}
+      <span>
+        {architecture ? (
+          <>
+            <strong>{architecture}</strong> {noun} name
+          </>
+        ) : (
+          label
+        )}
+      </span>
       <input
         id={id}
         type="text"
         value={value}
-        placeholder={placeholder}
+        placeholder={`Name registered on ${place}`}
         spellCheck={false}
         autoComplete="off"
+        // The legend of the group is not part of the input's accessible name,
+        // so the name repeats the version.
+        aria-label={`${label} for ${release.acp} (Kubernetes ${release.kubernetes})`}
         aria-invalid={shared || (trimmed !== '' && !LABEL_VALUE.test(trimmed))}
         onChange={event => onChange(event.target.value)}
         style={controlStyle}
@@ -316,7 +360,7 @@ function TemplateNameField({ id, label, value, placeholder, shared = false, onCh
 }
 
 function SingleVersionForm({ provider }: { provider: Provider }) {
-  const { noun, slug, place } = PROVIDERS[provider]
+  const { slug } = PROVIDERS[provider]
   const id = useId()
   const os = useOsField(id)
   const arch = useArchitectureField(id, provider)
@@ -344,20 +388,25 @@ function SingleVersionForm({ provider }: { provider: Provider }) {
   return (
     <>
       <div style={fieldRowStyle}>
-        {arch.architectures.map(architecture => (
-          <TemplateNameField
-            key={keyOf(architecture)}
-            id={`${id}-name${architecture ? `-${architecture}` : ''}`}
-            label={`${capitalize(noun)} name${architecture ? ` (${architecture})` : ''}`}
-            value={templateNames[keyOf(architecture)] ?? ''}
-            placeholder={`Name registered on ${place}`}
-            shared={shared.includes(nameOf(architecture))}
-            onChange={value => setTemplateNames(names => ({ ...names, [keyOf(architecture)]: value }))}
-          />
-        ))}
         <AcpVersionField id={`${id}-acp`} label="ACP version" value={release.acp} onChange={setAcpVersion} />
         {os.fields}
         {arch.field}
+      </div>
+      <div style={nameGroupsStyle}>
+        <TemplateNameGroup release={release}>
+          {arch.architectures.map(architecture => (
+            <TemplateNameField
+              key={keyOf(architecture)}
+              id={`${id}-name${architecture ? `-${architecture}` : ''}`}
+              provider={provider}
+              release={release}
+              architecture={architecture}
+              value={templateNames[keyOf(architecture)] ?? ''}
+              shared={shared.includes(nameOf(architecture))}
+              onChange={value => setTemplateNames(names => ({ ...names, [keyOf(architecture)]: value }))}
+            />
+          ))}
+        </TemplateNameGroup>
       </div>
       <InvalidNamesAlert names={invalidNames(arch.architectures.map(nameOf))} provider={provider} />
       <SharedNamesAlert names={shared} provider={provider} />
@@ -367,7 +416,7 @@ function SingleVersionForm({ provider }: { provider: Provider }) {
 }
 
 function UpgradePathForm({ provider }: { provider: Provider }) {
-  const { noun, slug, place } = PROVIDERS[provider]
+  const { slug } = PROVIDERS[provider]
   const id = useId()
   const os = useOsField(id)
   const arch = useArchitectureField(id, provider)
@@ -379,13 +428,15 @@ function UpgradePathForm({ provider }: { provider: Provider }) {
 
   const path = planUpgradePath(currentAcp, targetAcp)
   // One ConfigMap per version on the path and per selected architecture.
-  const rows = path.hops.flatMap(hop =>
-    arch.architectures.map(architecture => ({
+  const groups = path.hops.map(hop => ({
+    release: hop.release,
+    rows: arch.architectures.map(architecture => ({
       release: hop.release,
       architecture,
       key: architecture ? `${hop.release.acp}/${architecture}` : hop.release.acp,
     })),
-  )
+  }))
+  const rows = groups.flatMap(group => group.rows)
   const nameOf = (row: (typeof rows)[number]) => (templateNames[row.key] ?? '').trim()
   const shared = sharedNames(rows.map(row => ({ name: nameOf(row), architecture: row.architecture })))
 
@@ -404,19 +455,22 @@ function UpgradePathForm({ provider }: { provider: Provider }) {
       </div>
       {path.error === undefined ? (
         <>
-          <div style={{ display: 'grid', gap: '0.75rem', marginBottom: '0.75rem' }}>
-            {rows.map(row => (
-              <TemplateNameField
-                key={row.key}
-                id={`${id}-name-${row.release.acp}${row.architecture ? `-${row.architecture}` : ''}`}
-                label={`${capitalize(noun)} name for ${row.release.acp} (Kubernetes ${row.release.kubernetes}${
-                  row.architecture ? `, ${row.architecture}` : ''
-                })`}
-                value={templateNames[row.key] ?? ''}
-                placeholder={`Name registered on ${place}`}
-                shared={shared.includes(nameOf(row))}
-                onChange={value => setTemplateNames(names => ({ ...names, [row.key]: value }))}
-              />
+          <div style={nameGroupsStyle}>
+            {groups.map(group => (
+              <TemplateNameGroup key={group.release.acp} release={group.release}>
+                {group.rows.map(row => (
+                  <TemplateNameField
+                    key={row.key}
+                    id={`${id}-name-${row.release.acp}${row.architecture ? `-${row.architecture}` : ''}`}
+                    provider={provider}
+                    release={row.release}
+                    architecture={row.architecture}
+                    value={templateNames[row.key] ?? ''}
+                    shared={shared.includes(nameOf(row))}
+                    onChange={value => setTemplateNames(names => ({ ...names, [row.key]: value }))}
+                  />
+                ))}
+              </TemplateNameGroup>
             ))}
           </div>
           <InvalidNamesAlert names={invalidNames(rows.map(nameOf))} provider={provider} />
