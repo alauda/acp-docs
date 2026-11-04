@@ -360,7 +360,8 @@ the pipeline actually uses:
 
 ```bash
 kubectl -n $NS get configmap flowlogs-pipeline-config \
-  -o jsonpath='{.data.config\.json}' | yq '.. | select(.name? == "clickhouse") | .write.clickhouse.table'
+  -o jsonpath='{.data.config\.json}' \
+  | jq -r '.parameters[] | select(.name == "clickhouse") | .write.clickhouse.table'
 ```
 
 Query the table to confirm rows are arriving and are recent:
@@ -394,10 +395,21 @@ kubectl apply -f ./netobserv-dashboard.yaml -f ./clickhouse-dashboard.yaml
 ```
 
 Both manifests are ACP `MonitorDashboard` resources created in `cpaas-system`
-and tagged `netobserv`. In the ACP console go to __Monitor__ > __Dashboards__
-and filter by the `netobserv` tag.
+and tagged `netobserv`. They require the ACP monitoring components to be
+installed, because the `MonitorDashboard` API comes from that package; applying
+the manifests also needs permission to create resources in `cpaas-system` and
+`pods/exec` in the operator namespace.
+
+In the ACP console go to __Operations Center__ > __Monitoring__ > __Monitoring
+Dashboards__ and filter by the `netobserv` tag. ACP 4.4 and later also provide
+the Perses dashboard capability; the manifests above use the `MonitorDashboard`
+(legacy) API, which stays available alongside Perses.
 
 ### Panels that need no extra configuration
+
+`Agent Available`, `FLP Available`, and `Console Available` depend only on
+kube-state-metrics. They are availability ratios rendered as percentages, so a
+healthy deployment reads 100%, not the raw Pod count.
 
 __NetObserv Agent and FLP__ proves that the pipeline ingests and writes:
 
@@ -420,6 +432,10 @@ __ClickHouse Operations and Capacity__ proves that storage accepts the data:
 
 ### Panels that need eBPF agent metrics
 
+`End-to-End Flow Rate` plots the agent output, the pipeline ingest, and the
+ClickHouse batch writes on one chart, so its agent series stays empty until agent
+metrics are enabled.
+
 The agent exposes its own Prometheus metrics only when
 `spec.agent.ebpf.metrics.enable` is `true`. The FlowCollector example on this
 page sets it to `false` to keep the footprint small, so these panels stay empty
@@ -432,21 +448,39 @@ until you enable it:
 | `Agent Dropped Flows` | Flat at 0. A rising curve means the pipeline cannot keep up |
 | `Agent Sampling Interval` | Matches `spec.agent.ebpf.sampling` |
 
-`Agent Available`, `FLP Available`, and `Console Available` are availability
-ratios rendered as percentages, so a healthy deployment reads 100%, not the raw
-Pod count.
-
 ### ClickHouse dashboard prerequisites
 
-The `chi_*` panels of __ClickHouse Operations and Capacity__ need ClickHouse
-metrics scraped by Prometheus. Apply the ServiceMonitor from the same manifests
-directory when the operator does not already provide one:
+The `chi_*` panels of __ClickHouse Operations and Capacity__ read the metrics
+exported by the ClickHouse Operator, not by the ClickHouse server. They need a
+ServiceMonitor that selects the operator's metrics port. Create it in the
+namespace where the ClickHouse Operator runs, and set `namespaceSelector` to the
+same namespace:
 
-```bash
-# netobserv-clickhouse-servicemonitor.yaml is not copied into the operator image;
-# take it from the release assets and apply it in the ClickHouse namespace
-kubectl apply -f netobserv-clickhouse-servicemonitor.yaml
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: netobserv-clickhouse
+  namespace: <clickhouse-operator-namespace>
+  labels:
+    app.kubernetes.io/name: netobserv-clickhouse
+    app.kubernetes.io/part-of: netobserv
+spec:
+  namespaceSelector:
+    matchNames:
+      - <clickhouse-operator-namespace>
+  selector:
+    matchLabels:
+      app: clickhouse-operator
+  endpoints:
+    - port: clickhouse-operator-metrics
+      honorLabels: true
+      interval: 30s
+      scrapeTimeout: 20s
 ```
+
+This file is not part of the operator image; create it from the manifest above
+when the monitoring stack does not already scrape the ClickHouse Operator.
 
 The shipped dashboard panels select `namespace="cpaas-system"` and
 `chi="netobserv"`. When ClickHouse runs elsewhere, or is an external server,
@@ -469,6 +503,9 @@ component health, so use the two dashboards to diagnose a missing pipeline.
   address in `spec.clickhouse.addresses`, and the pipeline logs.
 - Rows exist but the console shows an empty page: check the time range first,
   then whether the console plugin reads the same database and table.
+- A panel shows no series at all rather than a flat zero: the metrics are not
+  scraped. Check that the monitoring stack scrapes the `netobserv` ServiceMonitors,
+  and for the ClickHouse dashboard the ClickHouse Operator ServiceMonitor above.
 
 ## Use the NetObserv console
 
@@ -524,10 +561,16 @@ kubectl patch flowcollector cluster --type=merge \
   -p '{"spec":{"execution":{"mode":"OnHold"}}}'
 ```
 
-With `OnHold`, the operator deletes the eBPF agent DaemonSet and its metrics
-Service, the flow logs pipeline, and the console plugin Deployment, Service, and
-HPA. The FlowCollector itself, its namespace, the ClickHouse configuration, and
-all flow records already written to ClickHouse are kept. The operator keeps
+With `OnHold`, the operator deletes every workload and its supporting objects
+that it owns:
+
+- eBPF agent: the DaemonSet, its metrics Service, and its ServiceAccount
+- flow logs pipeline: the Deployment, its ConfigMap, ServiceMonitor, and PrometheusRule
+- console plugin: the Deployment, Service, HPA, metrics Service, ServiceAccount,
+  ConfigMap, and ServiceMonitor
+
+The FlowCollector itself, its namespace, the pipeline configuration, and all
+flow records already written to ClickHouse are kept. The operator keeps
 reconciling the instance but skips the deleted components.
 
 Because the console plugin is removed while the instance is on hold,
@@ -543,7 +586,9 @@ kubectl get flowcollector cluster \
 ```
 
 The paused components report `Unknown` with reason `ComponentUnused` and the
-message `FlowCollector is on hold`. No agent, pipeline, or plugin Pods remain.
+message `FlowCollector is on hold`. This applies to the `EBPFAgents`,
+`WebConsole`, `FLPMonolith`, and `FLPTransformer` conditions. No agent, pipeline,
+or plugin Pods remain.
 
 Resume collection by setting the mode back to `Running`:
 
