@@ -29,11 +29,14 @@ CatalogSource and monitoring ServiceAccounts remain in the platform namespace, `
 | --- | --- |
 | `cluster-image-registry-operator` Deployment | Reconciles the singleton Registry from `Config/cluster` and `ImagePruner/cluster`. |
 | `image-registry` Deployment | Serves OCI push and pull traffic, authentication, authorization, storage access, health checks, and metrics. |
-| `image-api-server` Deployment | Serves the <Term name="productShort" /> Image API through Kubernetes API aggregation. |
-| `APIService/v1.image.alauda.io` | Registers `image.alauda.io/v1` with the Kubernetes API server. |
+| `image-api-server` Deployment | Processes public Image API requests, including image metadata, tag resolution, imports, and namespace image limits. |
 | `node-ca` DaemonSet | Distributes Registry CA trust and Registry service host mappings to nodes. |
 | `image-pruner` CronJob | Runs scheduled image pruning and, while the Registry is managed, registry garbage collection. |
 | Managed imagePullSecret controller | Creates, injects, refreshes, and removes service account pull secrets for the internal registry. |
+
+The Operator publishes the Image API as `image.alauda.io/v1` through the Kubernetes API server.
+It manages the APIService registration and internal metadata storage resources. Use the public
+Image API or `ac` for image operations; internal storage CRDs are not an alternative management API.
 
 ## Install Alauda Container Platform Registry
 
@@ -221,12 +224,17 @@ The Registry and Image API deployments are created after storage is configured a
    kubectl -n cpaas-system rollout status deployment/image-registry --timeout=300s
    kubectl -n cpaas-system rollout status deployment/image-api-server --timeout=300s
    kubectl wait --for=condition=Available apiservice/v1.image.alauda.io --timeout=300s
+   kubectl api-resources --api-group=image.alauda.io --cached=false
+   kubectl get imagedigests.image.alauda.io
    kubectl get configs.imageregistry.operator.alauda.io cluster -o yaml
    ```
 
 Expected results:
 
 - Both deployments are available, and `APIService/v1.image.alauda.io` is `Available=True`.
+- Public API discovery includes cluster-scoped `imagedigests` and namespaced `imagestreams`,
+  `imagestreamtags`, and `imagestreamimages`. The ImageDigest query succeeds; a new Registry can
+  return no objects.
 - `Config/cluster.spec.managementState` is `Managed`; its conditions report `Available=True`,
   `Progressing=False`, and `Degraded=False`.
 
@@ -275,7 +283,12 @@ OperatorHub. The Operator upgrade updates the `cluster-image-registry-operator` 
 reconciles the existing `Config/cluster`, `ImagePruner/cluster`, Registry, Image API, and supporting
 resources.
 
-Before upgrading, confirm that the current Registry is healthy.
+These steps apply to installations that already use the compatible ImageDigest storage model.
+Before upgrading, confirm that the current Registry is healthy and that the current and target
+releases use compatible image metadata resources. An Operator upgrade does not automatically
+rename or copy objects between different metadata storage resources. For an earlier preview that
+uses a different image metadata schema, obtain a supported migration plan before approving an
+InstallPlan.
 
 > **Important:** For Alauda Container Platform Registry versions earlier than `v4.4`, contact
 > technical support for upgrade and migration plans.
@@ -285,6 +298,7 @@ kubectl -n image-registry-system get subscription,csv
 kubectl get configs.imageregistry.operator.alauda.io cluster -o yaml
 kubectl -n cpaas-system rollout status deployment/image-registry --timeout=300s
 kubectl -n cpaas-system rollout status deployment/image-api-server --timeout=300s
+kubectl api-resources --api-group=image.alauda.io --cached=false
 ```
 
 Set the Subscription approval strategy to `Manual` before making a new Operator package available:
@@ -332,7 +346,7 @@ Expected results:
 
 - The new CSV is `Succeeded` and the Subscription reports the new installed CSV.
 - `cluster-image-registry-operator`, `image-registry`, and `image-api-server` are available.
-- Existing storage, routes, Image API metadata, and ImagePruner configuration remain reconciled.
+- Existing storage, routes, compatible Image API metadata, and ImagePruner configuration remain reconciled.
 - `Config/cluster` reports `Available=True`, `Progressing=False`, and `Degraded=False`.
 
 If the upgraded Operator Pod reports an image pull authorization error, follow
@@ -444,6 +458,12 @@ kubectl -n cpaas-system get deploy image-registry image-api-server
 kubectl -n cpaas-system get daemonset node-ca
 kubectl -n cpaas-system get cronjob image-pruner
 kubectl get apiservice v1.image.alauda.io
+kubectl get apiservice v1.image.alauda.io \
+  -o jsonpath='{.spec.service.namespace}{"/"}{.spec.service.name}{":"}{.spec.service.port}{"\n"}'
+kubectl api-resources --api-group=image.alauda.io --cached=false
+kubectl get imagedigests.image.alauda.io
+kubectl get imagestreams.image.alauda.io -A
+kubectl get imagesignatures.image.alauda.io
 kubectl get configs.imageregistry.operator.alauda.io cluster -o yaml
 kubectl get imagepruners.imageregistry.operator.alauda.io cluster -o yaml
 ```
@@ -454,7 +474,15 @@ Expected results:
 - `cluster-image-registry-operator`, `image-registry`, and `image-api-server` are available.
 - `node-ca` is ready on target nodes.
 - `APIService/v1.image.alauda.io` is `Available=True`.
+- The APIService backend is `cpaas-system/image-api-server:443`, or the recorded operand namespace
+  when customized.
+- Discovery exposes `imagedigests` as `ImageDigest` at cluster scope. The public metadata queries
+  succeed, even when they return no objects.
 - `Config/cluster` reports `Available=True`, `Progressing=False`, and `Degraded=False`.
+
+APIService availability checks connectivity to the Image API server. The discovery and resource
+queries also check the public resource path and its metadata backend. They do not verify Registry
+blob availability; complete a push or pull check for the required images separately.
 
 ## Check Registry Logs and Metrics Access
 
