@@ -23,12 +23,17 @@ export interface OsVariant {
   /** Identifier used in VM template ConfigMap names. */
   value: string
   label: string
+  /**
+   * Whether the nodes of one cluster can mix x86_64 and Arm. Only Bare Metal
+   * clusters can, and only with an OS that has this capability.
+   */
+  mixedArchitecture: boolean
 }
 
 export const OS_VARIANTS: readonly OsVariant[] = [
-  { value: 'm55', label: 'Alauda OS M55' },
-  { value: 'ko', label: 'Alauda OS KO' },
-  { value: 'ku', label: 'Alauda OS KU' },
+  { value: 'm55', label: 'Alauda OS M55', mixedArchitecture: false },
+  { value: 'ko', label: 'Alauda OS KO', mixedArchitecture: false },
+  { value: 'ku', label: 'Alauda OS KU', mixedArchitecture: true },
 ]
 
 const KUBERNETES_VERSION = /^v?(\d+)\.(\d+)\.(\d+)(.*)$/
