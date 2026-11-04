@@ -139,11 +139,21 @@ function Note({ provider }: { provider: Provider }) {
         <code>global</code> clusters: the ConfigMaps are not synchronized between them.
       </p>
       {selectsArchitecture(provider) ? (
-        <p>
-          For each ACP version, register {nouns} of only one OS per architecture on a <code>global</code>{' '}
-          cluster. When {nouns} of different OSes have the same Kubernetes version and architecture, an
-          upgrade can move a cluster to the other OS.
-        </p>
+        <>
+          <p>
+            For each ACP version, register {nouns} of only one OS per architecture on a <code>global</code>{' '}
+            cluster. When {nouns} of different OSes have the same Kubernetes version and architecture, an
+            upgrade can move a cluster to the other OS.
+          </p>
+          {/* The upgrade controllers ignore an entry without an architecture once another entry of its
+              Kubernetes version has one, so deleting it changes nothing for that version. While an upgrade
+              runs, the old entry can still be the only one naming the VM template or image some groups run. */}
+          <p>
+            ConfigMaps created from earlier versions of this document have no <code>architecture</code> key and
+            no architecture in their name. Once the ConfigMaps of an ACP version exist for each architecture that
+            you use, you can delete the earlier ConfigMaps of that version when no upgrade is in progress.
+          </p>
+        </>
       ) : (
         <p>
           For each ACP version, register {nouns} of only one OS on a <code>global</code> cluster. When{' '}
