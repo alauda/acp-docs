@@ -155,7 +155,7 @@ spec:
               env:
                 - name: CLICKHOUSE_DO_NOT_CHOWN
                   value: "1"
-              image: build-harbor.alauda.cn/middleware/clickhouse-server:v25.8.16.34-61a7880e
+              image: <registry>/middleware/clickhouse-server:<version>
               name: clickhouse-pod
               resources:
                 limits:
@@ -174,7 +174,7 @@ spec:
     volumeClaimTemplates:
       - name: default
         spec:
-          storageClassName: sc-topolvm
+          storageClassName: <storage-class>
           accessModes:
             - ReadWriteOnce
           resources:
@@ -182,13 +182,18 @@ spec:
               storage: 80Gi
       - name: log-volume-template
         spec:
-          storageClassName: sc-topolvm
+          storageClassName: <storage-class>
           accessModes:
             - ReadWriteOnce
           resources:
             requests:
               storage: 15Gi
 ```
+
+Replace the placeholders before applying the manifest: `<registry>` with the
+registry that serves the ClickHouse server image in your environment, and
+`<storage-class>` with a StorageClass that provides `ReadWriteOnce` volumes in
+the target cluster.
 
 After the ClickHouse instance is ready, get the service endpoint by inspecting field `.status.endpoint` of the ClickHouseInstallation instance.
 You can also run the following command to get the endpoint:
@@ -330,71 +335,136 @@ A `Ready` FlowCollector only proves that the operator reconciled the resources.
 It does not prove that flows reach ClickHouse. On a new cluster, check the data
 path before you hand the environment over.
 
-1. Check the workloads and the table the pipeline writes to.
+### Check the workloads and the table
 
-   ```bash
-   NS=netobserv   # the value of .spec.namespace
-   kubectl -n $NS get pods
-   kubectl get flowcollector cluster \
-     -o jsonpath='{range .status.conditions[*]}{.type}={.status} {.message}{"\n"}{end}'
-   kubectl -n kube-public get configmap global-info -o jsonpath='{.data.clusterName}{"\n"}'
-   ```
+```bash
+NS=netobserv   # the value of .spec.namespace
+kubectl -n $NS get pods
+kubectl get flowcollector cluster \
+  -o jsonpath='{range .status.conditions[*]}{.type}={.status} {.message}{"\n"}{end}'
+kubectl -n kube-public get configmap global-info -o jsonpath='{.data.clusterName}{"\n"}'
+```
 
-   The eBPF agent DaemonSet has one Ready Pod per node, and the flow logs
-   pipeline Pod is Ready. Flows are written to `flow_logs_<clusterName>` in the
-   ClickHouse database, where `<clusterName>` is derived from
-   `kube-public/global-info`. Setting `.spec.clickhouse.table` overrides the
-   derived name.
+The eBPF agent DaemonSet has one Ready Pod per node, and the flow logs pipeline
+Pod is Ready. In the FlowCollector conditions, a `Waiting*` condition reports
+`False` when the component is healthy; `True` or `Unknown` means the operator
+is still waiting on, or deliberately skipped, that component.
 
-   Query the table to confirm rows are arriving and are recent:
+Flows are written to `flow_logs_<clusterName>` in the ClickHouse database. The
+table name is derived from `kube-public/global-info`, key `data.clusterName`,
+after lowercasing it, replacing every character outside `[a-z0-9_]` with `_`,
+collapsing repeated `_`, and trimming leading and trailing `_`. For example, a
+cluster named `Biz-Cluster-1` writes to `flow_logs_biz_cluster_1`. Setting
+`.spec.clickhouse.table` overrides the derived name; you can also read the name
+the pipeline actually uses:
 
-   ```bash
-   CH_POD=$(kubectl -n cpaas-system get pod \
-     -l clickhouse.altinity.com/chi=netobserv \
-     -o jsonpath='{.items[0].metadata.name}')
-   kubectl -n cpaas-system exec "$CH_POD" -- clickhouse client \
-     --user <user> --password <password> --database netobserv \
-     --query 'SELECT count(), max(Timestamp) FROM flow_logs_<clusterName>'
-   ```
+```bash
+kubectl -n $NS get configmap flowlogs-pipeline-config \
+  -o jsonpath='{.data.config\.json}' | yq '.. | select(.name? == "clickhouse") | .write.clickhouse.table'
+```
 
-   Replace the label value, namespace, database, and table with the values of
-   your deployment when the ClickHouse instance is not the one from this page.
+Query the table to confirm rows are arriving and are recent:
 
-2. Open the monitoring dashboards shipped with the package. In the ACP console go
-   to __Monitor__ > __Dashboards__ and filter by the `netobserv` tag.
+```bash
+CH_POD=$(kubectl -n cpaas-system get pod \
+  -l clickhouse.altinity.com/chi=netobserv \
+  -o jsonpath='{.items[0].metadata.name}')
+kubectl -n cpaas-system exec "$CH_POD" -- clickhouse client \
+  --user <user> --password <password> --database netobserv \
+  --query 'SELECT count(), max(Timestamp) FROM flow_logs_<clusterName>'
+```
 
-   __NetObserv Agent and FLP__ shows whether every hop of the pipeline moves data:
+Replace the label value, namespace, database, and table with the values of your
+deployment when the ClickHouse instance is not the one from this page. If the
+instance runs with a log sidecar container, add `-c <clickhouse-container>`.
 
-   | Panel | What to check |
-   | --- | --- |
-   | `Agent Available` / `FLP Available` | Equal to the node count and to at least 1 replica respectively |
-   | `Agent Flow Rate` | Non-zero while there is traffic on the captured interfaces |
-   | `FLP Ingest Rate` | Non-zero and in the same order of magnitude as `Agent Flow Rate` |
-   | `Flow Rate by Agent` | Every node contributes; a single silent node points to a scheduling or eBPF problem |
-   | `Flow Rate by FLP` | Includes ClickHouse batch rows, which proves the pipeline writes downstream |
-   | `Agent Dropped Flows` | Flat at 0. A rising curve means the pipeline cannot keep up |
-   | `FLP Queue Size` | Fluctuates but does not grow monotonically |
-   | `Container Restarts` | No repeated restarts of the agent or pipeline containers |
+### Install the monitoring dashboards
 
-   __ClickHouse Operations and Capacity__ shows whether the storage side accepts the data:
+The package ships two dashboard manifests inside the controller-manager image,
+under `/opt/netobserv/docs/ops/manifests/`. The operator does not create them, so
+apply them once per cluster:
 
-   | Panel | What to check |
-   | --- | --- |
-   | `ClickHouse Write Rate` | Non-zero and matching the ingest rate above |
-   | `ClickHouse Write Errors` | 0 for both retried and dropped entries |
-   | `ClickHouse Batch Send P95` | Stable; a growing trend points to ClickHouse pressure |
-   | `Selected Tables Rows` / `Selected Tables Size` | Growing, which confirms inserts land in the table |
-   | `ClickHouse Disk Used` | Within the capacity you provisioned for the retention period |
+```bash
+POD=$(kubectl -n netobserv-operator get pod -l app=netobserv-operator \
+  -o jsonpath='{.items[0].metadata.name}')
+for dashboard in netobserv-dashboard.yaml clickhouse-dashboard.yaml; do
+  kubectl -n netobserv-operator cp "$POD:/opt/netobserv/docs/ops/manifests/$dashboard" "./$dashboard"
+done
+kubectl apply -f ./netobserv-dashboard.yaml -f ./clickhouse-dashboard.yaml
+```
 
-3. Cross-check the numbers in the console: open **Observe** > **Network Traffic**,
-   select a 5 to 15 minute range, and confirm that bytes, packets, and flow counts
-   are non-zero and comparable with the two dashboards above.
+Both manifests are ACP `MonitorDashboard` resources created in `cpaas-system`
+and tagged `netobserv`. In the ACP console go to __Monitor__ > __Dashboards__
+and filter by the `netobserv` tag.
+
+### Panels that need no extra configuration
+
+__NetObserv Agent and FLP__ proves that the pipeline ingests and writes:
+
+| Panel | What to check |
+| --- | --- |
+| `FLP Ingest Rate` | Non-zero while there is traffic on the captured interfaces |
+| `Flow Rate by FLP` | Non-zero, and its ClickHouse batch series follows the ingest rate |
+| `FLP Queue Size` | Fluctuates but does not grow monotonically |
+| `Container Restarts` | No repeated restarts of the pipeline container |
+
+__ClickHouse Operations and Capacity__ proves that storage accepts the data:
+
+| Panel | What to check |
+| --- | --- |
+| `ClickHouse Write Rate` | Non-zero and comparable with `FLP Ingest Rate` |
+| `ClickHouse Write Errors` | Flat at 0 for all three series: retried, dropped, and uncertain |
+| `ClickHouse Batch Send P95` | Stable; a growing trend points to ClickHouse pressure |
+| `Selected Tables Rows` / `Selected Tables Size` | Growing, which confirms inserts land in the table |
+| `ClickHouse Disk Used` | Within the capacity you provisioned for the retention period |
+
+### Panels that need eBPF agent metrics
+
+The agent exposes its own Prometheus metrics only when
+`spec.agent.ebpf.metrics.enable` is `true`. The FlowCollector example on this
+page sets it to `false` to keep the footprint small, so these panels stay empty
+until you enable it:
+
+| Panel | What to check |
+| --- | --- |
+| `Agent Flow Rate` | Non-zero and in the same order of magnitude as `FLP Ingest Rate` |
+| `Flow Rate by Agent` | Every node contributes; one silent node points to scheduling or eBPF problems |
+| `Agent Dropped Flows` | Flat at 0. A rising curve means the pipeline cannot keep up |
+| `Agent Sampling Interval` | Matches `spec.agent.ebpf.sampling` |
+
+`Agent Available`, `FLP Available`, and `Console Available` are availability
+ratios rendered as percentages, so a healthy deployment reads 100%, not the raw
+Pod count.
+
+### ClickHouse dashboard prerequisites
+
+The `chi_*` panels of __ClickHouse Operations and Capacity__ need ClickHouse
+metrics scraped by Prometheus. Apply the ServiceMonitor from the same manifests
+directory when the operator does not already provide one:
+
+```bash
+# netobserv-clickhouse-servicemonitor.yaml is not copied into the operator image;
+# take it from the release assets and apply it in the ClickHouse namespace
+kubectl apply -f netobserv-clickhouse-servicemonitor.yaml
+```
+
+The shipped dashboard panels select `namespace="cpaas-system"` and
+`chi="netobserv"`. When ClickHouse runs elsewhere, or is an external server,
+those panels stay empty; only the `netobserv_*` write panels remain meaningful.
+
+### Cross-check in the console
+
+Open **Observe** > **Network Traffic**, select a 5 to 15 minute range, and
+confirm that bytes, packets, and flow counts are non-zero and comparable with
+the dashboards above. The console shows traffic data from ClickHouse, not
+component health, so use the two dashboards to diagnose a missing pipeline.
 
 ### When no data arrives
 
-- `Agent Flow Rate` is zero: there is no traffic on the monitored interfaces,
-  `spec.agent.ebpf.sampling` is too coarse, or the agent Pods are not Ready.
-- `Agent Flow Rate` is non-zero but `ClickHouse Write Rate` stays zero: the
+- `FLP Ingest Rate` is zero: the pipeline does not receive flows. Check whether
+  the agent Pods are Ready, and whether `spec.agent.ebpf.sampling` is so coarse
+  that little is captured.
+- `FLP Ingest Rate` is non-zero but `ClickHouse Write Rate` stays zero: the
   pipeline cannot connect to ClickHouse. Check the `ck-auth` secret, the
   address in `spec.clickhouse.addresses`, and the pipeline logs.
 - Rows exist but the console shows an empty page: check the time range first,
@@ -454,10 +524,26 @@ kubectl patch flowcollector cluster --type=merge \
   -p '{"spec":{"execution":{"mode":"OnHold"}}}'
 ```
 
-With `OnHold`, the operator deletes the managed services and workloads, except
-the static console plugin and the operator itself, so the cluster keeps minimal
-resources without losing the configuration. Flow records that are already in
-ClickHouse are not deleted and remain visible until the retention period expires.
+With `OnHold`, the operator deletes the eBPF agent DaemonSet and its metrics
+Service, the flow logs pipeline, and the console plugin Deployment, Service, and
+HPA. The FlowCollector itself, its namespace, the ClickHouse configuration, and
+all flow records already written to ClickHouse are kept. The operator keeps
+reconciling the instance but skips the deleted components.
+
+Because the console plugin is removed while the instance is on hold,
+**Observe** > **Network Traffic** cannot query the data during that period.
+Records written before the pause stay in ClickHouse and become visible again as
+soon as collection is resumed, until their retention period expires.
+
+Confirm that the instance is on hold:
+
+```bash
+kubectl get flowcollector cluster \
+  -o jsonpath='{range .status.conditions[*]}{.type}={.status} {.reason} {.message}{"\n"}{end}'
+```
+
+The paused components report `Unknown` with reason `ComponentUnused` and the
+message `FlowCollector is on hold`. No agent, pipeline, or plugin Pods remain.
 
 Resume collection by setting the mode back to `Running`:
 
@@ -466,4 +552,5 @@ kubectl patch flowcollector cluster --type=merge \
   -p '{"spec":{"execution":{"mode":"Running"}}}'
 ```
 
-The agents and the pipeline are recreated with the same configuration.
+The operator recreates the agents, the pipeline, and the console plugin with the
+same configuration.
