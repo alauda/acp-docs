@@ -1,0 +1,212 @@
+---
+weight: 25
+---
+
+# Create an Image Registry with mirror-registry
+
+## Prerequisites
+
+- A dedicated machine that is not shared with any cluster node.
+- Linux with systemd and OpenSSL installed. You must be able to run commands as `root`.
+- 4 or more vCPUs.
+- 8 GB or more of RAM.
+- At least 200 GB of storage.
+
+<Directive type="warning" title="Important">
+Storage requirements depend on your environment. For example, you need more space to retain multiple versions or multiple CPU architectures.
+</Directive>
+
+## About mirror-registry
+
+Deploying <Term name="productShort" /> requires an image registry that stores the images needed to install and later upgrade the platform. Every machine in the clusters must have access to this registry. If the registry is unreachable, tasks such as installation, upgrades, and routine operations such as workload relocation might fail. The registry must be operated in a highly available manner, so that its availability aligns with the production availability of your <Term name="productShort" /> clusters. A customer-provided registry is recommended.
+
+If a non-production environment has no existing registry, you can use mirror-registry. mirror-registry is a small-scale image registry provided with <Term name="productShort" />, available on the Core Package download page. It is based on the native Distribution registry, runs as a single instance managed by systemd, and is accessible only over HTTPS. By default, it listens on port `443` and uses local storage and an automatically generated self-signed certificate. You must configure credentials when you deploy it. Optional settings include the port, custom TLS certificates, and S3-compatible object storage.
+
+If another image registry is already available in the installation environment, you do not need mirror-registry.
+
+### mirror-registry Limitations
+
+The following limitations apply to mirror-registry:
+
+- mirror-registry supports only single-instance deployment and is not a highly available registry. With S3-compatible object storage, the image data is stored off the machine, but the registry service remains a single instance.
+- mirror-registry does not meet the high availability requirement and cannot be used in production environments. Production environments must use a customer-provided, highly available registry.
+- mirror-registry supports hosting only <Term name="productShort" /> platform images.
+- Content built by customers, including application images, should not be hosted in mirror-registry.
+- All clusters that use mirror-registry are affected by its single point of failure.
+
+## Install mirror-registry
+
+This procedure installs mirror-registry on the local machine and starts an image registry, which listens on port `443` by default, to store <Term name="productShort" /> platform images.
+
+<Directive type="info" title="Note">
+The installation makes the following changes to the machine: it creates the `/opt/mirror-registry` directory, which contains the binaries, configuration, and local storage, and it creates the `mirror-registry` systemd service, which starts at boot. The installation script does not change firewall rules.
+</Directive>
+
+### Supported Flags
+
+The following flags apply to the `install` and `upgrade` commands. Default values apply to the first installation. When you run `install` again or run `upgrade`, unspecified flags keep their existing configuration.
+
+**General flags**
+
+| Flag | Description |
+| --- | --- |
+| `--listen` | The listening port, on all IPv4 and IPv6 addresses of all interfaces. If the port is not `443`, include it when you access the registry and when you specify the registry address. Defaults to `443`. |
+| `--auth-file` | The path of the credentials file. Line 1 is the username and line 2 is the password. No default value. Required for the first installation. |
+| `--tls-cert` | The path of the TLS certificate, including the full chain. Specify it together with `--tls-key`. Defaults to an automatically generated self-signed certificate. |
+| `--tls-key` | The path of the TLS private key. Specify it together with `--tls-cert`. Defaults to an automatically generated private key. |
+| `--regen-cert` | Regenerates the self-signed certificate. Defaults to keeping the existing certificate. |
+
+**Storage flags**
+
+| Flag | Description |
+| --- | --- |
+| `--storage` | The storage type, `filesystem` or `s3`, which cannot be changed after installation. Defaults to `filesystem`. |
+| `--data-dir` | The image data directory for local storage, as an absolute path. Cannot be used with `--storage s3`. Defaults to `/opt/mirror-registry/data`. |
+| `--s3-endpoint` | The address of the S3-compatible service, without the bucket name or a path. Required with `--storage s3`. If it has no scheme, `https://` is used. No default value. |
+| `--s3-region` | The region of the bucket. Required with `--storage s3`. No default value. |
+| `--s3-bucket` | The name of the bucket, which must already exist. Required with `--storage s3`. No default value. |
+| `--s3-credentials-file` | The path of the S3 credentials file. Line 1 is the access key and line 2 is the secret key. Defaults to no credentials file. |
+| `--s3-root-dir` | The path prefix inside the bucket, which can contain only letters, digits, `.`, `_`, `-`, and `/`. Defaults to the bucket root. |
+
+### Prepare the Package and Credentials
+
+1. Download the `mirror-registry-<version>.<arch>.tar.gz` package that matches the machine architecture from the Core Package download page in the Customer Portal, and extract it:
+
+   ```bash
+   tar xzf mirror-registry-<version>.<arch>.tar.gz
+   cd mirror-registry-<version>.<arch>
+   ```
+
+2. Create the credentials file. Line 1 is the username and line 2 is the password:
+
+   ```bash
+   {
+     read -rp "Registry username: " USERNAME
+     read -rsp "Registry password: " PASSWORD; printf '\n'
+     (umask 077; printf '%s\n%s\n' "$USERNAME" "$PASSWORD" > /root/registry.auth)
+     unset USERNAME PASSWORD
+   }
+   ```
+
+   The username cannot contain whitespace or `:`, and the password can be at most 72 bytes. You can delete this file after the installation.
+
+### Deploy with Local Storage
+
+To use the default data directory, `/opt/mirror-registry/data`:
+
+```bash
+./mirror-registry install --auth-file /root/registry.auth
+```
+
+To store the data on another path, such as a dedicated data disk, and change the listening port:
+
+```bash
+./mirror-registry install \
+  --auth-file /root/registry.auth \
+  --data-dir /cpaas/registry \
+  --listen 8443
+```
+
+### Deploy with S3-Compatible Object Storage
+
+1. Create a bucket on the S3 service, and prepare an access key that can list, read, write, and delete objects and perform multipart uploads in the bucket. The script does not create the bucket. Paths inside the bucket do not need to exist in advance.
+
+2. Create the S3 credentials file. Line 1 is the access key and line 2 is the secret key:
+
+   ```bash
+   {
+     read -rp "S3 access key: " S3_ACCESS_KEY
+     read -rsp "S3 secret key: " S3_SECRET_KEY; printf '\n'
+     (umask 077; printf '%s\n%s\n' "$S3_ACCESS_KEY" "$S3_SECRET_KEY" > /root/s3.cred)
+     unset S3_ACCESS_KEY S3_SECRET_KEY
+   }
+   ```
+
+3. Set `--s3-endpoint` and `--s3-region` for your storage:
+
+   | Storage | `--s3-endpoint` | `--s3-region` |
+   | --- | --- | --- |
+   | MinIO | `https://<address>:9000` | `us-east-1` |
+   | Ceph RGW | `https://<address>:<RGW-port>` | `us-east-1` |
+   | AWS S3 | `https://s3.<region>.amazonaws.com` | The region of the bucket |
+
+4. Install mirror-registry:
+
+   ```bash
+   ./mirror-registry install \
+     --auth-file /root/registry.auth \
+     --storage s3 \
+     --s3-endpoint https://minio.example.com:9000 \
+     --s3-region us-east-1 \
+     --s3-bucket registry \
+     --s3-credentials-file /root/s3.cred
+   ```
+
+   If the bucket has other content, add `--s3-root-dir mirror/registry` to store the data under a path inside the bucket.
+
+   At the end of the installation, the script checks S3 connectivity. If `S3 check failed` appears, check the endpoint, bucket name, region, and keys.
+
+### Verify the Deployment
+
+1. Confirm that the registry is available:
+
+   ```bash
+   ./mirror-registry status
+   curl -k -u <username> https://localhost/v2/_catalog
+   ```
+
+   A new registry returns `{"repositories":[]}`. If you changed the port, add it to the URL.
+
+2. After you open the firewall port, continue with [Prepare the Target-Version Payload](./external-platform-image-registry.mdx#prepare-the-target-version-payload) to upload the platform images to this registry.
+
+<Directive type="info" title="Note">
+If images are affected by storage layer problems, you can upload the platform images again, or reinstall mirror-registry on more stable storage.
+</Directive>
+
+## Update mirror-registry
+
+This procedure updates mirror-registry by using the `upgrade` command.
+
+<Directive type="warning" title="Important">
+The service restarts during the update, so the registry is briefly unavailable.
+</Directive>
+
+**Prerequisites**
+
+- You have installed mirror-registry.
+
+**Procedure**
+
+- Extract the new package and run the following command from its directory:
+
+  ```bash
+  ./mirror-registry upgrade
+  ```
+
+  Unspecified flags keep their existing configuration. If the service is not healthy after the update, it automatically rolls back to the previous version.
+
+## Replace the mirror-registry SSL/TLS Certificates
+
+Use this procedure to replace the current certificate or to update it periodically.
+
+**Prerequisites**
+
+- You have installed mirror-registry.
+
+**Procedure**
+
+- To use your own certificate, run the following command. Specify both flags together. The private key cannot be passphrase-protected:
+
+  ```bash
+  ./mirror-registry install --tls-cert <full-chain-file> --tls-key <key-file>
+  ```
+
+- If the IP address or host name of the machine changes, regenerate the self-signed certificate:
+
+  ```bash
+  ./mirror-registry install --regen-cert
+  ```
+
+  <Directive type="info" title="Note">
+  The automatically generated certificate covers the host name, `localhost`, `127.0.0.1`, `::1`, and the global IP addresses of the machine at generation time, and is valid for 10 years. If you access the registry through another domain name, use your own certificate.
+  </Directive>
