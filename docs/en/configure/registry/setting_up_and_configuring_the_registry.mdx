@@ -54,6 +54,43 @@ kubectl get configs.imageregistry.operator.alauda.io cluster \
 kubectl -n cpaas-system rollout status deployment/image-registry --timeout=300s
 ```
 
+## Prepare Private Image Imports \{#prepare-private-image-imports}
+
+Before importing from a private source registry, create its image pull Secret in the destination
+image namespace. The Image API server reads credentials from that namespace; a local CLI auth file
+is not sent with an import request.
+
+1. Obtain a source registry account with read access to the required repository. Confirm that the
+   Image API server can reach the source endpoint and trusts its certificate.
+2. Follow the **Creating a container registry type Secret** procedure in
+   [Configuring Secrets](../../developer/building_application/configuration/add_secret.mdx).
+   Specify `--namespace=team-a` when running the creation command for this example. Use the source
+   registry host and its credentials, and select the container registry credential type.
+3. Verify the Secret metadata without displaying its credentials:
+
+   ```bash
+   kubectl -n team-a get secret <source-pull-secret> \
+     -o go-template='Type: {{.type}}{{"\n"}}Credential entries: {{len .data}}{{"\n"}}Excluded from imports: {{with .metadata.annotations}}{{index . "alauda.io/image.excludeSecret"}}{{else}}false{{end}}{{"\n"}}'
+   ```
+
+   Replace `<source-pull-secret>` with the name used in step 2. The Secret must use the registry
+   credential type created by that procedure, contain credential data, and not have
+   `alauda.io/image.excludeSecret: "true"`. A generic or basic-auth Secret is not an import credential.
+4. From a client authenticated to the target cluster, preview an import to verify source access:
+
+   ```bash
+   ac config set-registry-mode modern
+   ac import-image demo:latest \
+     --from=source.example.com/source-team/source-app:1.0 \
+     -n team-a
+   ```
+
+Replace `team-a` with the destination image namespace and the source reference with an existing
+image that the account can read. The preview must report `Success` in the `STATUS` column; it does
+not persist the ImageStream change. If it fails, check the source reference, namespace credentials,
+source permissions, and connectivity from the Image API server. Continue with
+[Manage ImageStreams](../../developer/registry/managing_images_with_ac.mdx) to persist the import.
+
 ## Before Configuring Storage \{#before-configuring-storage}
 
 > **Warning:** The storage examples configure a new Registry. Changing a backend, PVC claim, or
@@ -413,29 +450,74 @@ total request deadline.
 
 Use `spec.readOnly: true` during maintenance that must reject Registry pushes and deletes, along
 with Image API metadata mutations such as tag changes, imports, mappings, and signature writes.
-Authorized reads remain available.
+Authorized reads remain available. This procedure requires `Config/cluster.spec.managementState`
+to be `Managed` so the Operator applies the Registry configuration.
 
 > **Warning:** Metadata pruning and combined prune and garbage collection require writes. Keep
 > read-only mode disabled for those operations and quiesce external image writers instead.
 
-Enable read-only mode and wait for the Registry rollout:
+Enable read-only mode and record the requested configuration generation. Wait for the Operator to
+observe that generation and reconcile without a degraded condition before checking the rollout:
 
 ```bash
-kubectl patch configs.imageregistry.operator.alauda.io cluster \
-  --type=merge -p '{"spec":{"readOnly":true}}'
-kubectl -n cpaas-system rollout status deployment/image-registry --timeout=300s
+REGISTRY_CONFIG_GENERATION="$(kubectl patch configs.imageregistry.operator.alauda.io cluster \
+  --type=merge -p '{"spec":{"readOnly":true}}' \
+  -o jsonpath='{.metadata.generation}')" || exit 1
+kubectl wait configs.imageregistry.operator.alauda.io/cluster \
+  --for=jsonpath='{.status.observedGeneration}'="$REGISTRY_CONFIG_GENERATION" --timeout=300s || exit 1
+kubectl wait configs.imageregistry.operator.alauda.io/cluster \
+  --for=condition=Degraded=false --timeout=300s || exit 1
+kubectl wait configs.imageregistry.operator.alauda.io/cluster \
+  --for=condition=Progressing=false --timeout=300s || exit 1
+REGISTRY_TEMPLATE_READ_ONLY="$(kubectl -n cpaas-system get deployment image-registry \
+  -o jsonpath='{.spec.template.spec.containers[?(@.name=="registry")].env[?(@.name=="REGISTRY_STORAGE_MAINTENANCE_READONLY")].value}')" || exit 1
+test "$REGISTRY_TEMPLATE_READ_ONLY" = '{enabled: true}' || {
+  echo "The Registry Pod template has not enabled read-only mode." >&2
+  exit 1
+}
+kubectl -n cpaas-system rollout status deployment/image-registry --timeout=300s || exit 1
 kubectl get configs.imageregistry.operator.alauda.io cluster \
   -o jsonpath='{.spec.readOnly}{"\n"}'
 ```
 
 Expected result: `true`. Authorized reads succeed, while pushes and Image API mutations receive
-read-only rejections. After the maintenance operation, restore writes before resuming writers or pruning:
+read-only rejections. The Operator applies the Registry setting through a Pod rollout; checking an
+old Deployment or the desired Config field alone does not establish readiness. Check every Registry Pod:
 
 ```bash
-kubectl patch configs.imageregistry.operator.alauda.io cluster \
-  --type=merge -p '{"spec":{"readOnly":false}}'
-kubectl -n cpaas-system rollout status deployment/image-registry --timeout=300s
+kubectl -n cpaas-system get pods -l app.kubernetes.io/name=image-registry \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.deletionTimestamp}{"\t"}{.spec.containers[?(@.name=="registry")].env[?(@.name=="REGISTRY_STORAGE_MAINTENANCE_READONLY")].value}{"\n"}{end}'
 ```
+
+Continue only when Pods are present, every row contains `{enabled: true}`, and the deletion timestamp
+column is empty. Repeat the check while old Pods are terminating. Keep writers paused until
+in-flight requests have finished and no old writable Registry Pod remains.
+
+After maintenance, restore writes and wait for the corresponding reconciliation before resuming
+writers or pruning:
+
+```bash
+REGISTRY_CONFIG_GENERATION="$(kubectl patch configs.imageregistry.operator.alauda.io cluster \
+  --type=merge -p '{"spec":{"readOnly":false}}' \
+  -o jsonpath='{.metadata.generation}')" || exit 1
+kubectl wait configs.imageregistry.operator.alauda.io/cluster \
+  --for=jsonpath='{.status.observedGeneration}'="$REGISTRY_CONFIG_GENERATION" --timeout=300s || exit 1
+kubectl wait configs.imageregistry.operator.alauda.io/cluster \
+  --for=condition=Degraded=false --timeout=300s || exit 1
+kubectl wait configs.imageregistry.operator.alauda.io/cluster \
+  --for=condition=Progressing=false --timeout=300s || exit 1
+REGISTRY_TEMPLATE_READ_ONLY="$(kubectl -n cpaas-system get deployment image-registry \
+  -o jsonpath='{.spec.template.spec.containers[?(@.name=="registry")].env[?(@.name=="REGISTRY_STORAGE_MAINTENANCE_READONLY")].value}')" || exit 1
+test -z "$REGISTRY_TEMPLATE_READ_ONLY" || {
+  echo "The Registry Pod template is still read-only." >&2
+  exit 1
+}
+kubectl -n cpaas-system rollout status deployment/image-registry --timeout=300s || exit 1
+```
+
+Repeat the Pod check above. Before resuming writers or pruning, Pods must be present, the deletion
+timestamp column must be empty, and the read-only value column must be empty in every row. If any
+check fails, keep writers paused and inspect the Operator conditions before retrying.
 
 ### Other Runtime Settings
 
@@ -651,6 +733,54 @@ Expected results:
 
 - `ImagePruner/cluster` contains the configured schedule and retention policy.
 - The rendered `image-pruner` CronJob remains suspended in the Registry operand namespace.
+
+Before enabling the schedule, check the `pruner` ServiceAccount's permission to read `Config/cluster`.
+The current CLI checks this permission before scanning, but the Operator-generated `system:image-pruner`
+role does not grant it. Run this check as a cluster administrator who can impersonate ServiceAccounts
+and their groups. Replace `cpaas-system` with the recorded operand namespace when it differs:
+
+```bash
+kubectl auth can-i get configs.imageregistry.operator.alauda.io/cluster \
+  --as=system:serviceaccount:cpaas-system:pruner \
+  --as-group=system:serviceaccounts \
+  --as-group=system:serviceaccounts:cpaas-system \
+  --as-group=system:authenticated
+```
+
+If the result is `yes`, continue. If it is `no`, keep the schedule suspended. An administrator can
+provide the missing read permission with a separate grant. Do not edit the role reconciled by the
+Operator. Save the following as `image-pruner-config-reader.yaml`:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: image-pruner-config-reader
+rules:
+  - apiGroups: [imageregistry.operator.alauda.io]
+    resources: [configs]
+    resourceNames: [cluster]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: image-pruner-config-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: image-pruner-config-reader
+subjects:
+  - kind: ServiceAccount
+    name: pruner
+    namespace: cpaas-system
+```
+
+Apply the supplemental grant, then repeat the permission check. Continue only when it returns `yes`:
+
+```bash
+kubectl apply -f image-pruner-config-reader.yaml
+```
 
 Enable the schedule only after reviewing the policy and arranging writer quiescence for every run.
 If that cannot be guaranteed, keep it suspended and perform reviewed manual cleanup during a

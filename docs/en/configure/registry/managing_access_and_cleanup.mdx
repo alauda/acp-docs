@@ -382,7 +382,28 @@ searches a fixed set of namespaces rather than the Config namespace binding:
 namespace that `ac adm registry gc` cannot locate, contact technical support for a matching cleanup
 procedure.
 
-Record the current settings and suspend scheduled pruning to prevent overlapping cleanup:
+Run the procedure from an administrator environment with `kubectl`, `ac`, `curl`, pull access to
+the critical images, and enough disk space to extract them. Select and verify the access path
+before changing Registry settings:
+
+- For an external endpoint, use the verified HTTPS hostname from
+  [Exposing the Registry](./exposing_the_registry.mdx).
+- For an internal-only Registry, run from a maintenance environment with cluster network and DNS
+  access. Use `image-registry.cpaas-system.svc:5000` and the Registry service CA. You do not need to
+  expose an external Ingress for cleanup.
+
+An administrator can obtain the internal service CA from the operand namespace:
+
+```bash
+kubectl -n cpaas-system get configmap serviceca \
+  -o jsonpath='{.data.service-ca\.crt}' > registry-service-ca.crt
+```
+
+Set the endpoint and CA bundle for the selected path. The CA bundle must validate the endpoint's
+certificate chain and hostname. The examples pass it explicitly to `curl` and pruning. On Linux,
+`SSL_CERT_FILE` provides it to each direct `ac` client invocation. On macOS or Windows, add the CA
+to the client's system trust store before login and extraction; the environment variable does not
+replace that step. See [Configure client trust](./exposing_the_registry.mdx#configure-client-trust).
 
 ```bash
 REGISTRY_NAMESPACE="$(kubectl get configs.imageregistry.operator.alauda.io cluster \
@@ -391,6 +412,51 @@ test "$REGISTRY_NAMESPACE" = cpaas-system || {
   echo "This cleanup procedure requires the default Registry operand namespace." >&2
   exit 1
 }
+REGISTRY_HOST='<registry-host>'
+REGISTRY_URL="https://$REGISTRY_HOST"
+REGISTRY_CA='/absolute/path/to/registry-ca.crt'
+
+HTTP_STATUS="$(curl --silent --show-error --cacert "$REGISTRY_CA" \
+  --output /dev/null --write-out '%{http_code}' "${REGISTRY_URL%/}/v2/")" || exit 1
+case "$HTTP_STATUS" in
+  200|401) ;;
+  *) echo "Registry endpoint check failed: HTTP $HTTP_STATUS" >&2; exit 1 ;;
+esac
+
+REGISTRY_AUTH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/registry-auth.XXXXXX")" || exit 1
+REGISTRY_AUTH_FILE="$REGISTRY_AUTH_DIR/config.json"
+SSL_CERT_FILE="$REGISTRY_CA" ac registry login \
+  --registry "$REGISTRY_HOST" --to "$REGISTRY_AUTH_FILE" || exit 1
+VERIFY_IMAGE="$REGISTRY_HOST/team-a/demo@sha256:<digest>"
+VERIFY_PLATFORM=linux/amd64
+```
+
+| Value | Description |
+| --- | --- |
+| `<registry-host>` | Verified external Registry host, or `image-registry.cpaas-system.svc:5000` from a maintenance environment that can reach it. Do not include a scheme or path. |
+| `REGISTRY_CA` | Absolute path to a PEM CA bundle that validates the selected endpoint. For the internal service, use the `registry-service-ca.crt` file obtained above. For a public certificate, you can use the workstation's system CA bundle. |
+| `VERIFY_IMAGE` | Immutable reference to an image that must survive cleanup. Replace `team-a/demo` and the hexadecimal `<digest>` with a critical repository and digest. |
+| `VERIFY_PLATFORM` | Platform required by consumers, in `os/arch` form. |
+
+A `401` response is the expected unauthenticated challenge; it proves reachability, not permission.
+Use the following extraction as the baseline verification before entering maintenance:
+
+```bash
+VERIFY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/registry-verify.XXXXXX")" || exit 1
+SSL_CERT_FILE="$REGISTRY_CA" ac image extract "$VERIFY_IMAGE" \
+  --filter-by-os="$VERIFY_PLATFORM" \
+  --path "/:$VERIFY_DIR" \
+  --registry-config="$REGISTRY_AUTH_FILE" || exit 1
+```
+
+Expected result: the image filesystem is extracted successfully. Repeat with every critical image
+and required platform, each time using a fresh directory. Resolve any failure before cleanup.
+Keep these endpoint, authentication, and verification variables in the same shell throughout the
+maintenance procedure.
+
+Record the current settings and suspend scheduled pruning to prevent overlapping cleanup:
+
+```bash
 REGISTRY_READ_ONLY="$(kubectl get configs.imageregistry.operator.alauda.io cluster \
   -o jsonpath='{.spec.readOnly}')" || exit 1
 REGISTRY_READ_ONLY="${REGISTRY_READ_ONLY:-false}"
@@ -418,27 +484,8 @@ existing maintenance restriction before proceeding. Keep `spec.readOnly` false d
 because pruning must update and delete Image API resources. Enforce writer exclusion through your
 maintenance controls instead.
 
-Verify that your workstation can reach the same Registry endpoint that pruning will use. The
-following example uses HTTPS with a private CA:
-
-```bash
-REGISTRY_URL=https://registry.example.com
-REGISTRY_CA=/path/to/registry-ca.crt
-HTTP_STATUS="$(curl --silent --show-error --cacert "$REGISTRY_CA" \
-  --output /dev/null --write-out '%{http_code}' "${REGISTRY_URL%/}/v2/")"
-case "$HTTP_STATUS" in
-  200|401) ;;
-  *) echo "Registry endpoint check failed: HTTP $HTTP_STATUS" >&2; exit 1 ;;
-esac
-```
-
-Replace `REGISTRY_URL` with a verified Registry URL, including the scheme and any port, and
-`REGISTRY_CA` with the issuing CA bundle supplied by the certificate administrator. A `401`
-response is the expected unauthenticated challenge. It proves reachability, not deletion permission;
-use the administrator account authenticated to this cluster for pruning. For a publicly trusted
-certificate, omit `--cacert` above and `--certificate-authority` from both commands below.
-
-Preview the metadata candidates with explicit retention and repository exclusions:
+Use the endpoint and CA verified during preparation, with the administrator account authenticated
+to this cluster. Preview the metadata candidates with explicit retention and repository exclusions:
 
 ```bash
 ac adm prune images \
@@ -474,20 +521,11 @@ that all eligible manifests were unlinked. Resolve any such errors before declar
 ### Collect Already Unlinked Blobs
 
 Use standalone GC when storage manifest links have already been removed. It does not unlink
-manifests based on Image API retention. After stopping writers, enable read-only mode and wait for
-the Registry rollout. Do not run metadata pruning in this mode; Image API writes and deletes are
-blocked.
-
-```bash
-kubectl patch configs.imageregistry.operator.alauda.io cluster \
-  --type=merge -p '{"spec":{"readOnly":true}}'
-kubectl -n "$REGISTRY_NAMESPACE" rollout status deployment/image-registry --timeout=300s
-kubectl get configs.imageregistry.operator.alauda.io cluster \
-  -o jsonpath='{.spec.readOnly}{"\n"}'
-```
-
-Expected results: the rollout completes and `spec.readOnly` is `true`. Keep other writers paused
-and allow in-flight operations to finish before previewing GC.
+manifests based on Image API retention. After stopping writers, complete the enabling steps in
+[Enable read-only mode](./setting_up_and_configuring_the_registry.mdx#enable-read-only-mode).
+Wait for the requested Config generation to reconcile and the Registry rollout to complete; keep
+read-only mode enabled until blob verification finishes. Do not run metadata pruning in this mode;
+Image API writes and deletes are blocked.
 
 Preview storage garbage collection:
 
@@ -513,41 +551,61 @@ Continue to verify blob availability before restoring the previous settings.
 
 ### Verify Blob Availability \{#verify-blob-availability}
 
-Run this check from an administrator workstation with `ac`, enough local disk space, and trust
-configured for the Registry CA. Use an account with pull access to the image namespace. Write
-credentials to a new dedicated file, then extract each critical image by immutable digest into a
-fresh directory. Extraction reads the selected platform's layers without using a local runtime cache:
+Repeat the baseline verification from preparation, using the same immutable image reference and
+platform. Extract into a fresh directory to read the image layers without a local runtime cache:
 
 ```bash
-REGISTRY_AUTH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/registry-auth.XXXXXX")"
-REGISTRY_AUTH_FILE="$REGISTRY_AUTH_DIR/config.json"
-ac registry login --registry registry.example.com --to "$REGISTRY_AUTH_FILE"
-VERIFY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/registry-verify.XXXXXX")"
-
-ac image extract \
-  'registry.example.com/team-a/demo@sha256:<digest>' \
-  --filter-by-os=linux/amd64 \
+VERIFY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/registry-verify.XXXXXX")" || exit 1
+SSL_CERT_FILE="$REGISTRY_CA" ac image extract "$VERIFY_IMAGE" \
+  --filter-by-os="$VERIFY_PLATFORM" \
   --path "/:$VERIFY_DIR" \
-  --registry-config="$REGISTRY_AUTH_FILE"
+  --registry-config="$REGISTRY_AUTH_FILE" || exit 1
 ```
 
-Replace `<digest>` with the hexadecimal suffix of the required SHA-256 digest. Replace
-`linux/amd64` with the platform to verify. For a multi-architecture image, identify its platforms
-with `ac image info --show-multiarch` and repeat extraction for every required platform, each time
-using a new directory. Expected result: extraction completes and writes the image filesystem to
-`$VERIFY_DIR`. An `ac image info` inspection alone does not verify layer availability. Remove the
-temporary authentication and image directories after verification and any investigation are complete.
+Expected result: extraction completes and writes the image filesystem to `$VERIFY_DIR`. Repeat for
+every critical image and required platform checked before cleanup. An `ac image info` inspection
+alone does not verify layer availability. Remove temporary authentication and image directories
+after verification and any investigation are complete.
 
 ### Restore the Previous Settings
 
 After successful verification, restore the recorded read-only and schedule settings:
 
 ```bash
-kubectl patch configs.imageregistry.operator.alauda.io cluster \
-  --type=merge -p "{\"spec\":{\"readOnly\":$REGISTRY_READ_ONLY}}"
-kubectl -n "$REGISTRY_NAMESPACE" rollout status deployment/image-registry --timeout=300s
+REGISTRY_CONFIG_GENERATION="$(kubectl patch configs.imageregistry.operator.alauda.io cluster \
+  --type=merge -p "{\"spec\":{\"readOnly\":$REGISTRY_READ_ONLY}}" \
+  -o jsonpath='{.metadata.generation}')" || exit 1
+kubectl wait configs.imageregistry.operator.alauda.io/cluster \
+  --for=jsonpath='{.status.observedGeneration}'="$REGISTRY_CONFIG_GENERATION" --timeout=300s || exit 1
+kubectl wait configs.imageregistry.operator.alauda.io/cluster \
+  --for=condition=Degraded=false --timeout=300s || exit 1
+kubectl wait configs.imageregistry.operator.alauda.io/cluster \
+  --for=condition=Progressing=false --timeout=300s || exit 1
+EXPECTED_REGISTRY_READ_ONLY=''
+if [ "$REGISTRY_READ_ONLY" = true ]; then
+  EXPECTED_REGISTRY_READ_ONLY='{enabled: true}'
+fi
+REGISTRY_TEMPLATE_READ_ONLY="$(kubectl -n "$REGISTRY_NAMESPACE" get deployment image-registry \
+  -o jsonpath='{.spec.template.spec.containers[?(@.name=="registry")].env[?(@.name=="REGISTRY_STORAGE_MAINTENANCE_READONLY")].value}')" || exit 1
+test "$REGISTRY_TEMPLATE_READ_ONLY" = "$EXPECTED_REGISTRY_READ_ONLY" || {
+  echo "The Registry Pod template does not match the recorded read-only setting." >&2
+  exit 1
+}
+kubectl -n "$REGISTRY_NAMESPACE" rollout status deployment/image-registry --timeout=300s || exit 1
+
+kubectl -n "$REGISTRY_NAMESPACE" get pods -l app.kubernetes.io/name=image-registry \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.deletionTimestamp}{"\t"}{.spec.containers[?(@.name=="registry")].env[?(@.name=="REGISTRY_STORAGE_MAINTENANCE_READONLY")].value}{"\n"}{end}'
+```
+
+Continue only when Pods are present, no row has a deletion timestamp, and every read-only value
+matches `EXPECTED_REGISTRY_READ_ONLY` (empty when the recorded setting was `false`). Repeat the
+Pod check until all old Pods have terminated. Then restore the schedule:
+
+```bash
 kubectl patch imagepruners.imageregistry.operator.alauda.io cluster \
-  --type=merge -p "{\"spec\":{\"suspend\":$PRUNER_SUSPENDED}}"
+  --type=merge -p "{\"spec\":{\"suspend\":$PRUNER_SUSPENDED}}" || exit 1
+kubectl -n "$REGISTRY_NAMESPACE" wait cronjob/image-pruner \
+  --for=jsonpath='{.spec.suspend}'="$PRUNER_SUSPENDED" --timeout=300s || exit 1
 ```
 
 Verify that the rollout completes and the two fields match their recorded values. Resume writers
