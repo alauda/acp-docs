@@ -93,6 +93,19 @@ source permissions, and connectivity from the Image API server. Continue with
 
 ## Before Configuring Storage \{#before-configuring-storage}
 
+ACP 4.4 supports the following storage configurations:
+
+| Storage | Configuration | Use |
+| --- | --- | --- |
+| Ephemeral Pod storage | `spec.storage.emptyDir` | Disposable development or test data; one replica. |
+| Persistent volume | `spec.storage.pvc.claim` | A PVC backed by storage suitable for the required access mode and availability. |
+| Node-local storage | `spec.storage.pvc.claim` referencing a hostPath-backed PV/PVC | One replica bound to the node that holds the data. |
+| S3-compatible object storage | `spec.storage.s3` | A bucket with explicit endpoint, credentials, and certificate trust. |
+
+Other storage fields can remain in the API schema, but those backends are outside the ACP 4.4
+support scope. Configure exactly one backend. The `null` fields in the examples remove previous
+backend selections; they do not indicate support for those storage types.
+
 > **Warning:** The storage examples configure a new Registry. Changing a backend, PVC claim, or
 > bucket does not migrate existing blobs or Image API metadata. Before replacing storage, back up
 > both, [suspend scheduled pruning](#configure-scheduled-image-pruning), wait for active cleanup Jobs
@@ -243,6 +256,35 @@ Expected results:
 - `Config/cluster` reports `Available=True`, `Progressing=False`, and `Degraded=False`.
 - The `image-registry` Deployment rolls out successfully.
 
+### Use hostPath-backed Storage \{#use-hostpath-backed-storage}
+
+For node-local storage, have the storage administrator provide a dedicated hostPath-backed PV and
+create its PVC in the Registry operand namespace. Set the PV node affinity to the node that holds the data,
+and ensure that the directory is writable by the Registry container's configured user and group.
+The PVC must be `Bound` before activating the Registry. Inspect the volume and its node affinity:
+
+```bash
+kubectl -n cpaas-system get pvc <claim-name> -o wide
+kubectl get pv <volume-name> -o yaml
+```
+
+| Placeholder | Description |
+| --- | --- |
+| `<claim-name>` | Dedicated PVC supplied by the storage administrator in the Registry operand namespace. |
+| `<volume-name>` | PV shown in the PVC's `VOLUME` column. Confirm its `spec.hostPath.path` and `spec.nodeAffinity`. |
+
+Follow [Configure PVC storage](#configure-pvc-storage), using this claim instead of creating the
+example claim. Keep `spec.replicas: 1` and `spec.rolloutStrategy: Recreate`. Verify that the Registry
+Pod runs on the PV's node and that the Deployment rolls out successfully:
+
+```bash
+kubectl -n cpaas-system get pods -l app.kubernetes.io/name=image-registry -o wide
+kubectl -n cpaas-system rollout status deployment/image-registry --timeout=300s
+```
+
+The Config API has no separate `storage.hostPath` field. Node-local data is unavailable when its
+node fails and does not follow a Pod to another node. Back up the data outside that node.
+
 ## Configure S3-Compatible Storage \{#configure-s3-compatible-storage}
 
 > **Warning:** For an existing Registry, complete the [storage replacement preparation](#before-configuring-storage)
@@ -337,8 +379,8 @@ kubectl patch configs.imageregistry.operator.alauda.io cluster \
 | `<s3-endpoint>` | S3-compatible endpoint host and optional port reachable from the Registry Pod, without `https://` and without the bucket name. The example supplies the `https://` scheme. |
 | `<trusted-ca-configmap>` | ConfigMap in the Registry operand namespace that contains the CA certificate for the object storage endpoint. Omit `trustedCA` when the endpoint uses a public CA trusted by the Registry Pod. |
 
-Use exactly one operational backend: `emptyDir`, `pvc`, `s3`, `gcs`, `ibmcos`, or `azure`. Schema
-presence alone does not establish support; the limitations below apply to `swift` and `oss`.
+Use exactly one supported backend: `emptyDir`, `pvc`, or `s3`. HostPath-backed storage uses the PVC
+configuration described above.
 
 Verify the configuration and rollout:
 
@@ -352,33 +394,6 @@ Expected results:
 
 - `Config/cluster` reports `Available=True`, `Progressing=False`, and `Degraded=False`.
 - The Registry logs do not show storage authentication, bucket, endpoint, or certificate errors.
-
-## Configure Cloud Storage Backends
-
-For GCS, IBM COS, or Azure, prepare existing provider resources and supply the required configuration
-explicitly. Store the credentials below in `image-registry-private-configuration-user` in the
-Registry operand namespace. Use the same merge-patch pattern shown above and set the other backend
-fields to `null`. For an existing Registry, first complete the
-[storage replacement preparation](#before-configuring-storage).
-
-| Backend | Main `Config/cluster.spec.storage` fields | Required user-managed Secret data |
-| --- | --- | --- |
-| GCS | `gcs.bucket`, `gcs.region`, `gcs.projectID`, and optional `gcs.keyID` | `REGISTRY_STORAGE_GCS_KEYFILE` containing the service-account key file. |
-| IBM COS | `ibmcos.bucket`, `ibmcos.location`, `ibmcos.resourceGroupName`, `ibmcos.resourceKeyCRN`, and `ibmcos.serviceInstanceCRN` | `REGISTRY_STORAGE_IBMCOS_IAMAPIKEY`. |
-| Azure | `azure.accountName`, `azure.container`, `azure.cloudName`, and optional `azure.networkAccess` | `REGISTRY_STORAGE_AZURE_ACCOUNTKEY`. |
-
-For IBM COS, the resource key must contain HMAC credentials. Confirm the provider resources,
-permissions, and values with the storage administrator; do not rely on automatic platform discovery.
-After configuration, verify `Config/cluster` conditions and the Registry rollout as shown above.
-Do not print Secret data while troubleshooting.
-
-The following fields are present in the `Config` schema but cannot configure usable storage in
-this ACP 4.4 release:
-
-| Schema field | Limitation |
-| --- | --- |
-| `storage.swift` | Swift is selected only when the cluster Infrastructure reports the `OpenStack` platform and the Operator can authenticate to Swift. Do not configure it. |
-| `storage.oss` | No storage driver is implemented. Using it alone produces `StorageNotConfigured`. Do not configure it. |
 
 ## Configure Request Handling
 
@@ -667,22 +682,28 @@ Expected results:
 
 ## Configure Scheduled Image Pruning \{#configure-scheduled-image-pruning}
 
-The Operator creates `ImagePruner/cluster` with an enabled schedule. Its defaults are:
+The Operator creates `ImagePruner/cluster` with a suspended schedule. Its defaults are:
 
 | Setting | Default |
 | --- | --- |
 | Schedule | `0 0 * * *` in the CronJob controller's time zone |
-| Suspended | `false` |
+| Suspended | `true` |
 | Tag revisions to retain | `3` |
 | Minimum age | `60m` |
 
 > **Warning:** Jobs run `ac adm prune images --confirm=true`. While the Registry is managed, they
 > also use `--prune-registry=true` to remove eligible storage manifest references and run garbage
 > collection after metadata pruning. This deletes data without an interactive confirmation. Stop
-> CI pushes and other image writers for the entire cleanup window, including scheduled runs. Keep
+> CI pushes and other image writers for the entire cleanup window. Keep
 > `spec.readOnly` disabled because the combined operation requires Image API and Registry writes.
 
-Suspend the schedule before reviewing or changing the policy:
+Automatic writer isolation and upload draining are not available. The Operator therefore keeps the
+CronJob suspended, including metadata-only schedules, and reports
+`Scheduled=False` with reason `ScheduledGCUnsafe`. Setting `spec.suspend: false` does not override
+this restriction. Use reviewed manual cleanup during a maintenance window.
+
+Verify suspension before reviewing or changing the policy. An existing installation can still have
+Jobs started before suspension:
 
 ```bash
 kubectl patch imagepruners.imageregistry.operator.alauda.io cluster \
@@ -739,7 +760,7 @@ The Operator grants the `pruner` ServiceAccount permission to read `Config/clust
 grant is limited to `get` on the configuration named `cluster`; it does not allow changing the
 Registry configuration. The CLI checks this permission before scanning.
 
-Before enabling the schedule, verify the ServiceAccount's effective permission.
+Before using the pruner's configured command for manual cleanup, verify the ServiceAccount's effective permission.
 Run this check as a cluster administrator who can impersonate ServiceAccounts and their groups.
 Replace `cpaas-system` with the recorded operand namespace when it differs:
 
@@ -766,19 +787,18 @@ repeat the permission check. The CLI exits with
 `ac adm prune images requires platform-admin access to Registry Config/cluster` when this check is
 denied; do not edit the role reconciled by the Operator.
 
-Enable the schedule only after reviewing the policy and arranging writer quiescence for every run.
-If that cannot be guaranteed, keep it suspended and perform reviewed manual cleanup during a
-maintenance window. For a scheduled cleanup window, resume and inspect the rendered command:
+Inspect the suspension reason and rendered command:
 
 ```bash
-kubectl patch imagepruners.imageregistry.operator.alauda.io cluster \
-  --type=merge -p '{"spec":{"suspend":false}}'
+kubectl get imagepruners.imageregistry.operator.alauda.io cluster \
+  -o jsonpath='{range .status.conditions[?(@.type=="Scheduled")]}{.status}{"\t"}{.reason}{"\n"}{end}'
 kubectl -n cpaas-system get cronjob image-pruner \
   -o jsonpath='{.spec.suspend}{"\n"}{.spec.jobTemplate.spec.template.spec.containers[0].args}{"\n"}'
 ```
 
-Expected result: `false`, `--confirm=true`, and, for a managed Registry, `--prune-registry=true`.
-Inspect the resulting Job status and logs to verify completion before resuming image writers.
+Expected results: `False` with reason `ScheduledGCUnsafe`, a CronJob suspension value of `true`,
+and `--confirm=true` in the command. A managed Registry also has `--prune-registry=true`.
+These arguments describe the generated command; they do not enable automatic execution.
 
 Metadata-only pruning leaves storage manifest references in place. Standalone garbage collection
 follows those references and can retain linked manifests and blobs after their Image API metadata
@@ -788,8 +808,10 @@ manifest cleanup. Use a reviewed combined prune and Registry cleanup when storag
 For manual pruning and registry garbage collection commands, see [Managing access and cleanup](./managing_access_and_cleanup.mdx).
 
 Optional `ImagePruner` fields include `successfulJobsHistoryLimit`, `failedJobsHistoryLimit`,
-`nodeSelector`, `tolerations`, and `affinity`. The schema also contains `ignoreInvalidImageReferences`
-and `logLevel`, but this release does not apply them to the generated Job.
+`nodeSelector`, `tolerations`, and `affinity`. `ignoreInvalidImageReferences` sets
+`--ignore-invalid-refs`. `logLevel` maps `Normal`, `Debug`, `Trace`, and `TraceAll` to `--v=0`,
+`--v=4`, `--v=6`, and `--v=8`, respectively. These fields configure the generated Job and do not
+override its suspension.
 
 ## Operate Storage
 

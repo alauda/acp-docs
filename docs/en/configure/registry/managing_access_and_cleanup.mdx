@@ -387,12 +387,9 @@ standalone GC can leave blobs retained by their storage manifest links.
 
 ### Prepare the Maintenance Window
 
-These GC procedures apply to the default operand namespace, `cpaas-system`. `ac adm registry gc`
-searches a fixed set of namespaces rather than the Config namespace binding:
-`image-registry-system`, `alauda-image-registry`, and `cpaas-system`. The `--prune-registry` path of
-`ac adm prune images` uses the detected Registry namespace instead. For a customized operand
-namespace that `ac adm registry gc` cannot locate, contact technical support for a matching cleanup
-procedure.
+Both `ac adm registry gc` and `ac adm prune images --prune-registry` resolve the Registry operand
+namespace from the installation binding. This also applies when Registry mode is selected
+explicitly. The CLI refuses cleanup when it cannot verify the binding or find a ready Registry Pod.
 
 Run the procedure from an administrator environment with `kubectl`, `ac`, `curl`, pull access to
 the critical images, and enough disk space to extract them. Select and verify the access path
@@ -407,7 +404,13 @@ before changing Registry settings:
 An administrator can obtain the internal service CA from the operand namespace:
 
 ```bash
-kubectl -n cpaas-system get configmap serviceca \
+REGISTRY_NAMESPACE="$(kubectl get configs.imageregistry.operator.alauda.io cluster \
+  -o jsonpath='{.metadata.annotations.imageregistry\.operator\.alauda\.io/operand-namespace}')" || exit 1
+test -n "$REGISTRY_NAMESPACE" || {
+  echo "The Registry operand namespace binding is missing." >&2
+  exit 1
+}
+kubectl -n "$REGISTRY_NAMESPACE" get configmap serviceca \
   -o jsonpath='{.data.service-ca\.crt}' > registry-service-ca.crt
 ```
 
@@ -418,12 +421,6 @@ to the client's system trust store before login and extraction; the environment 
 replace that step. See [Configure client trust](./exposing_the_registry.mdx#configure-client-trust).
 
 ```bash
-REGISTRY_NAMESPACE="$(kubectl get configs.imageregistry.operator.alauda.io cluster \
-  -o jsonpath='{.metadata.annotations.imageregistry\.operator\.alauda\.io/operand-namespace}')" || exit 1
-test "$REGISTRY_NAMESPACE" = cpaas-system || {
-  echo "This cleanup procedure requires the default Registry operand namespace." >&2
-  exit 1
-}
 REGISTRY_HOST='<registry-host>'
 REGISTRY_URL="https://$REGISTRY_HOST"
 REGISTRY_CA='/absolute/path/to/registry-ca.crt'
@@ -472,10 +469,6 @@ Record the current settings and suspend scheduled pruning to prevent overlapping
 REGISTRY_READ_ONLY="$(kubectl get configs.imageregistry.operator.alauda.io cluster \
   -o jsonpath='{.spec.readOnly}')" || exit 1
 REGISTRY_READ_ONLY="${REGISTRY_READ_ONLY:-false}"
-PRUNER_SUSPENDED="$(kubectl get imagepruners.imageregistry.operator.alauda.io cluster \
-  -o jsonpath='{.spec.suspend}')" || exit 1
-PRUNER_SUSPENDED="${PRUNER_SUSPENDED:-false}"
-
 kubectl patch imagepruners.imageregistry.operator.alauda.io cluster \
   --type=merge -p '{"spec":{"suspend":true}}' || exit 1
 kubectl -n "$REGISTRY_NAMESPACE" wait cronjob/image-pruner \
@@ -526,9 +519,12 @@ ac adm prune images \
 
 Remaining ImageStream references can retain a shared digest or manifest. Verify metadata cleanup
 with the same dry run, then continue to [verify blob availability](#verify-blob-availability).
-Review every manifest-deletion error in the output: the command can remove metadata before a
-Registry connection failure leaves storage links intact. A successful exit alone does not prove
-that all eligible manifests were unlinked. Resolve any such errors before declaring cleanup complete.
+The CLI saves pending manifest targets in `image-pruner-state` in the operand namespace before
+deleting metadata. A manifest deletion failure returns a nonzero exit status and prevents GC.
+Resolve the reported error, review another dry run, and repeat the command with the same endpoint,
+retention policy, and exclusion options. The dry run includes pending targets from the earlier
+attempt; confirmation rechecks live references and workload usage. Changed pruning options are
+rejected while targets remain pending. Do not delete the state ConfigMap to bypass that check.
 
 ### Collect Already Unlinked Blobs
 
@@ -581,7 +577,7 @@ after verification and any investigation are complete.
 
 ### Restore the Previous Settings
 
-After successful verification, restore the recorded read-only and schedule settings:
+After successful verification, restore the recorded read-only setting. Keep scheduled pruning suspended:
 
 ```bash
 REGISTRY_CONFIG_GENERATION="$(kubectl patch configs.imageregistry.operator.alauda.io cluster \
@@ -611,15 +607,15 @@ kubectl -n "$REGISTRY_NAMESPACE" get pods -l app.kubernetes.io/name=image-regist
 
 Continue only when Pods are present, no row has a deletion timestamp, and every read-only value
 matches `EXPECTED_REGISTRY_READ_ONLY` (empty when the recorded setting was `false`). Repeat the
-Pod check until all old Pods have terminated. Then restore the schedule:
+Pod check until all old Pods have terminated. Verify that scheduled pruning remains suspended:
 
 ```bash
 kubectl patch imagepruners.imageregistry.operator.alauda.io cluster \
-  --type=merge -p "{\"spec\":{\"suspend\":$PRUNER_SUSPENDED}}" || exit 1
+  --type=merge -p '{"spec":{"suspend":true}}' || exit 1
 kubectl -n "$REGISTRY_NAMESPACE" wait cronjob/image-pruner \
-  --for=jsonpath='{.spec.suspend}'="$PRUNER_SUSPENDED" --timeout=300s || exit 1
+  --for=jsonpath='{.spec.suspend}'=true --timeout=300s || exit 1
 ```
 
-Verify that the rollout completes and the two fields match their recorded values. Resume writers
+Verify that the rollout completes, read-only mode matches its recorded value, and pruning remains suspended. Resume writers
 when the Registry is intended to be writable. If verification fails, keep the maintenance controls
 in place while investigating.
