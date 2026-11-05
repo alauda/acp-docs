@@ -468,8 +468,10 @@ with Image API metadata mutations such as tag changes, imports, mappings, and si
 Authorized reads remain available. This procedure requires `Config/cluster.spec.managementState`
 to be `Managed` so the Operator applies the Registry configuration.
 
-> **Warning:** Metadata pruning and combined prune and garbage collection require writes. Keep
-> read-only mode disabled for those operations and quiesce external image writers instead.
+> **Warning:** Online image pruning, including metadata-only pruning, requires writes. Leave
+> read-only mode disabled for ordinary pruning; no maintenance window is required. Full storage
+> garbage collection requires this read-only procedure as well as writer isolation and upload
+> draining. Follow [Run Registry garbage collection](./managing_access_and_cleanup.mdx#run-registry-garbage-collection).
 
 Enable read-only mode and record the requested configuration generation. Wait for the Operator to
 observe that generation and reconcile without a degraded condition before checking the rollout:
@@ -682,28 +684,41 @@ Expected results:
 
 ## Configure Scheduled Image Pruning \{#configure-scheduled-image-pruning}
 
-The Operator creates `ImagePruner/cluster` with a suspended schedule. Its defaults are:
+On new installations, the Operator creates `ImagePruner/cluster` with an enabled schedule.
+Its defaults are:
 
 | Setting | Default |
 | --- | --- |
 | Schedule | `0 0 * * *` in the CronJob controller's time zone |
-| Suspended | `true` |
+| Suspended | `false` |
 | Tag revisions to retain | `3` |
 | Minimum age | `60m` |
 
-> **Warning:** Jobs run `ac adm prune images --confirm=true`. While the Registry is managed, they
-> also use `--prune-registry=true` to remove eligible storage manifest references and run garbage
-> collection after metadata pruning. This deletes data without an interactive confirmation. Stop
-> CI pushes and other image writers for the entire cleanup window. Keep
-> `spec.readOnly` disabled because the combined operation requires Image API and Registry writes.
+The Operator honors explicit `spec.suspend: true` and `false`. Upgrades preserve an existing
+explicit `true`, including values created by earlier safety releases; review the policy before
+enabling that schedule.
 
-Automatic writer isolation and upload draining are not available. The Operator therefore keeps the
-CronJob suspended, including metadata-only schedules, and reports
-`Scheduled=False` with reason `ScheduledGCUnsafe`. Setting `spec.suspend: false` does not override
-this restriction. Use reviewed manual cleanup during a maintenance window.
+> **Warning:** Jobs run `ac adm prune images --confirm=true` and delete data without an interactive
+> confirmation. A managed Registry also uses `--prune-registry=true` for targeted online HTTP
+> deletion of eligible references and blobs. This never runs full storage garbage collection or
+> executes commands in Registry Pods. Keep metadata and storage backups. Live reference checks
+> are not atomic with newly created references and do not detect consumers outside this cluster.
 
-Verify suspension before reviewing or changing the policy. An existing installation can still have
-Jobs started before suspension:
+Ordinary online pruning requires a writable Registry and Image API, without a full maintenance
+window or read-only mode. Choose retention that covers image publication and deployment workflows.
+Use the manual [repository exclusions](./managing_access_and_cleanup.mdx#prune-images) when consumers
+outside this cluster need protection; keep scheduled pruning suspended if its policy cannot retain
+those images.
+
+Before reconciling dependent resources, safety reconciliation suspends old job
+templates that do not meet the guarded modern command requirements. The condition `Scheduled=False`
+with reason `ScheduledGCUnsafe` describes that unsafe template. The replacement contains `--require-online-pruning=true`
+and selects modern mode. An older CLI rejects the flag before pruning; the flag also prevents
+selecting an incompatible Registry backend. After safe regeneration, the CronJob follows `spec.suspend`. Supported
+online templates are not suspended on every reconciliation. An explicit pause is applied before
+other resource prerequisites can fail.
+
+Temporarily suspend the schedule while reviewing or changing the policy:
 
 ```bash
 kubectl patch imagepruners.imageregistry.operator.alauda.io cluster \
@@ -760,7 +775,7 @@ The Operator grants the `pruner` ServiceAccount permission to read `Config/clust
 grant is limited to `get` on the configuration named `cluster`; it does not allow changing the
 Registry configuration. The CLI checks this permission before scanning.
 
-Before using the pruner's configured command for manual cleanup, verify the ServiceAccount's effective permission.
+Before enabling the schedule, verify the ServiceAccount's effective permission.
 Run this check as a cluster administrator who can impersonate ServiceAccounts and their groups.
 Replace `cpaas-system` with the recorded operand namespace when it differs:
 
@@ -796,22 +811,51 @@ kubectl -n cpaas-system get cronjob image-pruner \
   -o jsonpath='{.spec.suspend}{"\n"}{.spec.jobTemplate.spec.template.spec.containers[0].args}{"\n"}'
 ```
 
-Expected results: `False` with reason `ScheduledGCUnsafe`, a CronJob suspension value of `true`,
-and `--confirm=true` in the command. A managed Registry also has `--prune-registry=true`.
-These arguments describe the generated command; they do not enable automatic execution.
+Expected results while the reviewed policy is suspended: `False` with reason `Suspended`, a CronJob
+suspension value of `true`, and `--require-online-pruning=true` and `--confirm=true` in the command.
+A managed Registry also has `--prune-registry=true` and its bound Registry URL. When the Registry
+is `Removed` or `Unmanaged`, the Operator explicitly passes `--prune-registry=false` for metadata-only
+pruning. Those runs leave Registry manifest and layer references and blob data in place.
 
-Metadata-only pruning leaves storage manifest references in place. Standalone garbage collection
-follows those references and can retain linked manifests and blobs after their Image API metadata
-has been removed. A later standalone garbage collection is not a substitute for the required
-manifest cleanup. Use a reviewed combined prune and Registry cleanup when storage reclamation is intended.
+Verify the generated mode:
 
-For manual pruning and registry garbage collection commands, see [Managing access and cleanup](./managing_access_and_cleanup.mdx).
+```bash
+kubectl -n cpaas-system get cronjob image-pruner \
+  -o jsonpath='{.spec.jobTemplate.spec.template.spec.containers[0].env[?(@.name=="AC_IMAGE_REGISTRY_MODE")].value}{"\n"}'
+```
+
+Expected result: `modern`. The scheduled `pruner` ServiceAccount does not need `pods/exec`
+permission, and the Operator-managed pruner role does not grant it. Resolve a remaining `ScheduledGCUnsafe` or degraded condition before
+enabling execution; do not edit the CronJob or remove the guard.
+
+Enable the reviewed schedule through `ImagePruner/cluster`:
+
+```bash
+kubectl patch imagepruners.imageregistry.operator.alauda.io cluster \
+  --type=merge -p '{"spec":{"suspend":false}}'
+kubectl -n cpaas-system wait cronjob/image-pruner \
+  --for=jsonpath='{.spec.suspend}'=false --timeout=300s
+kubectl get imagepruners.imageregistry.operator.alauda.io cluster \
+  -o jsonpath='{range .status.conditions[?(@.type=="Scheduled")]}{.status}{"\t"}{.reason}{"\n"}{end}'
+```
+
+Expected result after reconciliation: `True` with reason `Scheduled`. Jobs run on the configured
+schedule; `Forbid` concurrency prevents overlapping scheduled Jobs, but does not coordinate manual
+pruning. Avoid overlapping manual and scheduled cleanup. Setting `spec.suspend: true` pauses future
+scheduled Jobs again.
+
+The `image-pruner-state` ConfigMap preserves unfinished online cleanup across Job restarts. Do not
+delete it to bypass a retry error. See [Prune images](./managing_access_and_cleanup.mdx#prune-images)
+for retry and metadata-only behavior. Full
+[Registry garbage collection](./managing_access_and_cleanup.mdx#run-registry-garbage-collection)
+is a separate maintenance operation requiring read-only mode and writer isolation; it is never
+part of scheduled pruning.
 
 Optional `ImagePruner` fields include `successfulJobsHistoryLimit`, `failedJobsHistoryLimit`,
 `nodeSelector`, `tolerations`, and `affinity`. `ignoreInvalidImageReferences` sets
 `--ignore-invalid-refs`. `logLevel` maps `Normal`, `Debug`, `Trace`, and `TraceAll` to `--v=0`,
-`--v=4`, `--v=6`, and `--v=8`, respectively. These fields configure the generated Job and do not
-override its suspension.
+`--v=4`, `--v=6`, and `--v=8`, respectively. An unsupported `logLevel` keeps the CronJob suspended
+until corrected.
 
 ## Operate Storage
 

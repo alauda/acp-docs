@@ -18,8 +18,8 @@ recorded image signature identity checks.
 | [Grant namespace permissions](#grant-namespace-permissions) | A user or service account needs pull, push, delete, or image catalog access in an image namespace. |
 | [View usage](#view-usage) | An administrator needs image or ImageStream usage information. |
 | [Check recorded signature identity](#verify-image-signatures) | An administrator needs to compare recorded identity claims or record an independently verified trust decision. |
-| [Prune images](#prune-images) | An administrator needs to remove unused image metadata after reviewing a dry run. |
-| [Run registry garbage collection](#run-registry-garbage-collection) | An administrator needs to unlink pruned manifests and reclaim unreferenced blobs, or collect blobs already unlinked from storage manifests. |
+| [Prune images](#prune-images) | An administrator needs online removal of unused image metadata, Registry references, and corresponding unreferenced blobs, or explicitly chooses metadata-only pruning. |
+| [Run Registry garbage collection](#run-registry-garbage-collection) | An administrator needs a separate maintenance operation to collect unreferenced storage blobs, including old orphaned content with no saved inventory. |
 
 ## Prerequisites
 
@@ -27,7 +27,7 @@ recorded image signature identity checks.
 - You have `kubectl` and `ac` access to the target cluster.
 - You have permission to create RoleBindings in the image namespace.
 - You can create cluster-scoped `subjectaccessreviews.authorization.k8s.io` to check another principal's permissions.
-- You have administrator permissions for usage reporting and cleanup. Garbage collection requires Registry Pod execution access and permission to update `Config/cluster` and `ImagePruner/cluster`.
+- You have administrator permissions for usage reporting and cleanup. Ordinary online pruning uses the Image API, cleanup state ConfigMap, and Registry HTTP deletion permissions; it does not require Registry Pod execution access. Full garbage collection additionally requires Registry Pod execution access and permission to update `Config/cluster` and `ImagePruner/cluster`.
 - For signature identity checks, you can `get` cluster-scoped `imagedigests.image.alauda.io`. Saving conditions or removing embedded signatures also requires `update` on that resource.
 
 Select the ACP 4.4 Registry backend before using the `ac` administrative commands:
@@ -295,45 +295,80 @@ ac get imagedigests.image.alauda.io 'sha256:<digest>' -o yaml
 
 ## Prune Images \{#prune-images}
 
-> **Warning:** Confirmed pruning permanently removes selected image metadata. Keep metadata and
-> storage backups, use a maintenance window, and review a dry run with the same retention and
-> exclusion flags before adding `--confirm`.
+> **Warning:** Confirmed online pruning permanently removes selected image metadata and eligible
+> Registry data. Keep metadata and storage backups, and review a dry run with the same retention,
+> endpoint, and exclusion flags before adding `--confirm`. There is no automatic rollback.
 
 Pruning is a platform-level operation. The account must be allowed to `get`
 `configs.imageregistry.operator.alauda.io/cluster`; otherwise the command exits before scanning.
 Namespace image roles such as `system:image-deleter` are not sufficient.
 
+For the Operator-managed Registry, `ac adm prune images` uses the Image API reference graph and authenticated HTTP
+requests to delete eligible manifest and layer references and corresponding unreferenced blobs.
+It never executes full storage garbage collection in a Registry Pod. Ordinary online pruning
+requires a writable Registry and Image API; it does not require a full maintenance window or
+read-only mode.
+
+Manual defaults are independent of `ImagePruner/cluster`:
+
+| Option | Default |
+| --- | --- |
+| `--keep-younger-than` | `60m` |
+| `--keep-tag-revisions` | `3` per tag |
+| `--prune-registry` | `true` |
+
+Explicit flags override these defaults. The examples retain five revisions per tag and images
+younger than 72 hours. Use the same policy for every preview, confirmation, and retry.
+The existing `--all` compatibility behavior still bypasses age and revision retention; do not add
+it when those limits must be honored. It does not mean "apply the configured retention to all images."
+
 The pruner scans Pod specifications in this cluster's Pods, Deployments, StatefulSets, DaemonSets,
-ReplicaSets, ReplicationControllers, Jobs, and CronJobs. Tagged images and tag history can be prune
-candidates. Consumers in other clusters or outside the platform are not scanned; exclude their
-repositories with `--whitelist` or retain the required images before proceeding.
+ReplicaSets, ReplicationControllers, Jobs, and CronJobs. Retained tag history, workload references,
+shared config and layer blobs, and image index children are protected by the observed graph.
+Consumers in other clusters or outside the platform are not scanned; exclude their repositories
+with `--whitelist` or retain the required images before proceeding.
 
-Manual retention defaults to zero revisions and zero age, independently of `ImagePruner/cluster`.
-The examples explicitly retain five revisions per tag and images younger than 72 hours. Adjust
-these values to your policy in every preview and confirmation command.
+For running containers, the pruner also checks resolved image IDs in regular, init, and ephemeral
+container statuses. This protects an older image while its workload tag advances. If a running
+container reports an image ID that cannot be interpreted safely, pruning stops before deletion;
+inspect the reported Pod and its container runtime status before retrying.
 
-This metadata-only procedure updates ImageStream references and removes eligible ImageDigest
-objects. Storage manifest links remain. If storage reclamation is intended, start with the
-[combined cleanup procedure](#prune-and-reclaim-storage) while the metadata graph is still intact.
+Live metadata and workload checks are refreshed during cleanup, but deletion is not atomic with
+arbitrary newly created references. Concurrent pushes, imports, retagging, or workload changes can
+introduce references after a check. Choose retention that covers image publication and deployment,
+and avoid reusing candidates while they are being deleted. These checks do not lock out writers.
 
-Preview image pruning:
+### Prune Metadata and Reclaim Storage \{#prune-and-reclaim-storage}
+
+Use online pruning while the Image API graph is still available. The CLI verifies the Registry
+operand binding and uses its endpoint. If your workstation cannot reach the internal service,
+add `--registry-url` with a verified reachable endpoint and `--certificate-authority` with its PEM
+CA bundle to every invocation. See [Configure client trust](./exposing_the_registry.mdx#configure-client-trust).
+Registry Pod selection and execution are not part of this operation.
+
+Preview online pruning:
 
 ```bash
 ac adm prune images \
+  --require-online-pruning=true \
   --keep-tag-revisions=5 \
-  --keep-younger-than=72h
+  --keep-younger-than=72h \
+  --prune-registry=true
 ```
 
 Expected result:
 
-- The dry run lists prune candidates and does not delete image metadata.
+- The dry run lists metadata candidates and any pending cleanup targets without deleting metadata,
+  Registry references, or blobs. It does not run full storage garbage collection.
 
 Run pruning after reviewing the dry-run output:
 
 ```bash
 ac adm prune images \
+  --require-online-pruning=true \
   --keep-tag-revisions=5 \
   --keep-younger-than=72h \
+  --prune-registry=true \
   --confirm
 ```
 
@@ -341,21 +376,30 @@ Verify pruning:
 
 ```bash
 ac adm prune images \
+  --require-online-pruning=true \
   --keep-tag-revisions=5 \
-  --keep-younger-than=72h
+  --keep-younger-than=72h \
+  --prune-registry=true
 ```
 
 Expected result:
 
-- A follow-up dry run no longer lists the metadata that was pruned by the confirmed command.
+- A follow-up dry run no longer lists the completed targets. Check command errors and pending
+  cleanup separately; an empty metadata candidate list alone does not prove storage cleanup finished.
+
+Verify that retained ImageStream tags still resolve and that critical images can be fully pulled
+or extracted from a fresh client directory. Metadata inspection alone does not verify layer
+availability. Resolve failures before another cleanup run.
 
 Keep repositories out of pruning with `--whitelist`. The flag takes regular expressions and can be
 repeated:
 
 ```bash
 ac adm prune images \
+  --require-online-pruning=true \
   --keep-tag-revisions=5 \
   --keep-younger-than=72h \
+  --prune-registry=true \
   --whitelist='^cpaas-system/.*'
 ```
 
@@ -363,33 +407,86 @@ After reviewing the preview, confirm the same policy:
 
 ```bash
 ac adm prune images \
+  --require-online-pruning=true \
   --keep-tag-revisions=5 \
   --keep-younger-than=72h \
+  --prune-registry=true \
   --whitelist='^cpaas-system/.*' \
   --confirm
 ```
 
-For scheduled pruning, see [Setting up and configuring the registry](./setting_up_and_configuring_the_registry.mdx#configure-scheduled-image-pruning).
+### Prune Metadata Only \{#prune-metadata-only}
 
-Confirmed pruning is not automatically reversible. Restore pruned metadata from backup, recreate
-metadata from a trusted image source, or re-import the image when recovery is required.
+Set `--prune-registry=false` explicitly to update ImageStream references and remove eligible
+ImageDigest objects without deleting Registry references or blobs. Preview and confirm the same policy:
+
+```bash
+ac adm prune images \
+  --require-online-pruning=true \
+  --keep-tag-revisions=5 \
+  --keep-younger-than=72h \
+  --prune-registry=false
+
+ac adm prune images \
+  --require-online-pruning=true \
+  --keep-tag-revisions=5 \
+  --keep-younger-than=72h \
+  --prune-registry=false \
+  --confirm
+```
+
+Metadata-only pruning leaves storage manifest and layer references in place. Standalone garbage
+collection follows those references and can retain their blobs even after Image API metadata is
+gone. Choose online pruning before discarding the graph when storage reclamation is intended;
+later garbage collection does not replace missing manifest unlink information.
+
+Metadata-only runs also read pending cleanup state and retain its UID and workload protections.
+They do not execute pending Registry deletions.
+
+### Retry Unfinished Online Cleanup \{#retry-unfinished-online-cleanup}
+
+Before deleting metadata, the CLI persists version-2 cleanup records in `image-pruner-state` in
+the operand namespace. Each record saves the image identity and the known manifest, config, layer,
+and index-child inventory, so a CLI or Job restart does not lose the deletion targets.
+
+Confirmation rechecks live ImageDigest UIDs, workload usage, retained references, shared blobs,
+and index children. These checks refresh after manifest unlinks and again after layer-reference
+deletion, before blob deletion; each phase still uses a snapshot rather than locking new references.
+A recreated or replaced ImageDigest stops the run for review. Failed or protected targets remain
+pending; the next run rebuilds the live reference graph before deletion.
+Do not assume that restarting a failed process authorizes deleting a newly referenced image.
+
+Resolve the reported error, review another dry run, and retry with the same Registry endpoint,
+retention, and exclusion options. Changed pruning options are rejected while targets remain
+pending. Do not delete the state ConfigMap or edit its records to bypass these checks.
+
+Older version-1 records can finish their known manifest unlinks, but have no saved blob inventory
+and cannot authorize a global blob sweep. Unknown old orphaned blobs require the separate
+[maintenance garbage collection procedure](#run-registry-garbage-collection), once their manifest
+references have been removed. Ordinary online pruning does not scan all storage for old orphans.
+
+For scheduled pruning, see [Configure scheduled image pruning](./setting_up_and_configuring_the_registry.mdx#configure-scheduled-image-pruning).
+For recovery, restore both metadata and missing blobs from verified backups or republish from a
+trusted image source. Re-importing external metadata alone does not restore local blob data.
 
 ## Run Registry Garbage Collection \{#run-registry-garbage-collection}
 
-Storage reclamation has three stages: prune Image API metadata, unlink eligible storage manifests,
-then collect blobs no longer referenced by storage manifests. Metadata-only pruning followed by
-standalone GC can leave blobs retained by their storage manifest links.
+`ac adm registry gc` performs full storage garbage collection in a Registry Pod. It is separate
+from ordinary online image pruning and collects blobs no longer referenced by storage manifests,
+including old orphaned blobs with no saved cleanup inventory. It does not select images by Image
+API retention or unlink manifests based on that policy. Metadata-only pruning followed by GC can
+leave blobs retained by storage manifest links.
 
-> **Warning:** Confirmed blob reclamation is irreversible through the Registry. Neither standalone
-> GC nor combined pruning automatically stops writers. Prevent concurrent pushes, imports, and other
-> Registry or Image API writes, and let in-flight writes finish before cleanup. Keep writers paused
+> **Warning:** Confirmed blob reclamation is irreversible through the Registry. Full GC does not
+> automatically stop writers. Prevent concurrent pushes, imports, and other Registry or Image
+> API writes, enable read-only mode, and let in-flight writes finish before cleanup. Keep writers paused
 > until verification completes. Restore missing data from a storage backup or a trusted image source.
 
 ### Prepare the Maintenance Window
 
-Both `ac adm registry gc` and `ac adm prune images --prune-registry` resolve the Registry operand
-namespace from the installation binding. This also applies when Registry mode is selected
-explicitly. The CLI refuses cleanup when it cannot verify the binding or find a ready Registry Pod.
+`ac adm registry gc` resolves the Registry operand namespace from the installation binding.
+This also applies when Registry mode is selected explicitly. The CLI refuses GC when it cannot
+verify the binding or find a ready Registry Pod.
 It uses the bound Service's complete selector to choose the Pod.
 
 Run the procedure from an administrator environment with `kubectl`, `ac`, `curl`, pull access to
@@ -416,7 +513,7 @@ kubectl -n "$REGISTRY_NAMESPACE" get configmap serviceca \
 ```
 
 Set the endpoint and CA bundle for the selected path. The CA bundle must validate the endpoint's
-certificate chain and hostname. The examples pass it explicitly to `curl` and pruning. On Linux,
+certificate chain and hostname. The examples pass it explicitly to `curl`. On Linux,
 `SSL_CERT_FILE` provides it to each direct `ac` client invocation. On macOS or Windows, add the CA
 to the client's system trust store before login and extraction; the environment variable does not
 replace that step. See [Configure client trust](./exposing_the_registry.mdx#configure-client-trust).
@@ -470,6 +567,9 @@ Record the current settings and suspend scheduled pruning to prevent overlapping
 REGISTRY_READ_ONLY="$(kubectl get configs.imageregistry.operator.alauda.io cluster \
   -o jsonpath='{.spec.readOnly}')" || exit 1
 REGISTRY_READ_ONLY="${REGISTRY_READ_ONLY:-false}"
+REGISTRY_PRUNER_SUSPENDED="$(kubectl get imagepruners.imageregistry.operator.alauda.io cluster \
+  -o jsonpath='{.spec.suspend}')" || exit 1
+REGISTRY_PRUNER_SUSPENDED="${REGISTRY_PRUNER_SUSPENDED:-false}"
 kubectl patch imagepruners.imageregistry.operator.alauda.io cluster \
   --type=merge -p '{"spec":{"suspend":true}}' || exit 1
 kubectl -n "$REGISTRY_NAMESPACE" wait cronjob/image-pruner \
@@ -480,56 +580,8 @@ kubectl -n "$REGISTRY_NAMESPACE" get jobs -l created-by=image-pruner \
 
 Wait until every existing pruner Job has a terminal `Complete` or `Failed` condition. Suspending the
 schedule does not stop an existing Job. Pause image-changing workflows and prevent other clients
-from writing throughout the selected cleanup procedure.
-
-### Prune Metadata and Reclaim Storage \{#prune-and-reclaim-storage}
-
-Use this path before metadata-only pruning when you need to remove eligible manifest links and
-reclaim blobs. The recorded `REGISTRY_READ_ONLY` value must be `false`; if it is `true`, resolve the
-existing maintenance restriction before proceeding. Keep `spec.readOnly` false during this path
-because pruning must update and delete Image API resources. Enforce writer exclusion through your
-maintenance controls instead.
-
-Use the endpoint and CA verified during preparation, with the administrator account authenticated
-to this cluster. Preview the metadata candidates with explicit retention and repository exclusions:
-
-```bash
-ac adm prune images \
-  --registry-url="$REGISTRY_URL" \
-  --certificate-authority="$REGISTRY_CA" \
-  --keep-tag-revisions=5 \
-  --keep-younger-than=72h \
-  --whitelist='^cpaas-system/.*' \
-  --prune-registry
-```
-
-This dry run lists metadata candidates and skips GC. The confirmed run also unlinks eligible
-storage manifests and collects all then-unreferenced blobs, including previously unlinked content.
-After reviewing the candidates and backups, run:
-
-```bash
-ac adm prune images \
-  --registry-url="$REGISTRY_URL" \
-  --certificate-authority="$REGISTRY_CA" \
-  --keep-tag-revisions=5 \
-  --keep-younger-than=72h \
-  --whitelist='^cpaas-system/.*' \
-  --prune-registry \
-  --confirm
-```
-
-Remaining ImageStream references can retain a shared digest or manifest. Verify metadata cleanup
-with the same dry run, then continue to [verify blob availability](#verify-blob-availability).
-The CLI saves pending manifest targets in `image-pruner-state` in the operand namespace before
-deleting metadata. A manifest deletion failure returns a nonzero exit status and prevents GC.
-Retries process eligible pending metadata deletions before unlinking manifests and stop for review
-if metadata for a pending digest has been created or replaced since planning.
-Metadata-only pruning also reads the pending state and retains these identity and workload-use
-protections; it does not execute pending manifest deletions or GC.
-Resolve the reported error, review another dry run, and repeat the command with the same endpoint,
-retention policy, and exclusion options. The dry run includes pending targets from the earlier
-attempt; confirmation rechecks live references and workload usage. Changed pruning options are
-rejected while targets remain pending. Do not delete the state ConfigMap to bypass that check.
+from writing throughout garbage collection and verification. Read-only mode alone does not fence
+direct backend writers or finish requests already in flight.
 
 ### Collect Already Unlinked Blobs
 
@@ -582,7 +634,8 @@ after verification and any investigation are complete.
 
 ### Restore the Previous Settings
 
-After successful verification, restore the recorded read-only setting. Keep scheduled pruning suspended:
+After successful verification, restore the recorded read-only setting while keeping writers
+isolated and scheduled pruning suspended:
 
 ```bash
 REGISTRY_CONFIG_GENERATION="$(kubectl patch configs.imageregistry.operator.alauda.io cluster \
@@ -612,15 +665,17 @@ kubectl -n "$REGISTRY_NAMESPACE" get pods -l app.kubernetes.io/name=image-regist
 
 Continue only when Pods are present, no row has a deletion timestamp, and every read-only value
 matches `EXPECTED_REGISTRY_READ_ONLY` (empty when the recorded setting was `false`). Repeat the
-Pod check until all old Pods have terminated. Verify that scheduled pruning remains suspended:
+Pod check until all old Pods have terminated. Resume writers only when verification has succeeded
+and the Registry is intended to be writable. After completing maintenance, restore the recorded
+schedule state:
 
 ```bash
 kubectl patch imagepruners.imageregistry.operator.alauda.io cluster \
-  --type=merge -p '{"spec":{"suspend":true}}' || exit 1
+  --type=merge -p "{\"spec\":{\"suspend\":$REGISTRY_PRUNER_SUSPENDED}}" || exit 1
 kubectl -n "$REGISTRY_NAMESPACE" wait cronjob/image-pruner \
-  --for=jsonpath='{.spec.suspend}'=true --timeout=300s || exit 1
+  --for=jsonpath='{.spec.suspend}'="$REGISTRY_PRUNER_SUSPENDED" --timeout=300s || exit 1
 ```
 
-Verify that the rollout completes, read-only mode matches its recorded value, and pruning remains suspended. Resume writers
-when the Registry is intended to be writable. If verification fails, keep the maintenance controls
-in place while investigating.
+Verify that the rollout completes and both settings match their recorded values. An originally
+suspended schedule remains suspended. If any verification fails, keep the maintenance controls
+and schedule suspension in place while investigating.

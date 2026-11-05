@@ -31,7 +31,7 @@ CatalogSource and monitoring ServiceAccounts remain in the platform namespace, `
 | `image-registry` Deployment | Serves OCI push and pull traffic, authentication, authorization, storage access, health checks, and metrics. |
 | `image-api-server` Deployment | Processes public Image API requests, including image metadata, tag resolution, imports, and namespace image limits. |
 | `node-ca` DaemonSet | Distributes Registry CA trust and Registry service host mappings to nodes. |
-| `image-pruner` CronJob | Holds the pruning command and policy; automatic execution remains suspended for cleanup safety. |
+| `image-pruner` CronJob | Runs online image pruning according to the retention policy and `ImagePruner.spec.suspend`. |
 | Managed imagePullSecret controller | Creates, injects, refreshes, and removes service account pull secrets for the internal registry. |
 
 The Operator publishes the Image API as `image.alauda.io/v1` through the Kubernetes API server.
@@ -210,9 +210,10 @@ The Registry and Image API deployments are created after storage is configured a
    If the configuration is not found, check the Operator Pod and retry after it starts. For image pull
    authorization errors, use [Repair Workload Image Pulls](#repair-workload-image-pulls).
 
-2. [Suspend scheduled pruning and review its policy](./setting_up_and_configuring_the_registry.mdx#configure-scheduled-image-pruning)
-   before activating the Registry. The Operator keeps the pruning schedule suspended.
-   Keep the schedule suspended through activation.
+2. [Review the scheduled pruning policy](./setting_up_and_configuring_the_registry.mdx#configure-scheduled-image-pruning)
+   before activating the Registry. New installations default to `spec.suspend: false`. Temporarily
+   set it to `true` while configuring storage and reviewing retention, and keep it suspended through
+   activation.
 3. Configure [PVC storage](./setting_up_and_configuring_the_registry.mdx#configure-pvc-storage) or
    [S3-compatible storage](./setting_up_and_configuring_the_registry.mdx#configure-s3-compatible-storage).
    These examples also set `managementState: Managed`. If the backend is already configured, use
@@ -237,6 +238,10 @@ Expected results:
   return no objects.
 - `Config/cluster.spec.managementState` is `Managed`; its conditions report `Available=True`,
   `Progressing=False`, and `Degraded=False`.
+
+After activation and policy review, follow
+[Configure scheduled image pruning](./setting_up_and_configuring_the_registry.mdx#configure-scheduled-image-pruning)
+to verify the generated online command and enable the schedule.
 
 ### Repair Workload Image Pulls \{#repair-workload-image-pulls}
 
@@ -347,6 +352,8 @@ Expected results:
 - The new CSV is `Succeeded` and the Subscription reports the new installed CSV.
 - `cluster-image-registry-operator`, `image-registry`, and `image-api-server` are available.
 - Existing storage, routes, compatible Image API metadata, and ImagePruner configuration remain reconciled.
+- An existing explicit `ImagePruner.spec.suspend: true` remains suspended, including values from
+  earlier safety releases. Review the policy and generated online command before setting it to `false`.
 - `Config/cluster` reports `Available=True`, `Progressing=False`, and `Degraded=False`.
 
 If the upgraded Operator Pod reports an image pull authorization error, follow
@@ -435,16 +442,27 @@ The Operator reconciles the singleton `ImagePruner/cluster` into an `image-prune
 Registry operand namespace (`cpaas-system` by default). Configure the retention policy in the
 `ImagePruner` resource. See [Setting up and configuring the registry](./setting_up_and_configuring_the_registry.mdx#configure-scheduled-image-pruning).
 
-The Operator keeps the CronJob suspended and reports `Scheduled=False` with reason
-`ScheduledGCUnsafe`, because automatic writer isolation and upload draining are unavailable.
-This also prevents metadata-only schedules from discarding the reference graph needed for later
-manifest cleanup. User retention settings remain configured, but `spec.suspend: false` does not
-enable execution. Existing Jobs are not stopped by suspension.
+New installations default to `spec.suspend: false`. The Operator honors explicit `true` and `false`
+and preserves an existing explicit `true`, including values from earlier safety releases.
+Suspension prevents new scheduled Jobs; it does not stop an existing Job.
 
-Use [manual pruning and garbage collection](./managing_access_and_cleanup.mdx#run-registry-garbage-collection)
-in a maintenance window. The Operator also creates the `image-pruner-state` ConfigMap in the operand
-namespace to retain unfinished manifest cleanup across CLI or Job restarts. Do not delete it while
-cleanup is pending.
+Generated Jobs select modern mode and pass `--require-online-pruning=true`. An older CLI rejects
+the unknown flag before pruning. The flag also prevents selecting an incompatible Registry backend. Scheduled
+pruning uses authenticated HTTP deletion of selected Registry references and blobs, without Pod
+execution or full storage garbage collection. The Operator-managed pruner role grants no `pods/exec` permission.
+
+Before reconciliation can fail on other prerequisites, the Operator suspends an old job template
+that does not meet the guarded modern command requirements. Until safe regeneration, it reports
+`Scheduled=False` with reason `ScheduledGCUnsafe`. The replacement honors `spec.suspend`; supported online
+templates are not routinely suspended during reconciliation. If the safety suspension fails,
+inspect the `Degraded` condition with reason `SuspensionFailed` and the Operator logs.
+
+The Operator also creates the `image-pruner-state` ConfigMap in the operand namespace. Version-2
+cleanup records preserve blob inventories before metadata deletion and support retries across
+CLI or Job restarts. Do not delete this ConfigMap while cleanup is pending. See
+[Prune images](./managing_access_and_cleanup.mdx#prune-images) for online cleanup and retry behavior.
+Full [Registry garbage collection](./managing_access_and_cleanup.mdx#run-registry-garbage-collection)
+remains a separate maintenance procedure with read-only mode and writer isolation.
 
 ## Check Operator and Registry Status
 
