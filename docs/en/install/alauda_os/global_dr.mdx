@@ -1,269 +1,312 @@
 ---
 weight: 20
-title: Global Cluster Disaster Recovery
+title: Create a Global Cluster Disaster Recovery Pair
 queries:
-  - global cluster disaster recovery on immutable infrastructure
-  - immutable infra etcd sync
-  - alauda os global dr
-  - vmware vsphere global cluster disaster recovery
-  - immutable os disaster recovery
+  - create a global cluster disaster recovery pair on alauda os
+  - primary and standby global cluster install-config.yaml differences
+  - generate dr encryption key and serviceAccountSigningKey before install
+  - install etcd-sync on the standby global cluster
+  - start global cluster disaster recovery synchronization
+  - bare metal global dr endpoint and identity
 ---
 
-# Global Cluster Disaster Recovery
+# Create a Global Cluster Disaster Recovery Pair
 
-This page is the disaster recovery entry point for a `global` cluster whose nodes run Alauda OS. Deploy-time disaster recovery configuration is part of the `global` cluster installation procedure.
+This page creates a disaster recovery (DR) pair of `global` clusters, from planning to the first synchronization. Read it before you write the first `install-config.yaml` of either side.
 
-## Deployment Procedure
+| You are | Go to |
+|---|---|
+| Planning, or installing the two sides | The sections below, from the top |
+| You already installed a single `global` cluster | [Decide Before You Install](#decide-before-you-install) |
+| Both sides are installed | [Start Synchronization](#start-synchronization) |
+| The primary has failed, or you switch over on purpose | [Fail Over to the Standby global Cluster](./disaster_recovery_failover.mdx) |
 
-Use [Optional Disaster Recovery Deployment](./installing.mdx#optional-disaster-recovery-deployment) in the installation guide when you create the primary and standby `global` clusters.
+## What a DR Pair Is \{#what-a-dr-pair-is}
 
-That deployment procedure is the authoritative source for the installation-time DR configuration, including:
+A DR pair is two `global` clusters: a primary and a standby. The primary is the `global` cluster that serves the platform access address, a domain name: in normal operation the domain points to it, except while you install the standby and during a failover. The other is the standby. After a failover, the former standby is the new primary.
 
-- Each side is installed from its own bootstrap node: two bootstrap nodes in total, on every provider.
-- Primary and standby clusters use the same Kubernetes API server encryption provider configuration.
-- Each cluster's `KubeadmControlPlane` etcd server certificate SAN list includes that cluster's own control plane VIP, the Platform Access Address, and `etcd.kube-system`; the primary and standby lists differ (see [Add DR etcd Server Certificate SANs to KubeadmControlPlane](./installing.mdx#dr-etcd-server-cert-sans)). This list is separate from the platform `console.cert` SAN list.
-- Huawei DCS deployments reference the shared encryption provider Secret from `DCSCluster.spec.encryptionProviderConfigRef`. The Secret must exist in each final `global` cluster, not only in the bootstrap cluster that installed it.
-- VMware vSphere deployments write the same `/etc/kubernetes/encryption-provider.conf` file through `KubeadmControlPlane.spec.kubeadmConfigSpec.files`.
-- Huawei Cloud Stack deployments write the same `/etc/kubernetes/encryption-provider.conf` file through `KubeadmControlPlane.spec.kubeadmConfigSpec.files`.
-- Bare Metal deployments reference the shared encryption provider Secret from `BaremetalCluster.spec.encryptionProviderConfigRef` and use the same Kubernetes ServiceAccount signing key on both sides.
-- Huawei DCS, VMware vSphere, and Huawei Cloud Stack create the `dcs-import-extra-resources` ConfigMap before installer import so the installation can import referenced credential Secrets and, where applicable, provider-specific infrastructure resources. The name keeps the `dcs` prefix for historical installer compatibility.
-- Bare Metal creates the `dcs-import-extra-resources` ConfigMap before installer import so the installation can preserve the durable bare-metal and elemental owner resources required by handoff. It does not import Global plan Secrets or kubeadm bootstrap data Secrets; fresh handoff creates the initial Global plan Secrets after all target Global `MachineInventory` objects exist.
-- The standby cluster installs `global-etcd-sync` with connection values that point to the active primary after both installations succeed.
+Each side is an ordinary installation with ACP CLI (`ac`), run from its own bootstrap node with its own `install-config.yaml`. After both sides are installed, **<Term name="product" /> Global Cluster Disaster Recovery** (`etcd-sync`) on the standby copies the primary's etcd data to it. `ac` prepares every `global` cluster for DR, so a DR pair needs no manifest edits. Each side's infrastructure credentials and node registry configuration are not synchronized, so the two sides can use different accounts and registries.
 
-After both clusters are installed, install the infrastructure provider and the Cluster Bootstrap Provider on **both** `global` clusters, so that the standby can reconcile the workload clusters after a failover. See [Huawei DCS](../../workload_clusters/alauda_os/huawei-dcs/install_provider.mdx), [VMware vSphere](../../workload_clusters/alauda_os/vmware-vsphere/install_provider.mdx), [Huawei Cloud Stack](../../workload_clusters/alauda_os/huawei-cloud-stack/install_provider.mdx), or [Bare Metal](../../workload_clusters/alauda_os/bare-metal/install_provider.mdx).
+This page applies to every provider. Steps that only Bare Metal needs are marked **Bare Metal only**.
 
-## Network Requirements \{#network-requirements}
+## Decide Before You Install \{#decide-before-you-install}
 
-A stable Platform Access Address that uses a DNS name is a prerequisite for disaster recovery. During normal operation, the domain resolves only to the primary `global` cluster VIP. The standby `global` cluster uses the domain to access platform services on the primary `global` cluster.
+Decide before you write the first `install-config.yaml` of either side. The standby can decrypt the primary's Secrets only with the primary's encryption key, and an installed cluster keeps the key it was installed with. If a `global` cluster is already installed as a single cluster, contact technical support before you install a standby. Do not install a standby with a key of its own: it cannot decrypt the primary's Secrets.
 
-Before installing either cluster, complete both of the following network preparations:
+## Prepare for DR \{#prepare-for-dr}
 
-- Configure each cluster's load balancer to forward the required TCP ports on its VIP to the control plane nodes behind that VIP. Configure port `80` only when users access the platform over HTTP.
-- Allow the required TCP ports in **both directions** between the primary and standby cluster networks. Apply the rules to firewalls, security groups, router ACLs, and any other inter-site network controls.
+Each side has its own:
 
-| TCP port | Service | Why it is required |
-|----------|---------|--------------------|
-| `443` | <Term name="productShort" /> platform HTTPS | The standby cluster uses the Platform Access Address to reach the active platform. **<Term name="product" /> Global Cluster Disaster Recovery** uses this address, and logging and monitoring components send alert callbacks to it. |
-| `80` | <Term name="productShort" /> platform HTTP | Required only when users access the platform over HTTP. The connectivity requirement is otherwise the same as for port `443`. |
-| `6443` | Kubernetes API server | During installation or reinstallation of **<Term name="product" /> Global Cluster Disaster Recovery**, the standby cluster connects to the active cluster API server to obtain the etcd CA material required for synchronization. |
-| `11443` | Built-in image registry | The standby cluster pulls platform and plugin images from the registry configured through the Platform Access Address. This applies to the platform built-in Registry only. |
-| `2379` | etcd | **<Term name="product" /> Global Cluster Disaster Recovery** on the standby cluster reads etcd data from the primary cluster and writes it to the local standby etcd. |
+- Bootstrap node.
+- Infrastructure.
+- Control plane VIP.
 
-The network policy must be bidirectional because the cluster roles are reversed after failover. Before failover, the effective service traffic is normally from standby to primary. After failover, the former primary becomes the new standby and must reach the new primary on the same ports. This requirement does not make etcd replication bidirectional: **<Term name="product" /> Global Cluster Disaster Recovery** runs only on the current standby cluster and writes synchronized data to its local etcd.
+The platform image registry (`global.registry`) can be the same external registry for both sides, or each side can have its own.
+
+Each side meets the [common prerequisites](./prerequisites.mdx) and the prerequisites of its provider.
+
+Also prepare:
+
+- **The platform domain name.** It is the platform access address. During normal operation it resolves only to the primary VIP, and the standby reaches the primary's platform through it. You point it at a VIP three times during the installation, see [Install the Primary and the Standby](#install-primary-and-standby-clusters), and once more at a failover. Book those changes in advance.
+- **A third-party certificate and its private key** for the domain, as the same files on both bootstrap nodes.
+- **The shared keys**, generated once; see [Generate the Shared Keys](#generate-the-shared-keys).
+- **A copy of each side's installation directory**, in particular `output/kubeconfig`, kept where you can reach it when a site is down.
+- **Violet v4.2.13 or later** on a machine that reaches the standby VIP and the standby registry. The `etcd-sync` package is a component of **<Term name="product" /> Global Cluster Disaster Recovery** and is in **ACP Common Aligned Extensions**; see [Install etcd-sync](#install-etcd-sync).
+
+### Generate the Shared Keys \{#generate-the-shared-keys}
+
+Generate each key once and write the same value in both `install-config.yaml` files. A key file holds a secret: run `chmod 600` on it and keep it private.
+
+Run the commands on a Linux machine with OpenSSL. Encryption key for Secrets at rest:
+
+```bash
+openssl rand -base64 32 > dr-encryption.key
+chmod 600 dr-encryption.key
+```
+
+`ac` uses the value as it is and checks it before it changes anything: it must be the base64 of a 16, 24, or 32 byte key, as the command above produces.
+
+**Bare Metal only:** the key that signs ServiceAccount tokens:
+
+```bash
+openssl genrsa -out sa.key 2048
+base64 -w0 sa.key > sa.key.b64
+chmod 600 sa.key sa.key.b64
+```
+
+The signing key cannot be changed after installation: if the cluster already holds a different `global-sa`, `ac` stops rather than overwrite it.
+
+## Network \{#network-requirements}
+
+Before you install either cluster, ask your network administrator for the flows that the communication matrix marks **Global DR**, allowed in both directions between the two sides' networks and, for a VIP on a load balancer, forwarded on both VIPs. See [Platform Access Address and `global` VIP](../prepare/communication_matrix.mdx#global_vip) and [Global Disaster Recovery](../prepare/communication_matrix.mdx#global_dr).
+
+The nodes of each side pull their images from the registry in `global.registry`; the flows to it are in [Image Registry](../prepare/communication_matrix.mdx#image_registry).
 
 ## Observability Placement \{#observability-placement}
 
-Disaster recovery replicates only the `global` cluster's etcd data, and namespaces such as `cpaas-system` are excluded from that replication. Monitoring and logging data is therefore never copied to the standby cluster. Plan observability placement before you install either cluster.
+DR replicates only the `global` cluster's etcd data. Metrics and logs are stored outside etcd, so they are never copied to the standby. Plan observability before you install either cluster:
 
-- Each `global` cluster collects, stores, and queries its own metrics and logs. The primary and standby clusters never use each other's monitoring or log storage, so the standby cluster can observe itself immediately after a failover.
-- Workload cluster monitoring and logging must not be written to either `global` cluster. Aggregate workload cluster metrics and logs in a dedicated workload cluster that runs the VictoriaMetrics Center and the log storage, then point the collection agents of each workload cluster at that cluster.
-- If a network zone cannot reach that aggregation cluster, give the zone its own aggregation cluster instead of falling back to a `global` cluster.
-- Workload cluster observability data that is stored in a `global` cluster becomes unavailable when that cluster's role changes, because the data is not replicated and the other `global` cluster cannot serve it.
+- Each `global` cluster collects, stores, and queries its own metrics and logs, so the standby can observe itself immediately after a failover.
+- Do not write workload cluster monitoring and logging to either `global` cluster. Aggregate them in a dedicated workload cluster that runs the VictoriaMetrics Center and the log storage. A network zone that cannot reach it gets its own aggregation cluster.
 
-For the synchronized and excluded scope, which is shared with the non-Alauda OS path, see [Global Cluster Disaster Recovery](../non_alauda_os/global_dr.mdx).
+For the synchronized and excluded scope, see [Global Cluster Disaster Recovery](../non_alauda_os/global_dr.mdx).
 
-## Operational Scope
+## Write the Two install-config.yaml Files \{#configure-install-config}
 
-After the primary and standby clusters are installed, operate DR as a separate lifecycle process. Keep the installation manifests aligned with the installation guide, then use an approved operations runbook for the following tasks:
+Write each side's `install-config.yaml` as for a single `global` cluster, following the Create the global Cluster page of your provider, with these values: [Bare Metal](./bare-metal/create_cluster.mdx), [Huawei DCS](./huawei-dcs/create_cluster.mdx), [VMware vSphere](./vmware-vsphere/create_cluster.mdx), or [Huawei Cloud Stack](./huawei-cloud-stack/create_cluster.mdx).
 
-- Verify the health and replication lag of **<Term name="product" /> Global Cluster Disaster Recovery**.
-- Verify that the standby cluster can decrypt Kubernetes Secrets created on the primary cluster.
-- Validate the primary and standby control plane VIPs and the platform access path before a planned failover.
-- Before a planned failover or failback, verify that the required ports are allowed in both directions between the two cluster networks. After the switch, the former standby becomes the new primary and the former primary becomes the new standby, so the direction of service traffic is reversed.
-- Execute failover and failback with an approved operations procedure.
-- Reconcile provider-specific resources after a failover.
+| Field | Primary | Standby |
+|---|---|---|
+| `global.platform.address` | The platform domain | The same domain |
+| `global.platform.cert` | A third-party certificate and key whose SANs cover the domain | The same certificate and key files |
+| `global.platform.username`, `global.platform.password` | The platform administrator account | The same values |
+| `global.platform.extraAddresses` | `[<primary-vip>]` | `[<standby-vip>]` |
+| `cluster.network.loadBalancer.address` (`provider.hcs.elb.vipAddress` on Huawei Cloud Stack) | The primary VIP | The standby VIP |
+| `global.registry` | The platform image registry | The same registry, or the standby's own |
+| `cluster.encryptionProviderConfig` | The encryption key from [Generate the Shared Keys](#generate-the-shared-keys) | The same value |
+| `provider.baremetal.serviceAccountSigningKey` (Bare Metal only) | The content of `sa.key.b64` | The same value |
 
-<Directive type="warning" title="Verify consistency before uninstalling Alauda Container Platform Global Cluster Disaster Recovery">
-A disaster recovery switchover and a DR-aware `global` cluster upgrade both uninstall **<Term name="product" /> Global Cluster Disaster Recovery**. Before that uninstall, confirm that the standby `global` cluster data is consistent with the primary. On Alauda OS clusters, workload-cluster nodes are backed by Cluster API `Machine` objects, so an incorrect owner-reference resolution after an inconsistent sync can delete those `Machine` objects and destroy the backing virtual machines. If the consistency check reports missing or surplus keys, do not uninstall the plugin; resolve the inconsistency or contact technical support first. For the detailed switchover and upgrade procedures, which are shared with the non-Alauda OS path, see [Global Cluster Disaster Recovery](../non_alauda_os/global_dr.mdx) and [Upgrade in a DR Environment](../../upgrade/global/upgrade_global_dr.mdx).
-</Directive>
+- **Platform address**: use a domain name, not an IP address. `ac` accepts an IP address here, but `etcd-sync` refuses to run when the platform address is not a domain name.
+- **Certificate**: do not omit `global.platform.cert`. Self-signed certificates are not supported for DR: without the field, each side generates its own self-signed certificate, and after a failover clients reject the other side's certificate; on Bare Metal this includes the agents of the workload hosts. For the accepted formats, see [Common `install-config.yaml` Fields](./reference.mdx#install-config).
+- **`extraAddresses`**: each side's own VIP, which you use to reach that side while the domain points at the other one. `ac` does not add it.
+- **Keys**: write them before the first `manifests` or `create` run on each side. A key that you change afterward does not change what an installed cluster uses; see [Rendered Manifests](./reference.mdx#render-manifests).
+- **VM folder** (VMware vSphere): when both sides share a vCenter, you can set a different `provider.vsphere.folder` on each side to keep their VMs apart. The same folder also works.
 
-## Failover \{#failover-procedure}
+**Applies to**: every DR pair, before the first `manifests` or `create` run.
 
-The sequence below is provider-neutral: it is driven by the platform domain and
-the `etcd-sync` lifecycle, not by any provider API. Provider-specific
-synchronization sources and post-failover checks are in
-[Provider Notes](#provider-notes) and, for Bare Metal, in the
-[Bare Metal DR Model](#bare-metal-dr-model) section.
+Run on each bootstrap node, in the installation directory:
 
-1. Fence the primary so it cannot write workload resources.
-2. Wait for the monitor to show no differences, then **uninstall** `etcd-sync` from the old standby. Removing its `ModuleInfo` is what uninstalls the plugin; scaling the Deployments to zero is not enough (see the warning below). On Bare Metal, then set `elemental.systemAgent.sharedAuthReadOnly: false` in the [Bare Metal provider's `ModuleInfo`](../../workload_clusters/alauda_os/bare-metal/install_provider.mdx#install-the-cluster-plugins) on the old standby, which becomes the active cluster, and wait until the `elemental-operator` Deployment no longer has the `--system-agent-shared-auth-read-only` argument (check with `kubectl -n cpaas-system get deploy elemental-operator -o yaml | grep -- --system-agent-shared-auth-read-only`). Until then, new worker nodes cannot obtain their plans.
-3. Switch the platform domain to the standby control-plane entrance.
-4. Verify the standby API and platform endpoint.
-5. Confirm workload hosts reconnect through the platform domain and can update plan feedback.
-6. On Bare Metal, first set `elemental.systemAgent.sharedAuthReadOnly: true` in the provider's `ModuleInfo` on the new standby and confirm with the same command that the `elemental-operator` Deployment has the `--system-agent-shared-auth-read-only` argument. Then install the `etcd-sync` plugin on the new standby (the fenced former primary) with the reverse active/standby values and, on Bare Metal, the same `baremetal-dr-rules` ConfigMap. Remember that the active-cluster token must now come from the new active cluster, and that pushing the plugin package uses the Registry credential of the cluster the platform domain now points to.
+```bash
+v=$(awk '$1=="encryptionProviderConfig:"{gsub(/[\r"\047]/,"",$2);print $2}' install-config.yaml); [ -n "$v" ] && printf '%s' "$v" | sha256sum
+```
 
-<Directive type="warning" title="Uninstall the mirror, do not just scale it down">
-  On startup `etcd-sync` resolves the platform domain and checks that the cluster the domain points to does not have `etcd-sync` installed. This is what prevents the mirror from running on both sides at once. If step 2 only scaled the Deployments to zero, the `ModuleInfo` still exists and the new standby refuses to start with:
+Continue when the command prints a hash and both sides print the same hash; otherwise, set or correct the value in the file that prints nothing or a different hash.
 
-  ~~~text
-  check failed, error: moduleinfo <name> is found, it shouldn't happen,
-    please remove it or check the DNS resolution of platformURL: <platform-domain>
-  ~~~
+**Bare Metal only.** Run this command as well on each bootstrap node, in the installation directory:
 
-  Despite the wording this is the safety check working as intended, not a defect. Delete the `ModuleInfo` on the new active cluster and the new standby starts normally.
-</Directive>
+```bash
+v=$(awk '$1=="serviceAccountSigningKey:"{gsub(/[\r"\047]/,"",$2);print $2}' install-config.yaml); [ -n "$v" ] && printf '%s' "$v" | sha256sum
+```
 
-Keep the fenced cluster isolated until a separately planned failback. Never run both providers against the same workload inventory.
+Continue when the command prints a hash and both sides print the same hash; otherwise, set or correct the value in the file that prints nothing or a different hash.
 
-After the switch, on the new active cluster verify that every workload `Cluster` and `Machine` object is intact — on Alauda OS clusters those objects back real machines, so a resource lost in the switch becomes a deleted node.
+## Install the Primary and the Standby \{#install-primary-and-standby-clusters}
 
-## Bare Metal DR Model \{#bare-metal-dr-model}
+The platform domain must point to the side being installed. While the domain points at one side, reach the other side through its VIP with the kubeconfig in its installation directory.
 
-This section is the Bare Metal DR procedure for ACP 4.4.0 and later. It covers a fresh primary/standby installation; create both clusters with [Optional Disaster Recovery Deployment](./installing.mdx#optional-disaster-recovery-deployment).
+| Step | What you do |
+|---|---|
+| 1 | Point the domain at the primary VIP. On the primary bootstrap node, install the cluster as described on the Create the global Cluster page of your provider. |
+| 2 | When the primary is installed, point the domain at the standby VIP. On the standby bootstrap node, install the standby the same way. |
+| 3 | When the standby is installed, point the domain back at the primary VIP. |
 
-Bare Metal keeps physical hosts and their plan Secrets in MachineInventory objects. DR therefore separates Global hosts from workload hosts.
+When both sides are installed and the domain points at the primary, continue with [Start Synchronization](#start-synchronization).
 
-### Endpoint and Identity \{#endpoint-and-identity}
+## Start Synchronization \{#start-synchronization}
 
-| Host | Endpoint | Identity | Sync |
-| --- | --- | --- | --- |
-| Local `Cluster/global` host | `https://<local-control-plane-vip>:6443` | `baremetal-global-system-agent` | Local only |
-| Non-`global` workload host | `https://<platform-domain>/kubernetes/global` | `baremetal-system-agent` | Primary to standby |
+After both sides are installed, you install **<Term name="product" /> Global Cluster Disaster Recovery** (`etcd-sync`) on the standby, which then copies the primary's etcd data to it, and you verify the synchronization.
 
-The Global row is specific to DR and to the post-handoff Global registration described below. The workload row is the standard Bare Metal registration path; for the stage-by-stage network requirements of the workload-cluster path — including DNS, NTP, the registry, and cluster-internal traffic — see [Network Connectivity](../../workload_clusters/alauda_os/bare-metal/create_cluster.mdx#network-connectivity).
+Before you start:
 
-Set `elemental.systemAgent.splitAuthEnabled: true` on the Bare Metal provider of both sides. The active Global uses `sharedAuthReadOnly: false`; the standby uses `sharedAuthReadOnly: true` while it receives data. Set these values on each side's bootstrap release as described in [Add Provider-Specific DR Fields](./installing.mdx#add-provider-specific-dr-fields), and again on each final `global` cluster in the provider's `ModuleInfo`, together with `elemental.tls.caCertSecretKey`; see [Install the cluster plugins](../../workload_clusters/alauda_os/bare-metal/install_provider.mdx#install-the-cluster-plugins). Keep the standard ServiceAccount, Secret, Role, and RoleBinding names. Never grant namespace-wide Secret access.
+- The platform domain points at the primary VIP.
+- Both sides were installed with the same `cluster.encryptionProviderConfig`; see [Generate the Shared Keys](#generate-the-shared-keys). If they were not, contact technical support before you continue.
+- **Applies to** workload clusters on infrastructure other than the `global` cluster's own: install that provider on **both** `global` clusters, so that the standby can reconcile the same workload clusters after a failover. See [Prepare](../../workload_clusters/alauda_os/prepare/index.mdx). Upload to the standby with the standby's `--platform-address` and `--dest-repo`, as in [step 1](#install-etcd-sync). Skip it otherwise: `ac` has installed the provider of its own platform on each side.
 
-After handoff, every Global registration must use the local API server:
+### Conventions \{#conventions}
 
-~~~yaml
+Run the commands on a machine with `ac` that reaches both sides:
+
+- **Primary**: log in once with `ac login https://<platform-domain>` as the platform administrator while the domain points at the primary. Commands for the primary start with `ac config use-cluster global`.
+- **Standby**: use the standby's kubeconfig, `output/kubeconfig` in its installation directory, here `<standby-kubeconfig>`. Commands for the standby start with `export KUBECONFIG=<standby-kubeconfig>` and end with `unset KUBECONFIG`.
+- To show which cluster a command talks to, run `ac whoami --show-server`.
+- In the plugin's parameter names, **Active** means the primary.
+
+The step marked **Bare Metal only** is not numbered.
+
+### 1. Install etcd-sync \{#install-etcd-sync}
+
+Install **<Term name="product" /> Global Cluster Disaster Recovery** (`etcd-sync`) on the standby `global` cluster only, after both sides have completed `create`. It must never be installed on both sides. Use the version released with <Term name="productShort" /> 4.5.
+
+Reach the standby through its VIP.
+
+1. Get the plugin package from **ACP Common Aligned Extensions** and upload it to the standby with **Violet v4.2.13 or later**. Create the token on the standby Web Console (`https://<standby-vip>`): **Profile** → **API Tokens**. Set both `--platform-address` and `--dest-repo` to the standby: otherwise the package goes to the primary. `--dest-repo` is the platform image registry of the standby, the same address as the primary's when both sides share a registry. Use `--no-auth` instead of the registry credentials when the standby registry needs none. For the flags, see [Upload Packages](../../extend/upload_package.mdx#violet_push_usage).
+
+   ```bash
+   read -rsp "Standby platform token: " STANDBY_TOKEN; printf '\n'
+   read -rsp "Standby registry password: " STANDBY_REGISTRY_PASSWORD; printf '\n'
+   violet push <etcd-sync-package>.tgz \
+     --platform-address "https://<standby-vip>" --platform-token "${STANDBY_TOKEN}" \
+     --dest-repo "<standby-registry-address>" --username "<registry-username>" --password "${STANDBY_REGISTRY_PASSWORD}"
+   unset STANDBY_TOKEN STANDBY_REGISTRY_PASSWORD
+   ```
+
+2. Create the token Secret on the standby. The value is the bearer token of the primary's `cpaas-system/k8sadmin` ServiceAccount; the commands do not print it:
+
+   ```bash
+   ac config use-cluster global
+   ac whoami --show-server   # the primary
+   PRIMARY_TOKEN=$(ac -n cpaas-system get secret k8sadmin -o jsonpath='{.data.token}' | base64 -d)
+   export KUBECONFIG=<standby-kubeconfig>
+   ac whoami --show-server   # the standby VIP
+   printf '%s' "${PRIMARY_TOKEN}" | ac -n cpaas-system create secret generic etcd-sync-active-cluster-token \
+     --from-file=token=/dev/stdin --dry-run=client -o yaml | ac apply -f -
+   unset PRIMARY_TOKEN
+   unset KUBECONFIG
+   ```
+
+3. Open the standby Web Console at `https://<standby-vip>`, go to **Marketplace** → **Cluster Plugins**, select the `global` cluster, and install **<Term name="product" /> Global Cluster Disaster Recovery** with these parameters.
+
+   | Parameter | Value |
+   |-----------|-------|
+   | Active Global Cluster VIP | Control plane VIP of the primary `global` cluster |
+   | Active Global Cluster ETCD Endpoints | Optional. `https://<primary-control-plane-vip>:2379`; separate several addresses with commas |
+   | Standby Cluster ETCD Endpoints | Default value |
+   | Active Global Cluster Token Secret | `etcd-sync-active-cluster-token` |
+   | Data Check Interval (unit: hour) | Default value |
+   | Print detail logs | Disabled unless troubleshooting |
+
+### 2. Start and Verify Synchronization \{#start-and-verify-synchronization}
+
+First check that the plugin is running on the standby:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac get moduleinfo -l cpaas.io/module-name=etcd-sync
+ac -n cpaas-system get pod -l 'app in (etcd-sync,etcd-sync-monitor)'
+unset KUBECONFIG
+```
+
+Continue when the `ModuleInfo` shows `STATUS` `Running` and every Pod is `Running`; otherwise, wait and run the commands again. If they do not change, run the steps in [Global Cluster Disaster Recovery Does Not Synchronize](../../upgrade/troubleshooting.mdx#dr-sync-diagnostics).
+
+The mirror copies the primary's data after its start delay. Wait until the initial synchronization has finished:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+leader_pod=$(ac -n cpaas-system get lease etcd-sync-mirror -o jsonpath='{.spec.holderIdentity}')
+ac -n cpaas-system logs "$leader_pod" | grep "Start Sync update"
+unset KUBECONFIG
+```
+
+Continue when the output contains `Start Sync update`; otherwise, wait and run it again.
+
+Then check the synchronization. Read the monitor's address on your machine:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac -n cpaas-system get svc etcd-sync-monitor -o jsonpath='{.spec.clusterIP}{"\n"}'
+unset KUBECONFIG
+```
+
+Run the check on a standby control plane node; put an IPv6 address in brackets, for example `[fd00::10]`:
+
+```bash
+curl -g "http://<monitor-cluster-ip>/check"
+```
+
+| Result | Action |
+|---|---|
+| Zero missed and zero surplus keys (`localMissedKeys [0]` and `localSurplusKeys [0]`) | Continue. |
+| HTTP `425` (`check too frequent`) | Wait, then run the check again. |
+| Missed keys are listed (`localMissedKeys`) | Wait until the log of the current leader shows `Start Sync update`, then run the check again. If missed keys remain, restart the leader Pod with the commands below, wait for `Start Sync update` again, and run the check again. |
+| Surplus keys are listed (`localSurplusKeys`) | Contact technical support. |
+| `paused: true` | Synchronization is paused for an upgrade. Contact technical support. |
+| The command fails or prints anything else | Run the steps in [Global Cluster Disaster Recovery Does Not Synchronize](../../upgrade/troubleshooting.mdx#dr-sync-diagnostics), then run the check again. |
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+leader_pod=$(ac -n cpaas-system get lease etcd-sync-mirror -o jsonpath='{.spec.holderIdentity}')
+ac -n cpaas-system delete pod "$leader_pod"
+unset KUBECONFIG
+```
+
+### Bare Metal Only: Check the Shared Agent Identity \{#check-the-shared-agent-identity}
+
+Check the shared workload agent identity on each side:
+
+```bash
+# Primary: ac config use-cluster global
+# Standby: export KUBECONFIG=<standby-kubeconfig>, and unset KUBECONFIG afterwards
+ac -n cpaas-system get sa/baremetal-system-agent secret/baremetal-system-agent-token \
+  role/baremetal-system-agent rolebinding/baremetal-system-agent
+```
+
+Continue when all four objects exist on both sides, or none exists on either side; otherwise, contact technical support.
+
+### 3. Restart the Dependent Pods \{#restart-the-dependent-pods}
+
+On each side, restart the Pods that must reload the DR and endpoint configuration, where installed:
+
+```bash
+# Primary: ac config use-cluster global
+# Standby: export KUBECONFIG=<standby-kubeconfig>, and unset KUBECONFIG afterwards
+ac delete po -n cpaas-system -l 'service_name in (alertmanager,vmselect,vminsert)'
+ac delete po -n cpaas-system -l service_name=cpaas-elasticsearch
+ac delete po -n cpaas-system -l service_name=cluster-transformer
+```
+
+## Keep It Healthy \{#keep-it-healthy}
+
+- Run the check in [step 2](#start-and-verify-synchronization) regularly. The plugin also checks by itself, by default every hour, and reports the results as the metrics `local_missed_keys_count` and `local_surplus_keys_count`.
+- After each change to your workload clusters, save the output of `ac get clusters.cluster.x-k8s.io -A` and `ac get machines.cluster.x-k8s.io -A` from the primary. After a failover you compare against it; see [Fail Over](./disaster_recovery_failover.mdx#check-the-new-primary).
+- A DR-aware upgrade of the `global` clusters uninstalls the plugin and has its own consistency check; see [Upgrade `global` Clusters in a DR Environment](../../upgrade/global/upgrade_global_dr.mdx).
+
+## Bare Metal: Agents and the Platform Address \{#bare-metal-dr}
+
+**Bare Metal only.** The agent of a `global` host talks only to the API server of its own `global` cluster, through that cluster's VIP. The agent of a workload cluster host talks to the platform access address, not to the VIP of its cluster, so after a failover it reaches the new primary without any change.
+
+A registration that you create later on a `global` cluster, for example to replace a `global` host, is named `global` or starts with `global-`; otherwise it is not ready and gives no registration URL. It needs these annotations so that its agent uses the local API server:
+
+```yaml
 metadata:
   annotations:
     baremetal.cluster.io/system-agent-auth-scope: global
     baremetal.cluster.io/system-agent-server-url: https://<local-control-plane-vip>:6443
     baremetal.cluster.io/system-agent-endpoint-mode: direct-apiserver
-~~~
+```
 
-Workload registrations use the platform domain. Do not reuse a bootstrap Global ISO after handoff; create a new Global registration and SeedImage on the active Global. A workload ISO remains reusable only when its registration URL uses the platform domain.
+Do not reuse a bootstrap Global ISO after the handover; create a new Global registration and `SeedImage` on the `global` cluster that the host belongs to.
 
-### Synchronization Rules \{#synchronization-rules}
+## Next
 
-`etcd-sync` runs on the standby and reads the primary. The DR-capable v4.4 chart already supplies the standard Bare Metal prefixes and Global-resource exclusions, and accepts additional rules from labeled ConfigMaps. The custom rule source must exist on both Global clusters so it is available after a role switch.
-
-Create `baremetal-dr-rules` with weight `100`:
-
-~~~yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: baremetal-dr-rules
-  namespace: cpaas-system
-  labels:
-    etcd-sync.cpaas.io/enabled: "true"
-  annotations:
-    etcd-sync.cpaas.io/weight: "100"
-data:
-  ignore-equal.txt: |
-    # Add one line for every Global plan Secret on both sides.
-    /registry/secrets/cpaas-system/<primary-global-plan-secret>
-    /registry/secrets/cpaas-system/<standby-global-plan-secret>
-~~~
-
-The built-in chart rules already cover Bare Metal resource prefixes, Global inventory/registration filtering, `SeedImage`, the Global-local system-agent bundle, the monitor, and the local registry credentials. Do not duplicate those entries in this ConfigMap. The installed chart must contain those built-in rules before synchronization starts.
-
-Replace the plan placeholders with live values:
-
-- Read plan names from `MachineInventory.status.plan.secretRef.name`.
-- Add one line for every Global plan Secret on both sides.
-- Update the ConfigMap on both sides whenever a Global plan Secret is added or replaced.
-
-Before the first sync, require the rule source annotation `etcd-sync.cpaas.io/status: accepted` and confirm that `etcd-sync-rule-snapshot` contains the source:
-
-~~~shell
-kubectl --kubeconfig <standby-kubeconfig> -n cpaas-system \
-  get configmap baremetal-dr-rules \
-  -o jsonpath='{.metadata.annotations.etcd-sync\.cpaas\.io/status}{"\n"}'
-kubectl --kubeconfig <standby-kubeconfig> -n cpaas-system \
-  get configmap etcd-sync-rule-snapshot \
-  -o jsonpath='{.data.snapshot\.json}'
-~~~
-
-A rejected source is not active. Fix it before allowing the mirror to write.
-
-The plugin chart owns the standard CAPI, Bare Metal, Elemental, Global-resource, system-agent, SeedImage, registry, and monitor rules. This ConfigMap adds only the runtime Global plan Secret keys that cannot be known when the chart is rendered.
-
-`dcs-import-extra-resources` is an installation-time handoff input. It must contain durable provider resources and, for DCS and Bare Metal, the referenced encryption Secret, but it is not an etcd-sync rule source.
-
-### Start and Verify
-
-1. Install `global-etcd-sync` only on the current standby.
-2. Set `active_cluster_vip` to the primary VIP.
-3. Set `active_cluster_token_secret_ref` to a standby-local Secret containing the primary cluster token.
-4. Wait for the AppRelease and both Deployments to become Ready.
-5. Run the monitor check and require zero missed and zero surplus keys.
-6. Treat the rule snapshot and monitor result as part of the acceptance gate; AppRelease status alone is not sufficient.
-
-### Acceptance
-
-After failover, verify:
-
-- Workload `Cluster` and `Machine` objects remain healthy.
-- Each `BaremetalMachine` still references the expected `MachineInventory`.
-- A workload plan reaches `Applied` and its feedback is updated.
-- Worker scale-out creates a plan and updates the shared Role.
-- Worker scale-in completes its clean plan and releases inventory.
-- A workload ISO whose URL uses the platform domain can register a new host.
-- Global hosts still use the local VIP, local token, and local plan Secrets.
-
-### Troubleshooting \{#troubleshooting}
-
-| Symptom | First check |
-| --- | --- |
-| Rule source is `rejected` | Rule data keys, syntax, and the `message` annotation |
-| A Global plan is overwritten | Its exact Secret key is missing from `ignore-equal.txt`; stop sync and update both rule ConfigMaps |
-| A Global inventory is deleted | The installed chart is missing its built-in Global exclusion; stop sync and verify the rendered chart before restoring the local object |
-| A workload host gets `401` or `403` | Signing key, issuer/audience, shared token Secret, and Role `resourceNames` |
-| Monitor reports differences | Active/standby direction, rule snapshot, and fencing state |
-
-## Provider Notes \{#provider-notes}
-
-<Tabs>
-  <Tab label="Huawei DCS">
-
-Follow the DCS steps in [Optional Disaster Recovery Deployment](./installing.mdx#optional-disaster-recovery-deployment). The DCS installation must keep the same encryption provider Secret and `DCSCluster.spec.encryptionProviderConfigRef` on both sides. Do not add the encryption provider file to `KubeadmControlPlane.spec.kubeadmConfigSpec.files` for DCS. Create the DCS `dcs-import-extra-resources` ConfigMap on both sides so the installer imports the Secret referenced by `DCSCluster.spec.credentialSecretRef.name` and the Secret referenced by `DCSCluster.spec.encryptionProviderConfigRef.name`. DCS provider resources are migrated by the built-in flow, but that flow does not copy either Secret.
-
-The encryption provider Secret must exist in each final `global` cluster. If it stays only in the bootstrap cluster, the installation still completes and the pair looks healthy, but every later control-plane machine creation fails once the bootstrap cluster is gone — the new `Machine` stays in `Provisioning` and the provider logs `get encryption provider config secret ... not found`. Verify it on both sides before decommissioning either bootstrap cluster.
-
-For a planned switch, run the [failover sequence](#failover-procedure). The `baremetal-dr-rules` ConfigMap and the registration checks are Bare Metal-only; every other step applies to DCS as written. After the switch, verify on the new active cluster that the workload `Cluster`, `Machine`, and `DCSMachine` objects are intact and no virtual machine was deleted: during failover the `global-` name prefix from the installation guide's [naming convention](./installing.mdx#common-prerequisites) is what identifies the resources owned by the `global` pair, which is why every DCS resource of both sides must carry it. Also confirm that the DCS credential Secret and the encryption provider Secret exist on whichever side is now active.
-
-  </Tab>
-  <Tab label="VMware vSphere">
-
-Follow the VMware vSphere steps in [Optional Disaster Recovery Deployment](./installing.mdx#optional-disaster-recovery-deployment). The VMware vSphere installation uses the same `KubeadmControlPlane` encryption file entry as the primary installation, and its own etcd SAN list. No `VSphereCluster` encryption Secret reference is required. Create the VMware vSphere `dcs-import-extra-resources` ConfigMap so the installer imports vSphere infrastructure resources and the `global-vsphere-credentials` Secret referenced by `VSphereCluster.spec.identityRef.name`.
-
-  </Tab>
-  <Tab label="Huawei Cloud Stack">
-
-Follow the HCS steps in [Optional Disaster Recovery Deployment](./installing.mdx#optional-disaster-recovery-deployment). The HCS installation uses the same `KubeadmControlPlane` encryption file entry as the primary installation, and its own etcd SAN list. No `HCSCluster` encryption Secret reference is required. Create the HCS `dcs-import-extra-resources` ConfigMap so the installer imports HCS infrastructure resources and the Secret referenced by `HCSCluster.spec.identityRef.name`.
-
-  </Tab>
-  <Tab label="Bare Metal">
-
-Follow the Bare Metal steps in [Optional Disaster Recovery Deployment](./installing.mdx#optional-disaster-recovery-deployment). Use two bootstrap KIND hosts, one for primary and one for standby. Before installing standby, switch the platform domain to the standby entrance so platform-rendered URLs resolve to the side being installed.
-
-Bare Metal requires all of the following to be aligned:
-
-- Same Kubernetes encryption provider Secret content on both sides, referenced by `BaremetalCluster.spec.encryptionProviderConfigRef`.
-- The encryption provider Secret is imported into each final `global` cluster through `dcs-import-extra-resources`; it must not exist only in the bootstrap KIND cluster.
-- Same ServiceAccount signing key files and same issuer/audience values on both sides.
-- Same trusted platform HTTPS certificate on both sides, with the stable platform domain in its SAN list. Add a control-plane VIP SAN only when platform HTTPS intentionally uses that VIP; do not add internal Service names to `console.cert`. With the platform built-in Registry, the registry on port `11443` uses an independently managed `global-registry-server` certificate chain.
-- `dcs-import-extra-resources` created before the installer API call on both sides, containing the durable Global Bare Metal and Elemental owner resources plus the referenced encryption-provider Secret. It must exclude Global plan Secrets, `KubeadmConfig` objects, and kubeadm bootstrap data Secrets; fresh handoff creates the initial Global plan Secrets with the live Global `MachineInventory` UID.
-- Bare Metal provider AppRelease values on each bootstrap cluster set with the local `handoffHook.controlPlaneVIP`, `handoffHook.directAPIServer: true`, `elemental.systemAgent.authMode: shared`, `elemental.systemAgent.splitAuthEnabled: true`, and `elemental.systemAgent.globalServiceAccountName: baremetal-global-system-agent`. The active side sets `elemental.systemAgent.sharedAuthReadOnly: false`; the inactive side sets it to `true`. On each final `global` cluster, set only `elemental.tls.caCertSecretKey`, `elemental.systemAgent.splitAuthEnabled: true`, and that side's `sharedAuthReadOnly` value, in `spec.valuesOverride` of the provider's `ModuleInfo`; see [Install the cluster plugins](../../workload_clusters/alauda_os/bare-metal/install_provider.mdx#install-the-cluster-plugins).
-- The deployed `elemental-operator` image and every newly produced `baremetal-base-image` and `baremetal-base-image-iso` are built from the same pinned elemental commit. Rebuild the installation media whenever that commit changes.
-
-Do not sync `SeedImage` from primary to standby. Sync non-`global` `MachineRegistration` resources when workload ISOs need to remain valid across failover. Do not sync primary Global `MachineRegistration` resources to standby. Create Global registrations locally with `baremetal.cluster.io/system-agent-auth-scope: global`, `baremetal.cluster.io/system-agent-server-url: https://<local-global-control-plane-vip>:6443`, and `baremetal.cluster.io/system-agent-endpoint-mode: direct-apiserver`.
-
-After failover, keep the primary fenced until a separate failback plan is executed. Do not run primary and standby Bare Metal providers against the same workload inventories at the same time.
-
-  </Tab>
-</Tabs>
-
-## See Also
-
-For disaster recovery of a `global` cluster on a non-Alauda OS, see [Global Cluster Disaster Recovery](../non_alauda_os/global_dr.mdx).
-
-For installation and upgrade of the `global` cluster on Alauda OS, see:
-
-- [Installing the global Cluster](./installing.mdx)
-- [Upgrade the Distribution Version](../../upgrade/global/upgrade_global_cluster.mdx), then [Upgrade Kubernetes on Alauda OS](../../upgrade/global/upgrade_kubernetes_on_alauda_os.mdx)
-- [Upgrade in a DR Environment](../../upgrade/global/upgrade_global_dr.mdx)
+- [Fail Over to the Standby global Cluster](./disaster_recovery_failover.mdx)
+- [Upgrade `global` Clusters in a DR Environment](../../upgrade/global/upgrade_global_dr.mdx)

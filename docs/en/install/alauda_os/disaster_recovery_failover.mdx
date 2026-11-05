@@ -1,0 +1,215 @@
+---
+weight: 21
+title: Fail Over to the Standby global Cluster
+queries:
+  - fail over to the standby global cluster
+  - primary global cluster failure standby takes over
+  - uninstall etcd-sync and switch the platform domain
+  - bare metal failover shared agent identity
+---
+
+# Fail Over to the Standby global Cluster
+
+Use this page when the primary `global` cluster has failed, or when you switch to the standby on purpose. In step 2 you uninstall **<Term name="product" /> Global Cluster Disaster Recovery** (`etcd-sync`, "the plugin") from the standby. The standby becomes the new primary at step 3, and the former primary becomes the new standby at step 6. For the definitions, see [What a DR Pair Is](./global_dr.mdx#what-a-dr-pair-is).
+
+While the plugin is uninstalled there is no DR protection; step 6 restores it. To make the former primary the primary again later, fail over again; see step 6.
+
+| Situation | What to do |
+|---|---|
+| You can reach the primary | Follow steps 1 to 6. Steps 1 to 5 need no other page. |
+| The primary is unreachable | Do step 1. Then contact technical support before step 2. Do not uninstall the plugin or switch the platform domain until you have their answer. |
+
+Have ready:
+
+- A machine with `ac` that reaches the standby.
+- `<standby-kubeconfig>`: `output/kubeconfig` in the standby's installation directory.
+- SSH access to a standby control plane node.
+- The platform administrator account.
+- Someone who can change the DNS record of the platform domain.
+- The list of workload clusters and `Machine` objects that you saved from the primary; see [Keep It Healthy](./global_dr.mdx#keep-it-healthy).
+
+Commands for the standby start with `export KUBECONFIG=<standby-kubeconfig>` and end with `unset KUBECONFIG`, through step 3. To show which cluster a command talks to, run `ac whoami --show-server`.
+
+**Planned failover only.** Before step 1, check on both `global` clusters:
+
+```bash
+# Primary: ac config use-cluster global
+# Standby: export KUBECONFIG=<standby-kubeconfig>, and unset KUBECONFIG afterwards
+ac get machines.cluster.x-k8s.io -A
+```
+
+Then, on the primary, check that no workload cluster upgrade is in progress:
+
+```bash
+ac config use-cluster global
+ac -n cpaas-system get cvsh \
+  -o custom-columns='CLUSTER:.metadata.name,REQUESTED:.spec.desiredUpdate.version,CURRENT:.status.current.version'
+```
+
+Continue when every machine on both clusters is `Running`, on every row of the `cvsh` list `REQUESTED` is empty or equal to `CURRENT` (or the command reports `the server doesn't have a resource type`), and the ports marked **Global DR** in [Global Disaster Recovery](../prepare/communication_matrix.mdx#global_dr) are allowed in both directions. If `REQUESTED` differs from `CURRENT` on a row, run the block again after that workload cluster upgrade completes; if it does not advance, see [Inspect Upgrade State](../../upgrade/troubleshooting.mdx#inspect-upgrade-state). Otherwise, contact technical support.
+## Procedure \{#failover-procedure}
+
+### 1. Isolate the Primary \{#isolate-the-primary}
+
+Isolate the primary so that it cannot change your workload clusters:
+
+- The primary has failed: confirm that it is powered off, or that its VIP cannot be reached from the workload networks.
+- Planned failover: block the primary's VIP from the workload networks. Do not stop its control plane before step 2 is complete: the check in step 2 needs it.
+
+Ask your network administrator if you do not control the firewall. Continue when the primary's VIP cannot be reached from the workload networks or the primary is powered off; otherwise, repeat the isolation.
+
+### 2. Check Consistency and Uninstall the Plugin \{#uninstall-the-plugin}
+
+<Directive type="warning" title="Verify consistency before uninstalling Alauda Container Platform Global Cluster Disaster Recovery">
+Workload nodes are backed by Cluster API `Machine` objects, so an inconsistent sync can delete those objects and destroy the backing machines. If the check reports missing or surplus keys, do not uninstall the plugin; resolve the inconsistency or contact technical support.
+</Directive>
+
+**Applies to**: a primary that you can still reach. If the primary is unreachable, the check cannot run, and this page cannot confirm that the standby holds all of the primary's data: contact technical support before you uninstall the plugin, and give them the time the primary stopped and the time and result of the last successful check.
+
+Read the monitor's address on your machine:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac -n cpaas-system get svc etcd-sync-monitor -o jsonpath='{.spec.clusterIP}{"\n"}'
+unset KUBECONFIG
+```
+
+Run the check on a standby control plane node; put an IPv6 address in brackets, for example `[fd00::10]`:
+
+```bash
+curl -g "http://<monitor-cluster-ip>/check"
+```
+
+| Result | Action |
+|---|---|
+| Zero missed and zero surplus keys (`localMissedKeys [0]` and `localSurplusKeys [0]`) | Continue. |
+| HTTP `425` (`check too frequent`) | Wait, then run the check again. |
+| Missed keys are listed (`localMissedKeys`) | Wait until the log of the current leader shows `Start Sync update`, then run the check again. If missed keys remain, restart the leader Pod with the commands below, wait for `Start Sync update` again, and run the check again. |
+| Surplus keys are listed (`localSurplusKeys`) | Contact technical support. |
+| `paused: true` | Synchronization is paused for an upgrade. Contact technical support. |
+| The command fails, hangs, or prints anything else | The primary may be unreachable: see **Applies to** above. |
+
+To read the leader's log and, if missed keys remain, restart the leader:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+leader_pod=$(ac -n cpaas-system get lease etcd-sync-mirror -o jsonpath='{.spec.holderIdentity}')
+ac -n cpaas-system logs "$leader_pod" | grep "Start Sync update"
+ac -n cpaas-system delete pod "$leader_pod"
+unset KUBECONFIG
+```
+
+When the check passes, uninstall the plugin from the standby:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server   # the standby VIP
+ac delete moduleinfo -l cpaas.io/module-name=etcd-sync,cpaas.io/cluster-name=global
+ac get moduleinfo -l cpaas.io/module-name=etcd-sync
+ac -n cpaas-system get pod -l 'app in (etcd-sync,etcd-sync-monitor)'
+unset KUBECONFIG
+```
+
+Continue when the last two commands report `No resources found`; otherwise, run them again after one minute, and if they still list objects, contact technical support.
+
+<Directive type="warning" title="Uninstall the plugin, do not just scale it down">
+  Scaling the Deployments to zero is not enough: the `ModuleInfo` still exists, and at step 6 the new standby refuses to run with:
+
+  ~~~text
+  check failed, error: moduleinfo <name> is found, it shouldn't happen,
+    please remove it or check the DNS resolution of platformURL: https://<platform-domain>
+  ~~~
+
+  Run the `ac delete moduleinfo` command above on the new primary, the cluster you are switching to; the new standby then starts normally.
+</Directive>
+
+Check that the plugin's marker is gone:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac -n kube-public get configmap etcd-sync
+unset KUBECONFIG
+```
+
+Continue when the command reports `NotFound`; otherwise, wait and run it again. The providers do not reconcile workload clusters while the marker exists, and resume about one minute after it is gone. On Bare Metal, the provider also takes over the shared agent identity then: until it has, new workload hosts cannot obtain their plans.
+
+<Directive type="warning" title="Do not change clusters until the former primary is the new standby">
+  While the plugin is uninstalled, there is no DR protection. Do not create, scale, or delete clusters or nodes, and do not change cluster configuration, on either `global` cluster until step 6 is complete. If the former primary cannot be recovered, contact technical support before you change any cluster.
+</Directive>
+
+### 3. Switch the Platform Domain \{#switch-the-platform-domain}
+
+Switch the platform domain to the standby VIP. The standby is now the new primary. Check that the platform resolves the domain there:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac exec -n cpaas-system deployments/sentry -- nslookup <platform-domain>
+unset KUBECONFIG
+```
+
+Continue when the answer is the standby VIP; otherwise, correct the DNS record and run it again.
+
+### 4. Log In Again and Restart the Dependent Pods \{#restart-after-failover}
+
+The platform domain now reaches the new primary, so start with a new login instead of reusing a session from before the switch, then restart the Pods that must reload the DR and endpoint configuration, where installed:
+
+```bash
+ac login https://<platform-domain>
+ac config use-cluster global
+ac delete po -n cpaas-system -l 'service_name in (alertmanager,vmselect,vminsert)'
+ac delete po -n cpaas-system -l service_name=cpaas-elasticsearch
+ac delete po -n cpaas-system -l service_name=cluster-transformer
+```
+
+If workload clusters send monitoring data to the `global` cluster, also restart `warlock` in each workload cluster:
+
+```bash
+ac config use-cluster <cluster-name>
+ac delete po -n cpaas-system -l service_name=warlock
+ac config use-cluster global
+```
+
+### 5. Check the New Primary \{#check-the-new-primary}
+
+Verify on the new primary that every workload `Cluster` and `Machine` object is intact: if a `Machine` object is lost, its node is deleted.
+
+```bash
+ac config use-cluster global
+ac get clusters.cluster.x-k8s.io -A
+ac get machines.cluster.x-k8s.io -A
+```
+
+Continue when every workload cluster and `Machine` from the list that you saved before the failover is listed, and the provider checks below are met; otherwise, contact technical support. List the objects of a provider with `ac get <kind> -A`.
+
+| Provider | Continue when |
+|---|---|
+| Bare Metal | Each `BaremetalMachine` still references the expected `MachineInventory`. A workload plan reaches `Applied` and its feedback is updated. A workload ISO whose URL uses the platform domain can register a new host. `global` hosts still use the local VIP, local token, and local plan Secrets. |
+| Huawei DCS | The `DCSMachine` objects are intact, and no VM was deleted. The workload clusters' credential Secrets exist in `cpaas-system`. |
+| VMware vSphere | The `VSphereMachine`, `VSphereVM`, and `VSphereMachineConfigPool` objects are intact, and no VM was deleted. The pools' slot and persistent disk status must have survived the synchronization. The workload clusters' vCenter credential Secrets exist in `cpaas-system`. |
+| Huawei Cloud Stack | `HCSCluster global` reports its own side's VIP as the control plane endpoint, and the platform ELB listeners answer on it. The `HCSMachine` and `HCSMachineConfigPool` objects are intact, and no instance was deleted. The pools' persistent disk status must have survived the synchronization. The workload clusters' HCS credential Secrets exist in `cpaas-system`. |
+
+### 6. Make the Former Primary the New Standby \{#make-former-primary-standby}
+
+To protect the new primary again, make the former primary the new standby once it is healthy. Keep it isolated from the workload networks until the plugin runs on it: the providers of a `global` cluster reconcile workload clusters until the plugin's marker exists.
+
+If the former primary has to be installed again, contact technical support first.
+
+Follow [Start Synchronization](./global_dr.mdx#start-synchronization) with these values:
+
+| In that section | After the failover |
+|---|---|
+| The primary | The new primary: the cluster the platform domain points to now |
+| The standby and `<standby-kubeconfig>` | The new standby, the former primary, with its own `output/kubeconfig` |
+| `--platform-address` and `--dest-repo` of `violet push` | The VIP and the registry of the new standby |
+| **Active Global Cluster VIP** and **Active Global Cluster ETCD Endpoints** | The VIP of the new primary |
+| The token for `etcd-sync-active-cluster-token` | The `cpaas-system/k8sadmin` token of the new primary |
+
+After step 6 the two sides are synchronized. To make the former primary the primary again once it is healthy, fail over again: run this page again with the roles exchanged.
+
+## Troubleshooting \{#troubleshooting}
+
+| Symptom | First check |
+| --- | --- |
+| The new standby's `etcd-sync` refuses to run | The warning in [step 2](#uninstall-the-plugin). |
+| Workload machines are not reconciled after a failover | Whether `kube-public/etcd-sync` still exists on the new primary. |
+| Bare Metal: a workload host gets `401` or `403` right after the failover | Wait about one minute after the plugin is gone; then check the shared token Secret and the Role `resourceNames`. |
