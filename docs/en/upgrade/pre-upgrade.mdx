@@ -4,6 +4,7 @@ weight: 20
 
 import AlaudaOsUpgradePath /* eslint-disable-line no-unused-vars */ from '../../shared/components/AlaudaOsUpgradePath'
 import DcsVmTemplateConfigMap /* eslint-disable-line no-unused-vars */ from '../../shared/components/DcsVmTemplateConfigMap'
+import VmTemplateConfigMap /* eslint-disable-line no-unused-vars */ from '../../shared/components/VmTemplateConfigMap'
 import BareMetalImageCatalog /* eslint-disable-line no-unused-vars */ from '../../shared/components/BareMetalImageCatalog'
 
 # Prepare for the Upgrade
@@ -427,40 +428,22 @@ Save this script as `check-global-hcs.sh`:
 ac whoami --show-server
 KCP=$(ac -n cpaas-system get clusters.cluster.x-k8s.io global -o jsonpath='{.spec.controlPlaneRef.name}')
 
-echo "== Rollout settings"
-ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='replicas={.spec.replicas} maxSurge={.spec.rolloutStrategy.rollingUpdate.maxSurge}{"\n"}'
-ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=global \
-  -o custom-columns='NAME:.metadata.name,SURGE:.spec.strategy.rollingUpdate.maxSurge,UNAVAILABLE:.spec.strategy.rollingUpdate.maxUnavailable'
-
-echo "== Machine templates in use, and the pools"
+echo "== Pools of the machine templates in use"
 ac -n cpaas-system get hcsmachinetemplate \
   $(ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{.spec.machineTemplate.infrastructureRef.name}') \
   $(ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=global -o jsonpath='{.items[*].spec.template.spec.infrastructureRef.name}') \
-  -o custom-columns='NAME:.metadata.name,DATA_VOLUMES:.spec.template.spec.dataVolumes[*].mountPath,POOL:.spec.template.spec.configPoolRef.name'
+  -o custom-columns='NAME:.metadata.name,POOL:.spec.template.spec.configPoolRef.name'
 ac -n cpaas-system get hcsmachineconfigpool \
   -o custom-columns='NAME:.metadata.name,AVAILABLE:.status.availableCount,DISKS:.spec.configs[*].persistentDisks[*].slot,HOSTNAMES:.spec.configs[*].hostname,USED:.status.usedConfigs[*].hostname'
-
-echo "== Kubelet patch files: the encoding, then the content or a Secret name and key"
-echo "${KCP}:"
-ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{range .spec.kubeadmConfigSpec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
-for t in $(ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=global -o jsonpath='{.items[*].spec.template.spec.bootstrap.configRef.name}'); do
-  echo "${t}:"
-  ac -n cpaas-system get kubeadmconfigtemplate "${t}" -o jsonpath='{range .spec.template.spec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
-done
 
 echo "== Providers"
 ac get moduleinfo -l cpaas.io/cluster-name=global \
   -o custom-columns='MODULE:.metadata.labels.cpaas\.io/module-name,PHASE:.status.phase' | grep -E '^MODULE|cluster-api-provider'
 
-echo "== Pods with hostPath volumes"
-ac get pods -A --no-headers \
-  -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,OWNER:.metadata.ownerReferences[*].kind,MIRROR:.metadata.annotations.kubernetes\.io/config\.mirror,PHASE:.status.phase,HOSTPATH:.spec.volumes[*].hostPath.path' \
-  | awk '$1 !~ /^(kube-system|kube-public|kube-node-lease|cpaas-system)$/ && $3 !~ /DaemonSet/ && $4 == "<none>" && $5 !~ /^(Succeeded|Failed)$/ && $6 != "<none>"'
-
-echo "== Local and hostPath PersistentVolumes with a claim"
+echo "== Local, hostPath, and TopoLVM PersistentVolumes with a claim"
 ac get pv --no-headers \
-  -o custom-columns='NAME:.metadata.name,CLAIM_NAMESPACE:.spec.claimRef.namespace,CLAIM:.spec.claimRef.name,LOCAL:.spec.local.path,HOSTPATH:.spec.hostPath.path' \
-  | awk '$2 !~ /^(<none>|kube-system|kube-public|kube-node-lease|cpaas-system)$/ && ($4 != "<none>" || $5 != "<none>")'
+  -o custom-columns='NAME:.metadata.name,CLAIM_NAMESPACE:.spec.claimRef.namespace,CLAIM:.spec.claimRef.name,LOCAL:.spec.local.path,HOSTPATH:.spec.hostPath.path,CSI:.spec.csi.driver' \
+  | awk '$2 !~ /^(<none>|kube-system|kube-public|kube-node-lease|cpaas-system)$/ && ($4 != "<none>" || $5 != "<none>" || $6 ~ /^topolvm\.(io|cybozu\.com)$/)'
 ```
 
 Then run it:
@@ -473,28 +456,20 @@ bash check-global-hcs.sh
 
 | Result | Action |
 | --- | --- |
-| `replicas` is 3 or more and `maxSurge` is `0`, and every MachineDeployment shows `SURGE` `0` and `UNAVAILABLE` `1` | Continue. |
-| `replicas` is less than 3 | The cluster cannot be upgraded. |
-| `replicas` is 3 or more and `maxSurge` is empty or not `0`, or a MachineDeployment shows `SURGE` empty, `<none>`, or not `0`, or `UNAVAILABLE` empty, `<none>`, or not `1` | Run the commands in [Set the Rollout Settings](#rollout-settings). |
-| No machine template lists `/var/cpaas` in `DATA_VOLUMES` | Continue. |
-| A machine template lists `/var/cpaas` in `DATA_VOLUMES` | [Migrate to pool-managed persistent disks](./persistent_disk_migration.mdx) before the upgrade. The migration replaces nodes. |
 | Every pool in `POOL` whose `DISKS` lists slot numbers shows `AVAILABLE` empty, `<none>`, or `0` | Continue. |
 | Such a pool shows `AVAILABLE` greater than `0` | Remove its free configurations, the ones in `HOSTNAMES` that are not in `USED`, from `spec.configs` with `ac -n cpaas-system edit hcsmachineconfigpool <pool-name>`. |
-| The edit is rejected for a free configuration that was used before | Contact technical support. |
-| Each kubelet patch file shows `encoding=[]`, then its content, or a Secret name and a key for which the command in [Kubelet Patch File](#kubernetes-1-35-kubelet-patch) prints the content | Continue. |
-| No `encoding=` line follows a name under `== Kubelet patch files`, a file shows a value inside `encoding=[]`, such as `encoding=[base64]`, or no content, or its Secret or key does not exist | Contact technical support. |
-| A kubelet patch file lacks `"imagePullCredentialsVerificationPolicy": "NeverVerify"` | Continue. Add it in the Kubernetes upgrade, for each version 1.35 or later: see [Update the KubeadmControlPlane](./upgrade_kubernetes_hcs_vsphere.mdx#update-kcp) and [Create the Worker Templates](./upgrade_kubernetes_hcs_vsphere.mdx#create-worker-templates). |
+| The edit is rejected for a free configuration that was used before | Keep the configuration: its persistent disk is still tracked. Scale up a node group that uses the pool so that a new node takes it, and keep the control plane at an odd number of nodes. Do not delete EVS disks. |
 | `cluster-api-provider-kubeadm` and `cluster-api-provider-hcs` show `PHASE` `Running` | Continue. |
 | A provider is missing, or shows another `PHASE` | Contact technical support. |
-| Nothing is listed under `== Pods with hostPath volumes`, and nothing under `== Local and hostPath PersistentVolumes with a claim` | Continue. |
-| A Pod or a PersistentVolume is listed under either title | Move its data to CSI storage before the upgrade. If the data is on a pool-managed persistent disk, or you cannot move it, contact technical support. |
+| Nothing is listed under `== Local, hostPath, and TopoLVM PersistentVolumes with a claim` | Continue. |
+| A PersistentVolume is listed under `== Local, hostPath, and TopoLVM PersistentVolumes with a claim` | Move its data to CSI storage before the upgrade. If you have confirmed that the data is safe or can be lost, [exempt the volume](./troubleshooting.mdx#exempt-hostpath-volume). |
 
-  </Tab>
-  <Tab label="VMware vSphere">
+Run the next script only when `InfraClusterVersionPreflight` reports `ProviderCapabilityNotDeclared` in [Run Preflight Checks](#run-preflight). Otherwise, `InfraClusterVersionPreflight` covers these items.
 
-Do not restructure the disk lists of the machine config pools as part of an upgrade.
+<details>
+<summary>When `InfraClusterVersionPreflight` reports `ProviderCapabilityNotDeclared`</summary>
 
-Save this script as `check-global-vsphere.sh`:
+Save this script as `check-global-hcs-no-preflight.sh`:
 
 ```bash
 #!/usr/bin/env bash
@@ -506,9 +481,11 @@ ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='replicas={.spec
 ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=global \
   -o custom-columns='NAME:.metadata.name,SURGE:.spec.strategy.rollingUpdate.maxSurge,UNAVAILABLE:.spec.strategy.rollingUpdate.maxUnavailable'
 
-echo "== Machine config pools"
-ac -n cpaas-system get vspheremachineconfigpool \
-  -o custom-columns='NAME:.metadata.name,CLUSTER:.spec.clusterRef.name,READY:.status.conditions[?(@.type=="Ready")].status'
+echo "== Machine templates in use"
+ac -n cpaas-system get hcsmachinetemplate \
+  $(ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{.spec.machineTemplate.infrastructureRef.name}') \
+  $(ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=global -o jsonpath='{.items[*].spec.template.spec.infrastructureRef.name}') \
+  -o custom-columns='NAME:.metadata.name,IMAGE:.spec.template.spec.imageName,DATA_VOLUMES:.spec.template.spec.dataVolumes[*].mountPath'
 
 echo "== Kubelet patch files: the encoding, then the content or a Secret name and key"
 echo "${KCP}:"
@@ -518,19 +495,62 @@ for t in $(ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-
   ac -n cpaas-system get kubeadmconfigtemplate "${t}" -o jsonpath='{range .spec.template.spec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
 done
 
+echo "== Pods with hostPath volumes"
+ac get pods -A --no-headers \
+  -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,OWNER:.metadata.ownerReferences[*].kind,MIRROR:.metadata.annotations.kubernetes\.io/config\.mirror,PHASE:.status.phase,HOSTPATH:.spec.volumes[*].hostPath.path' \
+  | awk '$1 !~ /^(kube-system|kube-public|kube-node-lease|cpaas-system)$/ && $3 !~ /DaemonSet/ && $4 == "<none>" && $5 !~ /^(Succeeded|Failed)$/ && $6 != "<none>" {
+      n = split($6, p, ","); keep = 0
+      for (i = 1; i <= n; i++) if (p[i] !~ /^\/(dev|proc|sys|run|var\/run|var\/lib\/kubelet)(\/|$)/) keep = 1
+      if (keep) print }'
+```
+
+Then run it:
+
+```bash
+ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
+bash check-global-hcs-no-preflight.sh
+# on the standby: unset KUBECONFIG
+```
+
+| Result | Action |
+| --- | --- |
+| `replicas` is 3 or more and `maxSurge` is `0`, and every MachineDeployment shows `SURGE` `0` and `UNAVAILABLE` `1` | Continue. |
+| `replicas` is less than 3 | The cluster cannot be upgraded. |
+| `replicas` is 3 or more and `maxSurge` is empty or not `0`, or a MachineDeployment shows `SURGE` empty, `<none>`, or not `0`, or `UNAVAILABLE` empty, `<none>`, or not `1` | Run the commands in [Set the Rollout Settings](#rollout-settings). |
+| No machine template lists `/var/cpaas` in `DATA_VOLUMES` | Continue. |
+| A machine template lists `/var/cpaas` in `DATA_VOLUMES` | [Migrate to pool-managed persistent disks](./persistent_disk_migration.mdx) before the upgrade. The migration replaces nodes. |
+| Every machine template shows the same `IMAGE` | Continue. |
+| The machine templates show different `IMAGE` values | Contact technical support. |
+| Each kubelet patch file shows `encoding=[]`, then its content, or a Secret name and a key for which the command in [Kubelet Patch File](#kubernetes-1-35-kubelet-patch) prints the content | Continue. |
+| No `encoding=` line follows a name under `== Kubelet patch files`, a file shows a value inside `encoding=[]`, such as `encoding=[base64]`, or no content, or its Secret or key does not exist | Contact technical support. |
+| Nothing is listed under `== Pods with hostPath volumes` | Continue. |
+| A Pod is listed under `== Pods with hostPath volumes` | Move its data to CSI storage before the upgrade. If you have confirmed that the data is safe or can be lost, [exempt the volume](./troubleshooting.mdx#exempt-hostpath-volume). A `hostPath` under a persistent disk declared for the node in `HCSMachineConfigPool` does not count; no action is needed for it. |
+
+</details>
+
+  </Tab>
+  <Tab label="VMware vSphere">
+
+Do not restructure the disk lists of the machine config pools as part of an upgrade.
+
+Save this script as `check-global-vsphere.sh`:
+
+```bash
+#!/usr/bin/env bash
+ac whoami --show-server
+
+echo "== Machine config pools"
+ac -n cpaas-system get vspheremachineconfigpool \
+  -o custom-columns='NAME:.metadata.name,CLUSTER:.spec.clusterRef.name,READY:.status.conditions[?(@.type=="Ready")].status'
+
 echo "== Providers"
 ac get moduleinfo -l cpaas.io/cluster-name=global \
   -o custom-columns='MODULE:.metadata.labels.cpaas\.io/module-name,PHASE:.status.phase' | grep -E '^MODULE|cluster-api-provider'
 
-echo "== Pods with hostPath volumes"
-ac get pods -A --no-headers \
-  -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,OWNER:.metadata.ownerReferences[*].kind,MIRROR:.metadata.annotations.kubernetes\.io/config\.mirror,PHASE:.status.phase,HOSTPATH:.spec.volumes[*].hostPath.path' \
-  | awk '$1 !~ /^(kube-system|kube-public|kube-node-lease|cpaas-system)$/ && $3 !~ /DaemonSet/ && $4 == "<none>" && $5 !~ /^(Succeeded|Failed)$/ && $6 != "<none>"'
-
-echo "== Local and hostPath PersistentVolumes with a claim"
+echo "== Local, hostPath, and TopoLVM PersistentVolumes with a claim"
 ac get pv --no-headers \
-  -o custom-columns='NAME:.metadata.name,CLAIM_NAMESPACE:.spec.claimRef.namespace,CLAIM:.spec.claimRef.name,LOCAL:.spec.local.path,HOSTPATH:.spec.hostPath.path' \
-  | awk '$2 !~ /^(<none>|kube-system|kube-public|kube-node-lease|cpaas-system)$/ && ($4 != "<none>" || $5 != "<none>")'
+  -o custom-columns='NAME:.metadata.name,CLAIM_NAMESPACE:.spec.claimRef.namespace,CLAIM:.spec.claimRef.name,LOCAL:.spec.local.path,HOSTPATH:.spec.hostPath.path,CSI:.spec.csi.driver' \
+  | awk '$2 !~ /^(<none>|kube-system|kube-public|kube-node-lease|cpaas-system)$/ && ($4 != "<none>" || $5 != "<none>" || $6 ~ /^topolvm\.(io|cybozu\.com)$/)'
 ```
 
 Then run it:
@@ -543,18 +563,74 @@ bash check-global-vsphere.sh
 
 | Result | Action |
 | --- | --- |
+| Every pool whose `CLUSTER` is `global` shows `READY` `True` | Continue. |
+| Such a pool does not show `True` | Contact technical support. |
+| `cluster-api-provider-kubeadm` and `cluster-api-provider-vsphere` show `PHASE` `Running` | Continue. |
+| A provider is missing, or shows another `PHASE` | Contact technical support. |
+| Nothing is listed under `== Local, hostPath, and TopoLVM PersistentVolumes with a claim` | Continue. |
+| A PersistentVolume is listed under `== Local, hostPath, and TopoLVM PersistentVolumes with a claim` | Move its data to CSI storage before the upgrade. If you have confirmed that the data is safe or can be lost, [exempt the volume](./troubleshooting.mdx#exempt-hostpath-volume). |
+
+Run the next script only when `InfraClusterVersionPreflight` reports `ProviderCapabilityNotDeclared` in [Run Preflight Checks](#run-preflight). Otherwise, `InfraClusterVersionPreflight` covers these items.
+
+<details>
+<summary>When `InfraClusterVersionPreflight` reports `ProviderCapabilityNotDeclared`</summary>
+
+Save this script as `check-global-vsphere-no-preflight.sh`:
+
+```bash
+#!/usr/bin/env bash
+ac whoami --show-server
+KCP=$(ac -n cpaas-system get clusters.cluster.x-k8s.io global -o jsonpath='{.spec.controlPlaneRef.name}')
+
+echo "== Rollout settings"
+ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='replicas={.spec.replicas} maxSurge={.spec.rolloutStrategy.rollingUpdate.maxSurge}{"\n"}'
+ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=global \
+  -o custom-columns='NAME:.metadata.name,SURGE:.spec.strategy.rollingUpdate.maxSurge,UNAVAILABLE:.spec.strategy.rollingUpdate.maxUnavailable'
+
+echo "== Machine templates in use"
+ac -n cpaas-system get vspheremachinetemplate \
+  $(ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{.spec.machineTemplate.infrastructureRef.name}') \
+  $(ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=global -o jsonpath='{.items[*].spec.template.spec.infrastructureRef.name}') \
+  -o custom-columns='NAME:.metadata.name,VM_TEMPLATE:.spec.template.spec.template'
+
+echo "== Kubelet patch files: the encoding, then the content or a Secret name and key"
+echo "${KCP}:"
+ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='{range .spec.kubeadmConfigSpec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
+for t in $(ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=global -o jsonpath='{.items[*].spec.template.spec.bootstrap.configRef.name}'); do
+  echo "${t}:"
+  ac -n cpaas-system get kubeadmconfigtemplate "${t}" -o jsonpath='{range .spec.template.spec.files[?(@.path=="/etc/kubernetes/patches/kubeletconfiguration0+strategic.json")]}{"encoding=["}{.encoding}{"] "}{.content}{.contentFrom.secret.name}{" "}{.contentFrom.secret.key}{"\n"}{end}'
+done
+
+echo "== Pods with hostPath volumes"
+ac get pods -A --no-headers \
+  -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,OWNER:.metadata.ownerReferences[*].kind,MIRROR:.metadata.annotations.kubernetes\.io/config\.mirror,PHASE:.status.phase,HOSTPATH:.spec.volumes[*].hostPath.path' \
+  | awk '$1 !~ /^(kube-system|kube-public|kube-node-lease|cpaas-system)$/ && $3 !~ /DaemonSet/ && $4 == "<none>" && $5 !~ /^(Succeeded|Failed)$/ && $6 != "<none>" {
+      n = split($6, p, ","); keep = 0
+      for (i = 1; i <= n; i++) if (p[i] !~ /^\/(dev|proc|sys|run|var\/run|var\/lib\/kubelet)(\/|$)/) keep = 1
+      if (keep) print }'
+```
+
+Then run it:
+
+```bash
+ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
+bash check-global-vsphere-no-preflight.sh
+# on the standby: unset KUBECONFIG
+```
+
+| Result | Action |
+| --- | --- |
 | `replicas` is 3 or more and `maxSurge` is `0`, and every MachineDeployment shows `SURGE` `0` and `UNAVAILABLE` `1` | Continue. |
 | `replicas` is less than 3 | The cluster cannot be upgraded. |
 | `replicas` is 3 or more and `maxSurge` is empty or not `0`, or a MachineDeployment shows `SURGE` empty, `<none>`, or not `0`, or `UNAVAILABLE` empty, `<none>`, or not `1` | Run the commands in [Set the Rollout Settings](#rollout-settings). |
-| Every pool whose `CLUSTER` is `global` shows `READY` `True` | Continue. |
-| Such a pool does not show `True` | Contact technical support. |
+| Every machine template shows the same `VM_TEMPLATE` | Continue. |
+| The machine templates show different `VM_TEMPLATE` values | Contact technical support. |
 | Each kubelet patch file shows `encoding=[]`, then its content, or a Secret name and a key for which the command in [Kubelet Patch File](#kubernetes-1-35-kubelet-patch) prints the content | Continue. |
 | No `encoding=` line follows a name under `== Kubelet patch files`, a file shows a value inside `encoding=[]`, such as `encoding=[base64]`, or no content, or its Secret or key does not exist | Contact technical support. |
-| A kubelet patch file lacks `"imagePullCredentialsVerificationPolicy": "NeverVerify"` | Continue. Add it in the Kubernetes upgrade, for each version 1.35 or later: see [Update the KubeadmControlPlane](./upgrade_kubernetes_hcs_vsphere.mdx#update-kcp) and [Create the Worker Templates](./upgrade_kubernetes_hcs_vsphere.mdx#create-worker-templates). |
-| `cluster-api-provider-kubeadm` and `cluster-api-provider-vsphere` show `PHASE` `Running` | Continue. |
-| A provider is missing, or shows another `PHASE` | Contact technical support. |
-| Nothing is listed under `== Pods with hostPath volumes`, and nothing under `== Local and hostPath PersistentVolumes with a claim` | Continue. |
-| A Pod or a PersistentVolume is listed under either title | Move its data to CSI storage before the upgrade. If the data is on a pool-managed persistent disk, or you cannot move it, contact technical support. |
+| Nothing is listed under `== Pods with hostPath volumes` | Continue. |
+| A Pod is listed under `== Pods with hostPath volumes` | Move its data to CSI storage before the upgrade. If you have confirmed that the data is safe or can be lost, [exempt the volume](./troubleshooting.mdx#exempt-hostpath-volume). A `hostPath` under a persistent disk declared for the node in `VSphereMachineConfigPool` does not count; no action is needed for it. |
+
+</details>
 
   </Tab>
 </Tabs>
@@ -587,7 +663,7 @@ ac -n cpaas-system get secret <secret-name> -o jsonpath='{.data.<secret-key>}' |
 # on the standby: unset KUBECONFIG
 ```
 
-On Kubernetes 1.35 or later, the file needs this setting. Do not add it for Kubernetes 1.34 or earlier. In the Kubernetes upgrade, Huawei DCS and Bare Metal add it to the existing files; on Huawei Cloud Stack and VMware vSphere, you add it in [Upgrade Kubernetes on Huawei Cloud Stack and VMware vSphere](./upgrade_kubernetes_hcs_vsphere.mdx).
+On Kubernetes 1.35 or later, the file needs this setting. Do not add it for Kubernetes 1.34 or earlier. In the Kubernetes upgrade, the platform adds it to the existing files.
 
 ```json
 {
@@ -827,7 +903,7 @@ Continue when the target version is listed; otherwise, run `violet push` for the
 
 On non-Alauda OS clusters, skip this section.
 
-Stage the image of the target version and of every intermediate Kubernetes version for each provider in use. The commands that the Huawei DCS and Bare Metal tabs generate run on `global`; in DR, run them on both `global` clusters, on the standby after `export KUBECONFIG=<standby-kubeconfig>`, and run `unset KUBECONFIG` afterwards:
+Stage the image of the target version and of every intermediate Kubernetes version for each provider in use. The commands that the tabs generate run on `global`; in DR, run them on both `global` clusters, on the standby after `export KUBECONFIG=<standby-kubeconfig>`, and run `unset KUBECONFIG` afterwards:
 
 ```bash
 ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
@@ -837,7 +913,7 @@ ac whoami --show-server
 <Tabs>
   <Tab label="Huawei DCS">
 
-Upload the `qcow2` image of each version to every DCS site that your clusters use, and register it as a VM template with the same name on every site. Then generate the VM template ConfigMaps and apply them on `global`. Select every architecture whose VM templates you register; each generated ConfigMap records its architecture.
+Upload the `qcow2` image of each version to every DCS site that your clusters use, and register it as a VM template with the same name on every site. Then generate the VM template ConfigMaps and apply them on `global`. Select every architecture whose VM templates you register; each generated ConfigMap records its architecture. Register the VM templates of every architecture that your clusters use, and in a cluster that mixes architectures, set `architecture` on every ConfigMap, as described in [VM Template ConfigMap](../workload_clusters/alauda_os/huawei-dcs/prerequisites.mdx#vm-template-configmap).
 
 <DcsVmTemplateConfigMap mode="path">
   Replace `<os>` with the OS of the VM templates, such as `m55`, `ko`, or `ku`, and take the ACP version, Kubernetes version, and etcd tag of each ConfigMap from [Version Mapping](../overview/alauda_os_support_matrix.mdx#version-mapping). Repeat the intermediate ConfigMap for each intermediate Kubernetes version, and omit it when there is none. Create the ConfigMaps for each architecture: replace `<architecture>` with `x86_64` or `aarch64`, and write `x86_64` as `x86-64` in the ConfigMap names.
@@ -876,14 +952,24 @@ List the architecture and OS labels of the hosts with `ac -n cpaas-system get ma
   </Tab>
   <Tab label="Huawei Cloud Stack">
 
-1. Upload the `qcow2` image of each version to the HCS image service, as an image in each region and project that your clusters use. The image must meet the image requirements in [Alauda OS Image](../workload_clusters/alauda_os/huawei-cloud-stack/prerequisites.mdx#alauda-os-image).
-2. Record the image name of each version. The Kubernetes upgrade of each cluster uses it.
+Upload the `qcow2` image of each version to the HCS image service, as an image with the same name in each region and project that your clusters use. The image must meet the image requirements in [Alauda OS Image](../workload_clusters/alauda_os/huawei-cloud-stack/prerequisites.mdx#alauda-os-image). Then generate the image ConfigMaps and apply them on `global`, as described in [Image ConfigMap](../workload_clusters/alauda_os/huawei-cloud-stack/prerequisites.mdx#image-configmap). Every Huawei Cloud Stack cluster needs them, including a cluster created with YAML. Select every architecture whose images you register; each generated ConfigMap records its architecture. Register the images of every architecture that your clusters use, and in a cluster that mixes architectures, set `architecture` on every ConfigMap, as described in [Image ConfigMap](../workload_clusters/alauda_os/huawei-cloud-stack/prerequisites.mdx#image-configmap).
+
+<VmTemplateConfigMap provider="hcs" mode="path">
+  Replace `<os>` with the OS of the images, such as `m55`, `ko`, or `ku`, and take the ACP version, Kubernetes version, and etcd tag of each ConfigMap from [Version Mapping](../overview/alauda_os_support_matrix.mdx#version-mapping). Repeat the intermediate ConfigMap for each intermediate Kubernetes version, and omit it when there is none. Create the ConfigMaps for each architecture: replace `<architecture>` with `x86_64` or `aarch64`, and write `x86_64` as `x86-64` in the ConfigMap names.
+</VmTemplateConfigMap>
+
+Keep the ConfigMaps of earlier ACP versions. For each ACP version, register only one image per architecture.
 
   </Tab>
   <Tab label="VMware vSphere">
 
-1. In each vCenter datacenter that your clusters use, deploy the `ova` of each version, and convert the deployed virtual machine to a VM template. Use the same template name in every datacenter. The template must meet the [VM template requirements](../workload_clusters/alauda_os/vmware-vsphere/prerequisites.mdx#vm-template-requirements).
-2. Record the template name of each version. The Kubernetes upgrade of each cluster uses it.
+In each vCenter datacenter that your clusters use, deploy the `ova` of each version, and convert the deployed virtual machine to a VM template. Use the same template name in every datacenter. The template must meet the [VM template requirements](../workload_clusters/alauda_os/vmware-vsphere/prerequisites.mdx#vm-template-requirements). Then generate the VM template ConfigMaps and apply them on `global`, as described in [VM Template ConfigMap](../workload_clusters/alauda_os/vmware-vsphere/prerequisites.mdx#vm-template-configmap). Every VMware vSphere cluster needs them.
+
+<VmTemplateConfigMap provider="vsphere" mode="path">
+  Replace `<os>` with the OS of the VM templates, such as `m55`, `ko`, or `ku`, and take the ACP version, Kubernetes version, and etcd tag of each ConfigMap from [Version Mapping](../overview/alauda_os_support_matrix.mdx#version-mapping). Repeat the intermediate ConfigMap for each intermediate Kubernetes version, and omit it when there is none.
+</VmTemplateConfigMap>
+
+Keep the ConfigMaps of earlier ACP versions. For each ACP version, register only one VM template.
 
   </Tab>
 </Tabs>
@@ -946,12 +1032,44 @@ The hosts of `global` are the ones in `HOSTS` of the pools whose `CLUSTER` is `g
   </Tab>
   <Tab label="Huawei Cloud Stack">
 
-In the HCS console, confirm that the image that you recorded for the target version and for each intermediate Kubernetes version exists in each region and project that `global` uses. Continue when it does; otherwise, run the Huawei Cloud Stack steps of [Stage the Alauda OS Images](#stage-alauda-os-images) for that version.
+Run this check only when `InfraClusterVersionPreflight` reports `ProviderCapabilityNotDeclared` in [Run Preflight Checks](#run-preflight). Otherwise, `InfraClusterVersionPreflight` covers these items.
+
+<details>
+<summary>When `InfraClusterVersionPreflight` reports `ProviderCapabilityNotDeclared`</summary>
+
+On `global`:
+
+```bash
+ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
+ac -n cpaas-system get configmap -l cpaas.io/hcs-vm-template -L cpaas.io/hcs-vm-template,cpaas.io/distribution-version
+# on the standby: unset KUBECONFIG
+```
+
+Continue when, for the target version and for each intermediate Kubernetes version, a ConfigMap shows its ACP version in `DISTRIBUTION-VERSION`, and, in the HCS console of every region and project that `global` uses, exactly one image has the name in its `HCS-VM-TEMPLATE` column; otherwise, run the Huawei Cloud Stack steps of [Stage the Alauda OS Images](#stage-alauda-os-images) for that version.
+
+</details>
 
   </Tab>
   <Tab label="VMware vSphere">
 
-In vCenter, confirm that the VM template that you recorded for the target version and for each intermediate Kubernetes version exists in each datacenter that `global` uses. Continue when it does; otherwise, run the VMware vSphere steps of [Stage the Alauda OS Images](#stage-alauda-os-images) for that version.
+Run this check only when `InfraClusterVersionPreflight` reports `ProviderCapabilityNotDeclared` in [Run Preflight Checks](#run-preflight). Otherwise, `InfraClusterVersionPreflight` covers these items.
+
+<details>
+<summary>When `InfraClusterVersionPreflight` reports `ProviderCapabilityNotDeclared`</summary>
+
+On `global`:
+
+```bash
+ac config use-cluster global        # on the standby, instead: export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server
+ac -n cpaas-system get configmap -l cpaas.io/vsphere-vm-template -L cpaas.io/vsphere-vm-template,cpaas.io/distribution-version
+# on the standby: unset KUBECONFIG
+```
+
+Continue when, for the target version and for each intermediate Kubernetes version, a ConfigMap shows its ACP version in `DISTRIBUTION-VERSION`, and, in vCenter, every datacenter that `global` uses has exactly one VM template with the name in its `VSPHERE-VM-TEMPLATE` column; otherwise, run the VMware vSphere steps of [Stage the Alauda OS Images](#stage-alauda-os-images) for that version.
+
+</details>
 
   </Tab>
 </Tabs>
@@ -996,7 +1114,7 @@ bash upgrade.sh --preflight
 | `ac get productmanifests` reports `the server doesn't have a resource type` | Continue without `bash upgrade.sh --preflight`. You run it in [Run the Final Preflight Check](./global/upgrade_global_cluster.mdx#final-preflight), after you deploy the Cluster Version Operator (CVO). |
 | On the standby, `DRSplitUpgradeWindow` is the only failed check, and its message names only `EtcdSyncNotPaused`, `TokenRotatorEnabled`, or both | Continue. `Summary` shows `Blocked` at this stage. |
 | On the standby, `DRSplitUpgradeWindow` names another reason | See [DR Standby Checks](./troubleshooting.mdx#dr-split-upgrade-window). |
-| On a `global` cluster on Huawei DCS or Bare Metal, `InfraClusterVersionPreflight` reports `ProviderCapabilityNotDeclared` | Run `check-global-dcs-no-preflight.sh` or `check-global-baremetal-no-preflight.sh` in the tab of [Check by OS and Provider](#global-provider-checks), and the check in the tab of [Check the Staged Images](#check-staged-images), and handle their results. Then continue. |
+| On a `global` cluster on Alauda OS, `InfraClusterVersionPreflight` reports `ProviderCapabilityNotDeclared` | Run the script whose name ends with `-no-preflight.sh` in the provider tab of [Check by OS and Provider](#global-provider-checks), and the check in the provider tab of [Check the Staged Images](#check-staged-images), and handle their results. Then continue. |
 | `InfraClusterVersionPreflight` reports `PreflightPending` | Run the preflight check again after 5 minutes; if it does not change, contact technical support. |
 | `InfraClusterVersionPreflight` reports another warning | Read the checks as described in [Kubernetes Upgrade Checks](./troubleshooting.mdx#infra-preflight-checks), and take the action of each check whose state is `Failed`. Then continue. |
 | `ResourcePatchUpgradeable` fails | Run the exemption commands in [Resolve Preflight Blocks](#resolve-preflight-blocks). |
