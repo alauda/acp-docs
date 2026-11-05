@@ -16,7 +16,7 @@ ACP CLI (ac) renders the cluster objects from one `install-config.yaml`, applies
 ## Prerequisites
 
 - You meet the [Bare Metal prerequisites](./prerequisites.mdx).
-- `ac` is logged in to the platform as a platform administrator (`ac login https://<platform-address>`).
+- `ac` is logged in to the platform as a platform administrator (`ac login https://<platform-address> --name <session-name>`).
 - You chose the cluster name. It **must not** be `global` or start with `global-`. Use it as the prefix of the registration and the pools.
 
 | Placeholder | Value |
@@ -24,7 +24,6 @@ ACP CLI (ac) renders the cluster objects from one `install-config.yaml`, applies
 | `<cluster-name>` | The workload cluster name, later `cluster.clusterName`. |
 | `<registry-address>` | The `registry` key of `cpaas-system/public-registry-credential` on the `global` cluster. After `ac config use-cluster global`: `ac -n cpaas-system get secret public-registry-credential -o jsonpath='{.data.registry}' \| base64 -d` |
 | `<base-image-iso>` | `<registry-address>/tkestack/baremetal-base-image-iso:<os-image-tag>`, from [OS Images and Image Catalog](./prerequisites.mdx#os-images-and-image-catalog). |
-| `<install-device>` | The whole-disk target for `elemental install`. On multi-disk hosts that reuse one ISO, `/dev/elemental-install-target`; see [Select a Fixed System Disk](./reference/configure-fixed-install-disk.mdx). |
 | `<os-id>` | The OS identifier of the image that the registration installs: `alaudaos.m.55` for Alauda OS M55, `alaudaos.k.25` for Alauda OS KU. See [OS Image Keys per Architecture and OS](./prerequisites.mdx#catalog-key-format). |
 
 ## Procedure
@@ -57,7 +56,8 @@ spec:
   config:
     elemental:
       install:
-        device: <install-device>
+        # Each host reports its disks and waits until you select its system disk.
+        device-selection: inventory
         eject-cd: true
         reboot: true
         snapshotter:
@@ -100,7 +100,7 @@ spec:
                       size: 20480
 ```
 
-- Keep `install.device`, `eject-cd: true`, and `reboot: true`: without a device, `elemental install` can pick the wrong disk, and without the other two a host can stay in the live environment.
+- Keep `device-selection: inventory`, `eject-cd: true`, and `reboot: true`: a host installs only to the disk you select in [Select the System Disk](#select-system-disk), and without the other two it can stay in the live environment.
 - Keep the `os.baremetal.alauda.io/arch` and `os.baremetal.alauda.io/id` labels in `machineInventoryLabels`: the provider uses them to find the image catalog key of each host; see [OS Image Keys per Architecture and OS](./prerequisites.mdx#catalog-key-format).
 - Do not annotate a workload `MachineRegistration` with `baremetal.cluster.io/system-agent-auth-scope: global`; that marks `global` hosts.
 - Do not add `/etc/resolv.conf` to `SeedImage.spec.cloud-config`. Put site-specific resolver configuration in `MachineRegistration.spec.config.cloud-config` only when first-boot registration needs it.
@@ -112,14 +112,6 @@ Keep the `state` partition size of the `SeedImage` above, 20480 MiB. With the El
 <Directive type="warning" title="Placement and stage both matter">
   The fragment must sit in `SeedImage.spec.cloud-config` under `stages.boot`. In `MachineRegistration.spec.config.cloud-config`, or under any other stage, the partition stays at 8 GiB and nothing reports an error.
 </Directive>
-
-Check the first installed host before you boot the rest. On that host:
-
-```bash
-lsblk -o NAME,SIZE,LABEL | grep COS_STATE
-```
-
-Continue when `COS_STATE` is about 20G; otherwise fix the `SeedImage`, build the ISO again, and reinstall the host.
 
 ### 2. Build the ISO and Boot the Hosts \{#build-iso}
 
@@ -134,9 +126,38 @@ ac -n cpaas-system get seedimage <cluster-name>-registration-iso \
   -o jsonpath='{.status.conditions[?(@.type=="SeedImageReady")].reason}{"\n"}{.status.downloadURL}{"\n"}{.status.checksumURL}{"\n"}'
 ```
 
-Continue only when the reason is `SeedImageBuildSuccess` and both URLs are non-empty. After `cleanupAfterMinutes`, the URLs are cleared while `SeedImageReady` can stay `True`; check the reason again before you download the ISO.
+Continue only when the reason is `SeedImageBuildSuccess` and both URLs are non-empty. After `cleanupAfterMinutes`, the URLs are cleared while `SeedImageReady` can stay `True`; check the reason again before you download the ISO. To get a new URL, delete the `SeedImage`, apply the file again, and repeat the commands above from `wait`:
 
-Boot every host from the ISO. Each host registers as a `MachineInventory` and installs Alauda OS to disk. If the live ISO has no DHCP address, configure the network from the host console as in [Network Connectivity](./prerequisites.mdx#network-connectivity).
+```bash
+ac -n cpaas-system delete seedimage <cluster-name>-registration-iso
+ac apply -f 01-machineregistration-seedimage.yaml
+```
+
+Hosts that have already booted the ISO keep registering; boot the remaining hosts from the new ISO.
+
+Boot every host from the ISO. Each host registers as a `MachineInventory`, reports its disks, and waits in the live environment until you select its system disk. If the live ISO has no DHCP address, configure the network from the host console as in [Network Connectivity](./prerequisites.mdx#network-connectivity).
+
+#### Select the System Disk \{#select-system-disk}
+
+Every host waits for a selection, including a host with a single disk. List the hosts and the disks that a waiting host reports:
+
+```bash
+ac -n cpaas-system get machineinventories.elemental.cattle.io \
+  -o custom-columns='NAME:.metadata.name,PHASE:.status.install.phase'
+ac -n cpaas-system get machineinventories.elemental.cattle.io <inventory-name> \
+  -o jsonpath='{range .status.install.candidates[*]}{.id}{"\t"}{.eligible}{"\t"}{.path}{"\t"}{.sizeBytes}{"\t"}{.reasons}{"\n"}{end}'
+```
+
+A waiting host shows `AwaitingTarget`. Each candidate line prints the disk ID, whether the disk can be selected, its device path in the live environment, its size in bytes, and the reasons when it cannot be selected. Identify the system disk by its size and path, and select it by its ID while the host is still in the live environment:
+
+```bash
+ac -n cpaas-system annotate machineinventories.elemental.cattle.io <inventory-name> \
+  baremetal.alauda.io/install-target-device=<disk-id>
+```
+
+- Select a disk that shows `true`, using its ID exactly as printed.
+- The phase changes to `Installing`, and the host installs Alauda OS to that disk and reboots. The selection cannot be changed after that.
+- If the annotation is rejected because the host was not seen recently, make sure that the host is still running the ISO, and run the command again.
 
 ### 3. Confirm the Registration \{#confirm-registration}
 
@@ -148,7 +169,7 @@ ac -n cpaas-system get machineinventories.elemental.cattle.io \
 
 Use an inventory only when it:
 
-- Shows `Ready=True` and has a non-empty `status.plan.secretRef.name`.
+- Shows `Ready=True`, `status.install.phase=Installed`, and a non-empty `status.plan.secretRef.name`.
 - Shows the `os.baremetal.alauda.io/arch` and `os.baremetal.alauda.io/id` labels that you set in the registration. A host without them is treated as `amd64` with Alauda OS M55.
 - Has a `spec.observedNetwork` that matches the host's expected NIC, when the install-time IP must survive reprovisions.
 - For managed data disks, runs an observer-capable OS image, reports a fresh `status.observedStorage`, and reaches `status.storage.phase=Prepared`.
@@ -203,10 +224,11 @@ spec:
 ```bash
 ac config use-cluster global
 ac apply -f 02-machineinventorypool.yaml
-ac -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io
+ac -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io \
+  -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status,TOTAL:.status.total,AVAILABLE:.status.available'
 ```
 
-Continue when each pool reports `Ready=True` and `total` equals the number of listed inventories; otherwise read the pool's `MembersValid` condition and see [Provider Conditions](./troubleshooting.mdx#provider-conditions).
+Continue when each pool shows `READY` `True` and `TOTAL` equals the number of listed inventories; otherwise read the pool's `MembersValid` condition and see [Provider Conditions](./troubleshooting.mdx#provider-conditions).
 
 Size each pool to at least the `replicas` of its node group: an upgrade replaces each node with a host from the same pool.
 
@@ -236,6 +258,7 @@ cluster:
   #   name: <registry-secret-name>          # Required: at most 63 characters.
   #   namespace: cpaas-system               # Default: cpaas-system, the only accepted value.
   # encryptionProviderConfig: <encryption-key>  # Optional: the base64 of a 16, 24, or 32 byte aescbc key. Empty generates a key.
+  ntpServers: []                            # Default: []. The NTP servers of the nodes. Empty keeps the image's time configuration.
   network:
     podCIDR: 10.199.0.0/16                  # Default: 10.199.0.0/16.
     serviceCIDR: 10.96.0.0/12               # Default: 10.96.0.0/12.
@@ -307,10 +330,11 @@ Continue when every node is `Ready`; otherwise see [Troubleshooting](./troublesh
 ```bash
 ac config use-cluster global
 ac -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io
-ac -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io
+ac -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io \
+  -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status,TOTAL:.status.total,AVAILABLE:.status.available'
 ```
 
-Continue when every `BaremetalMachine` reports `Running` and each pool reports `Ready=True`; otherwise see [Provider Conditions](./troubleshooting.mdx#provider-conditions).
+Continue when every `BaremetalMachine` reports `Running` and each pool shows `READY` `True`; otherwise see [Provider Conditions](./troubleshooting.mdx#provider-conditions).
 
 #### Managed Data Disks \{#verify-managed-storage}
 
