@@ -24,7 +24,6 @@ ACP CLI (ac) renders the cluster objects from one `install-config.yaml`, applies
 | `<cluster-name>` | The workload cluster name, later `cluster.clusterName`. |
 | `<registry-address>` | The `registry` key of `cpaas-system/public-registry-credential` on the `global` cluster. After `ac config use-cluster global`: `ac -n cpaas-system get secret public-registry-credential -o jsonpath='{.data.registry}' \| base64 -d` |
 | `<base-image-iso>` | `<registry-address>/tkestack/baremetal-base-image-iso:<os-image-tag>`, from [OS Images and Image Catalog](./prerequisites.mdx#os-images-and-image-catalog). |
-| `<install-device>` | The whole-disk target for `elemental install`. On multi-disk hosts that reuse one ISO, `/dev/elemental-install-target`; see [Select a Fixed System Disk](./reference/configure-fixed-install-disk.mdx). |
 | `<os-id>` | The OS identifier of the image that the registration installs: `alaudaos.m.55` for Alauda OS M55, `alaudaos.k.25` for Alauda OS KU. See [OS Image Keys per Architecture and OS](./prerequisites.mdx#catalog-key-format). |
 
 ## Procedure
@@ -57,7 +56,7 @@ spec:
   config:
     elemental:
       install:
-        device: <install-device>
+        device-selection: inventory
         eject-cd: true
         reboot: true
         snapshotter:
@@ -100,7 +99,7 @@ spec:
                       size: 20480
 ```
 
-- Keep `install.device`, `eject-cd: true`, and `reboot: true`: without a device, `elemental install` can pick the wrong disk, and without the other two a host can stay in the live environment.
+- Keep `install.device-selection: inventory`, `eject-cd: true`, and `reboot: true`: without the first, nothing lets you choose the system disk of a host with several disks, and without the other two a host can stay in the live environment.
 - Keep the `os.baremetal.alauda.io/arch` and `os.baremetal.alauda.io/id` labels in `machineInventoryLabels`: the provider uses them to find the image catalog key of each host; see [OS Image Keys per Architecture and OS](./prerequisites.mdx#catalog-key-format).
 - Do not annotate a workload `MachineRegistration` with `baremetal.cluster.io/system-agent-auth-scope: global`; that marks `global` hosts.
 - Do not add `/etc/resolv.conf` to `SeedImage.spec.cloud-config`. Put site-specific resolver configuration in `MachineRegistration.spec.config.cloud-config` only when first-boot registration needs it.
@@ -121,7 +120,7 @@ lsblk -o NAME,SIZE,LABEL | grep COS_STATE
 
 Continue when `COS_STATE` is about 20G; otherwise fix the `SeedImage`, build the ISO again, and reinstall the host.
 
-### 2. Build the ISO and Boot the Hosts \{#build-iso}
+### 2. Build the ISO, Boot the Hosts, and Choose Their System Disks \{#build-iso}
 
 Run the following commands from a machine where `ac` is logged in to the platform:
 
@@ -136,7 +135,30 @@ ac -n cpaas-system get seedimage <cluster-name>-registration-iso \
 
 Continue only when the reason is `SeedImageBuildSuccess` and both URLs are non-empty. After `cleanupAfterMinutes`, the URLs are cleared while `SeedImageReady` can stay `True`; check the reason again before you download the ISO.
 
-Boot every host from the ISO. Each host registers as a `MachineInventory` and installs Alauda OS to disk. If the live ISO has no DHCP address, configure the network from the host console as in [Network Connectivity](./prerequisites.mdx#network-connectivity).
+Boot every host from the ISO. Each host registers as a `MachineInventory`, reports its disks, and waits in the live environment until you choose its system disk. If the live ISO has no DHCP address, configure the network from the host console as in [Network Connectivity](./prerequisites.mdx#network-connectivity).
+
+Choose the system disk of each host from the machine where `ac` is logged in. `REGISTRATION-IP` is the address that the host console shows:
+
+```bash
+ac config use-cluster global
+ac -n cpaas-system get machineinventories.elemental.cattle.io -L elemental.cattle.io/registration-ip
+```
+
+```text
+NAME                            INSTALL          TARGET   AGE   REGISTRATION-IP
+<cluster-name>-4c4c4544-0042…   AwaitingTarget            2m    10.0.0.21
+```
+
+For each host in `AwaitingTarget`, list its disks and choose one whose `eligible` is `true`, writing its ID exactly as `candidates` lists it, for example `wwn:5000c500a1b2c3d4`:
+
+```bash
+ac -n cpaas-system get machineinventory <inventory> \
+  -o jsonpath='{range .status.install.candidates[*]}{.id}{"\t"}{.sizeBytes}{"\t"}{.model}{"\t"}{.eligible}{"\n"}{end}'
+ac -n cpaas-system annotate machineinventory <inventory> \
+  baremetal.alauda.io/install-target-device=<disk-id>
+```
+
+Within about 20 seconds the host starts the installation, installs Alauda OS to that disk, and reboots. `INSTALL` moves to `Installing` and then `Installed`. If the annotation is rejected or a host does not start installing, see [Choose the System Disk of Bare-Metal Hosts](./reference/configure-fixed-install-disk.mdx). Hosts with the same disk layout can also choose their disk by a rule on that page.
 
 ### 3. Confirm the Registration \{#confirm-registration}
 
@@ -151,17 +173,10 @@ Use an inventory only when it:
 - Shows `Ready=True` and has a non-empty `status.plan.secretRef.name`.
 - Shows the `os.baremetal.alauda.io/arch` and `os.baremetal.alauda.io/id` labels that you set in the registration. A host without them is treated as `amd64` with Alauda OS M55.
 - Has a `spec.observedNetwork` that matches the host's expected NIC, when the install-time IP must survive reprovisions.
-- For managed data disks, runs an observer-capable OS image, reports a fresh `status.observedStorage`, and reaches `status.storage.phase=Prepared`.
 
 Record the exact `MachineInventory` names for the pools.
 
-### 4. Optional: Prepare Managed Data Disks \{#optional-prepare-managed-storage}
-
-Managed storage belongs to the long-lived `MachineInventory`, so configure it while the inventory is unallocated, before you add it to a pool. Follow [Manage Data Disks on Bare-Metal Hosts](../../../configure/nodes/alauda_os/manage-bare-metal-storage.mdx) to verify `elemental-storage-observer.service`, select each device by a stable ID with `Adopt` or `InitializeIfBlank`, patch the declaration with `storagectl`, and wait for `StoragePrepared=True/AllRequiredVolumesPrepared` and `status.storage.phase=Prepared`. Then return to [Create the Pools](#step-2-pools).
-
-Without managed disks, leave `spec.storage` absent or set `volumes: []`; the inventory converges to `Unmanaged` with `StoragePrepared=True/NoManagedVolumes`.
-
-### 5. Create the Pools \{#step-2-pools}
+### 4. Create the Pools \{#step-2-pools}
 
 Create one pool for the control plane and one for each worker node group; two node groups cannot share a pool, and a `MachineInventory` must not appear in two active pools.
 
@@ -217,9 +232,9 @@ ac config use-cluster global
 ac -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io <cluster-name>-worker-pool
 ```
 
-`status.available` must be at least the target replica count. For more capacity, register more hosts, prepare any managed storage while each inventory is unallocated, and add their names to `spec.machineInventories`. A new host goes through the same first boot as the original nodes, so confirm its [network paths](./prerequisites.mdx#network-connectivity) and [clock](./prerequisites.mdx#host-time-synchronization) as well.
+`status.available` must be at least the target replica count. For more capacity, register more hosts, and add their names to `spec.machineInventories`. A new host goes through the same first boot as the original nodes, so confirm its [network paths](./prerequisites.mdx#network-connectivity) and [clock](./prerequisites.mdx#host-time-synchronization) as well.
 
-### 6. Write `install-config.yaml` \{#write-install-config}
+### 5. Write `install-config.yaml` \{#write-install-config}
 
 Create an installation directory for the cluster and write `install-config.yaml` in it. `ac` writes `manifests/` and `logs/ac.log` next to it. The hosts supply the CPU, memory, network, and disks, so the node groups only name their pools.
 
@@ -266,7 +281,7 @@ computes:                                   # Optional: the worker node groups. 
 
 You do not set the Kubernetes version: `ac` installs the latest version that the platform supports, and the image catalog must have its key for the architecture and OS of your hosts; see [Add Kubernetes Versions to the Image Catalog](./prerequisites.mdx#add-versions-to-image-catalog).
 
-### 7. Create the Cluster \{#create-with-ac}
+### 6. Create the Cluster \{#create-with-ac}
 
 Run the following command from a machine where `ac` is logged in to the platform:
 
@@ -279,7 +294,7 @@ ac adm alpha cluster create --dir <install-dir> --provider baremetal
 
 `create` returns once the objects are applied, and the cluster keeps building. Add `--wait` to wait until all stages are ready; `--timeout` (default `2h`) limits only the wait. To render without applying, run `ac adm alpha cluster manifests` with the same flags.
 
-### 8. Monitor the Creation \{#monitor-creation}
+### 7. Monitor the Creation \{#monitor-creation}
 
 ```bash
 ac config use-cluster global
@@ -289,7 +304,7 @@ ac adm alpha cluster wait-for install-complete --cluster <cluster-name>   # wait
 
 Continue when all four stages are ready; otherwise see [Troubleshooting](./troubleshooting.mdx).
 
-### 9. Verify the Cluster \{#verify-the-cluster}
+### 8. Verify the Cluster \{#verify-the-cluster}
 
 Run the following commands from a machine where `ac` is logged in to the platform:
 
@@ -311,18 +326,6 @@ ac -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io
 ```
 
 Continue when every `BaremetalMachine` reports `Running` and each pool reports `Ready=True`; otherwise see [Provider Conditions](./troubleshooting.mdx#provider-conditions).
-
-#### Managed Data Disks \{#verify-managed-storage}
-
-**Applies to**: hosts with managed data disks. Skip it when no `MachineInventory` declares `spec.storage`.
-
-```bash
-ac config use-cluster global
-ac -n cpaas-system get machineinventories.elemental.cattle.io \
-  -o custom-columns='NAME:.metadata.name,PHASE:.status.storage.phase,PREPARED:.status.storage.conditions[?(@.type=="StoragePrepared")].status,ACTIVE:.status.storage.conditions[?(@.type=="StorageActive")].status'
-```
-
-Continue when every used inventory with managed volumes shows `Active`, `True`, and `True`; otherwise see [Provider Conditions](./troubleshooting.mdx#provider-conditions).
 
 #### Self-built VIP \{#verify-self-built-vip}
 
@@ -366,6 +369,5 @@ Keep `<install-dir>/manifests/`, or set `cluster.encryptionProviderConfig`: a ge
 ## Next Steps
 
 - [Manage Nodes](../../../configure/nodes/alauda_os/bare-metal.mdx)
-- [Manage Data Disks](../../../configure/nodes/alauda_os/manage-bare-metal-storage.mdx)
 - [Upgrade Overview](../../../upgrade/overview.mdx#upgrade-steps-by-node-os)
 - [Delete the Cluster](./deleting.mdx)
