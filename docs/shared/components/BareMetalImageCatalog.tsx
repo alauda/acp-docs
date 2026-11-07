@@ -196,15 +196,25 @@ const selectedImages = (
     ),
   )
 
+// The packtool of the Core Package. The installation pages name the
+// architecture of the bootstrap node `<arch>`, as in `<extract-dir>/res/<arch>/ac`;
+// on a workload host it is `<host-arch>`, to keep it apart from the
+// architectures of the hosts being registered.
+const packtoolPath = (mode: Mode) =>
+  mode === 'install' ? '<extract-dir>/res/<arch>/packtool' : '<extract-dir>/res/<host-arch>/packtool'
+
 // Pushes both images with the packtool of the Core Package, which keeps the
 // manifest as it is in the archive; `--ref` selects each image by its name in
 // the archive. Lists the tags of each repository so that the push can be
 // checked.
-const renderPushCommand = ({ isoRepository, rootRepository, tag, registry, archive }: ArchiveImages) =>
+const renderPushCommand = (
+  { isoRepository, rootRepository, tag, registry, archive }: ArchiveImages,
+  packtool: string,
+) =>
   [
     "read -rsp 'Registry password: ' REGISTRY_PASSWORD; echo",
     `for repo in ${isoRepository} ${rootRepository}; do`,
-    `  <extract-dir>/res/<host-arch>/packtool image push ${archive} \\`,
+    `  ${packtool} image push ${archive} \\`,
     `    "${registry}/${PROJECT}/\${repo}:${tag}" --ref "\${repo}:${tag}" \\`,
     '    -u "<registry-username>" -p "${REGISTRY_PASSWORD}"',
     '  curl -sSk -u "<registry-username>:${REGISTRY_PASSWORD}" \\',
@@ -705,7 +715,7 @@ function SingleVersionForm({ mode, children }: { mode: SingleVersionMode; childr
       {mode === 'install' ? (
         <>
           <OutputTitle>Push the OS images</OutputTitle>
-          <CommandBlock command={renderPushCommand(images[0])} />
+          <CommandBlock command={renderPushCommand(images[0], packtoolPath('install'))} />
           <OutputTitle>
             Values for <code>install-config.yaml</code>
           </OutputTitle>
@@ -717,7 +727,7 @@ function SingleVersionForm({ mode, children }: { mode: SingleVersionMode; childr
         <>
           <OutputTitle>Push the OS images</OutputTitle>
           {images.map(item => (
-            <TitledBlock key={item.arch} lang="bash" title={item.arch} code={renderPushCommand(item)} />
+            <TitledBlock key={item.arch} lang="bash" title={item.arch} code={renderPushCommand(item, packtoolPath('register'))} />
           ))}
           <OutputTitle>Add the image catalog keys</OutputTitle>
           <CommandBlock command={renderCatalogCommand(releaseEntries(release, tagOf, host.values))} />
@@ -853,7 +863,7 @@ function MarkdownOutput({ mode, children }: { mode: Mode; children?: ReactNode }
           tag: '<os-image-tag>',
           registry: REGISTRY_PLACEHOLDER,
           archive: '<bare-metal-os-archive>',
-        })}
+        }, packtoolPath(mode))}
       />
       {pushPlaceholderNote}
     </>
