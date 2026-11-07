@@ -196,24 +196,20 @@ const selectedImages = (
     ),
   )
 
-// Pushes both images with `ctr`, which keeps the manifest as it is in the
-// archive, under the tag they have in the archive, and lists the tags of each
-// repository so that the push can be checked.
+// Pushes both images with the packtool of the Core Package, which keeps the
+// manifest as it is in the archive; `--ref` selects each image by its name in
+// the archive. Lists the tags of each repository so that the push can be
+// checked.
 const renderPushCommand = ({ isoRepository, rootRepository, tag, registry, archive }: ArchiveImages) =>
   [
     "read -rsp 'Registry password: ' REGISTRY_PASSWORD; echo",
-    `ctr -n bare-metal-os images import --all-platforms --no-unpack ${archive}`,
-    'ctr -n bare-metal-os images ls -q',
-    '',
     `for repo in ${isoRepository} ${rootRepository}; do`,
-    '  ctr -n bare-metal-os images push --local --skip-verify \\',
-    '    -u "<registry-username>:${REGISTRY_PASSWORD}" \\',
-    `    "${registry}/${PROJECT}/\${repo}:${tag}" "\${repo}:${tag}"`,
+    `  <extract-dir>/res/<host-arch>/packtool image push ${archive} \\`,
+    `    "${registry}/${PROJECT}/\${repo}:${tag}" --ref "\${repo}:${tag}" \\`,
+    '    -u "<registry-username>" -p "${REGISTRY_PASSWORD}"',
     '  curl -sSk -u "<registry-username>:${REGISTRY_PASSWORD}" \\',
     `    "https://${registry}/v2/${PROJECT}/\${repo}/tags/list"; echo`,
     'done',
-    '',
-    `ctr -n bare-metal-os images rm ${isoRepository}:${tag} ${rootRepository}:${tag}`,
     'unset REGISTRY_PASSWORD',
   ].join('\n')
 
@@ -340,8 +336,8 @@ const outputTitleStyle: CSSProperties = { margin: '1.25rem 0 0.5rem', fontWeight
 
 const tagHintText = (
   <>
-    An OS image tag is the file name of its OS archive without <code>.tar</code>. After the import,{' '}
-    <code>ctr -n bare-metal-os images ls -q</code> prints it as the tag of both images of the archive.
+    An OS image tag is the file name of its OS archive without <code>.tar</code>, and the tag of both images of
+    the archive.
   </>
 )
 
