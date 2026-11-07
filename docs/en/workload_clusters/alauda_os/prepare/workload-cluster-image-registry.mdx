@@ -13,7 +13,7 @@ queries:
 
 Alauda Container Platform installs and manages platform components on every workload cluster, such as Kube-OVN and the platform modules delivered after the cluster is up. By default, their images come from the registry that the `global` cluster uses. You can instead bind a workload cluster to a registry of its own, for example a registry close to a workload cluster in another region.
 
-Decide before you create the cluster: an existing cluster cannot be moved to another registry.
+Decide which registry credential the cluster uses before you create it. The credential selected at creation cannot be replaced later. You can update the address in that credential during operation.
 
 ## Options \{#options}
 
@@ -49,7 +49,7 @@ ac get secret public-registry-credential -n cpaas-system \
 
 Continue when the command prints a value; otherwise, contact technical support.
 
-If workload cluster nodes cannot reach the address of the `Platform Built-in` registry on the `global` cluster, see [Add External Address for Built-in Registry](../../how_to/add_external_addr_for_global_registry.mdx).
+If the `global` cluster was upgraded from an earlier version and still uses the platform built-in Registry, and workload cluster nodes cannot reach that registry, see [Add External Address for Built-in Registry](../../how_to/add_external_addr_for_global_registry.mdx). That page applies only to this upgraded-cluster case.
 
 ## Bind a Workload Cluster to Its Own Registry \{#dedicated}
 
@@ -84,87 +84,7 @@ Confirm in the administration interface or API of the registry that the uploaded
 
 ### Step 2 — Create the RegistryCredential Secret \{#create-the-secret}
 
-Write the Secret manifest with an editor, not at a shell prompt: a shell keeps the password in its history. Quote values that contain YAML special characters. Use one of the two manifests below.
-
-**Without a private CA**: the system trust store of the nodes verifies the registry certificate. For an anonymous registry, leave out `username` and `password`.
-
-```yaml title="registry-credential.yaml"
-apiVersion: v1
-kind: Secret
-metadata:
-  name: <registry-credential-name>
-  namespace: cpaas-system
-  labels:
-    capi.cpaas.io/provider: registry-credential
-    cpaas.io/registry-credential-format: direct
-type: CloudCredential
-stringData:
-  registry: <registry-host>:<port>
-  username: <username>
-  password: <password>
-```
-
-**With a private CA**: the registry certificate is self-signed or issued by a private CA. `registry`, `username`, and `password` are all required.
-
-```yaml title="registry-credential.yaml"
-apiVersion: v1
-kind: Secret
-metadata:
-  name: <registry-credential-name>
-  namespace: cpaas-system
-  labels:
-    capi.cpaas.io/provider: registry-credential
-    cpaas.io/registry-credential-format: direct
-type: CloudCredential
-stringData:
-  registry: <registry-host>:<port>
-  username: <username>
-  password: <password>
-  config.json: |
-    {
-      "mode": "mirror",
-      "endpoints": ["<registry-host>:<port>"],
-      "ca": "<base64-encoded-ca>",
-      "tlsPolicy": {
-        "endpointInsecureSkipVerify": false
-      }
-    }
-```
-
-Keep the file private (`chmod 600 registry-credential.yaml`); it holds the password. Create the Secret on the `global` cluster, and then remove the file:
-
-```bash
-chmod 600 registry-credential.yaml
-ac config use-cluster global
-ac create -f registry-credential.yaml
-rm -f registry-credential.yaml
-```
-
-:::warning
-Do not create or update a credential Secret with `ac apply`: client-side apply stores every value of the manifest, including the password, in an annotation on the Secret. Base64 is an encoding, not protection.
-:::
-
-| Key | Required | Notes |
-| --- | --- | --- |
-| Namespace | Yes | Must be `cpaas-system`. |
-| Name | Yes | At most 63 characters. |
-| Type | Yes | `CloudCredential`. |
-| `capi.cpaas.io/provider` label | Yes | Must be `registry-credential`. `ac` rejects a Secret without this label. |
-| `cpaas.io/registry-credential-format` label | Yes | Must be `direct`. Without it, the platform expects the legacy encrypted format instead of the keys below. |
-| `registry` | Yes | `<host>[:<port>]` only. No scheme, no path, no trailing `/`. |
-| `username`, `password` | Together | Set both or neither. Omit both for an anonymous registry. Both are required with `config.json`. |
-| `config.json` | Only for a private CA | See the fields below. |
-
-The fields of `config.json`:
-
-| Field | Value |
-| --- | --- |
-| `mode` | `mirror`. |
-| `endpoints` | One entry, exactly the value of `registry`. |
-| `ca` | The output of `base64 -w0 <ca-file>`, not the PEM text. Omit it when `endpointInsecureSkipVerify` is `true`. |
-| `tlsPolicy.endpointInsecureSkipVerify` | `false` verifies the registry certificate against `ca`. `true` skips the verification. |
-
-Keep the other fields as shown. Put the account in `username` and `password`, not in `config.json`. `ac` does not check `config.json`: a mistake in it surfaces only while the cluster is being created.
+Create the credential as described in [Create a Registry Credential](/workload_clusters/how_to/create_registry_credential.mdx). Its data contains the registry address and, when the registry requires authentication, the username and password.
 
 ### Step 3 — Reference the Credential When You Create the Cluster \{#reference-the-credential}
 
@@ -180,7 +100,7 @@ cluster:
 `ac` checks the Secret before it applies anything. If a check fails, nothing is applied, and the error names the problem; see [Troubleshooting](#troubleshooting).
 
 :::warning
-The binding is read only when the cluster is created. Changing the `cpaas.io/registry-reference` label on an existing `Cluster` has no effect. To move an existing cluster to another registry, you must recreate the cluster.
+The credential binding is read only when the cluster is created. Changing the `cpaas.io/registry-reference` label on an existing `Cluster` has no effect. To use a different credential, recreate the cluster. Updating the address in the selected credential is supported.
 :::
 
 ### Step 4 — Verify the Binding \{#verify}
@@ -216,7 +136,7 @@ ac -n cpaas-system get registry cpaas-registry -o yaml
 ac config use-cluster global
 ```
 
-Continue when `spec.endpoints` lists the address in the Secret and, with a [private CA](#create-the-secret), `spec.tlsSecretRef.name` is `acp-registry-ca`.
+Continue when the Registry status is ready and the platform component images use the dedicated registry.
 
 ## Operate an Existing Binding \{#operate}
 
@@ -224,7 +144,7 @@ Continue when `spec.endpoints` lists the address in the Secret and, with a [priv
 | --- | --- | --- |
 | Rotate the registry password or switch to another account | Yes | Patch the Secret, as shown below. The platform propagates the change to every cluster that references it, without a cluster restart. |
 | Correct the registry address in a credential | Yes | Patch the Secret. Every cluster that references it is repointed: make sure that all of them reach the new address and that it holds the payload for each of their versions. |
-| Move an existing cluster to a different registry | No | Recreate the cluster with the intended reference. |
+| Change the registry credential selected when the cluster was created | No | Recreate the cluster with the intended credential. Updating the address in the selected credential is supported. |
 | Share one credential across clusters | Yes | Reference the same Secret from any number of clusters. |
 | Delete a credential | Only when unreferenced | The platform rejects the deletion while a cluster still references the Secret, and the error names those clusters. |
 
@@ -252,9 +172,9 @@ rm -f registry-credential-patch.yaml
 | Result | Action |
 | --- | --- |
 | `ac` stops with `Secret cpaas-system/public-registry-credential …: the workload cluster registry cannot be derived` (no `registrySecretRef` set) | Contact technical support. |
-| `ac` stops with `Secret cpaas-system/<registry-credential-name> does not exist …` | Create the Secret as in [Step 2](#create-the-secret), then run `create` again. |
-| `ac` stops with `… must have label capi.cpaas.io/provider="registry-credential" …` | Apply both labels as in [Step 2](#create-the-secret), then run `create` again. |
-| `ac` stops with `… has no "registry" key …`, `… has an invalid "registry" value …`, or `… keys "username" and "password" must either both be set or both be empty` | Correct the Secret as in [Step 2](#create-the-secret), then run `create` again. |
+| `ac` stops with `Secret cpaas-system/<registry-credential-name> does not exist …` | Create the Secret as in [Create a Registry Credential](/workload_clusters/how_to/create_registry_credential.mdx), then run `create` again. |
+| `ac` stops with `… must have label capi.cpaas.io/provider="registry-credential" …` | Apply both labels as in [Create a Registry Credential](/workload_clusters/how_to/create_registry_credential.mdx), then run `create` again. |
+| `ac` stops with `… has no "registry" key …`, `… has an invalid "registry" value …`, or `… keys "username" and "password" must either both be set or both be empty` | Correct the Secret as in [Create a Registry Credential](/workload_clusters/how_to/create_registry_credential.mdx), then run `create` again. |
 | `ac` stops with `cluster.registrySecretRef.namespace must be "cpaas-system" …` | Set `namespace: cpaas-system` in `install-config.yaml` and create the Secret there. |
 | The Secret is rejected on create or update | Set `registry`, and set `username` and `password` together or leave both out. |
 | The Secret is rejected with an unsupported-format message | Set `cpaas.io/registry-credential-format` to `direct`. |
@@ -262,4 +182,4 @@ rm -f registry-credential-patch.yaml
 | The control plane is ready, but platform Pods stay in `ImagePullBackOff` | Repeat the check in [Step 1](#prepare-the-registry) from a workload cluster node, confirm the registry contents, and confirm the credential in the Secret. |
 | Deleting a credential is rejected | Read the cluster names from the error. Delete those clusters, or recreate them against a different credential, before you delete this one. |
 | A new label value on an existing `Cluster` changes nothing | Recreate the cluster with the intended reference. |
-| Value changes to the Secret never reach the clusters, or the Secret can be deleted while clusters still use it | Apply the `capi.cpaas.io/provider: registry-credential` label. See [Step 2](#create-the-secret). |
+| Value changes to the Secret never reach the clusters, or the Secret can be deleted while clusters still use it | Apply the `capi.cpaas.io/provider: registry-credential` label. See [Create a Registry Credential](/workload_clusters/how_to/create_registry_credential.mdx). |
