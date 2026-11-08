@@ -8,164 +8,33 @@ queries:
   - deploy kubernetes on bare metal
   - baremetal cluster creation guide
   - ac adm alpha cluster create --provider baremetal
+  - bare metal workload cluster install-config.yaml fields
 ---
 
 # Create a Cluster on Bare Metal
-ACP CLI (ac) renders the cluster objects from one `install-config.yaml`, applies them to the `global` cluster, and the Bare Metal provider builds the cluster from the hosts in your pools. Before that, you register the hosts and collect them into one `MachineInventoryPool` per node group; `ac` does not do either. Every object lives in the `cpaas-system` namespace of the `global` cluster.
+ACP CLI (ac) renders the cluster objects from one `install-config.yaml` and applies them to the `global` cluster. The Bare Metal provider then builds the cluster from the hosts in your pools. First, collect available hosts into one `MachineInventoryPool` for each node group, because `ac` does not register hosts or create pools. All objects are in the `cpaas-system` namespace of the `global` cluster.
 
 ## Prerequisites
 
 - You meet the [Bare Metal prerequisites](./prerequisites.mdx).
-- `ac` is logged in to the platform as a platform administrator (`ac login https://<platform-address>`).
-- You chose the cluster name. It **must not** be `global` or start with `global-`. Use it as the prefix of the registration and the pools.
+- Enough [available hosts](./register_hosts.mdx#available-hosts) of the cluster's OS: one for each control plane replica and one for each worker replica.
+- The image catalog has a key for the Kubernetes version of the `global` cluster, for the architecture and OS of these hosts; see [Add the Image Catalog Keys](./prepare_os.mdx#add-versions-to-image-catalog).
+- `ac` is logged in to the platform as a platform administrator (`ac login https://<platform-address> --name <session-name>`).
+- You have chosen the cluster name. It **must not** be `global` or start with `global-`. Use it as the prefix of the pool names.
 
 | Placeholder | Value |
 |---|---|
 | `<cluster-name>` | The workload cluster name, later `cluster.clusterName`. |
-| `<registry-address>` | The `registry` key of `cpaas-system/public-registry-credential` on the `global` cluster. After `ac config use-cluster global`: `ac -n cpaas-system get secret public-registry-credential -o jsonpath='{.data.registry}' \| base64 -d` |
-| `<base-image-iso>` | `<registry-address>/tkestack/baremetal-base-image-iso:<os-image-tag>`, from [OS Images and Image Catalog](./prerequisites.mdx#os-images-and-image-catalog). |
-| `<install-device>` | The whole-disk target for `elemental install`. On multi-disk hosts that reuse one ISO, `/dev/elemental-install-target`; see [Select a Fixed System Disk](./reference/configure-fixed-install-disk.mdx). |
-| `<os-id>` | The OS identifier of the image that the registration installs: `alaudaos.m.55` for Alauda OS M55, `alaudaos.k.25` for Alauda OS KU. See [OS Image Keys per Architecture and OS](./prerequisites.mdx#catalog-key-format). |
 
 ## Procedure
 
-### 1. Create the Registration and the ISO \{#step-1-machineregistration-seedimage}
+### 1. Create the Pools \{#step-2-pools}
 
-Write a `MachineRegistration`, which describes the registration and the first-install configuration, and a `SeedImage`, which builds the ISO from `<base-image-iso>`. Take `<base-image-iso>` from the same OS archive as the `baremetal-base-image` in the image catalog.
+List the [available hosts](./register_hosts.mdx#available-hosts) with the command on that page, and pick the hosts of each node group from them. All hosts of a cluster run the same OS. Alauda OS M55 hosts are `amd64`. An Alauda OS KU cluster can mix `amd64` and `arm64` hosts, even within one pool.
 
-```yaml title="01-machineregistration-seedimage.yaml"
-apiVersion: elemental.cattle.io/v1beta1
-kind: MachineRegistration
-metadata:
-  name: <cluster-name>-registration
-  namespace: cpaas-system
-  labels:
-    app.kubernetes.io/part-of: cluster-api-provider-baremetal
-spec:
-  # ${...} placeholders are expanded by elemental-register from SMBIOS data.
-  machineName: "<cluster-name>-${System Information/UUID}"
-  machineInventoryLabels:
-    app.kubernetes.io/part-of: cluster-api-provider-baremetal
-    pool.baremetal.alauda.io/eligible: "true"
-    elemental.cattle.io/serial-number: "${System Information/Serial Number}"
-    # Architecture of the host, reported by elemental-register. Keep the value as is.
-    os.baremetal.alauda.io/arch: "${Runtime/Architecture}"
-    # OS identifier of the image this registration installs.
-    os.baremetal.alauda.io/id: <os-id>
-  machineInventoryAnnotations:
-    elemental.cattle.io/machine-uuid: "${System Information/UUID}"
-  config:
-    elemental:
-      install:
-        device: <install-device>
-        eject-cd: true
-        reboot: true
-        snapshotter:
-          type: btrfs
-          maxSnaps: 4
-      registration:
-        # Each host uses its hardware TPM when usable, otherwise an emulated one.
-        tpm-mode: auto
-        emulated-tpm-seed: -1
----
-apiVersion: elemental.cattle.io/v1beta1
-kind: SeedImage
-metadata:
-  name: <cluster-name>-registration-iso
-  namespace: cpaas-system
-  labels:
-    app.kubernetes.io/part-of: cluster-api-provider-baremetal
-spec:
-  type: iso
-  baseImage: <base-image-iso>
-  registrationRef:
-    apiVersion: elemental.cattle.io/v1beta1
-    kind: MachineRegistration
-    name: <cluster-name>-registration
-    namespace: cpaas-system
-  targetPlatform: linux/amd64
-  size: 20Gi
-  cleanupAfterMinutes: 120
-  cloud-config:
-    stages:
-      boot:
-        - name: "Size COS_STATE for reprovisioning"
-          files:
-            - path: /etc/elemental/config.d/partitions.yaml
-              permissions: 0644
-              content: |
-                install:
-                  partitions:
-                    state:
-                      size: 20480
-```
+Create one pool for the control plane and one pool for each worker node group. Two node groups cannot share a pool, and a `MachineInventory` must not appear in two active pools.
 
-- Keep `install.device`, `eject-cd: true`, and `reboot: true`: without a device, `elemental install` can pick the wrong disk, and without the other two a host can stay in the live environment.
-- Keep the `os.baremetal.alauda.io/arch` and `os.baremetal.alauda.io/id` labels in `machineInventoryLabels`: the provider uses them to find the image catalog key of each host; see [OS Image Keys per Architecture and OS](./prerequisites.mdx#catalog-key-format).
-- Do not annotate a workload `MachineRegistration` with `baremetal.cluster.io/system-agent-auth-scope: global`; that marks `global` hosts.
-- Do not add `/etc/resolv.conf` to `SeedImage.spec.cloud-config`. Put site-specific resolver configuration in `MachineRegistration.spec.config.cloud-config` only when first-boot registration needs it.
-
-#### Size COS_STATE \{#size-cos-state}
-
-Keep the `state` partition size of the `SeedImage` above, 20480 MiB. With the Elemental default of 8192 MiB, a later cluster upgrade fails with `no space left on device`, and the size cannot be changed after the host is installed.
-
-<Directive type="warning" title="Placement and stage both matter">
-  The fragment must sit in `SeedImage.spec.cloud-config` under `stages.boot`. In `MachineRegistration.spec.config.cloud-config`, or under any other stage, the partition stays at 8 GiB and nothing reports an error.
-</Directive>
-
-Check the first installed host before you boot the rest. On that host:
-
-```bash
-lsblk -o NAME,SIZE,LABEL | grep COS_STATE
-```
-
-Continue when `COS_STATE` is about 20G; otherwise fix the `SeedImage`, build the ISO again, and reinstall the host.
-
-### 2. Build the ISO and Boot the Hosts \{#build-iso}
-
-Run the following commands from a machine where `ac` is logged in to the platform:
-
-```bash
-ac config use-cluster global
-ac apply -f 01-machineregistration-seedimage.yaml
-ac -n cpaas-system wait --for=condition=SeedImageReady=True \
-  seedimage/<cluster-name>-registration-iso --timeout=30m
-ac -n cpaas-system get seedimage <cluster-name>-registration-iso \
-  -o jsonpath='{.status.conditions[?(@.type=="SeedImageReady")].reason}{"\n"}{.status.downloadURL}{"\n"}{.status.checksumURL}{"\n"}'
-```
-
-Continue only when the reason is `SeedImageBuildSuccess` and both URLs are non-empty. After `cleanupAfterMinutes`, the URLs are cleared while `SeedImageReady` can stay `True`; check the reason again before you download the ISO.
-
-Boot every host from the ISO. Each host registers as a `MachineInventory` and installs Alauda OS to disk. If the live ISO has no DHCP address, configure the network from the host console as in [Network Connectivity](./prerequisites.mdx#network-connectivity).
-
-### 3. Confirm the Registration \{#confirm-registration}
-
-```bash
-ac config use-cluster global
-ac -n cpaas-system get machineinventories.elemental.cattle.io \
-  -L os.baremetal.alauda.io/arch,os.baremetal.alauda.io/id
-```
-
-Use an inventory only when it:
-
-- Shows `Ready=True` and has a non-empty `status.plan.secretRef.name`.
-- Shows the `os.baremetal.alauda.io/arch` and `os.baremetal.alauda.io/id` labels that you set in the registration. A host without them is treated as `amd64` with Alauda OS M55.
-- Has a `spec.observedNetwork` that matches the host's expected NIC, when the install-time IP must survive reprovisions.
-- For managed data disks, runs an observer-capable OS image, reports a fresh `status.observedStorage`, and reaches `status.storage.phase=Prepared`.
-
-Record the exact `MachineInventory` names for the pools.
-
-### 4. Optional: Prepare Managed Data Disks \{#optional-prepare-managed-storage}
-
-Managed storage belongs to the long-lived `MachineInventory`, so configure it while the inventory is unallocated, before you add it to a pool. Follow [Manage Data Disks on Bare-Metal Hosts](../../../configure/nodes/alauda_os/manage-bare-metal-storage.mdx) to verify `elemental-storage-observer.service`, select each device by a stable ID with `Adopt` or `InitializeIfBlank`, patch the declaration with `storagectl`, and wait for `StoragePrepared=True/AllRequiredVolumesPrepared` and `status.storage.phase=Prepared`. Then return to [Create the Pools](#step-2-pools).
-
-Without managed disks, leave `spec.storage` absent or set `volumes: []`; the inventory converges to `Unmanaged` with `StoragePrepared=True/NoManagedVolumes`.
-
-### 5. Create the Pools \{#step-2-pools}
-
-Create one pool for the control plane and one for each worker node group; two node groups cannot share a pool, and a `MachineInventory` must not appear in two active pools.
-
-```yaml title="02-machineinventorypool.yaml"
+```yaml title="machineinventorypools.yaml"
 apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
 kind: MachineInventoryPool
 metadata:
@@ -196,19 +65,20 @@ spec:
 
 1. `clusterName`: the workload cluster this pool serves.
 2. `name`: the exact `MachineInventory` name.
-3. `hostname`: optional. Applied at reprovision; defaults to the inventory name.
+3. `hostname`: optional. The host gets this name each time it is reinstalled. Defaults to the inventory name.
 
 </Callouts>
 
 ```bash
 ac config use-cluster global
-ac apply -f 02-machineinventorypool.yaml
-ac -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io
+ac apply -f machineinventorypools.yaml
+ac -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io \
+  -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status,TOTAL:.status.total,AVAILABLE:.status.available'
 ```
 
-Continue when each pool reports `Ready=True` and `total` equals the number of listed inventories; otherwise read the pool's `MembersValid` condition and see [Provider Conditions](./troubleshooting.mdx#provider-conditions).
+Continue when each pool shows `READY` `True` and its `TOTAL` equals the number of inventories that it lists. Otherwise, read the `MembersValid` condition of the pool, and see [Provider Conditions](./troubleshooting.mdx#provider-conditions).
 
-Size each pool to at least the `replicas` of its node group: an upgrade replaces each node with a host from the same pool.
+Give each pool at least as many hosts as the `replicas` of its node group, because an upgrade replaces each node with a host from the same pool.
 
 #### Pool Capacity \{#worker-pool-capacity}
 
@@ -217,56 +87,66 @@ ac config use-cluster global
 ac -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io <cluster-name>-worker-pool
 ```
 
-`status.available` must be at least the target replica count. For more capacity, register more hosts, prepare any managed storage while each inventory is unallocated, and add their names to `spec.machineInventories`. A new host goes through the same first boot as the original nodes, so confirm its [network paths](./prerequisites.mdx#network-connectivity) and [clock](./prerequisites.mdx#host-time-synchronization) as well.
+`status.available` must be at least the target replica count. To add capacity, register more hosts as described in [Register Hosts](./register_hosts.mdx), and add the names of the available hosts to `spec.machineInventories`.
 
-### 6. Write `install-config.yaml` \{#write-install-config}
+### 2. Write `install-config.yaml` \{#write-install-config}
 
-Create an installation directory for the cluster and write `install-config.yaml` in it. `ac` writes `manifests/` and `logs/ac.log` next to it. The hosts supply the CPU, memory, network, and disks, so the node groups only name their pools.
+Create an installation directory for the cluster and write `install-config.yaml` in it. `ac` writes `manifests/` and `logs/ac.log` into the same directory.
 
-Copy the following template, fill in the placeholders, and delete the comment blocks you do not use; for the fields, see [Parameters](./reference/install-config-parameters.mdx).
+Copy the following template and fill in the placeholders. The numbered lines are specific to Bare Metal, and the table below the template describes them. For the other fields, see [Common `install-config.yaml` Fields](../reference.mdx#install-config). For the objects that `ac` renders from this file, see [Rendered Manifests](./reference/install-config-parameters.mdx).
 
 ```yaml title="install-config.yaml"
 cluster:
-  # Required: a DNS-1123 subdomain of at most 63 characters, not global and not starting with global-.
   clusterName: <cluster-name>
-  sshKeys:                                  # Required: the SSH public keys installed on every node.
+  sshKeys:
     - <ssh-public-key>
-  # Use the following block only for a registry other than the platform's. It requires platform v4.4.0 or later.
   # registrySecretRef:
-  #   name: <registry-secret-name>          # Required: at most 63 characters.
-  #   namespace: cpaas-system               # Default: cpaas-system, the only accepted value.
-  # encryptionProviderConfig: <encryption-key>  # Optional: the base64 of a 16, 24, or 32 byte aescbc key. Empty generates a key.
+  #   name: <registry-secret-name>
+  #   namespace: cpaas-system
+  # encryptionProviderConfig: <encryption-key>
+  ntpServers: []
   network:
-    podCIDR: 10.199.0.0/16                  # Default: 10.199.0.0/16.
-    serviceCIDR: 10.96.0.0/12               # Default: 10.96.0.0/12.
+    podCIDR: 10.199.0.0/16
+    serviceCIDR: 10.96.0.0/12
     kubeOVN:
-      joinCIDR: 100.64.0.0/16               # Default: 100.64.0.0/16. The Pod, Service, and join CIDRs must not overlap.
-    loadBalancer:                           # Required: the control plane endpoint.
-      type: internal                        # Default: internal. Set external for an external load balancer.
-      # Required: the VIP, or the load balancer address with type: external. An IPv4 address that is not a node address and is outside the CIDRs above.
+      joinCIDR: 100.64.0.0/16
+    loadBalancer: # [!code callout]
+      type: internal
       address: <control-plane-endpoint>
-      port: 6443                            # Default: 6443.
-      # Required with type: internal: 0 to 255, unique in the control plane Layer 2 domain. Delete this line with type: external.
+      port: 6443
       vrid: <vrid>
 
-# Required: the control plane node group. Do not add cpuCore, memoryGiB, network, disks, or hosts: the hosts supply them.
 controlPlane:
-  # Required: an odd number, 1 or 3 or more. A cluster with a single control plane node is for testing and cannot be upgraded.
   replicas: 3
   baremetal:
-    machineInventoryPool: <cluster-name>-control-plane-pool  # Required: the MachineInventoryPool this node group draws from.
+    machineInventoryPool: <cluster-name>-control-plane-pool # [!code callout]
 
-computes:                                   # Optional: the worker node groups. Delete this section to run on the control plane nodes alone.
-  - name: worker                            # Required: a DNS-1123 label, unique per group. control-plane is reserved.
-    replicas: 3                             # Required: the number of nodes in this group.
+computes:
+  - name: worker
+    replicas: 3
     baremetal:
-      # Required: the MachineInventoryPool of this node group. Each node group has its own pool.
-      machineInventoryPool: <cluster-name>-worker-pool
+      machineInventoryPool: <cluster-name>-worker-pool # [!code callout]
 ```
 
-You do not set the Kubernetes version: `ac` installs the latest version that the platform supports, and the image catalog must have its key for the architecture and OS of your hosts; see [Add Kubernetes Versions to the Image Catalog](./prerequisites.mdx#add-versions-to-image-catalog).
+<table className="field-table">
+  <thead>
+    <tr><th>#</th><th>Field</th><th>Description</th></tr>
+  </thead>
+  <tbody>
+    <tr><td></td><td><code>cluster.<wbr />network</code></td><td><span className="field-meta">Required · `object`</span>The cluster network.</td></tr>
+    <tr><td><Callout>1</Callout></td><td><code>cluster.<wbr />network.<wbr />loadBalancer</code></td><td><span className="field-meta">Required · `object`</span>The control plane endpoint. `type`: the kind of endpoint. `internal`, the default, is a [Self-built VIP](../../../install/alauda_os/prerequisites.mdx#self-built-vip) that the provider runs on the control plane nodes, on the NIC that holds the node address. `external` is your [own load balancer](../../../install/alauda_os/prerequisites.mdx#external-load-balancer); it must be ready before you run `create` and must forward the ports in [Workload Cluster VIP and Nodes](../../../install/prepare/communication_matrix.mdx#workload_cluster). `address`: the VIP or the frontend address of the load balancer. It must be an IPv4 address that is not a node address and is outside the Pod, Service, and join CIDRs. For `internal`, use an unused address in the control plane Layer 2 domain; see [Network Connectivity](./prerequisites.mdx#network-connectivity). `port`: default `6443`. `vrid`: required with `internal`. A VRRP router ID from 1 to 255 that is unique in the control plane Layer 2 domain. Delete it with `external`. `interface` and `vipMode` are not supported.</td></tr>
+    <tr><td></td><td><code>controlPlane</code></td><td><span className="field-meta">Required · `object`</span>The control plane node group.</td></tr>
+    <tr><td><Callout>2</Callout></td><td><code>controlPlane.<wbr />baremetal.<wbr />machineInventoryPool</code></td><td><span className="field-meta">Required · `string`</span>The `MachineInventoryPool` that this node group takes its hosts from, which you created in [Create the Pools](#step-2-pools). Two node groups cannot share a pool.</td></tr>
+    <tr><td></td><td><code>computes[]</code></td><td><span className="field-meta">Optional · `[]object` · Default: `[]`</span>The worker node groups, one entry per group.</td></tr>
+    <tr><td><Callout>3</Callout></td><td><code>computes[].<wbr />baremetal.<wbr />machineInventoryPool</code></td><td><span className="field-meta">Required · `string`</span>The `MachineInventoryPool` of this worker group. Each node group has its own pool.</td></tr>
+  </tbody>
+</table>
 
-### 7. Create the Cluster \{#create-with-ac}
+On Bare Metal, a node group takes only `replicas` and `baremetal.machineInventoryPool`, because the hosts determine the size, network, and disks of every node. If you set `cpuCore`, `memoryGiB`, `network`, `disks`, or `hosts` in a node group, or set `provider.baremetal` or `credentialRef`, you get an error that names the field.
+
+You do not set the Kubernetes version. `ac` installs the latest version that the platform supports. The image catalog must have the key of that version for the architecture and OS of your hosts; see [Add the Image Catalog Keys](./prepare_os.mdx#add-versions-to-image-catalog).
+
+### 3. Create the Cluster \{#create-with-ac}
 
 Run the following command from a machine where `ac` is logged in to the platform:
 
@@ -275,11 +155,11 @@ ac config use-cluster global
 ac adm alpha cluster create --dir <install-dir> --provider baremetal
 ```
 
-`ac` first checks the provider CRDs on the `global` cluster, the pools and their size, and the registry. If a check fails, nothing is changed and the error names the item. Make sure that each pool has enough available hosts; see [Pool Capacity](#worker-pool-capacity).
+`ac` first checks the provider CRDs on the `global` cluster, the pools and their size, and the registry. If a check fails, nothing is changed, and the error names the failed item. Make sure that each pool has enough `Available` inventories; see [Pool Capacity](#worker-pool-capacity).
 
-`create` returns once the objects are applied, and the cluster keeps building. Add `--wait` to wait until all stages are ready; `--timeout` (default `2h`) limits only the wait. To render without applying, run `ac adm alpha cluster manifests` with the same flags.
+`create` returns as soon as the objects are applied, and the cluster continues to build after that. To wait until all stages are ready, add `--wait`. `--timeout` (default `2h`) limits only the wait. To render the objects without applying them, run `ac adm alpha cluster manifests` with the same flags.
 
-### 8. Monitor the Creation \{#monitor-creation}
+### 4. Monitor the Creation \{#monitor-creation}
 
 ```bash
 ac config use-cluster global
@@ -289,7 +169,7 @@ ac adm alpha cluster wait-for install-complete --cluster <cluster-name>   # wait
 
 Continue when all four stages are ready; otherwise see [Troubleshooting](./troubleshooting.mdx).
 
-### 9. Verify the Cluster \{#verify-the-cluster}
+### 5. Verify the Cluster \{#verify-the-cluster}
 
 Run the following commands from a machine where `ac` is logged in to the platform:
 
@@ -307,22 +187,11 @@ Continue when every node is `Ready`; otherwise see [Troubleshooting](./troublesh
 ```bash
 ac config use-cluster global
 ac -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io
-ac -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io
+ac -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io \
+  -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status,TOTAL:.status.total,AVAILABLE:.status.available'
 ```
 
-Continue when every `BaremetalMachine` reports `Running` and each pool reports `Ready=True`; otherwise see [Provider Conditions](./troubleshooting.mdx#provider-conditions).
-
-#### Managed Data Disks \{#verify-managed-storage}
-
-**Applies to**: hosts with managed data disks. Skip it when no `MachineInventory` declares `spec.storage`.
-
-```bash
-ac config use-cluster global
-ac -n cpaas-system get machineinventories.elemental.cattle.io \
-  -o custom-columns='NAME:.metadata.name,PHASE:.status.storage.phase,PREPARED:.status.storage.conditions[?(@.type=="StoragePrepared")].status,ACTIVE:.status.storage.conditions[?(@.type=="StorageActive")].status'
-```
-
-Continue when every used inventory with managed volumes shows `Active`, `True`, and `True`; otherwise see [Provider Conditions](./troubleshooting.mdx#provider-conditions).
+Continue when every `BaremetalMachine` reports `Running` and each pool shows `READY` `True`; otherwise see [Provider Conditions](./troubleshooting.mdx#provider-conditions).
 
 #### Self-built VIP \{#verify-self-built-vip}
 
@@ -337,10 +206,10 @@ ac config use-cluster global
 
 Continue when an Alive Pod is `Running` on each control plane node; otherwise see [Provider Conditions](./troubleshooting.mdx#provider-conditions).
 
-On a control plane node of the cluster:
+Log in to a control plane node of the cluster as the `boot` user (`ssh boot@<control-plane-node-ip>`). Use the private key that matches an SSH public key in `cluster.sshKeys`. Run `curl` with `sudo`, because only `root` can read the cluster CA file:
 
 ```bash
-curl --cacert /etc/kubernetes/pki/ca.crt https://<vip>:6443/healthz
+sudo curl --cacert /etc/kubernetes/pki/ca.crt https://<vip>:6443/healthz
 ```
 
 Continue when it prints `ok`; otherwise see [Provider Conditions](./troubleshooting.mdx#provider-conditions).
@@ -349,23 +218,26 @@ Continue when it prints `ok`; otherwise see [Provider Conditions](./troubleshoot
 
 **Applies to**: `type: external`. Skip it for a Self-built VIP.
 
-On the load balancer, check the frontend and every backend against [the External Load Balancer requirements](../../../install/prepare/communication_matrix.mdx#external_load_balancer). Continue when every current control plane node is registered and HTTPS `/healthz` returns HTTP `200` for each backend; otherwise fix the load balancer configuration.
+On the load balancer, check the frontend and every backend against [the External Load Balancer requirements](../../../install/prepare/communication_matrix.mdx#external_load_balancer). Continue when every current control plane node is registered as a backend and HTTPS `/healthz` returns HTTP `200` on each backend. Otherwise, fix the load balancer configuration.
 
 ## Run `create` Again \{#rerun-create}
 
-`create` only creates the cluster. Do not run it on a cluster that is already created; to change a running cluster, see [Manage Nodes](../../../configure/nodes/alauda_os/bare-metal.mdx).
+`create` only creates a cluster. Do not run it on a cluster that already exists. To change a running cluster, see [Manage Nodes](../../../configure/nodes/alauda_os/bare-metal.mdx).
 
-If `create` stops before the cluster is created, run the same command again; completed work is skipped. Running `create` again on the same directory recreates objects that were deleted, except that `ac` creates Secrets once and then leaves them as they are. It does not overwrite a field changed with another tool: when the rendered value differs, `create` reports that the fields are owned by another manager and stops. Do not delete the object that the error names. When `manifests/` already exists, `create` asks whether to reuse it: press Enter to reuse it, or answer `n` to render again after you change `install-config.yaml`. When standard input is not a terminal, pass `--reuse-manifests=true` or `--reuse-manifests=false`. Reusing `manifests/` ignores `install-config.yaml` and skips every check.
+If `create` stops before the cluster is created, run the same command again. It skips the work that is already done. When you run `create` again on the same directory:
+
+- It recreates objects that were deleted. Secrets are the exception: `ac` creates them once and then leaves them as they are.
+- It does not overwrite a field that another tool changed. When the rendered value differs, `create` reports that the fields are owned by another manager and stops. Do not delete the object that the error names.
+- When `manifests/` already exists, `create` asks whether to reuse it. Press Enter to reuse it, or answer `n` to render again after you change `install-config.yaml`. When standard input is not a terminal, pass `--reuse-manifests=true` or `--reuse-manifests=false`. Reusing `manifests/` ignores `install-config.yaml` and skips every check.
 
 Do not edit the files in `manifests/`.
 
 :::warning
-Keep `<install-dir>/manifests/`, or set `cluster.encryptionProviderConfig`: a generated encryption key is kept only in `manifests/`. Rendering again without either generates a new key, and `manifests/` then no longer records the key the cluster uses.
+Keep `<install-dir>/manifests/`, or set `cluster.encryptionProviderConfig`. A generated encryption key is stored only in `manifests/`. If you render again without either of them, a new key is generated, and `manifests/` no longer records the key that the cluster uses.
 :::
 
 ## Next Steps
 
 - [Manage Nodes](../../../configure/nodes/alauda_os/bare-metal.mdx)
-- [Manage Data Disks](../../../configure/nodes/alauda_os/manage-bare-metal-storage.mdx)
 - [Upgrade Overview](../../../upgrade/overview.mdx#upgrade-steps-by-node-os)
 - [Delete the Cluster](./deleting.mdx)
