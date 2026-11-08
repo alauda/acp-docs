@@ -20,7 +20,7 @@ This document explains how to scale worker nodes up and down, replace specific m
 **Important Prerequisites**
 
 - The control plane must already be running. See [Create Cluster](../../../workload_clusters/alauda_os/bare-metal/create_cluster.mdx).
-- The worker `MachineInventoryPool` must have enough free inventories (`status.available`) for the nodes that you add, plus the extra hosts that the rollout strategy needs. Take the new hosts from the [available hosts](../../../workload_clusters/alauda_os/bare-metal/register_hosts.mdx#available-hosts) of the cluster's OS.
+- The worker `MachineInventoryPool` must have enough free inventories (`status.available`) for the nodes that you add. With `maxSurge: 0`, a rollout needs no extra hosts. Take the new hosts from the [available hosts](../../../workload_clusters/alauda_os/bare-metal/register_hosts.mdx#available-hosts) of the cluster's OS.
 - The target `Machine.spec.version` must be a key in the `elemental-image-catalog` ConfigMap for the architecture and OS of the hosts. If the key is missing, add it as described in [Add the Image Catalog Keys](../../../workload_clusters/alauda_os/bare-metal/prepare_os.mdx#add-versions-to-image-catalog).
 - To manage the nodes of the `global` cluster itself, first install the provider on `global`; see [Manage Nodes on Alauda OS Clusters](./index.mdx). Register a host for the `global` cluster as described in [Hosts for the global Cluster](../../../workload_clusters/alauda_os/bare-metal/register_hosts.mdx#global-hosts). The host goes into a pool that the `install-config.yaml` of the `global` cluster names.
 :::
@@ -293,7 +293,7 @@ In the following steps, `<group>` is an existing worker node group, and `<new-gr
    ```
 
    - `version` must be the version of the existing group. It must also be a key in the `elemental-image-catalog` ConfigMap.
-   - Keep `maxSurge: 0`, because a pool cannot provide more physical hosts than it holds.
+   - Keep `maxSurge: 0`. Each old node is then removed before its replacement is created, so a rollout needs no spare host. The platform upgrade does not start while a node group has another `maxSurge`. An unset value counts as `1`.
    - If a field in `<bootstrap-template-name>` differs from `spec.template.spec` above, use the value from that template instead. For example, on Kubernetes 1.35 and later, the kubelet configuration patch needs `"imagePullCredentialsVerificationPolicy": "NeverVerify"`. Earlier versions do not accept this field.
    - Leave out the fields that the provider sets itself: the hostname, `kubeletExtraArgs.provider-id`, and `nodeRegistration.criSocket`.
 
@@ -313,15 +313,33 @@ In the following steps, `<group>` is an existing worker node group, and `<new-gr
 
 If a `BaremetalMachine` ends up in `Failed`, the safest recovery is to delete the failed `Machine`. CAPI immediately creates a replacement `Machine`, because `replicas` did not change. The bare-metal provider then picks an `Available` inventory from the same pool. The replacement is usually a different `MachineInventory`. The provider does not guarantee that it picks the inventory that was just released.
 
-```bash
-ac config use-cluster global
-ac -n cpaas-system delete machine <machine-name>
-ac -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io -w
-```
+**Procedure**:
 
-For a node of the `global` cluster, the replacement host must be registered for the `global` cluster; see [Hosts for the global Cluster](../../../workload_clusters/alauda_os/bare-metal/register_hosts.mdx#global-hosts).
+1. **Record why the machine failed**
 
-Investigate the original failure separately. Read `BaremetalMachine.status.conditions` and `MachineInventory.status.plan.state`. Also read the `failed-output` key of the failing plan secret on the host that ran the plan. The common root causes are listed in [Common Failure Modes](#common-failure-modes) below.
+   Before you delete the `Machine`, record why it failed, because the deletion replaces the plan and clears its output.
+
+   - Read `BaremetalMachine.status.conditions` and `MachineInventory.status.plan.state`. The common root causes are listed in [Common Failure Modes](#common-failure-modes) below.
+   - The plan Secret is on the `global` cluster, in `cpaas-system`. Its name is in `BaremetalMachine.status.planSecretRef.name`. Its `failed-output` key holds output only on Alauda OS KU hosts. There, it holds the output of the check that the host has enough free disk space for the new OS image. The other steps save no output in the key. To read the key, run:
+
+     ```bash
+     ac config use-cluster global
+     ac -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io <baremetalmachine-name> -o jsonpath='{.status.planSecretRef.name}{"\n"}'
+     ac -n cpaas-system get secret <plan-secret> -o jsonpath='{.data.failed-output}' | base64 -d | gzip -dc | jq -r 'to_entries[] | .key + ": " + (.value | @base64d)'
+     ```
+
+     The first command prints `<plan-secret>`. `<baremetalmachine-name>` is the name in `spec.infrastructureRef.name` of the failed `Machine`. If `gzip` reports `unexpected end of file`, the key is empty. The command needs jq 1.6 or later. The second command prints the name of each step that saved its output, followed by that output.
+   - For any other failure, run `journalctl -u elemental-system-agent` on the host. It shows the output of each step of the plan.
+
+2. **Delete the failed `Machine`**
+
+   ```bash
+   ac config use-cluster global
+   ac -n cpaas-system delete machine <machine-name>
+   ac -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io -w
+   ```
+
+   For a node of the `global` cluster, the replacement host must be registered for the `global` cluster; see [Hosts for the global Cluster](../../../workload_clusters/alauda_os/bare-metal/register_hosts.mdx#global-hosts).
 
 ### Moving Workers to a Different Pool \{#moving-workers-to-a-different-pool}
 
@@ -442,7 +460,7 @@ The default plan secret of each inventory also carries `baremetal.alauda.io/plan
 | Bootstrap secret missing | `BootstrapReady=False / Reason=BootstrapWaiting` | `Machine.spec.bootstrap.dataSecretName` |
 | Catalog miss | `BaremetalMachine` stays `Allocated`, `ImageResolved=False / Reason=ImageCatalogMiss`, and no plan is written. It continues once the key is added | `elemental-image-catalog` keys. Add missing keys as described in [Add the Image Catalog Keys](../../../workload_clusters/alauda_os/bare-metal/prepare_os.mdx#add-versions-to-image-catalog) |
 | Registry annotation missing | `ImageResolved=False / Reason=ImageRegistryMissing` | `Cluster.metadata.annotations["cpaas.io/registry-address"]` |
-| Reprovision plan failed | `BaremetalMachine` `Failed`, inventory marked `Unavailable` | The `failed-output` key of the plan secret, the host serial console, and whether the platform registry is reachable |
-| Clean failed | Deletion blocked by finalizer; inventory marked `Unavailable` | `clean` plan output and host mounts |
+| Reprovision plan failed | `BaremetalMachine` `Failed`, inventory marked `Unavailable` | `BaremetalMachine.status.conditions`, `journalctl -u elemental-system-agent` on the host, the host serial console, and whether the platform registry is reachable. On Alauda OS KU hosts, also the `failed-output` key of the plan Secret, which holds the output of the disk space check; see [Replacing a Single Failed Node](#replacing-a-node). Read them before you delete the `Machine` |
+| Clean failed | Deletion blocked by finalizer; inventory marked `Unavailable` | The output of the `clean` plan in `journalctl -u elemental-system-agent` on the host, and the host mounts |
 
 For the complete state machine reference, see [Provider Overview → BaremetalMachine](../../../workload_clusters/alauda_os/bare-metal/overview.mdx#baremetalmachine).
