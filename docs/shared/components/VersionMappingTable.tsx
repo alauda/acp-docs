@@ -1,6 +1,5 @@
 // Renders the Version Mapping table of the Alauda OS Support Matrix.
-// The rows come from ../alauda-os/version-mapping.json: to add a release,
-// append an entry there (see ../alauda-os/README.md), not here.
+// The rows come from ../alauda-os/version-mapping.json: do not hand-edit; see ../alauda-os/README.md.
 import versionMapping from '../alauda-os/version-mapping.json' with { type: 'json' }
 
 export default function VersionMappingTable() {
