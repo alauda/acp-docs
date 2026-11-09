@@ -1,6 +1,5 @@
 // Alauda OS data and upgrade path planning shared by the doc components. The
-// release values come from ../alauda-os/version-mapping.json: to add a
-// release, append an entry there (see ../alauda-os/README.md), not here.
+// release values come from ../alauda-os/version-mapping.json: do not hand-edit; see ../alauda-os/README.md.
 import versionMapping from '../alauda-os/version-mapping.json' with { type: 'json' }
 
 export type Release = (typeof versionMapping.releases)[number]

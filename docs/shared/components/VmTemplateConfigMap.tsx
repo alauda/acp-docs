@@ -2,8 +2,7 @@
 // (Huawei DCS, VMware vSphere) or the images (Huawei Cloud Stack) of an
 // infrastructure provider on the global cluster, for one ACP version or for
 // every version on an upgrade path. The Kubernetes version and etcd tag of each ACP version come
-// from ../alauda-os/version-mapping.json: to add a release, append an entry
-// there (see ../alauda-os/README.md), not here.
+// from ../alauda-os/version-mapping.json: do not hand-edit; see ../alauda-os/README.md.
 import { useId, useState, type CSSProperties, type ReactNode } from 'react'
 
 import { OS_VARIANTS, planUpgradePath, upgradeReleases, type Release } from './alauda-os.js'
