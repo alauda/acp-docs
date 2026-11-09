@@ -4,8 +4,7 @@
 // upgrade path, to the image catalog on the global cluster, the values that
 // `ac` takes in install-config.yaml, and the registration and ISO of the hosts
 // of one OS and architecture. The Kubernetes version and etcd tag of each ACP
-// version come from ../alauda-os/version-mapping.json: to add a release,
-// append an entry there (see ../alauda-os/README.md), not here.
+// version come from ../alauda-os/version-mapping.json: do not hand-edit; see ../alauda-os/README.md.
 import { CodeBlockRuntime } from '@alauda/doom/theme'
 import { useId, useState, type CSSProperties, type ReactNode } from 'react'
 
