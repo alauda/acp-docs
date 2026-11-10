@@ -699,24 +699,25 @@ explicit `true`, including values created by earlier safety releases; review the
 enabling that schedule.
 
 > **Warning:** Jobs run `ac adm prune images --confirm=true` and delete data without an interactive
-> confirmation. A managed Registry also uses `--prune-registry=true` for targeted online HTTP
-> deletion of eligible references and blobs. This never runs full storage garbage collection or
-> executes commands in Registry Pods. Keep metadata and storage backups. Live reference checks
-> are not atomic with newly created references and do not detect consumers outside this cluster.
+> confirmation. A managed Registry also uses `--prune-registry=true` to unlink eligible references
+> and run Registry garbage collection in a verified Registry Pod through a scoped RoleBinding. Keep
+> metadata and storage backups. Live reference checks are not atomic with newly created references
+> and do not detect consumers outside this cluster.
 
-Ordinary online pruning requires a writable Registry and Image API, without a full maintenance
-window or read-only mode. Choose retention that covers image publication and deployment workflows.
+Scheduled online pruning with `--prune-registry=true` requires a writable Registry and Image API,
+without a full maintenance window or read-only mode. Choose retention that covers image publication
+and deployment workflows.
 Use the manual [repository exclusions](./managing_access_and_cleanup.mdx#prune-images) when consumers
 outside this cluster need protection; keep scheduled pruning suspended if its policy cannot retain
 those images.
 
 Before reconciling dependent resources, safety reconciliation suspends old job
 templates that do not meet the guarded modern command requirements. The condition `Scheduled=False`
-with reason `ScheduledGCUnsafe` describes that unsafe template. The replacement contains `--require-online-pruning=true`
-and selects modern mode. An older CLI rejects the flag before pruning; the flag also prevents
-selecting an incompatible Registry backend. After safe regeneration, the CronJob follows `spec.suspend`. Supported
-online templates are not suspended on every reconciliation. An explicit pause is applied before
-other resource prerequisites can fail.
+with reason `ScheduledGCUnsafe` describes that unsafe template. The replacement binds modern mode,
+the operand namespace, retention settings, and the verified internal Registry endpoint. It passes
+`--prune-registry=true` for a managed Registry and `--prune-registry=false` otherwise. After safe
+regeneration, the CronJob follows `spec.suspend`. Supported online templates are not suspended on
+every reconciliation. An explicit pause is applied before other resource prerequisites can fail.
 
 Temporarily suspend the schedule while reviewing or changing the policy:
 
@@ -793,11 +794,16 @@ role and binding:
 ```bash
 kubectl get clusterrole system:image-pruner -o yaml
 kubectl get clusterrolebinding image-registry-system-pruner -o yaml
+kubectl get clusterrole system:image-pruner-gc -o yaml
+kubectl -n cpaas-system get rolebinding image-registry-pruner-gc -o yaml
 ```
 
-The role must grant `get` on `configs` in `imageregistry.operator.alauda.io`, restricted to
-`resourceNames: [cluster]`. The binding must reference that role and the `pruner` ServiceAccount in
-the recorded operand namespace. Resolve any Operator reconciliation or installation issue, then
+The `system:image-pruner` role must grant `get` on `configs` in
+`imageregistry.operator.alauda.io`, restricted to `resourceNames: [cluster]`. The binding must
+reference that role and the `pruner` ServiceAccount in the recorded operand namespace. The
+`system:image-pruner-gc` role must grant `create` on `pods/exec`, `get` on the Registry Service, and
+`list` on `endpointslices`; its `image-registry-pruner-gc` RoleBinding must bind that role to the
+same `pruner` ServiceAccount in the recorded operand namespace. Resolve any Operator reconciliation or installation issue, then
 repeat the permission check. The CLI exits with
 `ac adm prune images requires platform-admin access to Registry Config/cluster` when this check is
 denied; do not edit the role reconciled by the Operator.
@@ -812,10 +818,10 @@ kubectl -n cpaas-system get cronjob image-pruner \
 ```
 
 Expected results while the reviewed policy is suspended: `False` with reason `Suspended`, a CronJob
-suspension value of `true`, and `--require-online-pruning=true` and `--confirm=true` in the command.
-A managed Registry also has `--prune-registry=true` and its bound Registry URL. When the Registry
-is `Removed` or `Unmanaged`, the Operator explicitly passes `--prune-registry=false` for metadata-only
-pruning. Those runs leave Registry manifest and layer references and blob data in place.
+suspension value of `true`, and `--confirm=true` in the command. A managed Registry also has
+`--prune-registry=true` and its bound Registry URL. When the Registry is `Removed` or `Unmanaged`,
+the Operator explicitly passes `--prune-registry=false` for metadata-only pruning. Those runs leave
+Registry manifest and layer references and blob data in place.
 
 Verify the generated mode:
 
@@ -824,9 +830,11 @@ kubectl -n cpaas-system get cronjob image-pruner \
   -o jsonpath='{.spec.jobTemplate.spec.template.spec.containers[0].env[?(@.name=="AC_IMAGE_REGISTRY_MODE")].value}{"\n"}'
 ```
 
-Expected result: `modern`. The scheduled `pruner` ServiceAccount does not need `pods/exec`
-permission, and the Operator-managed pruner role does not grant it. Resolve a remaining `ScheduledGCUnsafe` or degraded condition before
-enabling execution; do not edit the CronJob or remove the guard.
+Expected result: `modern`. The `system:image-pruner` role does not grant `pods/exec`; when online
+Registry cleanup is enabled, the separate `system:image-pruner-gc` ClusterRole is bound to the
+same ServiceAccount only in the operand namespace. That binding grants `pods/exec`, Service GET,
+and EndpointSlice LIST for the verified Registry target. Resolve a remaining `ScheduledGCUnsafe`
+or degraded condition before enabling execution; do not edit the CronJob or remove the guard.
 
 Enable the reviewed schedule through `ImagePruner/cluster`:
 
@@ -844,18 +852,28 @@ schedule; `Forbid` concurrency prevents overlapping scheduled Jobs, but does not
 pruning. Avoid overlapping manual and scheduled cleanup. Setting `spec.suspend: true` pauses future
 scheduled Jobs again.
 
-The `image-pruner-state` ConfigMap preserves unfinished online cleanup across Job restarts. Do not
-delete it to bypass a retry error. See [Prune images](./managing_access_and_cleanup.mdx#prune-images)
-for retry and metadata-only behavior. Full
+The Operator does not create or write an `image-pruner-state` ConfigMap. Existing objects with that
+name are retained and ignored. Job failures are retried by Kubernetes according to `backoffLimit`,
+and a retry rebuilds the current image and workload view. See [Prune images](./managing_access_and_cleanup.mdx#prune-images)
+for metadata-only behavior. The generated `--prune-registry=true` path includes Registry garbage
+collection in the same Job. The separate
 [Registry garbage collection](./managing_access_and_cleanup.mdx#run-registry-garbage-collection)
-is a separate maintenance operation requiring read-only mode and writer isolation; it is never
-part of scheduled pruning.
+command remains a maintenance operation requiring read-only mode and writer isolation.
 
-Optional `ImagePruner` fields include `successfulJobsHistoryLimit`, `failedJobsHistoryLimit`,
-`nodeSelector`, `tolerations`, and `affinity`. `ignoreInvalidImageReferences` sets
-`--ignore-invalid-refs`. `logLevel` maps `Normal`, `Debug`, `Trace`, and `TraceAll` to `--v=0`,
-`--v=4`, `--v=6`, and `--v=8`, respectively. An unsupported `logLevel` keeps the CronJob suspended
-until corrected.
+Other supported `ImagePruner` fields include:
+
+| Field | Effect |
+| --- | --- |
+| `dryRun` | Creates a scheduled preview that does not delete Image API metadata or Registry data. |
+| `timeZone` | Sets the CronJob time zone for `schedule`. |
+| `protectedRepositories` | Supplies regular expressions for repositories excluded from scheduled pruning. |
+| `backoffLimit`, `activeDeadlineSeconds`, `startingDeadlineSeconds` | Controls Job retries and execution deadlines; `backoffLimit` defaults to `0` and accepts `0` through `3`. |
+| `successfulJobsHistoryLimit`, `failedJobsHistoryLimit` | Controls retained completed and failed Jobs. |
+| `resources`, `nodeSelector`, `tolerations`, `affinity` | Controls pruner Pod resources and placement. |
+
+`ignoreInvalidImageReferences` sets `--ignore-invalid-refs`. `logLevel` maps `Normal`, `Debug`,
+`Trace`, and `TraceAll` to `--v=0`, `--v=4`, `--v=6`, and `--v=8`, respectively. The CRD rejects
+other values.
 
 ## Operate Storage
 
