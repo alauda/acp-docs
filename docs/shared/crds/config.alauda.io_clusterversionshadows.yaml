@@ -55,6 +55,24 @@ spec:
           spec:
             description: spec is the desired state of the cluster upgrade.
             properties:
+              capabilities:
+                description: capabilities selects the optional capabilities enabled
+                  for this cluster.
+                properties:
+                  additional:
+                    description: additional lists capabilities enabled on top of the
+                      baseline.
+                    items:
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: set
+                  baseline:
+                    description: |-
+                      baseline is the capability set to start from, expanded to the
+                      capabilities of that version. Defaults to vCurrent when unset.
+                    pattern: ^(None|vCurrent|v[0-9]+\.[0-9]+)$
+                    type: string
+                type: object
               desiredUpdate:
                 description: |-
                   desiredUpdate is an optional field that indicates the desired value of
@@ -116,6 +134,92 @@ spec:
                 minItems: 1
                 type: array
                 x-kubernetes-list-type: atomic
+              capabilities:
+                description: |-
+                  capabilities reports which capabilities are currently enabled for
+                  this cluster, as opposed to what the spec asked for.
+
+                  The enabled set only grows (ratchet); narrowing the spec does not
+                  remove already-enabled capabilities — they appear in implicitlyEnabled.
+                properties:
+                  enabled:
+                    description: |-
+                      enabled lists the capabilities in force. Only ever grows: it is the
+                      union of previously enabled, spec-selected, and upgrade-carried.
+                    items:
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: set
+                  implicitlyEnabled:
+                    description: |-
+                      implicitlyEnabled lists enabled capabilities the spec does not
+                      currently select — those retained by the ratchet. Makes the
+                      difference between spec-selected and ratchet-retained visible.
+                    items:
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: set
+                  known:
+                    description: |-
+                      known lists every capability the current payload defines. Bounds what
+                      enabled and implicitlyEnabled can contain.
+                    items:
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: set
+                type: object
+              capabilityActivationContext:
+                description: |-
+                  capabilityActivationContext records the identity (payload, registry,
+                  spec generation) a capability activation was committed against, plus
+                  the frozen resolved component set. A restart uses it to decide
+                  whether the enabled set in capabilities is current or must be
+                  recomputed.
+
+                  Written together with capabilities in a single status update.
+                  Not a capability-set carrier — capabilities remains the sole record
+                  of known/enabled/implicitlyEnabled.
+                properties:
+                  observedGeneration:
+                    description: |-
+                      observedGeneration is the metadata.generation the activation was
+                      computed against. A restart reuses the frozen set only when this
+                      equals the live metadata.generation.
+                    format: int64
+                    type: integer
+                  payloadDigest:
+                    description: |-
+                      payloadDigest is the immutable digest of the release payload the
+                      activation was committed for. A different digest means a different
+                      payload; the stored set must not be reused.
+                    type: string
+                  registryID:
+                    description: |-
+                      registryID is the capability registry identity
+                      (acp-capability-registry/v1@sha256:<64 lowercase hex>) validated at
+                      activation. Must equal this binary's compiled registry ID for the
+                      frozen set to be reused.
+                    pattern: ^acp-capability-registry/v1@sha256:[0-9a-f]{64}$
+                    type: string
+                  resolvedComponents:
+                    description: |-
+                      resolvedComponents is the frozen component set the activation
+                      resolved, in sorted order with duplicates removed. A restart adopts
+                      it instead of resolving again.
+
+                      Must be present and non-empty; a record missing it is malformed and
+                      must not be adopted.
+                    items:
+                      type: string
+                    minItems: 1
+                    type: array
+                    x-kubernetes-list-type: atomic
+                required:
+                - observedGeneration
+                - payloadDigest
+                - registryID
+                - resolvedComponents
+                type: object
               conditions:
                 description: |-
                   conditions provides information about the cluster version. The condition
@@ -184,6 +288,34 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              coreConvergedContext:
+                description: |-
+                  coreConvergedContext identifies what the CoreConverged condition
+                  describes: which release, payload digest, and component set the
+                  evaluation covered. Written atomically with the condition.
+
+                  Consumers gating a specific upgrade must compare these values to the
+                  expected target — a True left over from a previous target is stale.
+                properties:
+                  payloadDigest:
+                    description: |-
+                      payloadDigest is the immutable digest of the release payload the
+                      evaluation read.
+                    type: string
+                  releaseVersion:
+                    description: releaseVersion is the desired release the evaluation
+                      targeted.
+                    type: string
+                  resolvedComponents:
+                    description: |-
+                      resolvedComponents lists, in sorted order, the component names the
+                      evaluation covered. Stored as a plain list so consumers can compare
+                      directly without a canonical hashing scheme.
+                    items:
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: atomic
+                type: object
               current:
                 description: current is the currently applied release version and
                   image of the cluster.
@@ -228,6 +360,15 @@ spec:
                 - message: at least one of the fields in [image version] must be set
                   rule: '[has(self.image),has(self.version)].filter(x,x==true).size()
                     >= 1'
+              effectiveClusterType:
+                description: |-
+                  effectiveClusterType is the cluster type this cluster resolved to,
+                  and which the component set was computed for. Decided once and
+                  recorded; not re-derived on subsequent passes.
+                enum:
+                - global
+                - workload
+                type: string
               history:
                 description: |-
                   history contains a list of the most recent versions applied to the cluster.
@@ -367,6 +508,12 @@ spec:
                               type: string
                             type: array
                             x-kubernetes-list-type: set
+                          message:
+                            description: |-
+                              message is a human-readable explanation of the current phase, written
+                              by the CVO (e.g. why the operation is waiting). Empty when there is
+                              nothing to explain.
+                            type: string
                           moduleInfo:
                             description: moduleInfo is the backing ModuleInfo name
                               (if any).
