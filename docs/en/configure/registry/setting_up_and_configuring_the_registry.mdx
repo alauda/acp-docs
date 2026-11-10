@@ -22,13 +22,21 @@ The Operator is installed in `image-registry-system`, while the Registry operand
 `cpaas-system` by default. Confirm the operand namespace before running namespace-scoped commands:
 
 ```bash
-kubectl get configs.imageregistry.operator.alauda.io cluster \
-  -o jsonpath='{.metadata.annotations.imageregistry\.operator\.alauda\.io/operand-namespace}{"\n"}'
+REGISTRY_NAMESPACE="$(kubectl get configs.imageregistry.operator.alauda.io cluster \
+  -o jsonpath='{.metadata.annotations.imageregistry\.operator\.alauda\.io/operand-namespace}')" || exit 1
+test -n "$REGISTRY_NAMESPACE" || {
+  echo "The Registry operand namespace binding is missing." >&2
+  exit 1
+}
+printf 'Registry operand namespace: %s\n' "$REGISTRY_NAMESPACE"
 ```
 
-Replace `cpaas-system` in operand commands with the returned namespace when it differs. Storage
-Secrets, CA ConfigMaps, PVCs, and generated workloads belong in that namespace. Workload namespaces
+Replace `cpaas-system` in operand commands and namespaced YAML manifests with the returned namespace
+when it differs. Storage Secrets, CA ConfigMaps, PVCs, and generated workloads belong in that
+namespace. Workload namespaces
 such as `team-a` are separate; use the namespace whose image access or limits you are configuring.
+Run the discovery block first and keep `REGISTRY_NAMESPACE` in the same shell for later command
+blocks.
 
 ## Configure Registry Authentication
 
@@ -51,8 +59,15 @@ Verify the authentication settings and Registry rollout:
 ```bash
 kubectl get configs.imageregistry.operator.alauda.io cluster \
   -o jsonpath='{.spec.auth.oidc}{"\n"}'
-kubectl -n cpaas-system rollout status deployment/image-registry --timeout=300s
+kubectl -n "$REGISTRY_NAMESPACE" rollout status deployment/image-registry --timeout=300s
 ```
+
+Expected results:
+
+- `runtimeDiscovery` is `true`.
+- `ldapID` is the supplied identity provider ID when one was configured; otherwise it is absent.
+- The Registry rollout completes successfully. The effective configuration reports
+  `Available=True`, `Progressing=False`, and `Degraded=False`.
 
 ## Prepare Private Image Imports \{#prepare-private-image-imports}
 
@@ -69,7 +84,7 @@ is not sent with an import request.
 3. Verify the Secret metadata without displaying its credentials:
 
    ```bash
-   kubectl -n team-a get secret <source-pull-secret> \
+   kubectl -n team-a get secret '<source-pull-secret>' \
      -o go-template='Type: {{.type}}{{"\n"}}Credential entries: {{len .data}}{{"\n"}}Excluded from imports: {{with .metadata.annotations}}{{index . "alauda.io/image.excludeSecret"}}{{else}}false{{end}}{{"\n"}}'
    ```
 
@@ -162,7 +177,7 @@ Verify the configuration and rollout:
 
 ```bash
 kubectl get configs.imageregistry.operator.alauda.io cluster -o yaml
-kubectl -n cpaas-system rollout status deployment/image-registry --timeout=300s
+kubectl -n "$REGISTRY_NAMESPACE" rollout status deployment/image-registry --timeout=300s
 ```
 
 Expected results:
@@ -186,7 +201,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: registry-data
-  namespace: cpaas-system
+  namespace: <registry-operand-namespace>
 spec:
   accessModes:
     - ReadWriteOnce
@@ -198,6 +213,7 @@ spec:
 
 | Placeholder | Description |
 | --- | --- |
+| `<registry-operand-namespace>` | Namespace stored in `Config/cluster.metadata.annotations[imageregistry.operator.alauda.io/operand-namespace]`. Use the value of `REGISTRY_NAMESPACE`. |
 | `<storage-class-name>` | StorageClass that provisions the Registry PVC. Run `kubectl get storageclass` to list available values. For multi-replica Registry deployments, choose storage that supports the required access mode. |
 
 Apply the PVC:
@@ -245,9 +261,9 @@ kubectl patch configs.imageregistry.operator.alauda.io cluster \
 Verify the PVC, configuration, and rollout:
 
 ```bash
-kubectl -n cpaas-system get pvc registry-data
+kubectl -n "$REGISTRY_NAMESPACE" get pvc registry-data
 kubectl get configs.imageregistry.operator.alauda.io cluster -o yaml
-kubectl -n cpaas-system rollout status deployment/image-registry --timeout=300s
+kubectl -n "$REGISTRY_NAMESPACE" rollout status deployment/image-registry --timeout=300s
 ```
 
 Expected results:
@@ -264,8 +280,8 @@ and ensure that the directory is writable by the Registry container's configured
 The PVC must be `Bound` before activating the Registry. Inspect the volume and its node affinity:
 
 ```bash
-kubectl -n cpaas-system get pvc <claim-name> -o wide
-kubectl get pv <volume-name> -o yaml
+kubectl -n "$REGISTRY_NAMESPACE" get pvc '<claim-name>' -o wide
+kubectl get pv '<volume-name>' -o yaml
 ```
 
 | Placeholder | Description |
@@ -278,8 +294,8 @@ example claim. Keep `spec.replicas: 1` and `spec.rolloutStrategy: Recreate`. Ver
 Pod runs on the PV's node and that the Deployment rolls out successfully:
 
 ```bash
-kubectl -n cpaas-system get pods -l app.kubernetes.io/name=image-registry -o wide
-kubectl -n cpaas-system rollout status deployment/image-registry --timeout=300s
+kubectl -n "$REGISTRY_NAMESPACE" get pods -l app.kubernetes.io/name=image-registry -o wide
+kubectl -n "$REGISTRY_NAMESPACE" rollout status deployment/image-registry --timeout=300s
 ```
 
 The Config API has no separate `storage.hostPath` field. Node-local data is unavailable when its
@@ -294,9 +310,9 @@ node fails and does not follow a Pod to another node. Back up the data outside t
 Create the user-managed storage Secret before configuring `Config/cluster`. The Operator merges this Secret into the Registry private configuration:
 
 ```bash
-kubectl -n cpaas-system create secret generic image-registry-private-configuration-user \
-  --from-literal=REGISTRY_STORAGE_S3_ACCESSKEY=<access-key-id> \
-  --from-literal=REGISTRY_STORAGE_S3_SECRETKEY=<secret-access-key> \
+kubectl -n "$REGISTRY_NAMESPACE" create secret generic image-registry-private-configuration-user \
+  --from-literal=REGISTRY_STORAGE_S3_ACCESSKEY='<access-key-id>' \
+  --from-literal=REGISTRY_STORAGE_S3_SECRETKEY='<secret-access-key>' \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
@@ -308,9 +324,9 @@ kubectl -n cpaas-system create secret generic image-registry-private-configurati
 Verify the Secret without printing its contents:
 
 ```bash
-kubectl -n cpaas-system get secret image-registry-private-configuration-user \
+kubectl -n "$REGISTRY_NAMESPACE" get secret image-registry-private-configuration-user \
   -o jsonpath='{.type}{"\n"}'
-kubectl -n cpaas-system get secret image-registry-private-configuration-user \
+kubectl -n "$REGISTRY_NAMESPACE" get secret image-registry-private-configuration-user \
   -o go-template='Access key present: {{if index .data "REGISTRY_STORAGE_S3_ACCESSKEY"}}true{{else}}false{{end}}{{"\n"}}Secret key present: {{if index .data "REGISTRY_STORAGE_S3_SECRETKEY"}}true{{else}}false{{end}}{{"\n"}}'
 ```
 
@@ -325,7 +341,7 @@ Use `disableRedirect: true` when clients cannot reach the object storage endpoin
 If the S3 endpoint uses a private CA, create the referenced ConfigMap with the required key:
 
 ```bash
-kubectl -n cpaas-system create configmap <trusted-ca-configmap> \
+kubectl -n "$REGISTRY_NAMESPACE" create configmap '<trusted-ca-configmap>' \
   --from-file=ca-bundle.crt=/path/to/ca-bundle.crt \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
@@ -333,7 +349,7 @@ kubectl -n cpaas-system create configmap <trusted-ca-configmap> \
 Verify the ConfigMap key without displaying the certificate:
 
 ```bash
-kubectl -n cpaas-system get configmap <trusted-ca-configmap> \
+kubectl -n "$REGISTRY_NAMESPACE" get configmap '<trusted-ca-configmap>' \
   -o jsonpath='{.data.ca-bundle\.crt}' | wc -c
 ```
 
@@ -386,8 +402,8 @@ Verify the configuration and rollout:
 
 ```bash
 kubectl get configs.imageregistry.operator.alauda.io cluster -o yaml
-kubectl -n cpaas-system rollout status deployment/image-registry --timeout=300s
-kubectl -n cpaas-system logs deployment/image-registry -c registry --tail=80
+kubectl -n "$REGISTRY_NAMESPACE" rollout status deployment/image-registry --timeout=300s
+kubectl -n "$REGISTRY_NAMESPACE" logs deployment/image-registry -c registry --tail=80
 ```
 
 Expected results:
@@ -425,7 +441,7 @@ Verify request handling settings and the rollout:
 
 ```bash
 kubectl get configs.imageregistry.operator.alauda.io cluster -o yaml
-kubectl -n cpaas-system rollout status deployment/image-registry --timeout=300s
+kubectl -n "$REGISTRY_NAMESPACE" rollout status deployment/image-registry --timeout=300s
 ```
 
 Expected results:
@@ -450,7 +466,7 @@ For example, explicitly configure the default values:
 kubectl patch configs.imageregistry.operator.alauda.io cluster \
   --type=merge \
   -p '{"spec":{"http":{"readTimeout":"30m","writeTimeout":"30m","idleTimeout":"60s"}}}'
-kubectl -n cpaas-system rollout status deployment/image-registry --timeout=300s
+kubectl -n "$REGISTRY_NAMESPACE" rollout status deployment/image-registry --timeout=300s
 kubectl get configs.imageregistry.operator.alauda.io cluster \
   -o jsonpath='{.spec.http}{"\n"}'
 ```
@@ -486,13 +502,13 @@ kubectl wait configs.imageregistry.operator.alauda.io/cluster \
   --for=condition=Degraded=false --timeout=300s || exit 1
 kubectl wait configs.imageregistry.operator.alauda.io/cluster \
   --for=condition=Progressing=false --timeout=300s || exit 1
-REGISTRY_TEMPLATE_READ_ONLY="$(kubectl -n cpaas-system get deployment image-registry \
+REGISTRY_TEMPLATE_READ_ONLY="$(kubectl -n "$REGISTRY_NAMESPACE" get deployment image-registry \
   -o jsonpath='{.spec.template.spec.containers[?(@.name=="registry")].env[?(@.name=="REGISTRY_STORAGE_MAINTENANCE_READONLY")].value}')" || exit 1
 test "$REGISTRY_TEMPLATE_READ_ONLY" = '{enabled: true}' || {
   echo "The Registry Pod template has not enabled read-only mode." >&2
   exit 1
 }
-kubectl -n cpaas-system rollout status deployment/image-registry --timeout=300s || exit 1
+kubectl -n "$REGISTRY_NAMESPACE" rollout status deployment/image-registry --timeout=300s || exit 1
 kubectl get configs.imageregistry.operator.alauda.io cluster \
   -o jsonpath='{.spec.readOnly}{"\n"}'
 ```
@@ -502,7 +518,7 @@ read-only rejections. The Operator applies the Registry setting through a Pod ro
 old Deployment or the desired Config field alone does not establish readiness. Check every Registry Pod:
 
 ```bash
-kubectl -n cpaas-system get pods -l app.kubernetes.io/name=image-registry \
+kubectl -n "$REGISTRY_NAMESPACE" get pods -l app.kubernetes.io/name=image-registry \
   -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.deletionTimestamp}{"\t"}{.spec.containers[?(@.name=="registry")].env[?(@.name=="REGISTRY_STORAGE_MAINTENANCE_READONLY")].value}{"\n"}{end}'
 ```
 
@@ -523,13 +539,13 @@ kubectl wait configs.imageregistry.operator.alauda.io/cluster \
   --for=condition=Degraded=false --timeout=300s || exit 1
 kubectl wait configs.imageregistry.operator.alauda.io/cluster \
   --for=condition=Progressing=false --timeout=300s || exit 1
-REGISTRY_TEMPLATE_READ_ONLY="$(kubectl -n cpaas-system get deployment image-registry \
+REGISTRY_TEMPLATE_READ_ONLY="$(kubectl -n "$REGISTRY_NAMESPACE" get deployment image-registry \
   -o jsonpath='{.spec.template.spec.containers[?(@.name=="registry")].env[?(@.name=="REGISTRY_STORAGE_MAINTENANCE_READONLY")].value}')" || exit 1
 test -z "$REGISTRY_TEMPLATE_READ_ONLY" || {
   echo "The Registry Pod template is still read-only." >&2
   exit 1
 }
-kubectl -n cpaas-system rollout status deployment/image-registry --timeout=300s || exit 1
+kubectl -n "$REGISTRY_NAMESPACE" rollout status deployment/image-registry --timeout=300s || exit 1
 ```
 
 Repeat the Pod check above. Before resuming writers or pruning, Pods must be present, the deletion
@@ -589,10 +605,10 @@ The controller reconciles pull credentials asynchronously. Verify the managed Ro
 ServiceAccount after the controller has had time to reconcile:
 
 ```bash
-kubectl -n <workload-namespace> get rolebinding image-registry-system-image-pullers -o yaml
-kubectl -n <workload-namespace> get serviceaccount default \
+kubectl -n '<workload-namespace>' get rolebinding image-registry-system-image-pullers -o yaml
+kubectl -n '<workload-namespace>' get serviceaccount default \
   -o jsonpath='{.imagePullSecrets[*].name}{"\n"}'
-kubectl -n <workload-namespace> get secret \
+kubectl -n '<workload-namespace>' get secret \
   -l imageregistry.operator.alauda.io/managed-pull-secret=true -o name
 ```
 
@@ -693,16 +709,21 @@ Its defaults are:
 | Suspended | `false` |
 | Tag revisions to retain | `3` |
 | Minimum age | `60m` |
+| Starting deadline | `3600s` |
+| Successful and failed Job history | `3` each |
+| Ignore invalid image references | `true` on the Operator-created initial resource |
 
 The Operator honors explicit `spec.suspend: true` and `false`. Upgrades preserve an existing
 explicit `true`, including values created by earlier safety releases; review the policy before
 enabling that schedule.
 
-> **Warning:** Jobs run `ac adm prune images --confirm=true` and delete data without an interactive
-> confirmation. A managed Registry also uses `--prune-registry=true` to unlink eligible references
-> and run Registry garbage collection in a verified Registry Pod through a scoped RoleBinding. Keep
-> metadata and storage backups. Live reference checks are not atomic with newly created references
-> and do not detect consumers outside this cluster.
+> **Warning:** When `ImagePruner.spec.dryRun` is `false`, Jobs run
+> `ac adm prune images --confirm=true` and delete data without an interactive confirmation. When
+> `dryRun` is `true`, the generated command uses `--confirm=false` and previews the same policy.
+> A managed Registry also uses `--prune-registry=true` to unlink eligible references and run
+> Registry garbage collection in a verified Registry Pod. Keep metadata and storage backups. Live
+> reference checks are not atomic with newly created references and do not detect consumers outside
+> this cluster.
 
 Scheduled online pruning with `--prune-registry=true` requires a writable Registry and Image API,
 without a full maintenance window or read-only mode. Choose retention that covers image publication
@@ -724,9 +745,9 @@ Temporarily suspend the schedule while reviewing or changing the policy:
 ```bash
 kubectl patch imagepruners.imageregistry.operator.alauda.io cluster \
   --type=merge -p '{"spec":{"suspend":true}}'
-kubectl -n cpaas-system get cronjob image-pruner \
+kubectl -n "$REGISTRY_NAMESPACE" get cronjob image-pruner \
   -o jsonpath='{.spec.suspend}{"\n"}'
-kubectl -n cpaas-system get jobs -l created-by=image-pruner
+kubectl -n "$REGISTRY_NAMESPACE" get jobs -l created-by=image-pruner
 ```
 
 Wait until the CronJob reports `true`. Suspension prevents new scheduled Jobs; it does not stop a
@@ -742,15 +763,17 @@ metadata:
 spec:
   schedule: "0 0 * * *"
   suspend: true
+  dryRun: false
   keepTagRevisions: 3
   keepYoungerThanDuration: 60m
+  ignoreInvalidImageReferences: true
   resources:
     requests:
-      cpu: 500m
-      memory: 500Mi
+      cpu: "1"
+      memory: 2Gi
     limits:
-      cpu: 500m
-      memory: 500Mi
+      cpu: "1"
+      memory: 2Gi
 ```
 
 Apply the configuration:
@@ -763,13 +786,21 @@ Verify the pruner resource and rendered CronJob:
 
 ```bash
 kubectl get imagepruners.imageregistry.operator.alauda.io cluster -o yaml
-kubectl -n cpaas-system get cronjob image-pruner
+kubectl -n "$REGISTRY_NAMESPACE" get cronjob image-pruner
+SERVICE_CA="$(kubectl -n "$REGISTRY_NAMESPACE" get configmap serviceca \
+  -o jsonpath='{.data.service-ca\.crt}')" || exit 1
+test -n "$SERVICE_CA" || {
+  echo "The serviceca ConfigMap does not contain service-ca.crt." >&2
+  exit 1
+}
+printf '%s\n' "$SERVICE_CA" | wc -c
 ```
 
 Expected results:
 
 - `ImagePruner/cluster` contains the configured schedule and retention policy.
 - The rendered `image-pruner` CronJob remains suspended in the Registry operand namespace.
+- The `serviceca` ConfigMap contains a non-empty `service-ca.crt` bundle for the pruner Pod.
 
 The Operator grants the `pruner` ServiceAccount permission to read `Config/cluster` through the
 `system:image-pruner` ClusterRole and the `image-registry-system-pruner` ClusterRoleBinding. The
@@ -778,13 +809,13 @@ Registry configuration. The CLI checks this permission before scanning.
 
 Before enabling the schedule, verify the ServiceAccount's effective permission.
 Run this check as a cluster administrator who can impersonate ServiceAccounts and their groups.
-Replace `cpaas-system` with the recorded operand namespace when it differs:
+The following commands use the recorded operand namespace through `REGISTRY_NAMESPACE`:
 
 ```bash
 kubectl auth can-i get configs.imageregistry.operator.alauda.io/cluster \
-  --as=system:serviceaccount:cpaas-system:pruner \
+  --as=system:serviceaccount:"$REGISTRY_NAMESPACE":pruner \
   --as-group=system:serviceaccounts \
-  --as-group=system:serviceaccounts:cpaas-system \
+  --as-group=system:serviceaccounts:"$REGISTRY_NAMESPACE" \
   --as-group=system:authenticated
 ```
 
@@ -795,16 +826,25 @@ role and binding:
 kubectl get clusterrole system:image-pruner -o yaml
 kubectl get clusterrolebinding image-registry-system-pruner -o yaml
 kubectl get clusterrole system:image-pruner-gc -o yaml
-kubectl -n cpaas-system get rolebinding image-registry-pruner-gc -o yaml
+kubectl -n "$REGISTRY_NAMESPACE" get rolebinding image-registry-pruner-gc -o yaml
+kubectl auth can-i create pods/exec -n "$REGISTRY_NAMESPACE" \
+  --as=system:serviceaccount:"$REGISTRY_NAMESPACE":pruner
+kubectl auth can-i get service/image-registry -n "$REGISTRY_NAMESPACE" \
+  --as=system:serviceaccount:"$REGISTRY_NAMESPACE":pruner
+kubectl auth can-i list endpointslices.discovery.k8s.io -n "$REGISTRY_NAMESPACE" \
+  --as=system:serviceaccount:"$REGISTRY_NAMESPACE":pruner
 ```
 
 The `system:image-pruner` role must grant `get` on `configs` in
 `imageregistry.operator.alauda.io`, restricted to `resourceNames: [cluster]`. The binding must
 reference that role and the `pruner` ServiceAccount in the recorded operand namespace. The
-`system:image-pruner-gc` role must grant `create` on `pods/exec`, `get` on the Registry Service, and
-`list` on `endpointslices`; its `image-registry-pruner-gc` RoleBinding must bind that role to the
-same `pruner` ServiceAccount in the recorded operand namespace. Resolve any Operator reconciliation or installation issue, then
-repeat the permission check. The CLI exits with
+`system:image-pruner-gc` role must grant `create` on `pods/exec`, `get` on Services, and `list` on
+`endpointslices`; its `image-registry-pruner-gc` RoleBinding must bind that role to the same
+`pruner` ServiceAccount in the recorded operand namespace. This binding is namespace-scoped, but
+its rules are not restricted by `resourceNames`; the CLI must validate the Registry Service
+selector, Ready EndpointSlice, and Pod before executing GC. The three `kubectl auth can-i` checks
+must return `yes`. Resolve any Operator reconciliation or installation issue, then repeat the
+permission check. The CLI exits with
 `ac adm prune images requires platform-admin access to Registry Config/cluster` when this check is
 denied; do not edit the role reconciled by the Operator.
 
@@ -813,20 +853,25 @@ Inspect the suspension reason and rendered command:
 ```bash
 kubectl get imagepruners.imageregistry.operator.alauda.io cluster \
   -o jsonpath='{range .status.conditions[?(@.type=="Scheduled")]}{.status}{"\t"}{.reason}{"\n"}{end}'
-kubectl -n cpaas-system get cronjob image-pruner \
+kubectl -n "$REGISTRY_NAMESPACE" get cronjob image-pruner \
   -o jsonpath='{.spec.suspend}{"\n"}{.spec.jobTemplate.spec.template.spec.containers[0].args}{"\n"}'
+kubectl -n "$REGISTRY_NAMESPACE" get cronjob image-pruner \
+  -o jsonpath='startingDeadline={.spec.startingDeadlineSeconds} successfulHistory={.spec.successfulJobsHistoryLimit} failedHistory={.spec.failedJobsHistoryLimit}{"\n"}'
 ```
 
 Expected results while the reviewed policy is suspended: `False` with reason `Suspended`, a CronJob
-suspension value of `true`, and `--confirm=true` in the command. A managed Registry also has
+suspension value of `true`, and `--confirm=true` for the sample `dryRun: false` policy. If
+`dryRun: true` is configured, the rendered command must contain `--confirm=false`. A managed Registry also has
 `--prune-registry=true` and its bound Registry URL. When the Registry is `Removed` or `Unmanaged`,
 the Operator explicitly passes `--prune-registry=false` for metadata-only pruning. Those runs leave
 Registry manifest and layer references and blob data in place.
+The rendered CronJob should report `startingDeadline=3600`, `successfulHistory=3`, and
+`failedHistory=3` when these fields were not customized.
 
 Verify the generated mode:
 
 ```bash
-kubectl -n cpaas-system get cronjob image-pruner \
+kubectl -n "$REGISTRY_NAMESPACE" get cronjob image-pruner \
   -o jsonpath='{.spec.jobTemplate.spec.template.spec.containers[0].env[?(@.name=="AC_IMAGE_REGISTRY_MODE")].value}{"\n"}'
 ```
 
@@ -841,7 +886,7 @@ Enable the reviewed schedule through `ImagePruner/cluster`:
 ```bash
 kubectl patch imagepruners.imageregistry.operator.alauda.io cluster \
   --type=merge -p '{"spec":{"suspend":false}}'
-kubectl -n cpaas-system wait cronjob/image-pruner \
+kubectl -n "$REGISTRY_NAMESPACE" wait cronjob/image-pruner \
   --for=jsonpath='{.spec.suspend}'=false --timeout=300s
 kubectl get imagepruners.imageregistry.operator.alauda.io cluster \
   -o jsonpath='{range .status.conditions[?(@.type=="Scheduled")]}{.status}{"\t"}{.reason}{"\n"}{end}'
@@ -882,8 +927,8 @@ For PVC-backed Registry storage:
 ```bash
 kubectl get configs.imageregistry.operator.alauda.io cluster \
   -o jsonpath='{.spec.storage.pvc.claim}{"\n"}'
-kubectl -n cpaas-system get pvc
-kubectl -n cpaas-system describe pvc <claim-name>
+kubectl -n "$REGISTRY_NAMESPACE" get pvc
+kubectl -n "$REGISTRY_NAMESPACE" describe pvc '<claim-name>'
 kubectl get pv
 ```
 

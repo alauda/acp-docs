@@ -61,6 +61,11 @@ stored in the kubeconfig cluster entry used by the current context, so every con
 the same cluster shares it. The `AC_IMAGE_REGISTRY_MODE` environment variable can override it for a
 command invocation.
 
+The Operator normally binds Registry operand resources to `cpaas-system` and records that binding
+on `Config/cluster`. The CLI has an `image-registry-system` built-in fallback for modern discovery
+when the binding cannot be read; treat the recorded `Config/cluster` annotation or an explicit
+`--registry-url` as authoritative, especially for confirmed storage cleanup and custom installations.
+
 Administrative usage reporting and cleanup are documented in
 [Managing access and cleanup](../../configure/registry/managing_access_and_cleanup.mdx). For stored
 signature claims, see [Check recorded signature identity](../../configure/registry/managing_access_and_cleanup.mdx#verify-image-signatures).
@@ -114,6 +119,14 @@ The examples in this section use `team-a` explicitly. Create an empty ImageStrea
 ```bash
 ac create imagestream demo -n team-a
 ```
+
+Verify the stream:
+
+```bash
+ac get imagestreams demo -n team-a -o yaml
+```
+
+Expected result: `ImageStream/demo` exists in `team-a`.
 
 Add `--lookup-local` when creating the stream to enable local image lookup. To change an existing
 stream, use `ac set image-lookup` as shown below.
@@ -173,7 +186,9 @@ Common import options:
 | `--import-mode=PreserveOriginal` | Preserve the source multi-architecture manifest list or image index and import its child manifests. |
 | `-o json\|yaml` | Print import results in a structured format. |
 
-Import failures return a nonzero exit status in every output format, including JSON and YAML.
+Import failures return a nonzero exit status after the result is rendered in every output format,
+including JSON and YAML. Automation can inspect the returned `status` fields for detail, while the
+process exit status is the reliable failure signal.
 
 Importing records metadata without eagerly copying image layers. With `source` reference policy,
 clients pull from the source registry and need access to it. With `local` policy, clients use the
@@ -202,11 +217,15 @@ ac tag source.example.com/source-team/source-app:1.0 demo:latest -n team-a
 ```
 
 To pin an external manifest or image index by digest, replace `<digest>` with its hash from the
-source registry. Preserve the original index when the source contains multiple platforms:
+source registry. Use an import to create the destination tag and preserve the original index when
+the source contains multiple platforms:
 
 ```bash
-ac tag source.example.com/source-team/source-app@sha256:<digest> demo:fixed \
-  --import-mode=PreserveOriginal -n team-a
+ac import-image demo:fixed \
+  --from='source.example.com/source-team/source-app@sha256:<digest>' \
+  --import-mode=PreserveOriginal \
+  -n team-a \
+  --confirm
 ac get imagestreamtags demo:fixed -n team-a -o yaml
 ```
 
@@ -225,6 +244,15 @@ Use `--alias` to link tags inside the same ImageStream:
 ```bash
 ac tag --source=imagestreamtag --alias team-a/demo:stable team-a/demo:latest
 ```
+
+Verify the alias relationship:
+
+```bash
+ac get imagestreamtags demo:latest -n team-a -o yaml
+```
+
+Expected result: the destination tag records the source tag relationship and resolves to the
+source image.
 
 `--alias` initially copies the source image and retains a reference to the source tag. A Registry
 push, import, or retag that changes the source also updates its direct aliases in the same
@@ -292,7 +320,7 @@ ac set image deployment/my-app app=team-a/demo:latest --source=imagestreamtag -n
 Set a workload image from an ImageStreamImage digest:
 
 ```bash
-ac set image deployment/my-app app=team-a/demo@sha256:<digest> \
+ac set image deployment/my-app 'app=team-a/demo@sha256:<digest>' \
   --source=imagestreamimage -n team-a
 ```
 
@@ -312,10 +340,9 @@ Expected result:
 
 `ac get imagestreams`, `ac get imagestreamtags`, and `ac get imagestreamimages` read the Image API.
 `ac get images` is a compatibility command: in `modern` mode it normally reads the Registry catalog
-over HTTPS. Its endpoint is the host recorded in `Config/cluster` status, then a configured
-`spec.routes[]` hostname, then a `spec.imagePullSecret.additionalRegistryHosts` entry, then the
-internal Service address. The client must be able to reach that endpoint, so from outside the
-cluster pass the external Ingress host explicitly:
+over HTTPS. Its endpoint is selected from the host recorded in `Config/cluster` status, a configured
+`spec.routes[]` hostname, or the internal Service address. The client must be able to reach that
+endpoint, so from outside the cluster pass the external Ingress host explicitly:
 
 ```bash
 ac get images -n team-a --registry-url=https://registry.example.com
@@ -347,7 +374,7 @@ Show ImageStreamImage metadata by digest. Your account needs `get` permission on
 and `imagestreamimages` in `team-a`; this query does not require cluster-scoped ImageDigest access:
 
 ```bash
-ac get imagestreamimages demo@sha256:<digest> -n team-a -o yaml
+ac get imagestreamimages 'demo@sha256:<digest>' -n team-a -o yaml
 ```
 
 List repository and tag references through the compatibility command:
@@ -422,6 +449,26 @@ ac delete images \
   --confirm
 ```
 
+Verify that both ImageStreamTag references are absent:
+
+```bash
+for tag in demo:old api:canary; do
+  result="$(kubectl get imagestreamtags.image.alauda.io "$tag" -n team-a \
+    --ignore-not-found -o name)" || {
+    echo "Could not verify ImageStreamTag team-a/$tag because the API request failed." >&2
+    exit 1
+  }
+  if [ -n "$result" ]; then
+    echo "ImageStreamTag team-a/$tag still exists" >&2
+    exit 1
+  fi
+done
+echo 'Deleted ImageStreamTags are no longer returned.'
+```
+
+Expected result: the loop completes successfully and prints the confirmation message. A missing
+ImageStreamTag is expected after deletion; storage reclamation is a separate Registry cleanup task.
+
 Deleting image references does not necessarily release blob storage immediately. Ask a Registry
 administrator to [prune images and reclaim storage](../../configure/registry/managing_access_and_cleanup.mdx#prune-images)
 when needed.
@@ -432,9 +479,22 @@ remove multiple tags that share the digest in the same repository; see
 
 ## Work with OCI Images Directly \{#work-with-oci-images-directly}
 
-These commands read and write registries directly. They use `REGISTRY_AUTH_FILE` or the explicit
-`--registry-config` path. For private source images, that file must also contain credentials for
-the source host; logging in to the destination does not authenticate another registry.
+These commands read and write registries directly. Credential lookup uses the explicit
+`--registry-config`/`-a` path first, then `REGISTRY_AUTH_FILE`, then the client's default auth file.
+For private source images, the selected file must also contain credentials for the source host;
+logging in to the destination does not authenticate another registry.
+
+Set `REGISTRY_AUTH_FILE` to the auth file created during login, or pass
+`--registry-config=/absolute/path/to/config.json` on every command. Keep that variable in the same
+shell for the examples that follow.
+
+```bash
+export REGISTRY_AUTH_FILE='/absolute/path/to/config.json'
+test -r "$REGISTRY_AUTH_FILE" || {
+  echo "Registry auth file is not readable." >&2
+  exit 1
+}
+```
 
 ### Inspect an Image
 
@@ -549,7 +609,7 @@ Prepare `layer.tar.gz` before running an append command. For example, create it 
 containing the files to add or replace:
 
 ```bash
-tar -czf layer.tar.gz -C <layer-directory> .
+tar -czf layer.tar.gz -C '<layer-directory>' .
 ```
 
 Replace `<layer-directory>` with the local directory containing those filesystem changes. Keep
@@ -581,6 +641,9 @@ ac image append \
 Select a platform supported by your base image and target workloads. Without an explicit platform
 or `--keep-manifest-list`, append uses the CLI machine's OS and architecture. Use
 `--keep-manifest-list` without a platform filter to apply the change to every platform in an index.
+
+The `--force` flag is accepted for compatibility but is rejected by the ACP 4.4 implementation;
+do not use it to force layer uploads.
 
 The `--image` option merges a JSON object into the runtime image configuration. The `--meta` option
 merges a JSON object into the top-level image metadata. To change metadata without adding a layer:
