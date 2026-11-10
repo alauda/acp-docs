@@ -25,7 +25,7 @@ ac adm upgrade status --cluster=<cluster-name> --verbose
 - `InProgress`: the upgrade runs. A step that is being retried also shows `InProgress`.
 - `Completed`: the cluster runs the target version.
 
-`Conditions` (`Ready`, `Reconciling`, `Stalled`) and `Preflight` give the reason and message. `Failed (non-blocking)` does not stop the upgrade. `Upgrade stages` shows what is running.
+`Conditions` (`Ready`, `Reconciling`, `Stalled`) and `Preflight` give the reason and message. `Failed (non-blocking)` does not stop the upgrade. `Upgrade stages` shows what is running. If `Upgrade` stays `InProgress` and `Ready` shows the reason `ClusterPluginAffinityMismatch`, see [Cluster Plugin Affinity Mismatch](#cluster-plugin-affinity-mismatch).
 
 On Alauda OS, when `Upgrade` stays `InProgress` in the `Kubernetes` stage, a node replacement that does not advance shows only on the `InfraClusterVersion` of the cluster. On the `global` cluster that manages the cluster, read its `Stalled` condition:
 
@@ -65,6 +65,11 @@ The value is the target version, for example `4.5.0`, and covers every patch ver
 | `ClusterModuleStable` | ACP Core of the cluster is not being upgraded and has not failed to deploy. | With the status `Upgrading` or an empty status, run the check again later; if it does not change, contact technical support. With `DeployFailed` or `UpgradeFailed`, follow [Diagnose a Module That Does Not Advance](#module-not-advancing). |
 | `ModuleInfoStable` | ACP Core and the installed Extensions (Operators and Cluster Plugins) with the `Aligned` lifecycle are stable. | Follow the module rows of [Check the Registry, Modules, and etcd Backup](./pre-upgrade.mdx#global-common-checks); for a workload cluster, use its name instead of `global` in the `moduleinfo` command. |
 | `InfraClusterVersionPreflight` | Alauda OS: the Kubernetes upgrade can run. | See [Kubernetes Upgrade Checks](#infra-preflight-checks). |
+| `ResourcePatchConflict` | No other `ResourcePatch` targets a resource that the upgrade patches itself. The message names the conflicting patches and their targets. | An exemption does not clear this check. Review each named patch with the technical support contact who supplied it, then delete it before the upgrade. |
+| `ClusterVersionUpgradeable` | The request does not change the target to a patch version of the minor version that a running upgrade moves to. | Reason `MinorVersionClusterUpdateInProgress` or `MajorVersionClusterUpdateInProgress`: let the running upgrade to the version in the message complete, then request the patch version. If that upgrade cannot complete, contact technical support. |
+| `ControlPlaneStaticPodsPresent` | Every control plane node runs the static Pods `etcd-<node-name>`, `kube-apiserver-<node-name>`, `kube-controller-manager-<node-name>`, and `kube-scheduler-<node-name>` in `kube-system`. | Restore the static Pods that the message names: on the node, check the manifests in `/etc/kubernetes/manifests` and read `journalctl -u kubelet`. If they cannot be restored, contact technical support. |
+| `CustomEtcdBackupCronJobsAbsent` | Non-Alauda OS clusters created by ACP: `cpaas-system` has no CronJob with the label `app=etcd-backup` other than `etcd-backup-default`. | Delete the CronJobs that the message names. `etcd-backup-default` keeps backing up etcd; see [Check the etcd Backup of a Cluster](./pre-upgrade.mdx#etcd-backup). |
+| `CRIUpgradePodsAbsent` | Non-Alauda OS clusters created by ACP: no Pod whose name starts with `cri-upgrade` remains in `kube-system`. | Delete the Pods that the message names. If one of them is still running, contact technical support. |
 | `AdminAckRequired` | `global` clusters only: every administrator gate is acknowledged. | See [Handle Administrator Acknowledgement Gates](#handle-administrator-acknowledgement-gates). |
 | `DRSplitUpgradeWindow` | Standby `global` cluster, identified by the DR marker `kube-public/etcd-sync`: synchronization is paused, the marker exists, no listed object is being deleted, and the token rotator is disabled and rolled out. | See [DR Standby Checks](#dr-split-upgrade-window). |
 | Any other check | — | Contact technical support with the check name, reason, and message. |
@@ -104,6 +109,17 @@ ac -n cpaas-system patch configmap admin-acks --type merge \
 bash upgrade.sh --preflight
 ```
 
+## Cluster Plugin Affinity Mismatch \{#cluster-plugin-affinity-mismatch}
+
+When `Upgrade` stays `InProgress` and `Ready` shows the reason `ClusterPluginAffinityMismatch`, the labels of the cluster no longer match the cluster affinity of a Cluster Plugin installed on it, as defined in the target version. The message names the Cluster Plugins. No component of the cluster is upgraded until this is resolved; then the upgrade continues by itself. On the `global` cluster, read the labels of the cluster:
+
+```bash
+ac config use-cluster global
+ac -n cpaas-system get clusters.cluster.x-k8s.io <cluster-name> --show-labels
+```
+
+If a label of the cluster was removed or changed, restore it. Otherwise, contact technical support with the message.
+
 ## Kubernetes Upgrade on Alauda OS \{#infra-kubernetes-upgrade}
 
 On Alauda OS, the upgrade request also upgrades Kubernetes and Alauda OS. The platform tracks this in an `InfraClusterVersion` named after the cluster, on the `global` cluster that manages it; a `global` cluster has its own, named `global`.
@@ -112,7 +128,7 @@ On Alauda OS, the upgrade request also upgrades Kubernetes and Alauda OS. The pl
 
 The platform checks the whole path to the target, including every intermediate Kubernetes version, and evaluates the checks again every 5 minutes. A fixed problem passes on the next evaluation. A message about one version on the path starts with `hop <version>: `, for example `hop v1.36.4-acp.3: DCS VM template <vm-template-name> not found`.
 
-The result appears in the upgrade preflight as `InfraClusterVersionPreflight`. Until the `global` upgrade installs the new provider, it is a non-blocking warning with the reason `ProviderCapabilityNotDeclared`. This is expected: the checks run again in the `Kubernetes` stage after ACP Core is upgraded. If a blocking check fails then, the upgrade waits in that stage and continues by itself once you fix the cause. On the `global` cluster that manages the cluster, read the checks:
+The result appears in the upgrade preflight as `InfraClusterVersionPreflight`. Until the `global` upgrade installs the new provider, it is a non-blocking warning with the reason `ProviderCapabilityNotDeclared`. This is expected: the checks run again in the `Kubernetes` stage after ACP Core is upgraded. If a blocking check fails then, the upgrade waits in that stage and continues by itself once you fix the cause. On the `global` cluster that manages the cluster, read the checks. Replace `<preflight-name>` with the name at the start of the `InfraClusterVersionPreflight` message in the upgrade preflight; in the list, it is a row whose `TARGET` is the target Kubernetes version:
 
 ```bash
 ac -n cpaas-system get infraclusterversionpreflight -l upgrade.alauda.io/cluster=<cluster-name>
@@ -322,9 +338,9 @@ NAME        PROVIDER     CURRENT         DESIRED         PHASE         HOLDER   
 cluster-1   DCSCluster   v1.35.6-acp.9   v1.36.4-acp.3   Progressing   cluster-api-provider-dcs   128d
 ```
 
-`CURRENT` advances after each intermediate Kubernetes version completes; `DESIRED` is the target. `PHASE` moves from `Pending` to `Preparing` (no node is replaced yet), `Progressing` (nodes are replaced one at a time; on Bare Metal, hosts are reinstalled), and `Succeeded`. There is no failed phase: a problem shows as `Stalled=True`, see [Stalled Reasons](#infra-stalled). On Bare Metal, a worker node pool that is not replaced at an intermediate version shows the step phase `Skipped`.
+`CURRENT` advances after each intermediate Kubernetes version completes; `DESIRED` is the target. Until the provider takes a new target, `PHASE` is empty or `Pending`, or still shows `Succeeded` from an earlier upgrade. It then moves to `Preparing` (no node is replaced yet), `Progressing` (nodes are replaced one at a time; on Bare Metal, hosts are reinstalled), and `Succeeded`. There is no failed phase: a problem shows as `Stalled=True`, see [Stalled Reasons](#infra-stalled). On Bare Metal, a worker node pool that is not replaced at an intermediate version shows the step phase `Skipped`.
 
-The Kubernetes upgrade is complete when `PHASE` is `Succeeded` and `Ready` is `True`. The `Ready` message `kube-proxy rollout pending` also means complete: kube-proxy is still rolling out; check the `kube-system/kube-proxy` DaemonSet on the cluster. While the upgrade runs, do not edit the `KubeadmControlPlane`, the `MachineDeployment` resources, their templates, the VM template ConfigMaps (Huawei DCS and VMware vSphere), the image ConfigMaps (Huawei Cloud Stack), or `elemental-image-catalog` (Bare Metal).
+The Kubernetes upgrade is complete when `CURRENT` equals `DESIRED`, `PHASE` is `Succeeded`, and `Ready` is `True`. The `Ready` message `kube-proxy rollout pending` also means complete: kube-proxy is still rolling out; check the `kube-system/kube-proxy` DaemonSet on the cluster. While the upgrade runs, do not edit the `KubeadmControlPlane`, the `MachineDeployment` resources, their templates, the VM template ConfigMaps (Huawei DCS and VMware vSphere), the image ConfigMaps (Huawei Cloud Stack), or `elemental-image-catalog` (Bare Metal).
 
 ### Stalled Reasons \{#infra-stalled}
 
@@ -336,6 +352,8 @@ A problem shows as the `InfraClusterVersion` condition `Stalled=True`. Its messa
 | Reason | Meaning | What to do |
 | --- | --- | --- |
 | A check reason, such as `ImageCatalogMiss`, `ImageNotFound`, `UnsupportedTopology`, or `RolloutMaxSurgeNotZero` | Planning found the same problem as the check. | Fix it as described in [Kubernetes Upgrade Checks](#infra-preflight-checks). |
+| `TemplateConflict` | A machine or bootstrap template that the upgrade creates already exists with a different spec. The message names it. | If no `KubeadmControlPlane` or `MachineDeployment` of the cluster references the named template, delete it; the upgrade creates it again. Otherwise, contact technical support. |
+| `TemplateCreateFailed` | The API server rejected a template that the upgrade creates. The message quotes the error. | Fix the cause in the message, such as an admission webhook or a quota. Otherwise, contact technical support. |
 | `NodeJoinFailed` | A new VM has not joined the cluster 20 minutes after it became ready. A common cause is an etcd tag in the VM template ConfigMap that does not match the images in the VM template. | On the VM, read `journalctl -u kubeadm`. If kubeadm failed in its own preflight, delete the named `Machine`; a new one is created. If kubeadm got past its preflight, confirm that the machine is not an etcd member before you delete it. |
 | `RolloutFailed` | A `Machine` failed, a new machine was not `Running` and healthy 60 minutes after it was created, or the control plane reported unhealthy components or etcd for more than 60 minutes. | Inspect the named `Machine` and `DCSMachine` resources. For unhealthy control plane components, check the static Pods on the new VMs with `crictl ps -a` and `journalctl -u kubelet`. |
 
@@ -345,6 +363,8 @@ A problem shows as the `InfraClusterVersion` condition `Stalled=True`. Its messa
 | Reason | Meaning | What to do |
 | --- | --- | --- |
 | A check reason, such as `ImageCatalogMiss`, `ImageNotFound`, `RolloutMaxSurgeNotZero`, or `FailedMachinesPresent` | Planning found the same problem as the check. | Fix it as described in [Kubernetes Upgrade Checks](#infra-preflight-checks). |
+| `TemplateConflict` | A machine or bootstrap template that the upgrade creates already exists with a different spec. The message names it. | If no `KubeadmControlPlane` or `MachineDeployment` of the cluster references the named template, delete it; the upgrade creates it again. Otherwise, contact technical support. |
+| `TemplateCreateFailed` | The API server rejected a template that the upgrade creates. The message quotes the error. | Fix the cause in the message, such as an admission webhook or a quota. Otherwise, contact technical support. |
 | `RolloutFailed` | A `BaremetalMachine` is `Failed`, a new machine was not `Running` with a healthy Node 90 minutes after it was created, or the control plane reported unhealthy components or etcd for more than 90 minutes. | Fix the cause reported by the `BaremetalMachine`, such as `COS_STATE` space. Remove a faulty host from the pool's `spec.machineInventories`, because the pool can select it again. Then delete the `Machine`; a new one is created. A `Failed` machine does not recover on its own. |
 | `NodeJoinFailed` | A reinstalled host has not joined the cluster 20 minutes after its `BaremetalMachine` became ready. | On the host, read `journalctl -u kubelet` and the cloud-init log. Confirm that the machine is not an etcd member, then delete the `Machine`. |
 | `PoolExhausted` | A new machine has waited more than 15 minutes for an `Available` host. Shorter waits are normal while a replaced host is cleaned. | Add a host to the pool, or repair its `Unavailable` hosts. |
@@ -355,6 +375,8 @@ A problem shows as the `InfraClusterVersion` condition `Stalled=True`. Its messa
 | Reason | Meaning | What to do |
 | --- | --- | --- |
 | A check reason, such as `ImageCatalogMiss`, `ImageNotFound`, `FreeConfigsPresent`, or `PersistentDiskError` | Planning or a node replacement found the same problem as the check. | Fix it as described in [Kubernetes Upgrade Checks](#infra-preflight-checks). |
+| `TemplateConflict` | A machine or bootstrap template that the upgrade creates already exists with a different spec. The message names it. | If no `KubeadmControlPlane` or `MachineDeployment` of the cluster references the named template, delete it; the upgrade creates it again. Otherwise, contact technical support. |
+| `TemplateCreateFailed` | The API server rejected a template that the upgrade creates. The message quotes the error. | Fix the cause in the message, such as an admission webhook or a quota. Otherwise, contact technical support. |
 | `NodeJoinFailed` | A new VM has not joined the cluster 20 minutes after it became ready. A common cause is an etcd tag in the image ConfigMap that does not match the Alauda OS image. | On the VM, read `journalctl -u kubeadm`. If kubeadm failed in its own preflight, delete the named `Machine`; a new one is created. If kubeadm got past its preflight, confirm that the machine is not an etcd member before you delete it. |
 | `RolloutFailed` | A `Machine` failed, a new machine was not `Running` and healthy 60 minutes after it was created, or the control plane reported unhealthy components or etcd for more than 60 minutes. | Inspect the named `Machine` and `HCSMachine` resources. For unhealthy control plane components, check the static Pods on the new VMs with `crictl ps -a` and `journalctl -u kubelet`. |
 | `MachineDeletionStuck` | An old `Machine` is not deleted in time, for example because a PodDisruptionBudget blocks the drain of its node. | Read the `Deleting` and `DrainingSucceeded` conditions of the `Machine` named in the message. If a PodDisruptionBudget blocks the drain, change the replicas of the workload or the PodDisruptionBudget. Do not force the deletion of the `HCSMachine`: it can delete data disks. |
@@ -366,6 +388,8 @@ A problem shows as the `InfraClusterVersion` condition `Stalled=True`. Its messa
 | Reason | Meaning | What to do |
 | --- | --- | --- |
 | A check reason, such as `ImageCatalogMiss`, `ImageNotFound`, `ReleasedSlotsPresent`, or `PersistentDiskError` | Planning or a node replacement found the same problem as the check. | Fix it as described in [Kubernetes Upgrade Checks](#infra-preflight-checks). |
+| `TemplateConflict` | A machine or bootstrap template that the upgrade creates already exists with a different spec. The message names it. | If no `KubeadmControlPlane` or `MachineDeployment` of the cluster references the named template, delete it; the upgrade creates it again. Otherwise, contact technical support. |
+| `TemplateCreateFailed` | The API server rejected a template that the upgrade creates. The message quotes the error. | Fix the cause in the message, such as an admission webhook or a quota. Otherwise, contact technical support. |
 | `NodeJoinFailed` | A new VM has not joined the cluster 20 minutes after it became ready. A common cause is an etcd tag in the VM template ConfigMap that does not match the images in the VM template. | On the VM, read `journalctl -u kubeadm`. If kubeadm failed in its own preflight, delete the named `Machine`; a new one is created. If kubeadm got past its preflight, confirm that the machine is not an etcd member before you delete it. |
 | `RolloutFailed` | A `Machine` failed, a new machine was not `Running` and healthy 60 minutes after it was created, or the control plane reported unhealthy components or etcd for more than 60 minutes. | Inspect the named `Machine`, `VSphereMachine`, and `VSphereVM` resources. A new control-plane machine that never bootstraps reports it in the `BootstrapReady` condition. For unhealthy control plane components, check the static Pods on the new VMs with `crictl ps -a` and `journalctl -u kubelet`. |
 | `MachineDeletionStuck` | An old `Machine` is not deleted in time and is not in a [rollout hold](#rollout-holds), for example because a PodDisruptionBudget blocks the drain of its node. | Read the `Deleting` and `DrainingSucceeded` conditions of the `Machine` named in the message. If a PodDisruptionBudget blocks the drain, change the replicas of the workload or the PodDisruptionBudget. Otherwise, read the `VMProvisioned` condition of the `VSphereVM`. Do not remove finalizers. |
@@ -375,7 +399,7 @@ A problem shows as the `InfraClusterVersion` condition `Stalled=True`. Its messa
   </Tab>
 </Tabs>
 
-If `PHASE` stays `Pending` and the upgrade status reports `InfraClusterVersionUnconsumed`, check that the Deployment `cluster-api-provider-dcs-icv-controller` (Huawei DCS), `cluster-api-provider-baremetal-icv-controller` (Bare Metal), `cluster-api-provider-hcs-icv-controller` (Huawei Cloud Stack), or `cluster-api-provider-vsphere-icv-controller` (VMware vSphere) in `cpaas-system` on the `global` cluster is running.
+If `PHASE` does not move to `Preparing` and the upgrade status reports `InfraClusterVersionUnconsumed`, check that the Deployment `cluster-api-provider-dcs-icv-controller` (Huawei DCS), `cluster-api-provider-baremetal-icv-controller` (Bare Metal), `cluster-api-provider-hcs-icv-controller` (Huawei Cloud Stack), or `cluster-api-provider-vsphere-icv-controller` (VMware vSphere) in `cpaas-system` on the `global` cluster is running.
 
 Before you change a Cluster API resource of the cluster by hand during an upgrade, stop this `InfraClusterVersion` controller on the `global` cluster that manages the cluster, and start it again when you are done; otherwise it continues the upgrade while you work. On Bare Metal, this includes deleting a `Machine`.
 
