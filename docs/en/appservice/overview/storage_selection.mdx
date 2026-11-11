@@ -36,13 +36,15 @@ Whether a product is validated on a storage type is stated in the **What the pro
 
 | Storage | Provisioner | When the node of a Pod is lost | Expansion | Snapshot |
 | --- | --- | --- | --- | --- |
-| **TopoLVM** ([LVM Storage](/storage/storagesystem_topolvm/index.mdx)) | `topolvm.cybozu.com` | The volume stays on that node. | Supported | Supported |
+| **TopoLVM** ([LVM Storage](/storage/storagesystem_topolvm/index.mdx)) | `topolvm.cybozu.com` | The volume stays on that node. | Supported | Thin device classes only |
 | **Local Storage** ([Local Storage](/storage/local_storage/index.mdx)) | The StorageClass that the operator creates | The volume stays on that node. | Not stated | Not stated |
 | **Ceph RBD** ([Ceph Distributed Storage](/storage/storagesystem_ceph/index.mdx)) | `rook-ceph.rbd.csi.ceph.com` | The volume follows the Pod. | Supported | Supported |
 | **CephFS** ([Ceph Distributed Storage](/storage/storagesystem_ceph/index.mdx)) | `rook-ceph.cephfs.csi.ceph.com` | The volume follows the Pod. | Supported | Supported |
 | **NFS** ([Creating an NFS Shared Storage Class](/configure/storage/functions/nfs_storageclass.mdx)) | `nfs.csi.k8s.io` | The volume follows the Pod. | Not supported | Not supported |
 | **Enterprise SAN**: a storage area network array from a third-party vendor | The vendor's CSI driver | The volume follows the Pod. | Depends on the driver | Depends on the driver |
 | **Object storage**: Ceph Object Storage, or enterprise object storage from a third-party vendor | Not a storage class | Not applicable | Not applicable | Not applicable |
+
+In production, use TopoLVM device classes whose **Provision Type** is **Thick** (`type: thick` in the lvmd configuration, the default). On this page, TopoLVM means a Thick device class. A **Thin** device class allows over-provisioning (`thin-pool.overprovision-ratio`): its volumes share the physical space of a thin pool, so a volume can run out of space before it reaches its requested size. TopoLVM creates snapshots and clones only for Thin volumes, so a Thick device class has no snapshots.
 
 For the storage systems that the platform provides and their typical uses, see [Overview](/storage/overview.mdx). For the access modes and the expansion and snapshot support of each storage class, see [Access Modes and Volume Modes](/configure/storage/concepts/selection.mdx). To make the platform recognize the capabilities of a third-party storage class, see [Third-Party Storage Capability Annotation Guide](/configure/storage/how_to/third_mask.mdx).
 
@@ -81,7 +83,7 @@ This section covers **MySQL-MGR, PostgreSQL, and CloudNativePG**.
 
 | Scenario | TopoLVM | Enterprise SAN | Ceph RBD | NFS or CephFS | Why |
 | --- | --- | --- | --- | --- | --- |
-| **Multi-replica production database** | Secondary | Recommended | Last resort | Do not use | Rebuilding a database replica copies the whole database. A SAN replica survives the loss of its node and follows the Pod, so it only catches up on missing changes instead of being rebuilt. The array handles disk failures.<br />TopoLVM gives each replica its own failure domain and the lowest latency, but a replica on it is fully rebuilt after its node or disk is lost permanently.<br />On Ceph RBD, all replicas share one Ceph failure domain, and every write is replicated again inside Ceph.<br />NFS and CephFS are shared file storage. CloudNativePG asks for a block-mode storage class, and none of the three products recommends file storage. |
+| **Multi-replica production database** | Recommended | Secondary | Last resort | Do not use | TopoLVM gives each replica its own failure domain and the lowest latency, and the MySQL-MGR and CloudNativePG documentation recommends it. A replica on it is fully rebuilt after its node or disk is lost permanently.<br />A SAN replica survives the loss of its node and only catches up on missing changes instead of being rebuilt, which matters for large databases. All replicas on one array share it as a failure domain. See the notes for when to prefer it.<br />On Ceph RBD, all replicas share one Ceph failure domain, and every write is replicated again inside Ceph.<br />NFS and CephFS are shared file storage. CloudNativePG asks for a block-mode storage class, and none of the three products recommends file storage. |
 | **Single-instance database** | Not recommended | Recommended | Secondary | Do not use | No replica can copy the data back, so the volume must follow the Pod to a replacement node. |
 | **Development and testing** | Recommended | Not needed | Not needed | Not needed | Data loss is acceptable. The default storage class also works. |
 
@@ -100,7 +102,10 @@ RPO = 0 comes from synchronous replication, not from storage. See [Settings for 
 
 - MySQL-MGR on storage other than TopoLVM, including an enterprise SAN, Ceph RBD, and NFS, requires MySQL-MGR v4.4.1 or later. Earlier versions cannot initialize the data directory on such volumes.
 - MySQL-MGR is validated on TopoLVM, Ceph RBD, and local persistent volumes. Validate it on your SAN before going live.
-- Prefer TopoLVM over the SAN if only one array is available and you cannot accept it as a common failure domain, if the SAN cannot meet your commit latency requirement in tests, or if the array lacks capacity. All replicas on one array share it as a failure domain.
+- Prefer the SAN over TopoLVM only when all of these hold:
+  - A full rebuild of a replica of the largest database on TopoLVM takes longer than you can run with one replica fewer.
+  - The SAN meets your commit latency requirement in tests, and the array has the capacity.
+  - You accept the array as a failure domain shared by all replicas, or you spread the replicas over arrays as described in the next note.
 - With two arrays, place the replicas of each database on different arrays by using CSI topology and Pod anti-affinity. One array still holds a majority of a 3-member MySQL-MGR cluster, so losing that array stops writes. To survive the loss of any one array, use three arrays.
 - On TopoLVM, one instance must fit on one node.
 - MySQL-MGR places at most one member on each node by default, so an N-member cluster needs at least N schedulable nodes. If the cluster has no more nodes than replicas, add nodes. With required anti-affinity, no storage lets a Pod move to a node that already runs another replica.
@@ -214,7 +219,7 @@ For the backup target, use enterprise object storage, or Ceph Object Storage as 
 | --- | --- | --- |
 | MySQL-MGR | Full and incremental backups, scheduled or manual, to S3-compatible storage registered under **Backup Center** > **External S3 Storage**. No point-in-time recovery (PITR). | <ExternalSiteLink name="mysql-mgr" href="/functions/20-backup_restore.html" children="Backup & Restore" /> |
 | PostgreSQL | Scheduled and manual backups to S3-compatible object storage, with PITR. A restore creates a new instance. | <ExternalSiteLink name="postgresql" href="/functions/15_back_restore.html" children="Backup and Restore" /> |
-| CloudNativePG | Backups and PITR through the Barman Cloud plugin, to S3-compatible object storage. Volume snapshot backups also exist; they count as backups only when the snapshots are stored off the primary device, and they were not tested in v1.30.1. | <ExternalSiteLink name="cnpg" href="/how_to/ops-runbook.html" children="Operations Runbook" /> |
+| CloudNativePG | Backups and PITR through the Barman Cloud plugin, to S3-compatible object storage. Volume snapshot backups also exist; they need a storage class with snapshot support, which TopoLVM provides only on Thin device classes, they count as backups only when the snapshots are stored off the primary device, and they were not tested in v1.30.1. | <ExternalSiteLink name="cnpg" href="/how_to/ops-runbook.html" children="Operations Runbook" /> |
 | Redis | S3 backup, or PVC backup to NFS, CephFS, or TopoLVM. A PVC backup counts as a backup only on NFS or CephFS separate from the primary data. A PVC backup on TopoLVM stays on one node's disks; use it only for development and testing. | <ExternalSiteLink name="redis" href="/functions/70-backup-restore.html" children="Backup & Restore Instance" /> |
 | Valkey | None. | <ExternalSiteLink name="valkey" href="/limitations.html" children="Current Limitations" /> |
 | Kafka | None for message data. Export the topic configurations; this does not recover the messages. | |
@@ -228,5 +233,5 @@ For the backup target, use enterprise object storage, or Ceph Object Storage as 
 - **Match the storage to the redundancy of the middleware.** In production, use TopoLVM only when the middleware keeps at least 2 copies of the data at the application layer. Otherwise, use storage whose volume follows the Pod, such as an enterprise SAN or Ceph RBD.
 - **Storage does not replace replication.** Redis and Valkey replicate asynchronously. On a failover, writes that did not reach the promoted replica are lost, whatever storage the old primary uses. No storage gives them a recovery point objective (RPO) of zero.
 - **Storage-layer redundancy under replicated middleware multiplies capacity and traffic.** That is why Ceph RBD is the last resort for components with multiple copies.
-- **Rebuild cost differs.** Rebuilding a database replica copies the whole database, which is why a SAN, on which a replica only catches up, is preferred for databases. Components that replicate data themselves rebuild replicas as a routine operation, which is why TopoLVM is preferred for them.
+- **Rebuild cost differs.** Rebuilding a database replica copies the whole database, which is why a SAN, on which a replica only catches up, is the alternative for large databases. Components that replicate data themselves rebuild replicas as a routine operation.
 - **Consider enterprise storage only when it is available**, that is, it already exists on site or is within the budget.
