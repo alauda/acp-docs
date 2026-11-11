@@ -1,0 +1,108 @@
+---
+weight: 20
+---
+
+# Storage Selection
+
+This guide helps you choose storage for Alauda Application Services. It first describes the storage selection principles for each type of middleware, then gives storage recommendations for the main scenarios of each type.
+
+The guide covers high availability and backup inside a single Kubernetes cluster in a single data center. Cross-data-center disaster recovery is out of scope. For the access modes and features of each storage class, see [Access Modes and Volume Modes](/configure/storage/concepts/selection.mdx).
+
+This guide uses the following terms:
+
+- **Enterprise storage**: external storage products from third-party vendors, such as an enterprise storage area network (SAN) array or enterprise object storage, connected to the cluster through the vendor's CSI driver. To make the platform recognize the capabilities of a third-party storage class, see [Third-Party Storage Capability Annotation Guide](/configure/storage/how_to/third_mask.mdx).
+- **TopoLVM**: the TopoLVM-based dynamic provisioner of [LVM Storage](/storage/storagesystem_topolvm/index.mdx). A TopoLVM volume is bound to the disks of one node.
+- **Ceph RBD** and **Ceph Object Storage**: the block storage and object storage of Alauda Storage, which is based on Ceph. See [Creating CephRBD Block Storage Class](/configure/storage/functions/cephrbd_storageclass.mdx).
+- **The volume follows the Pod**: when a Pod is rescheduled to another node, its volume is attached to that node. This applies to network storage such as an enterprise SAN or Ceph RBD, but not to TopoLVM.
+
+## Selection Principles
+
+### General Principles
+
+- **Match the storage to the redundancy of the middleware.** In production, use TopoLVM only when the middleware keeps at least two replicas of the data at the application layer. Otherwise, use storage whose volume follows the Pod, such as an enterprise SAN or Ceph RBD.
+- **Storage does not replace replication.** For example, Redis and Valkey replicate asynchronously, so no storage gives them a recovery point objective (RPO) of zero.
+- **Back up every production component that supports backup** to object storage on a different device from the primary data. If the primary data is in Ceph, back up outside that Ceph cluster. Snapshots that stay on the same array or node are not backups.
+- **Consider enterprise storage only when it is available**, that is, it already exists on site or is within the budget.
+
+### Relational Databases
+
+- **Prefer an enterprise SAN.** Rebuilding a database replica copies the whole database. A SAN volume survives a node failure and follows the Pod, so the replica only catches up on missing changes instead of being rebuilt.
+- **Use TopoLVM when independent failure domains matter more.** All replicas on one array share the array as a failure domain. TopoLVM gives each replica its own failure domain, but a replica must be fully rebuilt when its node or disk is lost permanently.
+- **For multi-replica databases, use Ceph RBD only as a last resort.** All replicas share one Ceph failure domain, and every write is replicated over the network inside Ceph. Do not use NFS or CephFS for high-load databases.
+- **Backup is mandatory**, and so is point-in-time recovery (PITR) where the database supports it. Both depend on object storage.
+
+### Middleware That Replicates Data Itself
+
+- **Prefer TopoLVM.** These components rebuild replicas as a routine operation. TopoLVM gives the lowest latency and a separate failure domain for each replica. Storage-layer redundancy only multiplies capacity and traffic: three replicas on Ceph RBD with the default three-replica pool become nine copies.
+- **Put ClickHouse Keeper on SSDs or NVMe.** It is the most sensitive to `fsync` latency.
+- **Two replicas or asynchronous replication carries extra risk.** With two replicas, only one copy remains while a replica is rebuilt. With asynchronous replication, an acknowledged write may exist on only one replica. If you cannot accept this, use an enterprise SAN.
+- **Without application-layer redundancy, use storage whose volume follows the Pod**, or better, change the component to keep multiple replicas.
+- **Replicas do not replace backup.** Accidental deletion is replicated to every replica.
+
+### Vector Databases
+
+- **Use external object storage with its own redundancy in production.** Milvus keeps vector data in object storage. The documented deployment of the built-in Silo object storage is a single instance, for development and testing only.
+- **Confirm that the object storage supports S3 conditional writes.** Woodpecker, the write-ahead log (WAL) of Milvus, depends on them when it stores the WAL in object storage.
+- **Plan backup separately.** The Milvus operator does not provide a general-purpose backup.
+
+## Recommendations by Middleware
+
+In the tables below, **Recommended** is the default choice and **Secondary** is the choice when the recommended storage is not available or does not fit your environment. Notes under each table list the last-resort option and conditions that change the order.
+
+### Relational Databases \{#rec-relational}
+
+This category covers **MySQL-MGR, PostgreSQL, and CloudNativePG**.
+
+| Scenario | Recommended | Secondary | Rationale |
+| --- | --- | --- | --- |
+| **Multi-replica production databases** | Enterprise SAN | TopoLVM | SAN: after a node failure, a replica only catches up on missing changes. The array handles disk failures.<br />TopoLVM: independent failure domains and the lowest latency, but a full rebuild after losing a node or disk.<br />RPO = 0 comes from synchronous replication, not from storage. See the notes. |
+| **Single-instance databases** | Enterprise SAN | Ceph RBD | No replica can copy the data back.<br />A SAN or Ceph RBD volume survives a lost node and can be attached to a replacement node. |
+| **Backup and PITR** | Enterprise object storage | Ceph Object Storage | MySQL-MGR backs up only to S3.<br />PostgreSQL (WAL-G) and CloudNativePG (Barman) need object storage for backup and point-in-time recovery.<br />Replicas and same-device snapshots do not protect against deletion or device failure. |
+| **Development and testing** | TopoLVM | Default storage class | Data loss is acceptable. |
+
+Notes:
+
+- Prefer TopoLVM over the SAN if only one array is available and you cannot accept it as a common failure domain, if the SAN cannot meet your commit latency requirement in tests, or if the array lacks capacity.
+- With two arrays, place the replicas of each database on different arrays by using CSI topology and Pod anti-affinity.
+- On TopoLVM, one instance must fit on one node. Measure the full rebuild time before going live.
+- Ceph RBD is the last resort for multi-replica databases. Measure the commit latency first.
+- If the cluster has no more nodes than replicas, add nodes. With required anti-affinity, no storage lets a Pod move to a node that already runs another replica.
+- After an unexpected node shutdown, a SAN or Ceph RBD volume might not detach automatically. See [Detach CSI Volumes After Non-Graceful Node Shutdown](/configure/storage/trouble_shooting/detach_csi_volumes_non_graceful_shutdown.mdx).
+- For RPO = 0, configure synchronous replication. PostgreSQL and CloudNativePG then pause writes when not enough synchronous standbys are available.
+  - MySQL-MGR: 3 or 5 members.
+  - PostgreSQL: set `synchronous_mode` and `synchronous_mode_strict` to `true` in Patroni.
+  - CloudNativePG: configure `spec.postgresql.synchronous`, and keep the default `dataDurability: required`.
+- Run restore drills regularly. A successful backup job does not prove that the data can be restored.
+
+### Middleware That Replicates Data Itself \{#rec-replicated}
+
+This category covers **Redis, Valkey, Kafka, RabbitMQ, ClickHouse and ClickHouse Keeper, and OpenSearch**.
+
+| Scenario | Recommended | Secondary | Rationale |
+| --- | --- | --- | --- |
+| **At least 3 replicas with majority or synchronous writes**: Kafka (replication factor 3, `min.insync.replicas=2`), RabbitMQ quorum queues, ClickHouse with `insert_quorum`, 3-member ClickHouse Keeper | TopoLVM | Enterprise SAN | Rebuilding a replica is routine and safe with one replica down.<br />TopoLVM: the lowest latency and one failure domain per replica.<br />No need to pay for three copies on an array. |
+| **2 replicas or asynchronous replication**: Redis or Valkey with persistence and replicas, ClickHouse without `insert_quorum`, OpenSearch with 1 replica | TopoLVM | Enterprise SAN | 2 replicas: one copy remains during a rebuild.<br />Asynchronous replication: an acknowledged write may exist on only one replica.<br />If you cannot accept this, use the SAN. |
+| **One copy only**: Kafka (replication factor 1), RabbitMQ classic queues, non-replicated ClickHouse tables, OpenSearch with 0 replicas, Redis or Valkey without replicas, Milvus Silo | Enterprise SAN | Ceph RBD | No replica can copy the data back, so the volume must follow the Pod. |
+| **Pure cache**: Redis or Valkey without persistence | None | Not applicable | The data can be regenerated. |
+| **Backup**: Redis, ClickHouse, OpenSearch, Kafka, RabbitMQ | Enterprise object storage | Ceph Object Storage | Replicas also replicate accidental deletions.<br />Redis: can back up to S3.<br />OpenSearch: snapshots to an S3 repository, which requires the `repository-s3` plugin.<br />ClickHouse: the operator does not provide backup. Use an external tool.<br />Kafka and RabbitMQ: no backup of message data. Export topic configurations and definitions only. |
+
+Notes:
+
+- Ceph RBD is the last resort. With the default three-replica pool, every write becomes nine copies on the network. Test the throughput first.
+- For components with only one copy, prefer adding replicas, for example a higher Kafka replication factor or RabbitMQ quorum queues, so that TopoLVM becomes an option.
+- Message queues that must not lose messages: Kafka uses a replication factor of 3, `min.insync.replicas=2`, and producer `acks=all`. RabbitMQ uses 3 or 5 nodes with quorum queues only.
+- ClickHouse on TopoLVM needs extra free space on each node for merges.
+
+### Vector Databases \{#rec-vector}
+
+This category covers **Milvus**.
+
+| Scenario | Recommended | Secondary | Rationale |
+| --- | --- | --- | --- |
+| **Vector data and the WAL** | Enterprise object storage | Ceph Object Storage | Replaces the single-instance Silo with redundant object storage.<br />Woodpecker needs S3 conditional writes for a WAL in object storage. Test them first. |
+| **Backup**: vector data and metadata | Enterprise object storage | Ceph Object Storage | The Milvus operator does not provide a general-purpose backup.<br />Copy the data to another device with an external tool. |
+
+Notes:
+
+- If neither option supports conditional writes, use an external Kafka as the WAL.
+- If you must use Silo outside development and testing, choose its volume by the "One copy only" row in [Middleware That Replicates Data Itself](#rec-replicated).
