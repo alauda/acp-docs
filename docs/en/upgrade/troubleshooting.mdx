@@ -558,62 +558,21 @@ Use this section when an upgrade stays in the component stage and Kubernetes nod
 failed to re-exec: writing /rootfs/usr/local/bin/machine-config-daemon: open /rootfs/usr/local/bin/.machine-config-daemon: read-only file system
 ```
 
-Handle one node at a time. Do not restart the node, delete a snapshot, or submit the upgrade request again.
+Handle one node at a time. Do not restart the node, delete a snapshot, or submit the upgrade request again. The overlay is stored on `/run` and disappears after any node restart. If the node restarts unexpectedly and `/usr/local/bin` is still read-only, mount the overlay again, then delete that node's `machine-config-daemon` Pod so it is recreated.
 
-On the affected node, as root, confirm the target:
-
-```bash
-findmnt -no FSTYPE,OPTIONS,FSROOT /
-findmnt -no TARGET,FSTYPE,OPTIONS,FSROOT /run/initramfs/elemental-state
-findmnt -T /usr/local/bin -no TARGET,SOURCE
-fsroot=$(findmnt -no FSROOT /)
-state_subvol=$(findmnt -no OPTIONS /run/initramfs/elemental-state | tr ',' '\n' | sed -n 's/^subvol=//p')
-rel=$fsroot
-case "$state_subvol" in
-  ""|"/") ;;
-  *)
-    case "$fsroot" in
-      "$state_subvol"/*) rel=${fsroot#"$state_subvol"} ;;
-    esac
-    ;;
-esac
-rootvol="/run/initramfs/elemental-state${rel}"
-printf 'state_subvol=%s\nrootvol=%s\n' "$state_subvol" "$rootvol"
-test -d "$rootvol"
-btrfs property get -ts "$rootvol" ro
-```
-
-Stop if any check fails: `/` is not `btrfs`, `/run/initramfs/elemental-state` is not a mounted `btrfs`, `findmnt -T` does not show `/usr/local/bin` on `/`, `FSROOT` is empty, `rootvol` is not an existing directory, or `btrfs property get` cannot open it. Do not choose another subvolume.
-
-When every check passes, on the same node:
+On the affected node, as root, mount a writable overlay on `/usr/local/bin`:
 
 ```bash
-fsroot=$(findmnt -no FSROOT /)
-state_subvol=$(findmnt -no OPTIONS /run/initramfs/elemental-state | tr ',' '\n' | sed -n 's/^subvol=//p')
-rel=$fsroot
-case "$state_subvol" in
-  ""|"/") ;;
-  *)
-    case "$fsroot" in
-      "$state_subvol"/*) rel=${fsroot#"$state_subvol"} ;;
-    esac
-    ;;
-esac
-rootvol="/run/initramfs/elemental-state${rel}"
-test -d "$rootvol"
-state_opts=$(findmnt -no OPTIONS /run/initramfs/elemental-state)
-case ",${state_opts}," in
-  *,ro,*) mount -o remount,rw /run/initramfs/elemental-state ;;
-esac
-btrfs property set -ts "$rootvol" ro false
-btrfs property get -ts "$rootvol" ro
-mount -o remount,rw /
-findmnt -no OPTIONS /
-probe=$(mktemp /usr/local/bin/.mcd-rwtest.XXXXXX)
-rm -f "$probe"
+mkdir -p -m 0755 /run/usr-local-bin/upper /run/usr-local-bin/work
+if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce)" != "Disabled" ]; then
+  chcon -t bin_t /run/usr-local-bin/upper
+fi
+if ! findmnt -M /usr/local/bin -no FSTYPE,OPTIONS | grep -Eq '^overlay rw(,|$)'; then
+  mount -t overlay overlay \
+    -o lowerdir=/usr/local/bin,upperdir=/run/usr-local-bin/upper,workdir=/run/usr-local-bin/work \
+    /usr/local/bin
+fi
 ```
-
-`btrfs property get` must print `ro=false`, and `mktemp` must succeed. If `mktemp` reports `Permission denied`, stop and keep the command output.
 
 On the cluster being upgraded, delete only that node's daemon Pod. Wait until the new Pod is `Running` and the node stays `Ready`:
 
