@@ -1,7 +1,6 @@
 // Lists the ACP versions whose Alauda OS images an upgrade passes through,
 // planned the way the platform plans it (see planUpgradePath). The versions
-// come from ../alauda-os/version-mapping.json: to add a release, append an
-// entry there (see ../alauda-os/README.md), not here.
+// come from ../alauda-os/version-mapping.json: do not hand-edit; see ../alauda-os/README.md.
 import { useId, useState, type ReactNode } from 'react'
 
 import { planUpgradePath, upgradeReleases } from './alauda-os.js'

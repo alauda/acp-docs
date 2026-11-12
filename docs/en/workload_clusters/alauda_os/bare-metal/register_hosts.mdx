@@ -1,0 +1,196 @@
+---
+weight: 36
+title: Register Hosts
+category: howto
+queries:
+  - add bare metal hosts
+  - machineinventory awaitingtarget select disk
+  - list available bare metal hosts
+  - register host for global cluster
+  - bare metal live iso static ip nmcli
+  - bare metal host time synchronization ntp requirement
+---
+
+# Register Hosts
+
+A host is registered once and stays registered for its whole life. It boots the ISO of its OS and architecture, registers with the `global` cluster as a `MachineInventory`, and installs Alauda OS to the system disk that you select. The registered host is then an available host until a cluster takes it through one of the pools of that cluster. When a host is added to a cluster, the provider reinstalls it with the image that the image catalog maps to the Kubernetes version of the cluster. A host therefore runs the OS of the cluster that it joins, whatever ISO version it registered with.
+
+Before you start, create the registration and the ISO of the host's OS and architecture as described in [Prepare Alauda OS for Hosts](./prepare_os.mdx). If the platform has been upgraded since then, update the registration first; see [After a Platform Upgrade](./prepare_os.mdx#after-upgrade).
+
+Hosts of the `global` cluster itself use a registration of their own; see [Hosts for the global Cluster](#global-hosts).
+
+Run the `ac` commands on this page from a machine where `ac` is logged in to the platform.
+
+## Available Hosts \{#available-hosts}
+
+An available host is a `MachineInventory` that:
+
+- Is `Ready=True`.
+- Has `status.install.phase=Installed`.
+- Has a plan Secret in `status.plan.secretRef.name`.
+- Is listed in no `MachineInventoryPool`.
+
+List the hosts:
+
+```bash
+ac config use-cluster global
+ac -n cpaas-system get machineinventories.elemental.cattle.io \
+  -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status,PHASE:.status.install.phase,PLAN:.status.plan.secretRef.name,ARCH:.metadata.labels.os\.baremetal\.alauda\.io/arch,OS:.metadata.labels.os\.baremetal\.alauda\.io/id,POOL:.metadata.annotations.baremetal\.alauda\.io/pool'
+```
+
+A host is available when:
+
+- `READY` is `True`.
+- `PHASE` is `Installed`, or `<none>` for a host registered before ACP 4.5.
+- `PLAN` is not `<none>`.
+- `POOL` is `<none>`. For a host that a pool lists, `POOL` shows that pool.
+
+`ARCH` and `OS` show the architecture and OS of the host. Hosts named `global-*` belong to the `global` cluster. Do not put them into the pools of a workload cluster.
+
+A cluster takes hosts of its own OS. Alauda OS M55 hosts are `amd64`. An Alauda OS KU cluster can take `amd64` and `arm64` hosts. The image catalog needs a key for the Kubernetes version of the cluster, for the architecture and OS of each host; see [Add the Image Catalog Keys](./prepare_os.mdx#add-versions-to-image-catalog).
+
+## Prepare the Hosts \{#prepare-hosts}
+
+Prepare every host as follows before it boots the ISO. Before the first host boots, open the network flows:
+
+- For hosts of workload clusters, the flows in [Network Connectivity](./prerequisites.mdx#network-connectivity).
+- For the installation of the `global` cluster, the flows in [Network](../../../install/alauda_os/bare-metal/prerequisites.mdx#network).
+
+When you prepare the hosts for the installation of the `global` cluster, return to [Prerequisites for Bare Metal](../../../install/alauda_os/bare-metal/prerequisites.mdx) afterwards.
+
+### Disks and Boot Order \{#host-disk-and-boot-preparation}
+
+Before a host boots the ISO, classify every disk and virtual disk on it. Record the OS install target and the disks that must keep their data:
+
+- Wipe the OS install disk and any obsolete boot disk, so that the host boots the ISO and not an old OS.
+- The installation wipes leftover system partitions from an earlier installation (`COS_*` labels) on other disks. When a disk cannot be wiped safely, the host stops before installing. It lists the disk in `status.install.staleSystemDisks` of its `MachineInventory`, with `action: Blocked` and the reason. Clean that disk, then boot the host from the ISO again.
+- Boot the virtual CD or ISO first. On virtual machines where ejecting the CD does not take effect, boot from disk first and CD second.
+
+### Clock \{#host-time-synchronization}
+
+Make sure that every host has the correct time when it boots the ISO: the same time zone on every node, and at most 10 seconds of difference between nodes, as in [Node Checks](../../../install/non_alauda_os/node_preprocessing.mdx#node_checks). Nothing in this procedure checks the time for you. A host with the wrong clock prevents the control plane from coming up.
+
+- Make the site NTP servers reachable on UDP `123`, and set them as the NTP servers of the cluster in `cluster.ntpServers` of `install-config.yaml`. Every node then syncs to them through chronyd from its first boot as a node. A production cluster should not depend on public NTP.
+- Set the clock in the BIOS/UEFI setup or through the BMC. You cannot set it from an OS, because the install disk is wiped. Keep the hardware clock on UTC.
+- Compare the clocks of the hosts with each other. The difference across the hosts of one cluster must stay within 10 seconds.
+- After the nodes are `Ready`, confirm the time with `timedatectl` and `chronyc tracking` on each node.
+
+A Day-2 chrony `MachineConfig`, as in [Configuring the Chrony Time Service](../../../configure/machine_config/managing.mdx#configuring-the-chrony-time-service), does not replace these steps, because it configures only running nodes.
+
+### Network in the Live ISO \{#live-iso-network}
+
+If a host gets no DHCP address in the live ISO, configure it from the host console before you wait for registration:
+
+```bash
+nmcli connection show
+nmcli connection modify "Wired connection 1" \
+  ipv4.method manual \
+  ipv4.addresses <host-ip>/<prefix-length> \
+  ipv4.gateway <gateway-ip> \
+  ipv4.dns <dns-ip> \
+  ipv4.ignore-auto-dns yes
+nmcli connection up "Wired connection 1"
+```
+
+### arm64 Hosts \{#arm64-hosts}
+
+An `arm64` host must provide SMBIOS data. An `arm64` machine without SMBIOS cannot register.
+
+## Boot the Hosts \{#boot-hosts}
+
+Boot each host from the ISO of its OS and architecture. The ISO is built on the `global` cluster as described in [Create the Registration and the ISO](./prepare_os.mdx#create-registration). Download the ISO from the download URL and verify it as described in [Verify the ISO](./prepare_os.mdx#verify-iso). If the URL is empty or has expired, rebuild the ISO as described in [Rebuild the ISO](./prepare_os.mdx#rebuild-iso). To see the registrations, the ISO image that each one is built from, and the current download URL, run:
+
+```bash
+ac config use-cluster global
+ac -n cpaas-system get seedimages.elemental.cattle.io \
+  -o custom-columns='NAME:.metadata.name,BASE:.spec.baseImage,REASON:.status.conditions[?(@.type=="SeedImageReady")].reason,URL:.status.downloadURL'
+```
+
+The tag in `BASE` names the OS, the architecture, and the ACP version of the ISO.
+
+Each host registers as a `MachineInventory` named `<name>-<system-uuid>`, where `<name>` is the name of the registration. The host then reports its disks and waits in the live environment until you select its system disk. If the host gets no DHCP address in the live ISO, configure the network as described in [Network in the Live ISO](#live-iso-network).
+
+## Select the System Disk \{#select-system-disk}
+
+Every host waits until you select its system disk, even a host with only one disk. List the hosts, and the disks that a waiting host reports:
+
+```bash
+ac config use-cluster global
+ac -n cpaas-system get machineinventories.elemental.cattle.io \
+  -o custom-columns='NAME:.metadata.name,PHASE:.status.install.phase,IP:.metadata.labels.elemental\.cattle\.io/registration-ip'
+ac -n cpaas-system get machineinventories.elemental.cattle.io <inventory-name> \
+  -o jsonpath='{range .status.install.candidates[*]}{.id}{"\t"}{.eligible}{"\t"}{.path}{"\t"}{.sizeBytes}{"\t"}{.reasons}{"\n"}{end}'
+```
+
+A waiting host shows `AwaitingTarget`. `IP` is the address that the host uses to reach the `global` cluster, so that you can match an inventory to a host. Each candidate line prints these values:
+
+- The disk ID.
+- Whether the disk can be selected.
+- The device path of the disk in the live environment.
+- The size of the disk in bytes.
+- The reasons why the disk cannot be selected, if any.
+
+Identify the system disk by its size and path. Select it by its ID while the host is still in the live environment:
+
+```bash
+ac -n cpaas-system annotate machineinventories.elemental.cattle.io <inventory-name> \
+  baremetal.alauda.io/install-target-device=<disk-id>
+```
+
+- Select a disk that shows `true`, using its ID exactly as printed.
+- The phase changes to `Installing`, and the host installs Alauda OS to that disk and reboots. The selection cannot be changed after that.
+- If the annotation is rejected because the host was not seen recently, make sure that the host is still running the ISO, and run the command again.
+- Selecting a disk needs `patch` on `machineinventories` and `update` on `machineinventories/installtarget` in `cpaas-system`.
+
+## Confirm the Registration \{#confirm-registration}
+
+List the hosts with the command in [Available Hosts](#available-hosts). Use a host only when it:
+
+- Shows `READY` `True`, `PHASE` `Installed`, and a `PLAN` other than `<none>`.
+- Shows in `ARCH` and `OS` the values of the `os.baremetal.alauda.io/arch` and `os.baremetal.alauda.io/id` labels that the registration sets. A host without these labels is treated as `amd64` with Alauda OS M55.
+- Has a `spec.observedNetwork` that matches the expected NIC of the host, when the host must keep its install-time IP each time it is reinstalled.
+
+Record the exact `MachineInventory` names for the pools. When a host does not meet these conditions, see [Troubleshooting](#troubleshooting).
+
+## Hosts for the global Cluster \{#global-hosts}
+
+To add or replace a host of the `global` cluster after the installation, register it on the `global` cluster that the host belongs to. In a disaster recovery pair, register it on that side. For the standby, use `export KUBECONFIG=<standby-kubeconfig>` instead of `ac config use-cluster global`, and run `unset KUBECONFIG` afterwards. Do not reuse a bootstrap Global ISO after the handover. Instead, create a new Global registration and `SeedImage` on the `global` cluster that the host belongs to.
+
+A registration for hosts of the `global` cluster must be named `global` or start with `global-`. Otherwise, it is not ready and gives no registration URL. It also needs the following annotations, so that its agent uses the local API server. `<local-control-plane-vip>` is the control plane VIP of that `global` cluster:
+
+```yaml
+metadata:
+  annotations:
+    baremetal.cluster.io/system-agent-auth-scope: global
+    baremetal.cluster.io/system-agent-server-url: https://<local-control-plane-vip>:6443
+    baremetal.cluster.io/system-agent-endpoint-mode: direct-apiserver
+```
+
+For everything else, write the registration and its `SeedImage` as described in [Prepare Alauda OS for Hosts](./prepare_os.mdx), for the OS and architecture of the hosts of the `global` cluster, with these changes:
+
+- In the generated **Registration file**, replace the registration name with one that starts with `global-`, for example `global-alaudaos-m55-amd64`. Replace it in `metadata.name`, `machineName`, the `SeedImage` name, and its `registrationRef`.
+- Add the annotations above to the `MachineRegistration`.
+- Use the new name in the commands of **Create the registration and build the ISO**.
+
+The hosts of this registration register as `global-*`. Then prepare, boot, and confirm them as described on this page. Add them to a pool of the `global` cluster as described in [Manage Nodes on Bare Metal](../../../configure/nodes/alauda_os/bare-metal.mdx).
+
+## Troubleshooting \{#troubleshooting}
+
+{/* lint ignore no-legacy-os-names */}
+
+| Result | Action |
+|---|---|
+| A host does not appear as a `MachineInventory` | From the host console, check that the host booted the ISO and not an old OS on a disk; see [Disks and Boot Order](#host-disk-and-boot-preparation). Check that it has a network address in the live ISO; see [Network in the Live ISO](#live-iso-network). Check that the network flows in [Prepare the Hosts](#prepare-hosts) are open. Check that it booted an ISO built on the `global` cluster, not one built while the `global` cluster was being installed. An `arm64` host must provide SMBIOS; see [arm64 Hosts](#arm64-hosts). If all of these hold, contact technical support. |
+| A `MachineInventory` shows `status.install.phase=AwaitingTarget` | The host waits for its system disk. Select it as described in [Select the System Disk](#select-system-disk). |
+| A host stops before installing, and its `MachineInventory` lists a disk in `status.install.staleSystemDisks` with `action: Blocked` | A disk holds system partitions from an earlier installation (`COS_*` labels) that cannot be wiped safely. Read the reason in `status.install.staleSystemDisks`. Either clean that disk from the host console, or use it as the system disk if the candidate list shows it with `true`; everything on it is erased. Then select the system disk again, because the earlier selection was discarded. The host checks its disks again while it waits in the ISO. See [Disks and Boot Order](#host-disk-and-boot-preparation). |
+| A `MachineInventory` is back in `AwaitingTarget`, `status.install.message` says that the install did not complete, and the inventory has an `InstallInterrupted` event | The host restarted during the installation, for example after a power loss. Select its system disk again. |
+| A `MachineInventory` is back in `AwaitingTarget`, and `status.install.message` says that the host booted the live ISO again after the install completed | The ISO is still attached. Remove it and boot the host from disk; the installed system is kept. To install again instead, select a disk. |
+| The disk annotation is rejected | Read the message. If the host was not seen recently, make sure that it is still running the ISO, and run the command again. If the disk is not a candidate or not eligible, use an ID that the candidate list shows with `true`. A device path such as `/dev/sda`, or a `wwn:0x…` form, is rejected; the message says which form to use. If the message names the ClusterRole `baremetal-install-target-approver`, your account lacks the permissions listed in [Select the System Disk](#select-system-disk); run the command as a platform administrator. |
+| A `MachineInventory` is not `Ready=True`, or its `PLAN` is `<none>` | Wait until the host has installed Alauda OS and rebooted, then list the hosts again. If it does not change, contact technical support. |
+| The download URL of the ISO is empty or has expired | Rebuild the ISO as described in [Rebuild the ISO](./prepare_os.mdx#rebuild-iso). If the reason of `SeedImageReady` is not `SeedImageBuildSuccess`, first check that the registry has the ISO image, as described in [Push the OS Images](./prepare_os.mdx#import-os-images). |
+| The installation of an Alauda OS KU host fails with `kubeos install requires elemental.install.system-uri` | The registration has no `install.system-uri`. Generate the registration again as described in [Prepare Alauda OS for Hosts](./prepare_os.mdx#generate), apply it, rebuild the ISO as described in [Rebuild the ISO](./prepare_os.mdx#rebuild-iso), and boot the host from the new ISO. |
+
+## Next Steps
+
+- [Create a Cluster](./create_cluster.mdx) from available hosts.
+- Add nodes or a worker node group to a cluster: [Manage Nodes on Bare Metal](../../../configure/nodes/alauda_os/bare-metal.mdx).
