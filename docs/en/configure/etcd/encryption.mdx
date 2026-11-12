@@ -11,158 +11,6 @@ Install and operate Control Plane Database Encryption in <Term name="productShor
 
 It ensures that sensitive data stored in etcd, such as secrets and configmaps, is encrypted using a secure algorithm, enhancing your cluster's security.
 
-## Key Strategies
-
-The plugin supports two key strategies. Pick the one that matches your cluster role.
-
-| Strategy | When to use | How keys are produced |
-| --- | --- | --- |
-| `random` | Default for workload and DCS clusters running standalone (no etcd synchronization). | Each rotation generates a fresh random key locally. |
-| `deterministic` | **Required** for `global` clusters, especially when paired in a DR setup via the Global Cluster Disaster Recovery plugin. | Each key is derived deterministically from a shared root Secret and a shared SeedBundle, so the Active and Standby clusters always reach the same key for the same revision. |
-
-In `deterministic` mode, the runtime Active / Standby role is detected automatically; it is not a manual install parameter.
-
-## Installation
-
-The plugin supports two installation paths depending on the target cluster:
-
-* **Workload / DCS clusters** — use the default `random` key strategy.
-* **Global clusters** — must use the `deterministic` key strategy (see [Global Clusters (Deterministic Mode)](#global-deterministic) below).
-
-See [Cluster Plugin](/extend/cluster_plugin.mdx) for the general plugin installation workflow.
-
-### Workload / DCS Clusters (random strategy)
-
-* Supported cluster types: On-Premises, DCS.
-* No additional installation parameters are required — install via the standard Cluster Plugin workflow.
-
-### Global Clusters (Deterministic Mode) \{#global-deterministic}
-
-<Directive type="warning" title="DR pair requirements">
-
-For a Global DR pair, install the plugin **on both the Active and Standby clusters** in `deterministic` mode, and configure **identical** `replication_group_id` and `root_secret_name` (with matching root key material) on both sides. Asymmetric or mismatched configuration causes the Standby to derive different per-revision keys than the Active and breaks failover.
-
-</Directive>
-
-#### Prerequisites
-
-* The cluster must be a `global` cluster. When `global.cluster.name` is `global`, the plugin enforces `etcdEncryption.keyStrategy=deterministic`; the plugin configuration UI also defaults the field to `deterministic` for clusters labeled `is-global=true`.
-
-<Directive type="warning" title="Global Cluster Disaster Recovery version">
-
-The **Global Cluster Disaster Recovery** plugin must be installed at version **v4.3.7 or later** before installing Control Plane Database Encryption in `deterministic` mode. Earlier versions do not replicate the shared SeedBundle, so the Standby cluster cannot derive matching keys.
-
-</Directive>
-
-#### Plugin Parameters
-
-The plugin form exposes the following parameters for deterministic installation.
-
-| Plugin parameter | Required | Default | Purpose |
-| --- | --- | --- | --- |
-| `key_strategy` | Yes | `random`; dynamically defaults to `deterministic` for `global` clusters. | Selects between random per-rotation key generation and deterministic derivation. |
-| `replication_group_id` | Yes | The plugin UI prefills the current cluster name (not recommended — see below). | Identifies the Active / Standby DR group and participates in HKDF domain separation. |
-| `root_secret_name` | Yes | `etcd-derivation-root` | Name of the Secret in `kube-system` that holds the deterministic root key material. |
-
-The `rootSecretRef.namespace` is fixed to `kube-system` and is not exposed in the form.
-
-##### `key_strategy`
-
-| Value | Meaning |
-| --- | --- |
-| `random` | Single-cluster random rotation. |
-| `deterministic` | Derived keys based on a shared root Secret and SeedBundle. |
-
-For `global` clusters this must be `deterministic`.
-
-##### `replication_group_id`
-
-| Property | Value |
-| --- | --- |
-| Purpose | Identifies one Active / Standby DR replication group and participates in HKDF domain separation. |
-| Consistency requirement | The Active and Standby clusters in the same DR group **must** use exactly the same value. |
-| Default in UI | Current cluster name. |
-| Recommended to keep the default | **No.** |
-
-Recommendations:
-
-* For DR clusters built with the Global Cluster Disaster Recovery plugin, both sides of the same DR group must share the same `replication_group_id`.
-* To avoid leaking real business, environment, or cluster identity, do **not** reuse the cluster name even when the UI prefills it. Plan a separate opaque identifier ahead of installation.
-* A UUID-style identifier may be a good fit, for example `6f1b9e2c-7c3a-4a9c-8b72-2fd0f8f3c1ab`.
-
-To generate a UUID-style value from the command line:
-
-```bash
-openssl rand -hex 16 | sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12})$/\1-\2-\3-\4-\5/'
-```
-
-<Directive type="warning" title="Use the same value on both clusters">
-
-Generate the value **once**, then configure the same `replication_group_id` on the Active and Standby clusters of the DR group. Generating different values on each side will produce divergent encryption keys.
-
-</Directive>
-
-##### `root_secret_name`
-
-| Property | Value |
-| --- | --- |
-| Purpose | Refers to the deterministic root key Secret. |
-| Default | `etcd-derivation-root` |
-| Fixed namespace | `kube-system` |
-| Cross-cluster requirement | All clusters in the same replication group must use the same root key material. |
-
-The plugin form exposes only the Secret name; the namespace is always `kube-system` at render time.
-
-#### Preparing the Root Secret
-
-The deterministic root Secret must exist in `kube-system` before installing the plugin. Prepare it in two steps:
-
-1. Generate 32 bytes of cryptographically strong random material into `./root-key.bin`. The bytes must come from a high-entropy source — typically the operating system CSPRNG. `openssl rand` is a safe default; equivalent OS-CSPRNG-backed commands such as `head -c 32 /dev/urandom > ./root-key.bin` also work. Do **not** use shell `$RANDOM`, language-level `rand()`, or any time-seeded generator.
-
-   ```bash
-   openssl rand -out ./root-key.bin 32
-   ```
-
-2. Create the Secret in `kube-system` from that file:
-
-   ```bash
-   kubectl -n kube-system create secret generic etcd-derivation-root \
-     --from-file=root-key=./root-key.bin
-   ```
-
-If you use a different Secret name, replace `etcd-derivation-root` above with the value you will enter as `root_secret_name`.
-
-<Directive type="warning" title="Use the same key material on both clusters">
-
-Generate `./root-key.bin` **once**, then transport the **same file** to every cluster in the replication group and run the `kubectl create secret` step on each. Do **not** regenerate the key material per cluster — different root key bytes will produce divergent encryption keys.
-
-</Directive>
-
-#### Advanced (chart values, not exposed in the plugin form)
-
-<details>
-<summary>Show advanced chart values</summary>
-
-The following fields exist in the chart but are not surfaced as plugin install parameters. They retain their chart defaults unless you install via YAML / Helm overrides.
-
-| Chart field | Default | Purpose |
-| --- | --- | --- |
-| `etcdEncryption.deterministic.activationPolicy` | `timed-approval` | Controls how a new derived key becomes active. Set to `manual` for Global clusters — see [Approving a Deterministic Key Rotation](#approving-a-deterministic-key-rotation). |
-| `etcdEncryption.deterministic.approvalDelay` | `30m` | Delay applied under `timed-approval`. Only relevant when `activationPolicy` is `timed-approval`. |
-| `etcdEncryption.deterministic.derivationAlgorithm` | `hkdf-sha512-v1` | Algorithm used to derive per-revision keys from the root Secret. |
-| `etcdEncryption.deterministic.dimension` | `default` | Additional HKDF domain separator. Leave at the default unless you need to fork a key lineage on purpose. |
-| `etcdEncryption.deterministic.rootSecretRef.namespace` | `kube-system` | Fixed; not exposed by the form. |
-
-</details>
-
-<Directive type="warning" title="Set activationPolicy to manual for Global clusters">
-
-For a Global Active/Standby pair, explicitly set `activationPolicy` to `manual`. A new key revision must not become active on the Active cluster until an operator has confirmed that the matching revision is ready on the Standby cluster. If `activationPolicy` is omitted, the plugin defaults to `timed-approval` with a `30m` delay — see [Timed Approval](#timed-approval) for the risks this carries.
-
-</Directive>
-
----
-
 ## How it Works
 
 Upon installation, an `etcd-encryption-manager` controller is deployed in the `kube-system` namespace, which:
@@ -189,21 +37,96 @@ When the plugin is installed in `deterministic` mode on a `global` DR pair, the 
 | Encryption algorithm | 256-bit AES-GCM     |
 | Rotation interval    | 168 hours (7 days)  |
 
----
+## Choose a Key Strategy
 
-## Operations Guide
+The plugin can be installed on clusters on non-Alauda OS nodes and on clusters created by the DCS provider. The key strategy depends on the cluster:
 
-### Configuration Files
+| Strategy | When to use | How keys are produced |
+| --- | --- | --- |
+| `random` | Default for workload clusters. | Each rotation generates a fresh random key locally. |
+| `deterministic` | **Required** for the `global` cluster, whether or not it is part of a Global DR pair. | Each key is derived from a root Secret and a SeedBundle. In a Global DR pair, the Active and Standby clusters share both, so they always reach the same key for the same revision. |
 
-| Path                                              | Content                                   |
-| ------------------------------------------------- | ----------------------------------------- |
-| `/etc/kubernetes/encryption-provider.conf`        | Current encryption configuration          |
-| `/etc/kubernetes/encryption-provider-history.bak` | Historical key records (for recovery)     |
-| `/etc/kubernetes/encryption-provider-bak/`        | Expired encryption configuration versions |
+The `global` cluster must use `deterministic`; the plugin rejects any other strategy there. In a Global DR pair, the Active / Standby role is detected automatically; it is not an install parameter.
 
----
+## Install on Workload Clusters
 
-### Checking Status
+Install the plugin via the standard [Cluster Plugin](/extend/cluster_plugin.mdx) workflow with the default key strategy `random`. No additional installation parameters are required.
+
+## Install on the global Cluster \{#global-deterministic}
+
+These steps apply to every `global` cluster. If the `global` cluster is part of a Global DR pair, also follow [Additional Requirements for a Global DR Pair](#global-dr-pair).
+
+<Steps>
+
+### Generate the Replication Group ID \{#step-replication-group-id}
+
+`replication_group_id` identifies the replication group: the `global` cluster alone, or the Active and Standby clusters of a Global DR pair. The plugin form prefills the current cluster name, but do **not** keep it: to avoid leaking real business, environment, or cluster identity, use a separate opaque identifier. A UUID-style identifier may be a good fit, for example `6f1b9e2c-7c3a-4a9c-8b72-2fd0f8f3c1ab`.
+
+To generate a UUID-style value from the command line:
+
+```bash
+openssl rand -hex 16 | sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12})$/\1-\2-\3-\4-\5/'
+```
+
+<Directive type="warning" title="Do not change replication_group_id after installation">
+
+Once the plugin is installed, do not change `replication_group_id`, including when you update the plugin configuration. Changing it breaks etcd encryption in a Global DR pair.
+
+</Directive>
+
+### Prepare the Root Secret \{#step-root-secret}
+
+The deterministic root Secret must exist in `kube-system` before installing the plugin.
+
+1. Generate 32 bytes of cryptographically strong random material into `./root-key.bin`.
+
+   ```bash
+   (umask 077 && openssl rand -out ./root-key.bin 32)
+   ```
+
+   The bytes must come from a high-entropy source — typically the operating system CSPRNG. `openssl rand` is a safe default; equivalent OS-CSPRNG-backed commands such as `head -c 32 /dev/urandom > ./root-key.bin` also work. Do **not** use shell `$RANDOM`, language-level `rand()`, or any time-seeded generator.
+
+2. Create the Secret:
+
+   ```bash
+   kubectl -n kube-system create secret generic etcd-derivation-root \
+     --from-file=root-key=./root-key.bin
+   ```
+
+   If you use a different Secret name, replace `etcd-derivation-root` with the value you will enter as `root_secret_name`.
+
+### Install the Plugin \{#step-install}
+
+Install the plugin via the [Cluster Plugin](/extend/cluster_plugin.mdx) workflow, with the following form values:
+
+| Plugin parameter | Value |
+| --- | --- |
+| `key_strategy` | `deterministic` |
+| `replication_group_id` | The value from [Generate the Replication Group ID](#step-replication-group-id). |
+| `root_secret_name` | The Secret name from [Prepare the Root Secret](#step-root-secret). Default: `etcd-derivation-root`. |
+| `activation_policy` | `manual` for a Global DR pair. `timed-approval` for a `global` cluster without DR. The form defaults to `manual` on the `global` cluster. |
+| `approval_delay_minutes` | Used only with `timed-approval`. Default `60` on the `global` cluster; minimum `30`. |
+
+With `manual`, a new key revision does not become active until an operator approves it — see [Approve a Deterministic Key Rotation](#approving-a-deterministic-key-rotation). In a Global DR pair, this ensures the Standby cluster has loaded the key first. Without DR there is no Standby to wait for, so `timed-approval` activates each rotation automatically after the approval delay.
+
+For a description of every parameter, see [Plugin Parameters](#plugin-parameters).
+
+</Steps>
+
+### Additional Requirements for a Global DR Pair \{#global-dr-pair}
+
+<Directive type="warning" title="Configure both DR clusters identically">
+
+Install the plugin **on both the Active and Standby clusters**, with the **same** `replication_group_id` and the **same** root key material. Generate each value **once** and reuse it on both clusters. Asymmetric or mismatched configuration causes the Standby to derive different per-revision keys than the Active and breaks failover.
+
+</Directive>
+
+* The **Global Cluster Disaster Recovery** plugin must be installed.
+* Use the same `replication_group_id` on the Active and Standby clusters.
+* Generate `./root-key.bin` **once**, transport the **same** file to both clusters, and create the root Secret on each. Do **not** regenerate the key material per cluster.
+* Set `activation_policy` to `manual` on both clusters, because the Standby becomes the Active after a failover.
+
+## Check Rotation Status
 
 Run the following command to check the current rotation status:
 
@@ -245,15 +168,29 @@ status:
   revision: 3
 ```
 
-### Approving a Deterministic Key Rotation \{#approving-a-deterministic-key-rotation\}
+## Approve a Deterministic Key Rotation \{#approving-a-deterministic-key-rotation}
 
-When the encryption manager rotates a key in `deterministic` mode, the new revision enters a `WaitingApproval` phase on the Active cluster. The key does not take effect until the operator approves it. This gate exists because the Active cluster must not encrypt data with a key that the Standby cluster has not yet loaded — otherwise a failover would leave Standby unable to decrypt the new ciphertext.
+When the encryption manager rotates a key in `deterministic` mode, the new revision enters a `WaitingApproval` phase on the Active cluster. The key does not take effect until it is approved. This gate exists because the Active cluster must not encrypt data with a key that the Standby cluster has not yet loaded — otherwise a failover would leave Standby unable to decrypt the new ciphertext.
+
+```mermaid
+flowchart TD
+    start(["New key waiting for approval"]) --> ready{"Standby<br/>Prepared?"}
+    ready -- "No" --> stop["Do not approve<br/>Investigate DR replication"]
+    ready -- "Yes" --> approve["Approve on the Active cluster"]
+    approve --> active{"Active and<br/>migration Success?"}
+    active -- "Not yet" --> wait["Wait and re-check"]
+    active -- "Yes" --> finish(["Rotation complete"])
+```
 
 Approval is always performed on the **Active cluster only**. Do not patch the Standby's `EtcdKeySeedBundleState`, and do not edit any resource's `status` field directly.
 
-#### Manual Approval (Recommended) \{#manual-approval}
+For a `global` cluster without DR, there is no Standby: skip the Standby checks below, or use [Timed Approval](#timed-approval).
 
-**Step 1 — Identify the pending revision.**
+## Manual Approval \{#manual-approval}
+
+<Steps>
+
+### Identify the Pending Revision
 
 Log in to a control-plane node of the **Active** cluster and list all bundle states:
 
@@ -270,7 +207,7 @@ STATE="seed-bundle-state-${REVISION}"
 BUNDLE="seed-bundle-${REVISION}"
 ```
 
-**Step 2 — Verify Standby readiness.**
+### Verify Standby Readiness
 
 Log in to a control-plane node of the **Standby** cluster and check the same revision:
 
@@ -281,7 +218,7 @@ kubectl get eksbs "$STATE" \
 
 The output must show `PHASE=Prepared` for the expected revision. **Stop** if the object is missing, still `Preparing`, or `Failed` — investigate the Global Cluster Disaster Recovery replication path before proceeding.
 
-**Step 3 — Cross-check derivation inputs.**
+### Cross-check Derivation Inputs
 
 Run the following command on **both the Active and Standby clusters** and compare the output. The `replicationGroupID`, `dimension`, and `derivationAlgorithm` must match exactly:
 
@@ -290,7 +227,7 @@ kubectl get eksb "$BUNDLE" \
   -o custom-columns='REVISION:.spec.revision,GROUP:.spec.replicationGroupID,DIMENSION:.spec.dimension,ALGORITHM:.spec.derivationAlgorithm'
 ```
 
-**Step 4 — Approve.**
+### Approve the Revision
 
 On the **Active** cluster, approve the pending revision:
 
@@ -301,7 +238,7 @@ kubectl patch eksbs "$STATE" \
 
 The patch records the approval. Activation, deployment to control-plane nodes, and data migration happen asynchronously after this point.
 
-**Step 5 — Confirm activation completes.**
+### Confirm Activation Completes
 
 On the **Active** cluster, check the bundle state and migration progress:
 
@@ -326,15 +263,19 @@ kubectl get eec default \
 
 Every control-plane node must report `state=Success` for the new revision. A bundle that remains `Activating` indicates deployment or migration is still in progress (or retrying after a failure).
 
-#### Timed Approval (Not Recommended) \{#timed-approval}
+</Steps>
 
-<Directive type="warning" title="Timed approval risks data loss during failover">
+## Timed Approval \{#timed-approval}
 
-`timed-approval` is **not recommended** for Global Active/Standby pairs. The `approvalDelay` timer (default `30m`) is a local countdown on the Active cluster — it does not check whether the Standby has actually loaded the new key. If etcd synchronization is slow, the Standby network is partitioned, or the Standby control plane is under maintenance, the deadline can expire while the Standby is still unprepared. A failover during this window leaves Standby unable to decrypt data encrypted with the new key.
+`timed-approval` is the recommended policy for a `global` cluster without DR.
+
+<Directive type="warning" title="Timed approval risks data loss during a DR failover">
+
+`timed-approval` is **not recommended** for Global Active/Standby pairs. The approval delay timer is a local countdown on the Active cluster — it does not check whether the Standby has actually loaded the new key. If etcd synchronization is slow, the Standby network is partitioned, or the Standby control plane is under maintenance, the deadline can expire while the Standby is still unprepared. A failover during this window leaves Standby unable to decrypt data encrypted with the new key.
 
 </Directive>
 
-When `activationPolicy` is set to `timed-approval`, the controller automatically approves the pending revision once `approvalDelay` elapses after the `EtcdKeySeedBundleState` is created. The delay must be long enough for the full Standby preparation pipeline to complete:
+When `activation_policy` is `timed-approval`, the controller automatically approves the pending revision once `approval_delay_minutes` elapses after the `EtcdKeySeedBundleState` is created. In a Global DR pair, the delay must be long enough for the full Standby preparation pipeline to complete:
 
 | Phase | What happens | Typical duration |
 | --- | --- | --- |
@@ -343,15 +284,102 @@ When `activationPolicy` is set to `timed-approval`, the controller automatically
 | Deploy | Deployer writes the new provider config to all Standby control-plane nodes | Seconds to minutes (scales with node count) |
 | Reload | Standby kube-apiserver loads the new provider | Seconds to minutes (depends on whether automatic reload is enabled for the encryption provider config) |
 
-The default `30m` provides margin for typical single-region deployments with a small control plane. Increase it if your setup involves cross-region replication, large control planes, or clusters without automatic provider reload.
+The delay is at least 30 minutes; the form defaults to 60 minutes on the `global` cluster. Increase it if your setup involves cross-region replication, large control planes, or clusters without automatic provider reload.
 
-##### Required monitoring
+To change the policy permanently, change `activation_policy` in the plugin configuration, not in `eec/default`. The plugin overwrites `eec/default` with its configured policy the next time it renders the configuration.
 
-If you choose `timed-approval`, you **must** verify that monitoring and alerting are working on **both** the Active and Standby clusters before enabling this policy.
+### Required Monitoring
+
+If a Global DR pair uses `timed-approval`, you **must** verify that monitoring and alerting are working on **both** the Active and Standby clusters before enabling this policy. See [Metrics](#metrics) and [Built-in Alert Rules](#built-in-alert-rules) for what the plugin provides.
+
+The alert to act on is `EtcdEncryptionManagerTimedApprovalDeadlineApproaching` on the **Active** cluster — it gives you a 10-minute window to check whether the Standby is `Prepared` and switch to `manual` if it is not.
+
+<Directive type="info" title="Cross-cluster correlation">
+
+Each cluster runs its own metrics and alerting independently. The built-in alerts detect local issues — a stuck `WaitingApproval` on Active or a failed activation on Standby. To correlate the two (e.g., "Active is about to auto-approve but Standby is not yet `Prepared`"), aggregate metrics from both clusters into a central Prometheus / Thanos / Victoria Metrics instance.
+
+</Directive>
+
+### Emergency Response
+
+If the `EtcdEncryptionManagerTimedApprovalDeadlineApproaching` alert fires and the Standby is not ready, switch the **Active** cluster to `manual` to halt auto-approval.
+
+1. On the **Active** cluster, switch the encryption configuration to `manual`:
+
+   ```bash
+   kubectl patch eec default \
+     --type=merge -p '{"spec":{"deterministic":{"activationPolicy":"manual"}}}'
+   ```
+
+   This takes effect immediately. The current pending bundle switches to manual approval and stays manual, even if the policy changes again later.
+
+2. Verify that the current pending bundle has not been approved:
+
+   ```bash
+   kubectl get eksbs \
+     -o custom-columns='NAME:.metadata.name,REVISION:.spec.revision,PHASE:.status.phase,APPROVED:.spec.approved'
+   ```
+
+   The bundle must still show `APPROVED=false`. If the bundle has already moved to `Activating`, the deadline has already taken effect; follow the [activation checks](#manual-approval) above and do not assume that changing the policy rolls it back.
+
+3. To keep `manual` for later rotations, also change the plugin configuration. Otherwise the plugin restores its configured policy the next time it renders `eec/default`, and later bundles use `timed-approval` again:
+
+   ```bash
+   MI=$(kubectl get moduleinfo \
+     -l cpaas.io/module-name=etcd-encryption-manager,cpaas.io/cluster-name=global \
+     -o jsonpath='{.items[0].metadata.name}')
+   kubectl patch moduleinfo "$MI" \
+     --type=merge -p '{"spec":{"config":{"activation_policy":"manual"}}}'
+   ```
+
+## Reference
+
+### Plugin Parameters \{#plugin-parameters}
+
+| Plugin parameter | Required | Default | Purpose |
+| --- | --- | --- | --- |
+| `key_strategy` | Yes | `deterministic` on the `global` cluster; otherwise `random`. | `random`: single-cluster random rotation. `deterministic`: derived keys based on a root Secret and SeedBundle. Must be `deterministic` for the `global` cluster. |
+| `replication_group_id` | Yes, for `deterministic` | The plugin form prefills the current cluster name (not recommended). | Identifies the replication group and participates in HKDF domain separation. Must be identical on the Active and Standby clusters of a Global DR pair. Do not change it after installation. |
+| `root_secret_name` | Yes, for `deterministic` | `etcd-derivation-root` | Name of the Secret that holds the deterministic root key material. All clusters in the same replication group must use the same root key material. |
+| `activation_policy` | Yes, for `deterministic` | `manual` on the `global` cluster; otherwise `timed-approval`. | How a new derived key becomes active. See [Approve a Deterministic Key Rotation](#approving-a-deterministic-key-rotation). |
+| `approval_delay_minutes` | Yes, for `timed-approval` | `60` on the `global` cluster; otherwise `30`. Minimum `30`. | Delay before a pending revision is approved automatically under `timed-approval`. |
+
+The Secret namespace (`rootSecretRef.namespace`) is fixed to `kube-system` and is not exposed in the form.
+
+### Advanced Chart Values
+
+<details>
+<summary>Show advanced chart values</summary>
+
+The following fields exist in the chart but are not surfaced as plugin install parameters. They retain their chart defaults unless you install via YAML / Helm overrides.
+
+| Chart field | Default | Purpose |
+| --- | --- | --- |
+| `etcdEncryption.deterministic.derivationAlgorithm` | `hkdf-sha512-v1` | Algorithm used to derive per-revision keys from the root Secret. |
+| `etcdEncryption.deterministic.dimension` | `default` | Additional HKDF domain separator. Leave at the default unless you need to fork a key lineage on purpose. |
+| `etcdEncryption.deterministic.rootSecretRef.namespace` | `kube-system` | Fixed; not exposed by the form. |
+
+</details>
+
+### Custom Resources
+
+| Kind | Short name | Purpose |
+| --- | --- | --- |
+| [EtcdEncryptionConfig](/apis/kubernetes_apis/security/etcdencryptionconfig.mdx) | `eec` | Encryption settings and rotation status, in the object named `default`. |
+| [EtcdKeySeedBundle](/apis/kubernetes_apis/security/etcdkeyseedbundle.mdx) | `eksb` | Derivation inputs for one key revision in `deterministic` mode. |
+| [EtcdKeySeedBundleState](/apis/kubernetes_apis/security/etcdkeyseedbundlestate.mdx) | `eksbs` | Approval and activation phase for one key revision in `deterministic` mode. |
+
+### Configuration Files
+
+| Path                                              | Content                                   |
+| ------------------------------------------------- | ----------------------------------------- |
+| `/etc/kubernetes/encryption-provider.conf`        | Current encryption configuration          |
+| `/etc/kubernetes/encryption-provider-history.bak` | Historical key records (for recovery)     |
+| `/etc/kubernetes/encryption-provider-bak/`        | Expired encryption configuration versions |
+
+### Metrics \{#metrics}
 
 The encryption manager exposes the following Prometheus metrics:
-
-##### Metrics
 
 | Metric | Type | Description |
 | --- | --- | --- |
@@ -360,9 +388,9 @@ The encryption manager exposes the following Prometheus metrics:
 | `etcd_encryption_manager_bundle_activating` | Gauge | `1` when any bundle is currently in the `Activating` phase. |
 | `etcd_encryption_manager_bundle_activation_failed` | Gauge | `1` when an `Activating` bundle has an explicit deployment or migration failure. |
 
-##### Built-in alert rules
+### Built-in Alert Rules \{#built-in-alert-rules}
 
-The plugin includes the following alerts:
+The plugin includes the following alerts. They fire on each cluster independently.
 
 | Alert | Severity | Condition |
 | --- | --- | --- |
@@ -372,29 +400,3 @@ The plugin includes the following alerts:
 | `EtcdEncryptionManagerTimedApprovalDeadlinePassed` | critical | A `timed-approval` bundle's deadline has passed while still in `WaitingApproval`. |
 | `EtcdEncryptionManagerActivationFailed` | critical | An `Activating` bundle has a deployment or migration failure. |
 | `EtcdEncryptionManagerActivationStuck` | critical | A bundle has remained `Activating` for ≥ 30 minutes. |
-
-These alerts fire on each cluster independently. For Global clusters, the critical alert to act on is `EtcdEncryptionManagerTimedApprovalDeadlineApproaching` on the **Active** cluster — it gives you a 10-minute window to check whether the Standby is `Prepared` and switch to `manual` if it is not.
-
-<Directive type="info" title="Cross-cluster correlation">
-
-Each cluster runs its own metrics and alerting independently. The built-in alerts detect local issues — a stuck `WaitingApproval` on Active or a failed activation on Standby. To correlate the two (e.g., "Active is about to auto-approve but Standby is not yet `Prepared`"), aggregate metrics from both clusters into a central Prometheus / Thanos / Victoria Metrics instance.
-
-</Directive>
-
-##### Emergency response
-
-If the `EtcdEncryptionManagerTimedApprovalDeadlineApproaching` alert fires and the Standby is not ready, switch the Active to `manual` to halt auto-approval. On the **Active** cluster:
-
-```bash
-kubectl patch eec default \
-  --type=merge -p '{"spec":{"deterministic":{"activationPolicy":"manual"}}}'
-```
-
-Verify the current pending bundle has switched:
-
-```bash
-kubectl get eksbs \
-  -o custom-columns='NAME:.metadata.name,REVISION:.spec.revision,PHASE:.status.phase,APPROVED:.spec.approved'
-```
-
-The bundle must still show `APPROVED=false`. Switching back to `timed-approval` later affects only future bundles — the current bundle remains under manual control. If the bundle has already moved to `Activating`, the deadline has already taken effect; follow the [activation checks](#manual-approval) above and do not assume that changing the policy rolls it back.
