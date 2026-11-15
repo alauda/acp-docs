@@ -1,18 +1,18 @@
 ---
 weight: 7
 queries:
-  - typical deployment scenarios for a single cluster and a multi-cluster platform on Alauda OS
+  - typical installation scenarios for a single cluster and a multi-cluster platform on Alauda OS
   - how many nodes, CPU, memory, and disks the control plane, infra, monitor, log, and ingress node pools need
   - which plugins run on infra nodes and which storage monitoring, logging, and the registry use
   - resource planning for Ceph inside a workload cluster
 ---
 
-# Typical Deployment Scenarios
+# Typical Installation Scenarios
 
-This page describes two typical ways to deploy <Term name="product" /> (<Term name="productShort" />) on Alauda OS: a [Single Cluster](#single-cluster) and a [Multi-Cluster](#multi-cluster) platform, with an optional [Ceph](#multi-cluster-ceph) setup for workload clusters. Each scenario lists the resources to prepare, the solution choices, and the installation steps in order.
+This page describes two typical ways to install <Term name="product" /> (<Term name="productShort" />) on Alauda OS: a [Single Cluster](#single-cluster) and a [Multi-Cluster](#multi-cluster) platform, with an optional [Ceph](#multi-cluster-ceph) setup for workload clusters. Each scenario lists the resources to prepare, the solution choices, and the installation steps in order.
 
 - The scenarios apply to the Bare Metal, Huawei DCS, VMware vSphere, and Huawei Cloud Stack providers.
-- The storage choices assume that no enterprise storage is available. If enterprise storage is available, use it for all data except the node-local platform disks.
+- The storage choices use the storage that <Term name="productShort" /> provides: TopoLVM, and Ceph through Alauda Storage in the [Multi-Cluster with Ceph](#multi-cluster-ceph) setup. If enterprise storage is already available, it can hold all data except the node-local platform disks.
 - Procedures, commands, and configuration fields are in the linked pages.
 
 To choose between the architectures, see [Plan](./planning.mdx).
@@ -35,14 +35,19 @@ The `global` cluster also runs the application workloads. Disaster recovery is n
 
 Sizes are per node, in GiB.
 
-| Node pool | System disk | `/var/lib/containerd` | `/var/lib/kubelet` | `/var/lib/etcd` | `/var/cpaas` | Data disk |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| bootstrap | 300 or more, for the extracted packages and `/var/cpaas` | — | — | — | — | — |
-| control-plane | 100 | 150 | 100 | 20 | 200 | — |
-| infra | 100 | 150 | 100 | — | 100 | TopoLVM, 1 TiB |
+| Disk | Used for | control-plane | infra |
+| --- | --- | ---: | ---: |
+| System disk | Operating system | 100 | 100 |
+| `/var/lib/containerd` | Container images and container writable layers | 150 | 150 |
+| `/var/lib/kubelet` | Pod ephemeral data, such as `emptyDir` volumes | 100 | 100 |
+| `/var/lib/etcd` | etcd data, on a dedicated high-IO disk | 20 | — |
+| `/var/cpaas` | Platform data: etcd local backups, the log collection buffer, and audit data | 200 | 100 |
+| TopoLVM data disk (raw) | Persistent volumes of logging, monitoring, and the registry | — | 1 TiB |
+
+The bootstrap node needs 300 GB or more for the extracted packages and `/var/cpaas`.
 
 - The tables give the minimum recommended size of each node. Physical servers are usually much larger; select servers that are at least this size. For ARM nodes, scale the sizes as described in [Machines](./planning.mdx#machines).
-- For the platform disks, see [Disk Configuration](../../configure/scalability/disk_configuration.mdx). Use a dedicated high-IO disk for etcd.
+- For the platform disks, see [Disk Configuration](../../configure/scalability/disk_configuration.mdx).
 - 4 cores and 8 GB is the x86 minimum for the bootstrap node. For its disk and the arm64 minimum, see [Bootstrap Node](../alauda_os/prerequisites.mdx#bootstrap-host-hardware).
 - The sizes assume about 20 application worker nodes. The number and size of worker nodes depend on the applications and are not covered here. After the installation, evaluate the load on the control plane nodes and scale up when needed; see [Evaluating Resources for Workload Cluster](../../configure/scalability/evaluating_workload.mdx). The `global` cluster of a Single Cluster is also a workload cluster, so it follows the workload cluster evaluation.
 - If no image registry is available and machines are limited, deploy mirror-registry on the bootstrap node as the platform image registry. The bootstrap node then cannot be reclaimed after the installation and must meet the mirror-registry requirements; see [Create an Image Registry with mirror-registry](./mirror-registry.mdx).
@@ -136,6 +141,7 @@ The `global` cluster runs only the platform. Applications run on workload cluste
 | bootstrap | 1 | 4 cores | 8 GB | Runs the installer. It can also host the platform image registry. |
 | control-plane | 3 | 16 cores | 32 GiB | Control plane and platform components, for up to 50 managed clusters. |
 | infra | 3 | 12 cores | 32 GiB | Monitoring and logging of the `global` cluster itself. 16 cores and 32 GiB is also suitable, and uses the same machine type as the control plane. |
+| Harbor, storage | — | — | — | Only when Harbor is the central registry and no DevOps cluster is used. For the sizes, see [Central Registry](#multi-cluster-registry). |
 
 **Workload cluster**: choose a size by the number of application worker nodes.
 
@@ -144,7 +150,7 @@ About 20 application worker nodes (size A):
 | Node pool | Nodes | CPU | Memory | Purpose |
 | --- | ---: | --- | --- | --- |
 | control-plane | 3 | 8 cores | 32 GiB | Control plane and platform components. |
-| infra | 3 | 16 cores | 48 GiB | Logging and monitoring, plus the application Ingress and the registry. Logging is planned for 5,000 log entries per second with 7 days of retention. For more logs, expand the disks. |
+| infra | 3 | 16 cores | 48 GiB | Logging and monitoring, plus the application Ingress. Logging is planned for 5,000 log entries per second with 7 days of retention. For more logs, expand the disks. |
 
 About 150 application worker nodes, with separate pools for ingress, monitoring, and logging (size B):
 
@@ -153,29 +159,63 @@ About 150 application worker nodes, with separate pools for ingress, monitoring,
 | control-plane | 3 | 8 cores | 32 GiB | Control plane and platform components, sized as the 120-worker reference. |
 | ingress | 2 | 8 cores | 16 GiB | Application Ingress, about 4,000 requests per second per node. |
 | monitor | 3 | 12 cores | 24 GiB | Monitoring. |
-| log | 3 | 12 cores | 32 GiB | Logging and the registry. Logging is planned for 5,000 log entries per second with 7 days of retention. For more logs, expand the disks. |
+| log | 3 | 12 cores | 32 GiB | Logging. Logging is planned for 5,000 log entries per second with 7 days of retention. For more logs, expand the disks. |
 
 #### Disks
 
-Sizes are per node, in GiB.
+Sizes are per node, in GiB. The bootstrap node needs 300 GB or more for the extracted packages and `/var/cpaas`.
 
-| Cluster | Node pool | System disk | `/var/lib/containerd` | `/var/lib/kubelet` | `/var/lib/etcd` | `/var/cpaas` | Data disk |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| All | bootstrap | 300 or more, for the extracted packages and `/var/cpaas` | — | — | — | — | — |
-| `global`, workload | control-plane | 100 | 150 | 100 | 20 | 200 | — |
-| `global` | infra | 100 | 150 | 100 | — | 100 | TopoLVM, 1 TiB |
-| Workload, size A | infra | 100 | 150 | 100 | — | 100 | TopoLVM, 1 TiB |
-| Workload, size B | ingress | 100 | 150 | 100 | — | 100 | — |
-| Workload, size B | monitor | 100 | 150 | 100 | — | 100 | TopoLVM, 100 |
-| Workload, size B | log | 100 | 150 | 100 | — | 100 | TopoLVM, 1 TiB |
+**`global` cluster**:
+
+| Disk | Used for | control-plane | infra |
+| --- | --- | ---: | ---: |
+| System disk | Operating system | 100 | 100 |
+| `/var/lib/containerd` | Container images and container writable layers | 150 | 150 |
+| `/var/lib/kubelet` | Pod ephemeral data, such as `emptyDir` volumes | 100 | 100 |
+| `/var/lib/etcd` | etcd data, on a dedicated high-IO disk | 20 | — |
+| `/var/cpaas` | Platform data: etcd local backups, the log collection buffer, and audit data | 200 | 100 |
+| TopoLVM data disk (raw) | Persistent volumes of logging and monitoring | — | 1 TiB |
+
+**Workload cluster, size A**:
+
+| Disk | Used for | control-plane | infra |
+| --- | --- | ---: | ---: |
+| System disk | Operating system | 100 | 100 |
+| `/var/lib/containerd` | Container images and container writable layers | 150 | 150 |
+| `/var/lib/kubelet` | Pod ephemeral data, such as `emptyDir` volumes | 100 | 100 |
+| `/var/lib/etcd` | etcd data, on a dedicated high-IO disk | 20 | — |
+| `/var/cpaas` | Platform data: etcd local backups, the log collection buffer, and audit data | 200 | 100 |
+| TopoLVM data disk (raw) | Persistent volumes of logging and monitoring | — | 1 TiB |
+
+**Workload cluster, size B**:
+
+| Disk | Used for | control-plane | ingress | monitor | log |
+| --- | --- | ---: | ---: | ---: | ---: |
+| System disk | Operating system | 100 | 100 | 100 | 100 |
+| `/var/lib/containerd` | Container images and container writable layers | 150 | 150 | 150 | 150 |
+| `/var/lib/kubelet` | Pod ephemeral data, such as `emptyDir` volumes | 100 | 100 | 100 | 100 |
+| `/var/lib/etcd` | etcd data, on a dedicated high-IO disk | 20 | — | — | — |
+| `/var/cpaas` | Platform data: etcd local backups, the log collection buffer, and audit data | 200 | 100 | 100 | 100 |
+| TopoLVM data disk (raw) | Persistent volumes of monitoring (monitor pool) or logging (log pool) | — | — | 100 | 1 TiB |
 
 - The tables give the minimum recommended size of each node. Physical servers are usually much larger; select servers that are at least this size. For ARM nodes, scale the sizes as described in [Machines](./planning.mdx#machines).
-- For the platform disks, see [Disk Configuration](../../configure/scalability/disk_configuration.mdx). Use a dedicated high-IO disk for etcd.
+- For the platform disks, see [Disk Configuration](../../configure/scalability/disk_configuration.mdx).
 - 4 cores and 8 GB is the x86 minimum for the bootstrap node. For its disk and the arm64 minimum, see [Bootstrap Node](../alauda_os/prerequisites.mdx#bootstrap-host-hardware).
 - The `global` cluster size covers up to 50 managed clusters. For more, evaluate again with [Evaluating Resources for Global Cluster](../../configure/scalability/evaluating_global.mdx).
 - The workload cluster sizes are estimated from the number of application worker nodes and are for reference only. The number and size of worker nodes depend on the applications and are not covered here. After the installation, evaluate the load on the control plane nodes and scale up when needed; see [Evaluating Resources for Workload Cluster](../../configure/scalability/evaluating_workload.mdx). For size B, also check the sizes against the actual monitoring data volume and log retention.
 - If no image registry is available, deploy mirror-registry on the bootstrap node as the platform image registry, one on each side for disaster recovery. One mirror-registry shared by many clusters is a single point of failure, so with many workload clusters, use a highly available registry. See [Create an Image Registry with mirror-registry](./mirror-registry.mdx).
-- To use Alauda Storage in place of enterprise storage at a large scale, contact Alauda for an evaluation first.
+- Alauda Storage can also serve as the main storage of a large platform. To size such a deployment, contact Alauda.
+
+#### Central Registry \{#multi-cluster-registry}
+
+A Multi-Cluster platform uses one central registry for application images, shared by the workload clusters.
+
+- **If a central registry already exists**, use it, and skip the planning and installation of Harbor.
+- **If no central registry exists**, use Harbor. Plan its resources in one of the following ways:
+  - **Only the registry is needed, without other DevOps tools**: add a Harbor node pool and a storage node pool to the `global` cluster.
+  - **Other DevOps tools are also needed**: run Harbor in a dedicated DevOps cluster together with the other tools.
+
+{/* TODO: link to the DevOps planning page in alauda/devops-docs once its release version is set */}For the sizes of these node pools and of the DevOps cluster, see the <ExternalSiteLink name="devops" children="Alauda DevOps" /> documentation.
 
 #### Node Pools
 
@@ -201,7 +241,7 @@ Platform traffic is usually light, so an enterprise load balancer for the endpoi
 | Logging | ClickHouse, one per cluster | TopoLVM |
 | Application ingress (workload clusters) | Ingress NGINX | — |
 | Application ingress VIP (workload clusters) | An enterprise load balancer if available; otherwise MetalLB | — |
-| Registry for application images (workload clusters) | <Term name="product" /> Registry, 1 replica | TopoLVM. With Ceph, see [Multi-Cluster with Ceph](#multi-cluster-ceph). |
+| Registry for application images | A central registry: the existing one, or Harbor; see [Central Registry](#multi-cluster-registry) | See the Alauda DevOps documentation |
 
 Each cluster stores only its own monitoring data and logs. Do not send them to the `global` cluster. Disaster recovery synchronizes only the etcd data of the `global` cluster, so monitoring data and logs are not copied to the standby; see [Observability Placement](../alauda_os/global_dr.mdx#observability-placement).
 
@@ -217,7 +257,7 @@ Workload cluster, size A:
 
 | Node pool | Plugins |
 | --- | --- |
-| infra | Alauda Container Platform Advanced Monitoring, Alauda Container Platform Log Storage Management, Alauda Data Services Analytical Database E1, Alauda Data Services Streaming E1, Alauda Container Platform Ingress Controller, Alauda Container Platform Registry |
+| infra | Alauda Container Platform Advanced Monitoring, Alauda Container Platform Log Storage Management, Alauda Data Services Analytical Database E1, Alauda Data Services Streaming E1, Alauda Container Platform Ingress Controller |
 
 Workload cluster, size B:
 
@@ -225,9 +265,9 @@ Workload cluster, size B:
 | --- | --- |
 | ingress | Alauda Container Platform Ingress Controller |
 | monitor | Alauda Container Platform Advanced Monitoring |
-| log | Alauda Container Platform Log Storage Management, Alauda Data Services Analytical Database E1, Alauda Data Services Streaming E1, Alauda Container Platform Registry |
+| log | Alauda Container Platform Log Storage Management, Alauda Data Services Analytical Database E1, Alauda Data Services Streaming E1 |
 
-Configure the placement of ClickHouse, Kafka, and the registry when you install them, in the same way as for a Single Cluster; see [Plugins on Infra Nodes](#single-cluster-infra-plugins). Decide the Kafka node label before you create the instance.
+Configure the placement of ClickHouse and Kafka when you install them, in the same way as for a Single Cluster; see [Plugins on Infra Nodes](#single-cluster-infra-plugins). Decide the Kafka node label before you create the instance.
 
 ### Installation Steps \{#multi-cluster-steps}
 
@@ -243,9 +283,10 @@ Configure the placement of ClickHouse, Kafka, and the registry when you install 
 | 8 | Start the synchronization. | [Start Synchronization](../alauda_os/global_dr.mdx#start-synchronization) |
 | 9 | Publish the Common Extensions to the primary and the standby. | [Publish the Common Extensions](../next_steps.mdx#publish_common_extensions) |
 | 10 | On both `global` clusters, declare the infra label and taint, and install TopoLVM, monitoring, logging, and the etcd backup plugin. Install these plugins only after both sides are installed and the synchronization runs. | [Install the Cluster Plugins](../alauda_os/global_dr.mdx#restart-the-dependent-pods), [Create Infra Nodes on Alauda OS Nodes](../../configure/nodes/node_planning.mdx#create-infra-nodes-alauda-os), [Install TopoLVM](../../storage/storagesystem_topolvm/installation.mdx), [ACP Advanced Monitoring](../../observability/monitor/install_monitor.mdx#acp-monitoring-with-victoriametrics), <ExternalSiteLink name="logs" href="/install/fast-install.html" children="Fast Install" />, [etcd Backup and Restore](../../configure/backup/etcd.mdx) |
-| 11 | Install the providers that the workload clusters need on the `global` cluster. | [Install the Providers on the global Cluster](../../workload_clusters/alauda_os/index.mdx#install-providers) |
-| 12 | Create the workload clusters. Choose the image registry, create the node pools for size A or size B, and declare the role labels and taints on the node pools. | [Cluster Creation Workflow](../../workload_clusters/alauda_os/index.mdx#workflow), [Choose the Image Registry](../../workload_clusters/alauda_os/prepare/index.mdx#image-registry), [Custom Role Nodes](../../configure/nodes/node_planning.mdx#custom-role-nodes) |
-| 13 | On each workload cluster, install in this order: TopoLVM, monitoring, logging, the Ingress Controller (and MetalLB if no enterprise load balancer is used), the registry, and the etcd backup plugin. | [Install TopoLVM](../../storage/storagesystem_topolvm/installation.mdx), [ACP Advanced Monitoring](../../observability/monitor/install_monitor.mdx#acp-monitoring-with-victoriametrics), <ExternalSiteLink name="logs" href="/install/fast-install.html" children="Fast Install" />, [Ingress Controller](../../networking/operators/ingress_nginx_operator.mdx), [MetalLB component placement](../../networking/operators/metallb_operator.mdx#configure-component-placement), [Install the Registry](../../configure/registry/image_registry_operator.mdx), [etcd Backup and Restore](../../configure/backup/etcd.mdx) |
+| 11 | If no central registry exists, install Harbor on the `global` cluster or in a dedicated DevOps cluster. | [Central Registry](#multi-cluster-registry) |
+| 12 | Install the providers that the workload clusters need on the `global` cluster. | [Install the Providers on the global Cluster](../../workload_clusters/alauda_os/index.mdx#install-providers) |
+| 13 | Create the workload clusters. Choose the image registry, create the node pools for size A or size B, and declare the role labels and taints on the node pools. | [Cluster Creation Workflow](../../workload_clusters/alauda_os/index.mdx#workflow), [Choose the Image Registry](../../workload_clusters/alauda_os/prepare/index.mdx#image-registry), [Custom Role Nodes](../../configure/nodes/node_planning.mdx#custom-role-nodes) |
+| 14 | On each workload cluster, install in this order: TopoLVM, monitoring, logging, the Ingress Controller (and MetalLB if no enterprise load balancer is used), and the etcd backup plugin. | [Install TopoLVM](../../storage/storagesystem_topolvm/installation.mdx), [ACP Advanced Monitoring](../../observability/monitor/install_monitor.mdx#acp-monitoring-with-victoriametrics), <ExternalSiteLink name="logs" href="/install/fast-install.html" children="Fast Install" />, [Ingress Controller](../../networking/operators/ingress_nginx_operator.mdx), [MetalLB component placement](../../networking/operators/metallb_operator.mdx#configure-component-placement), [etcd Backup and Restore](../../configure/backup/etcd.mdx) |
 | — | Fail over. | [Fail Over to the Standby global Cluster](../alauda_os/disaster_recovery_failover.mdx) |
 | — | Upgrade later. | [Upgrade Overview](../../upgrade/overview.mdx), [Upgrade global Clusters in a DR Environment](../../upgrade/global/upgrade_global_dr.mdx) |
 
@@ -261,9 +302,14 @@ When a workload cluster needs storage that follows the Pod across nodes, deploy 
 
 Sizes are per node, in GiB.
 
-| Node pool | System disk | `/var/lib/containerd` | `/var/lib/kubelet` | `/var/cpaas` | Data disks |
-| --- | ---: | ---: | ---: | ---: | --- |
-| storage | 100 | 150 | 100 | 100 | Ceph OSD raw disk, 500, SSD; persistent disk for `/var/lib/rook`, 100 |
+| Disk | Used for | storage |
+| --- | --- | ---: |
+| System disk | Operating system | 100 |
+| `/var/lib/containerd` | Container images and container writable layers | 150 |
+| `/var/lib/kubelet` | Pod ephemeral data, such as `emptyDir` volumes | 100 |
+| `/var/cpaas` | Platform data: the log collection buffer | 100 |
+| Ceph OSD data disk (raw, SSD) | Ceph data | 500 |
+| `/var/lib/rook` (persistent) | MON and Rook data | 100 |
 
 - With 3 replicas, usable capacity is about one third of the raw OSD capacity. Add OSD disks for more capacity.
 - `/var/lib/rook` must be on a persistent disk, and each OSD must be a separate raw disk; see [Prerequisites for Deploying on Alauda OS](../../storage/storagesystem_ceph/installation/immutable_infrastructure_prerequisites.mdx).
@@ -275,7 +321,6 @@ Sizes are per node, in GiB.
 | --- | --- |
 | Node pools | Add the storage node pool, with its own role label and taint. |
 | Other components that need persistent volumes | Use Ceph block storage (RBD). |
-| Registry for application images | Store the images in Ceph object storage (RGW) through the S3 interface; see [Configure S3-Compatible Storage](../../configure/registry/setting_up_and_configuring_the_registry.mdx#configure-s3-compatible-storage). |
 | Installation steps | Install Ceph after TopoLVM and before monitoring; see [Install](../../storage/storagesystem_ceph/installation/index.mdx). |
 
 ## Other Products \{#other-products}
