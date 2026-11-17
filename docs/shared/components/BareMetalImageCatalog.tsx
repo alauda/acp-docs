@@ -730,7 +730,6 @@ function SingleVersionForm({ mode, children }: { mode: SingleVersionMode; childr
           ))}
           <OutputTitle>Add the image catalog keys</OutputTitle>
           <CommandBlock command={renderCatalogCommand(releaseEntries(release, tagOf, host.values))} />
-          {catalogNotes}
           {children}
           <OutputTitle>Registration file</OutputTitle>
           {images.map(item => (
@@ -901,7 +900,7 @@ function MarkdownOutput({ mode, children }: { mode: Mode; children?: ReactNode }
         </p>
       ) : null}
       {mode === 'register' ? null : <p>{tagHintText}</p>}
-      {catalogNotes}
+      {mode === 'register' ? null : catalogNotes}
       {children}
     </>
   )
@@ -978,7 +977,8 @@ export interface BareMetalImageCatalogProps {
   mode?: Mode
   /**
    * Shown below the image catalog notes, in the page and in its Markdown
-   * output, and below the outputs with `install`. Use it for the
+   * output; below the catalog command with `register`, which has no notes;
+   * and below the outputs with `install`. Use it for the
    * `ResourcePatch` note, whose link must be written in the page so that it
    * resolves.
    */
