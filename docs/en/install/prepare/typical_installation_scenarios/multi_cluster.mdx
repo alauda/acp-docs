@@ -1,0 +1,243 @@
+---
+title: Multi-Cluster
+weight: 20
+queries:
+  - typical multi-cluster installation on Alauda OS with a primary and a standby global cluster
+  - how many nodes, CPU, memory, and disks the global cluster and workload clusters need
+  - central registry for application images in a multi-cluster platform
+  - resource planning for Ceph inside a workload cluster
+---
+
+# Multi-Cluster
+
+The `global` cluster runs only the platform, and business workloads run on workload clusters. The `global` cluster uses a primary and a standby for disaster recovery. For the assumptions that apply to every scenario, see [Common Assumptions](./index.mdx#common-assumptions).
+
+This page also covers an optional [Ceph](#multi-cluster-ceph) setup for workload clusters.
+
+## Resource Requirements \{#multi-cluster-resources}
+
+### Machines
+
+**`global` cluster**: the table lists one side. Prepare it for both the primary and the standby, or for one side without disaster recovery.
+
+| Node pool | Nodes per side | CPU | Memory | Purpose |
+| --- | ---: | --- | --- | --- |
+| bootstrap | 1 | 4 cores | 8 GB | Runs the installer and can also host the platform image registry. |
+| control-plane | 3 | 16 cores | 32 GiB | Control plane and platform components, for up to 50 managed clusters. |
+| infra | 3 | 12 cores | 24 GiB | Monitoring and logging of the `global` cluster itself. |
+| harbor | 3 | 12 cores | 24 GiB | Harbor, only when it is the central registry without a DevOps cluster. |
+| storage | 3, or 4 on Bare Metal | 8 cores | 24 GiB | Ceph for Harbor, in the same case as the harbor pool. |
+
+- For more than 50 managed clusters, select the control plane tier in [Evaluating Resources for Global Cluster](../../../configure/scalability/evaluating_global.mdx#node-sizing).
+- The harbor and storage pools go on the primary only by default. If Harbor needs a standby, prepare the same pools on the standby as well; see [Central Registry](#multi-cluster-registry).
+
+**Workload cluster**: size A matches the tier of 24 worker nodes and 500 namespaces in [Control Plane Node Sizing](../../../configure/scalability/evaluating_workload.mdx#control-plane-node-sizing), and size B matches the tier of 120 worker nodes and 1000 namespaces. For a different number of worker nodes or namespaces, select the matching tier on that page.
+
+Size A, for 24 worker nodes and 500 namespaces:
+
+| Node pool | Nodes | CPU | Memory | Purpose |
+| --- | ---: | --- | --- | --- |
+| control-plane | 3 | 4 cores | 16 GiB | Control plane and platform components. |
+| infra | 3 | 16 cores | 48 GiB | Logging, monitoring, and the application gateway. |
+
+Size B, for 120 worker nodes and 1000 namespaces, with separate pools for the gateway, monitoring, and logging:
+
+| Node pool | Nodes | CPU | Memory | Purpose |
+| --- | ---: | --- | --- | --- |
+| control-plane | 3 | 8 cores | 32 GiB | Control plane and platform components. |
+| gateway | 2 | 4 cores | 8 GiB | Application gateway (Envoy Gateway), planned for light load. |
+| monitor | 3 | 8 cores | 16 GiB | Monitoring. |
+| log | 3 | 8 cores | 16 GiB | Logging. |
+
+- The tables give the minimum recommended size of each node. Physical servers are usually much larger, so select servers that are at least this size.
+- The sizes follow the capacity tiers of each product component. After the installation, scale up according to the actual utilization.
+- For ARM nodes, scale the sizes as described in [Machines](../planning.mdx#machines).
+- Logging is planned for 5,000 log entries per second with 7 days of retention. For more logs, expand the disks.
+- For more requests than the gateway pool handles under light load, scale up its nodes.
+- The number and size of worker nodes depend on the business workloads and are not covered here.
+- 4 cores and 8 GB is the x86 minimum for the bootstrap node. For its disk and the arm64 minimum, see [Bootstrap Node](../../alauda_os/prerequisites.mdx#bootstrap-host-hardware).
+- If no image registry is available, deploy mirror-registry on the bootstrap node of each side as the platform image registry. With many workload clusters, use a highly available registry instead, because one mirror-registry is a single point of failure. See [Create an Image Registry with mirror-registry](../mirror-registry.mdx).
+- Alauda Storage can also serve as the main storage of a large platform. To size such a deployment, contact Alauda.
+
+### Disks
+
+Sizes are per node, in GB. For what each disk holds and why it has this size, see [Disk Configuration](../../../configure/scalability/disk_configuration.mdx). The bootstrap node needs 300 GB or more for the extracted packages and `/var/cpaas`.
+
+**`global` cluster**:
+
+| Disk | control-plane | infra |
+| --- | ---: | ---: |
+| **IaaS** |  |  |
+| System disk | 100 | 100 |
+| `/var/lib/etcd` | 20 | — |
+| `/var/lib/containerd` | 150 | 150 |
+| `/var/lib/kubelet` | 200 | 200 |
+| `/var/cpaas` (persistent) | 100 | 200 |
+| Raw disk for TopoLVM | — | 650 |
+| **Bare Metal** |  |  |
+| System disk, minimum / recommended | 512 / 1 TB | 512 / 1 TB |
+| Raw disk for TopoLVM | — | 1 TB |
+
+**Workload cluster, size A**:
+
+| Disk | control-plane | infra |
+| --- | ---: | ---: |
+| **IaaS** |  |  |
+| System disk | 100 | 100 |
+| `/var/lib/etcd` | 20 | — |
+| `/var/lib/containerd` | 150 | 150 |
+| `/var/lib/kubelet` | 100 | 100 |
+| `/var/cpaas` (persistent) | 100 | 200 |
+| Raw disk for TopoLVM | — | 650 |
+| **Bare Metal** |  |  |
+| System disk, minimum / recommended | 512 / 512 | 512 / 1 TB |
+| Raw disk for TopoLVM | — | 1 TB |
+
+**Workload cluster, size B**:
+
+| Disk | control-plane | gateway | monitor | log |
+| --- | ---: | ---: | ---: | ---: |
+| **IaaS** |  |  |  |  |
+| System disk | 100 | 100 | 100 | 100 |
+| `/var/lib/etcd` | 20 | — | — | — |
+| `/var/lib/containerd` | 150 | 150 | 150 | 150 |
+| `/var/lib/kubelet` | 100 | 100 | 100 | 100 |
+| `/var/cpaas` (persistent) | 100 | 50 | 50 | 200 |
+| Raw disk for TopoLVM | — | — | 100 | 600 |
+| **Bare Metal** |  |  |  |  |
+| System disk, minimum / recommended | 512 / 512 | 512 / 512 | 512 / 512 | 512 / 1 TB |
+| Raw disk for TopoLVM | — | — | 512 | 1 TB |
+
+- On IaaS, the raw disk for TopoLVM is sized for the current need, because it can be expanded later. See [Raw Disk for TopoLVM](../../../configure/scalability/disk_configuration.mdx#topolvm_raw_disk).
+- For the disks of the harbor and storage pools, see <ExternalSiteLink name="devops" href="/install/planning-devops-cluster.html#harbor-on-global" children="Harbor on the global Cluster" />.
+
+### Central Registry \{#multi-cluster-registry}
+
+A Multi-Cluster platform uses one central registry for application images, shared by the workload clusters.
+
+- **A central registry already exists**: use it, and skip the planning and installation of Harbor.
+- **Only the registry is needed, without other DevOps tools**: add the harbor and storage pools to the `global` cluster, as listed in [Machines](#multi-cluster-resources). See <ExternalSiteLink name="devops" href="/install/planning-devops-cluster.html#harbor-on-global" children="Harbor on the global Cluster" />.
+- **Other DevOps tools are also needed**: run Harbor in a dedicated DevOps cluster with the other tools. Add a pipeline pool only when 3 or more PipelineRuns run at the same time at peak. See <ExternalSiteLink name="devops" href="/install/planning-devops-cluster.html#devops-cluster" children="Dedicated DevOps Cluster" /> and <ExternalSiteLink name="devops" href="/install/planning-devops-cluster.html#pipeline-pool" children="Pipeline Pool" />.
+
+A Harbor standby is optional with disaster recovery. By default, add the harbor and storage pools to the primary only. If a Harbor standby is needed, prepare the same pools on the standby as well.
+
+### Node Pools
+
+- Keep `deployMode` at the default value `normal` on every cluster. For the fields, see [Installation Reference](../../alauda_os/reference.mdx#install-config).
+- For the infra pools of the `global` cluster and of size A workload clusters, declare the label and taint on the node pool after the cluster is created. See [Create Infra Nodes on Alauda OS Nodes](../../../configure/nodes/node_planning.mdx#create-infra-nodes-alauda-os).
+- For size B workload clusters, create one node pool each for gateway, monitor, and log, with its own role label and taint. See [Custom Role Nodes](../../../configure/nodes/node_planning.mdx#custom-role-nodes).
+
+### Control Plane Endpoint
+
+The `global` cluster and every workload cluster need a control plane endpoint. Choose one of the following:
+
+- **Self-built VIP**: needs no external device.
+- **Enterprise load balancer**: allocate one VIP on it for each control plane endpoint. The VIP of the application gateway can also come from the same load balancer.
+- **Huawei Cloud Stack**: use the ELB that the provider creates.
+
+For what to prepare, see [Confirm Install-Time Decisions](../planning.mdx#install-time-decisions) and [Plan the Control Plane Endpoint](../../alauda_os/prerequisites.mdx#control-plane-endpoint).
+
+## Solution Selection \{#multi-cluster-selection}
+
+### Features and Storage
+
+| Feature | Selection | Storage |
+| --- | --- | --- |
+| Monitoring | VictoriaMetrics, one per cluster | TopoLVM |
+| Logging | ClickHouse, one per cluster | TopoLVM |
+| Application gateway (workload clusters) | Envoy Gateway (Gateway API) | — |
+| Application gateway VIP (workload clusters) | An enterprise load balancer if available; otherwise MetalLB | — |
+| Registry for application images | A central registry: the existing one, or Harbor | Ceph, for Harbor |
+
+- On Huawei Cloud Stack, use the host network and the HCS ELB for the gateway VIP instead of MetalLB, as for a [Single Cluster](./single_cluster.mdx#single-cluster-selection).
+- For the registry, see [Central Registry](#multi-cluster-registry).
+- Each cluster stores only its own monitoring data and logs; do not send them to the `global` cluster. Disaster recovery does not copy them to the standby; see [Observability Placement](../../alauda_os/global_dr.mdx#observability-placement).
+
+### Plugins on Infra Nodes
+
+`global` cluster, the same on the primary and the standby:
+
+| Node pool | Plugins |
+| --- | --- |
+| infra | Alauda Container Platform Advanced Monitoring, Alauda Container Platform Log Storage Management, Alauda Data Services Analytical Database E1, Alauda Data Services Streaming E1 |
+
+Workload cluster, size A:
+
+| Node pool | Plugins |
+| --- | --- |
+| infra | Alauda Container Platform Advanced Monitoring, Alauda Container Platform Log Storage Management, Alauda Data Services Analytical Database E1, Alauda Data Services Streaming E1, Alauda Container Platform Gateway API Controller |
+
+Workload cluster, size B:
+
+| Node pool | Plugins |
+| --- | --- |
+| gateway | Alauda Container Platform Gateway API Controller |
+| monitor | Alauda Container Platform Advanced Monitoring |
+| log | Alauda Container Platform Log Storage Management, Alauda Data Services Analytical Database E1, Alauda Data Services Streaming E1 |
+
+## Installation Steps \{#multi-cluster-steps}
+
+| Step | Task | Documentation |
+| ---: | --- | --- |
+| 1 | Plan, and confirm which network flows apply. | [Plan](../planning.mdx), [Communication Matrix](../communication_matrix.mdx#applicability) |
+| 2 | Decide on disaster recovery before you write the first `install-config.yaml`. | [Create a Global Cluster Disaster Recovery Pair](../../alauda_os/global_dr.mdx), [Decide Before You Install](../../alauda_os/global_dr.mdx#decide-before-you-install) |
+| 3 | Download the installation packages. | [Download](../download.mdx) |
+| 4 | Prepare the platform image registry, and upload the images to both sides for disaster recovery. | [Prepare an External Platform Image Registry](../external-platform-image-registry.mdx#prepare-the-target-version-payload), [mirror-registry](../mirror-registry.mdx) |
+| 5 | Meet the common and provider prerequisites, with one bootstrap node on each side. | [Prerequisites](../../alauda_os/prerequisites.mdx), [Provider Pages](./index.mdx#provider-pages) |
+| 6 | Plan the disks of each node pool before you create the clusters. | [Fixed at Creation](../../../workload_clusters/alauda_os/index.mdx#fixed-at-creation), [Disk Configuration](../../../configure/scalability/disk_configuration.mdx) |
+| 7 | Install the primary `global` cluster, then the standby. | [Install the Primary and the Standby](../../alauda_os/global_dr.mdx#install-primary-and-standby-clusters) |
+| 8 | Start the synchronization. | [Start Synchronization](../../alauda_os/global_dr.mdx#start-synchronization) |
+| 9 | Publish the Common Extensions to the primary and the standby. | [Publish the Common Extensions](../../next_steps.mdx#publish_common_extensions) |
+| 10 | On both `global` clusters, after the synchronization runs, complete steps 10 to 13 and 18 of the Single Cluster steps, including the placement on the infra nodes. | [Install the Cluster Plugins](../../alauda_os/global_dr.mdx#restart-the-dependent-pods), [Single Cluster steps](./single_cluster.mdx#single-cluster-steps) |
+| 11 | If no central registry exists, install Harbor on the `global` cluster or in a dedicated DevOps cluster. | [Central Registry](#multi-cluster-registry) |
+| 12 | Install the providers that the workload clusters need on the `global` cluster. | [Install the Providers on the global Cluster](../../../workload_clusters/alauda_os/index.mdx#install-providers) |
+| 13 | Create the workload clusters with the node pools of size A or size B. | [Cluster Creation Workflow](../../../workload_clusters/alauda_os/index.mdx#workflow), [Choose the Image Registry](../../../workload_clusters/alauda_os/prepare/index.mdx#image-registry) |
+| 14 | Declare the role labels and taints on the node pools of each workload cluster. | [Custom Role Nodes](../../../configure/nodes/node_planning.mdx#custom-role-nodes) |
+| 15 | On each workload cluster, complete steps 11 to 16 and 18 of the Single Cluster steps, including the placement on the infra nodes. | [Single Cluster steps](./single_cluster.mdx#single-cluster-steps) |
+| — | Fail over. | [Fail Over to the Standby global Cluster](../../alauda_os/disaster_recovery_failover.mdx) |
+| — | Upgrade later. | [Upgrade Overview](../../../upgrade/overview.mdx), [Upgrade global Clusters in a DR Environment](../../../upgrade/global/upgrade_global_dr.mdx) |
+
+- For disaster recovery, step 2 also covers the keys that both sides share and the network flows between the sides.
+- On size B workload clusters, use the role label and taint of the gateway, monitor, or log pool in place of the infra label and taint when you place each component.
+
+## Multi-Cluster with Ceph \{#multi-cluster-ceph}
+
+When a workload cluster needs storage that follows the Pod across nodes, deploy a small Ceph cluster inside that workload cluster, on a dedicated storage node pool.
+
+### Machines and Disks
+
+| Node pool | Nodes | CPU | Memory | Purpose |
+| --- | ---: | --- | --- | --- |
+| storage | 3 on IaaS; 4 on Bare Metal | 8 cores | 24 GiB | Ceph, on nodes not shared with infra or worker nodes. |
+
+- Spread the storage nodes across failure domains.
+- On Bare Metal, use 4 storage nodes, because a replacement for a failed server can take a long time to arrive. With 3 nodes, Ceph runs degraded on 2 nodes until then, which blocks maintenance and upgrades. With 4 nodes, 3 remain after one failure, and Ceph can restore all 3 replicas.
+
+Sizes are per node, in GB. For what each disk holds and why it has this size, see [Disk Configuration](../../../configure/scalability/disk_configuration.mdx).
+
+| Disk | storage |
+| --- | ---: |
+| **IaaS** |  |
+| System disk | 100 |
+| `/var/lib/containerd` | 150 |
+| `/var/lib/kubelet` | 100 |
+| `/var/cpaas` (persistent) | 50 |
+| **Bare Metal** |  |
+| System disk, minimum / recommended | 512 / 512 |
+| **All environments** |  |
+| Raw disk for the Ceph OSD (SSD) | 512 |
+| Persistent disk for `/var/lib/rook` | 100 |
+
+- With 3 replicas, usable capacity is about one third of the raw OSD capacity. Add OSD disks for more capacity.
+- `/var/lib/rook` must be on a persistent disk, and each OSD must be a separate raw disk. See [Prerequisites for Deploying on Alauda OS](../../../storage/storagesystem_ceph/installation/immutable_infrastructure_prerequisites.mdx).
+- For the CPU and memory that Ceph reserves, see the small three-node baseline in [Aggregate Cluster Planning Budget](../../../storage/storagesystem_ceph/planning.mdx#aggregate-cluster-planning-budget).
+
+### Changes to the Workload Cluster
+
+| Item | Change |
+| --- | --- |
+| Node pools | Add the storage node pool, with its own role label and taint. |
+| Other components that need persistent volumes | Use Ceph block storage (RBD). |
+| Installation steps | Install Ceph after TopoLVM and before monitoring. |
+
+For the installation, see [Install](../../../storage/storagesystem_ceph/installation/index.mdx).
