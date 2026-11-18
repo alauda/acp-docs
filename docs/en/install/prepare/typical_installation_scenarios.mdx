@@ -2,7 +2,7 @@
 weight: 7
 queries:
   - typical installation scenarios for a single cluster and a multi-cluster platform on Alauda OS
-  - how many nodes, CPU, memory, and disks the control plane, infra, monitor, log, and ingress node pools need
+  - how many nodes, CPU, memory, and disks the control plane, infra, monitor, log, and gateway node pools need
   - which plugins run on infra nodes and which storage monitoring, logging, and the registry use
   - resource planning for Ceph inside a workload cluster
 ---
@@ -29,20 +29,24 @@ The `global` cluster also runs the application workloads. Disaster recovery is n
 | --- | ---: | --- | --- | --- |
 | bootstrap | 1 | 4 cores | 8 GB | Runs the installer. It can also host the platform image registry. |
 | control-plane | 3 | 8 cores | 16 GiB | Control plane and platform components, sized for 24 worker nodes; see [Control Plane Node Sizing for a Single Cluster](../../configure/scalability/evaluating_workload.mdx#single-cluster-control-plane). |
-| infra | 3 | 16 cores | 48 GiB | Logging and monitoring, plus the application Ingress and the registry. Logging is planned for 5,000 log entries per second with 7 days of retention. For more logs, expand the disks. |
+| infra | 3 | 16 cores | 48 GiB | Logging and monitoring, plus the application gateway and the registry. Logging is planned for 5,000 log entries per second with 7 days of retention. For more logs, expand the disks. |
 
 #### Disks
 
-Sizes are per node, in GiB.
+Sizes are per node, in GB. For what each disk holds and why it has this size, see [Disk Configuration](../../configure/scalability/disk_configuration.mdx).
 
-| Disk | Used for | control-plane | infra |
-| --- | --- | ---: | ---: |
-| System disk | Operating system | 100 | 100 |
-| `/var/lib/containerd` | Container images and container writable layers | 150 | 150 |
-| `/var/lib/kubelet` | Pod ephemeral data, such as `emptyDir` volumes | 100 | 100 |
-| `/var/lib/etcd` | etcd data, on a dedicated high-IO disk | 20 | — |
-| `/var/cpaas` | Platform data: etcd local backups, the log collection buffer, and audit data | 200 | 100 |
-| TopoLVM data disk (raw) | Persistent volumes of logging, monitoring, and the registry | — | 1 TiB |
+| Disk | control-plane | infra |
+| --- | ---: | ---: |
+| **On Huawei DCS, Huawei Cloud Stack, or VMware vSphere** |  |  |
+| System disk | 100 | 100 |
+| `/var/lib/etcd` | 20 | — |
+| `/var/lib/containerd` | 150 | 150 |
+| `/var/lib/kubelet` | 200 | 200 |
+| `/var/cpaas` (persistent) | 100 | 200 |
+| **On Bare Metal** |  |  |
+| System disk, minimum / recommended | 512 / 1 TB | 512 / 1 TB |
+| **On all providers** |  |  |
+| Raw disk for TopoLVM | — | 1 TB |
 
 The bootstrap node needs 300 GB or more for the extracted packages and `/var/cpaas`.
 
@@ -69,11 +73,7 @@ The control plane endpoint serves the Kubernetes API and the platform access add
 - **Self-built VIP**: needs no external device.
 - **An enterprise load balancer**: use it if one is available.
 
-On Huawei Cloud Stack, use the ELB that the provider creates. For the modes that each provider supports and what to prepare, see [Plan the Control Plane Endpoint](../alauda_os/prerequisites.mdx#control-plane-endpoint).
-
-:::tip
-Platform traffic is usually light, so an enterprise load balancer for the endpoint can be more capacity than needed.
-:::
+When an enterprise load balancer is available, allocate one VIP on it for the control plane endpoint. The VIP of the application gateway can also come from the same load balancer. On Huawei Cloud Stack, use the ELB that the provider creates. For the modes that each provider supports and what to prepare, see [Plan the Control Plane Endpoint](../alauda_os/prerequisites.mdx#control-plane-endpoint).
 
 ### Solution Selection \{#single-cluster-selection}
 
@@ -83,8 +83,8 @@ Platform traffic is usually light, so an enterprise load balancer for the endpoi
 | --- | --- | --- |
 | Monitoring | VictoriaMetrics | TopoLVM |
 | Logging | ClickHouse | TopoLVM |
-| Application ingress | Ingress NGINX | — |
-| Application ingress VIP | An enterprise load balancer if available; otherwise MetalLB | — |
+| Application gateway | Envoy Gateway (Gateway API), which uses the Gateway API rather than the Ingress API | — |
+| Application gateway VIP | An enterprise load balancer if available; otherwise MetalLB. On Huawei Cloud Stack, run `envoy-proxy` with the host network and put the HCS ELB in front of the gateway nodes, without MetalLB; see [How To Use `hostNetwork` In `envoy-proxy`](../../networking/how_to/tasks_for_envoy_gateway.mdx#envoy_proxy_hostnetwork). | — |
 | Registry for application images | <Term name="product" /> Registry, 1 replica | TopoLVM |
 
 #### Plugins on Infra Nodes \{#single-cluster-infra-plugins}
@@ -95,10 +95,12 @@ Platform traffic is usually light, so an enterprise load balancer for the endpoi
 | Alauda Container Platform Log Storage Management | Log storage management |
 | Alauda Data Services Analytical Database E1 | Log storage (ClickHouse) |
 | Alauda Data Services Streaming E1 | Log message queue (Kafka) |
-| Alauda Container Platform Ingress Controller | Application ingress |
+| Alauda Container Platform Gateway API Controller | Application gateway (Envoy Gateway) |
 | Alauda Container Platform Registry | Registry for application images |
 
-ClickHouse, Kafka, and the registry are not scheduled to infra nodes automatically. Configure their placement when you install them:
+Envoy Gateway, ClickHouse, Kafka, and the registry are not scheduled to infra nodes automatically. Configure their placement when you install them:
+
+- **Envoy Gateway**: set the node selector and tolerations of `envoy-proxy` in the `EnvoyProxy` resource; see [How To Set NodeSelector And Tolerations For `envoy-proxy`](../../networking/how_to/tasks_for_envoy_gateway.mdx#envoy_proxy_scheduling).
 
 - **ClickHouse**: configure the infra toleration and node affinity on the instance; see <ExternalSiteLink name="clickhouse" href="/how_to/deploy_as_logging_storage.html" children="Deploy as ACP logging storage" />.
 - **Kafka**: set the node label and the tolerations in the scheduling settings when you create the instance. The node label cannot be changed after the instance is created, so decide it first. See <ExternalSiteLink name="kafka" href="/functions/10-create-instance.html" children="Create Instance" />.
@@ -121,7 +123,7 @@ ClickHouse, Kafka, and the registry are not scheduled to infra nodes automatical
 | 11 | Install TopoLVM and create the storage on the data disks of the infra nodes. Monitoring, logging, and the registry use it, so install it first. | [Install](../../storage/storagesystem_topolvm/installation.mdx) |
 | 12 | Install monitoring on the infra nodes with TopoLVM storage. | [ACP Advanced Monitoring](../../observability/monitor/install_monitor.mdx#acp-monitoring-with-victoriametrics), [Planning Infra Nodes for Monitoring](../../observability/monitor/how_to/infra_nodes.mdx) |
 | 13 | Install logging on the infra nodes with TopoLVM storage. | <ExternalSiteLink name="logs" href="/install/fast-install.html" children="Fast Install" /> |
-| 14 | Install the Ingress Controller on the infra nodes. If no enterprise load balancer is used, install MetalLB and configure an address pool. | [Ingress Controller](../../networking/operators/ingress_nginx_operator.mdx), [MetalLB component placement](../../networking/operators/metallb_operator.mdx#configure-component-placement), [IP pool](../../networking/functions/configure_metallb.mdx#configure_ip_pool) |
+| 14 | Install Envoy Gateway and place `envoy-proxy` on the infra nodes. For the gateway VIP, use the enterprise load balancer, or install MetalLB and configure an address pool. On Huawei Cloud Stack, use the host network and the HCS ELB instead of MetalLB. | [Install Envoy Gateway via Envoy Gateway Operator](../../networking/operators/envoy_gateway_operator.mdx#install_envoy_gateway_operator), [Node selector and tolerations for `envoy-proxy`](../../networking/how_to/tasks_for_envoy_gateway.mdx#envoy_proxy_scheduling), [MetalLB component placement](../../networking/operators/metallb_operator.mdx#configure-component-placement), [IP pool](../../networking/functions/configure_metallb.mdx#configure_ip_pool), [`hostNetwork` in `envoy-proxy`](../../networking/how_to/tasks_for_envoy_gateway.mdx#envoy_proxy_hostnetwork) |
 | 15 | Install the registry on the infra nodes with TopoLVM storage. | [Install the Registry](../../configure/registry/image_registry_operator.mdx), [PVC storage](../../configure/registry/setting_up_and_configuring_the_registry.mdx#configure-pvc-storage) |
 | 16 | Install the etcd backup plugin. | [etcd Backup and Restore](../../configure/backup/etcd.mdx) |
 | 17 | Complete the other post-installation tasks. | [Next Steps](../next_steps.mdx) |
@@ -151,53 +153,65 @@ About 20 application worker nodes (size A):
 | Node pool | Nodes | CPU | Memory | Purpose |
 | --- | ---: | --- | --- | --- |
 | control-plane | 3 | 4 cores | 16 GiB | Control plane and platform components, sized as the 24-worker tier; see [Control Plane Node Sizing](../../configure/scalability/evaluating_workload.mdx#control-plane-node-sizing). |
-| infra | 3 | 16 cores | 48 GiB | Logging and monitoring, plus the application Ingress. Logging is planned for 5,000 log entries per second with 7 days of retention. For more logs, expand the disks. |
+| infra | 3 | 16 cores | 48 GiB | Logging and monitoring, plus the application gateway. Logging is planned for 5,000 log entries per second with 7 days of retention. For more logs, expand the disks. |
 
-About 150 application worker nodes, with separate pools for ingress, monitoring, and logging (size B):
+About 150 application worker nodes, with separate pools for the gateway, monitoring, and logging (size B):
 
 | Node pool | Nodes | CPU | Memory | Purpose |
 | --- | ---: | --- | --- | --- |
 | control-plane | 3 | 8 cores | 32 GiB | Control plane and platform components, sized as the 120-worker tier; see [Control Plane Node Sizing](../../configure/scalability/evaluating_workload.mdx#control-plane-node-sizing). |
-| ingress | 2 | 4 cores | 8 GiB | Application Ingress, planned for light load: up to about 1,000 requests per second per controller. For more requests, scale up the nodes. |
+| gateway | 2 | 4 cores | 8 GiB | Application gateway (Envoy Gateway), planned for light load. For more requests, scale up the nodes. |
 | monitor | 3 | 8 cores | 16 GiB | Monitoring. |
 | log | 3 | 8 cores | 16 GiB | Logging. Logging is planned for 5,000 log entries per second with 7 days of retention. For more logs, expand the disks. |
 
 #### Disks
 
-Sizes are per node, in GiB. The bootstrap node needs 300 GB or more for the extracted packages and `/var/cpaas`.
+Sizes are per node, in GB. For what each disk holds and why it has this size, see [Disk Configuration](../../configure/scalability/disk_configuration.mdx). The bootstrap node needs 300 GB or more for the extracted packages and `/var/cpaas`.
 
 **`global` cluster**:
 
-| Disk | Used for | control-plane | infra |
-| --- | --- | ---: | ---: |
-| System disk | Operating system | 100 | 100 |
-| `/var/lib/containerd` | Container images and container writable layers | 150 | 150 |
-| `/var/lib/kubelet` | Pod ephemeral data, such as `emptyDir` volumes | 100 | 100 |
-| `/var/lib/etcd` | etcd data, on a dedicated high-IO disk | 20 | — |
-| `/var/cpaas` | Platform data: etcd local backups, the log collection buffer, and audit data | 200 | 100 |
-| TopoLVM data disk (raw) | Persistent volumes of logging and monitoring | — | 1 TiB |
+| Disk | control-plane | infra |
+| --- | ---: | ---: |
+| **On Huawei DCS, Huawei Cloud Stack, or VMware vSphere** |  |  |
+| System disk | 100 | 100 |
+| `/var/lib/etcd` | 20 | — |
+| `/var/lib/containerd` | 150 | 150 |
+| `/var/lib/kubelet` | 200 | 200 |
+| `/var/cpaas` (persistent) | 100 | 200 |
+| **On Bare Metal** |  |  |
+| System disk, minimum / recommended | 512 / 1 TB | 512 / 1 TB |
+| **On all providers** |  |  |
+| Raw disk for TopoLVM | — | 1 TB |
 
 **Workload cluster, size A**:
 
-| Disk | Used for | control-plane | infra |
-| --- | --- | ---: | ---: |
-| System disk | Operating system | 100 | 100 |
-| `/var/lib/containerd` | Container images and container writable layers | 150 | 150 |
-| `/var/lib/kubelet` | Pod ephemeral data, such as `emptyDir` volumes | 100 | 100 |
-| `/var/lib/etcd` | etcd data, on a dedicated high-IO disk | 20 | — |
-| `/var/cpaas` | Platform data: etcd local backups, the log collection buffer, and audit data | 200 | 100 |
-| TopoLVM data disk (raw) | Persistent volumes of logging and monitoring | — | 1 TiB |
+| Disk | control-plane | infra |
+| --- | ---: | ---: |
+| **On Huawei DCS, Huawei Cloud Stack, or VMware vSphere** |  |  |
+| System disk | 100 | 100 |
+| `/var/lib/etcd` | 20 | — |
+| `/var/lib/containerd` | 150 | 150 |
+| `/var/lib/kubelet` | 100 | 100 |
+| `/var/cpaas` (persistent) | 100 | 200 |
+| **On Bare Metal** |  |  |
+| System disk, minimum / recommended | 512 / 512 | 512 / 1 TB |
+| **On all providers** |  |  |
+| Raw disk for TopoLVM | — | 1 TB |
 
 **Workload cluster, size B**:
 
-| Disk | Used for | control-plane | ingress | monitor | log |
-| --- | --- | ---: | ---: | ---: | ---: |
-| System disk | Operating system | 100 | 100 | 100 | 100 |
-| `/var/lib/containerd` | Container images and container writable layers | 150 | 150 | 150 | 150 |
-| `/var/lib/kubelet` | Pod ephemeral data, such as `emptyDir` volumes | 100 | 100 | 100 | 100 |
-| `/var/lib/etcd` | etcd data, on a dedicated high-IO disk | 20 | — | — | — |
-| `/var/cpaas` | Platform data: etcd local backups, the log collection buffer, and audit data | 200 | 100 | 100 | 100 |
-| TopoLVM data disk (raw) | Persistent volumes of monitoring (monitor pool) or logging (log pool) | — | — | 100 | 1 TiB |
+| Disk | control-plane | gateway | monitor | log |
+| --- | ---: | ---: | ---: | ---: |
+| **On Huawei DCS, Huawei Cloud Stack, or VMware vSphere** |  |  |  |  |
+| System disk | 100 | 100 | 100 | 100 |
+| `/var/lib/etcd` | 20 | — | — | — |
+| `/var/lib/containerd` | 150 | 150 | 150 | 150 |
+| `/var/lib/kubelet` | 100 | 100 | 100 | 100 |
+| `/var/cpaas` (persistent) | 100 | 50 | 50 | 200 |
+| **On Bare Metal** |  |  |  |  |
+| System disk, minimum / recommended | 512 / 512 | 512 / 512 | 512 / 512 | 512 / 1 TB |
+| **On all providers** |  |  |  |  |
+| Raw disk for TopoLVM | — | — | 512 | 1 TB |
 
 - The tables give the minimum recommended size of each node. Physical servers are usually much larger; select servers that are at least this size. For ARM nodes, scale the sizes as described in [Machines](./planning.mdx#machines).
 - For the platform disks, see [Disk Configuration](../../configure/scalability/disk_configuration.mdx).
@@ -223,15 +237,11 @@ A Multi-Cluster platform uses one central registry for application images, share
 
 - Keep `deployMode` at the default value `normal` on every cluster. For the fields, see [Installation Reference](../alauda_os/reference.mdx#install-config).
 - For the infra pools of the `global` cluster and of size A workload clusters, declare the label and taint on the node pool after the cluster is created; see [Create Infra Nodes on Alauda OS Nodes](../../configure/nodes/node_planning.mdx#create-infra-nodes-alauda-os).
-- For size B workload clusters, create one node pool each for ingress, monitor, and log, with its own role label and taint; see [Custom Role Nodes](../../configure/nodes/node_planning.mdx#custom-role-nodes).
+- For size B workload clusters, create one node pool each for gateway, monitor, and log, with its own role label and taint; see [Custom Role Nodes](../../configure/nodes/node_planning.mdx#custom-role-nodes).
 
 #### Control Plane Endpoint
 
-The `global` cluster and every workload cluster need a control plane endpoint. The choices are the same as for a Single Cluster: a Self-built VIP or an enterprise load balancer. On Huawei Cloud Stack, use the ELB that the provider creates. See [Plan the Control Plane Endpoint](../alauda_os/prerequisites.mdx#control-plane-endpoint).
-
-:::tip
-Platform traffic is usually light, so an enterprise load balancer for the endpoint can be more capacity than needed.
-:::
+The `global` cluster and every workload cluster need a control plane endpoint. The choices are the same as for a Single Cluster: a Self-built VIP or an enterprise load balancer. When an enterprise load balancer is available, allocate one VIP on it for the control plane endpoint. The VIP of the application gateway can also come from the same load balancer. On Huawei Cloud Stack, use the ELB that the provider creates. See [Plan the Control Plane Endpoint](../alauda_os/prerequisites.mdx#control-plane-endpoint).
 
 ### Solution Selection \{#multi-cluster-selection}
 
@@ -241,8 +251,8 @@ Platform traffic is usually light, so an enterprise load balancer for the endpoi
 | --- | --- | --- |
 | Monitoring | VictoriaMetrics, one per cluster | TopoLVM |
 | Logging | ClickHouse, one per cluster | TopoLVM |
-| Application ingress (workload clusters) | Ingress NGINX | — |
-| Application ingress VIP (workload clusters) | An enterprise load balancer if available; otherwise MetalLB | — |
+| Application gateway (workload clusters) | Envoy Gateway (Gateway API), which uses the Gateway API rather than the Ingress API | — |
+| Application gateway VIP (workload clusters) | An enterprise load balancer if available; otherwise MetalLB. On Huawei Cloud Stack, run `envoy-proxy` with the host network and put the HCS ELB in front of the gateway nodes, without MetalLB; see [How To Use `hostNetwork` In `envoy-proxy`](../../networking/how_to/tasks_for_envoy_gateway.mdx#envoy_proxy_hostnetwork). | — |
 | Registry for application images | A central registry: the existing one, or Harbor; see [Central Registry](#multi-cluster-registry) | See the Alauda DevOps documentation |
 
 Each cluster stores only its own monitoring data and logs. Do not send them to the `global` cluster. Disaster recovery synchronizes only the etcd data of the `global` cluster, so monitoring data and logs are not copied to the standby; see [Observability Placement](../alauda_os/global_dr.mdx#observability-placement).
@@ -259,17 +269,17 @@ Workload cluster, size A:
 
 | Node pool | Plugins |
 | --- | --- |
-| infra | Alauda Container Platform Advanced Monitoring, Alauda Container Platform Log Storage Management, Alauda Data Services Analytical Database E1, Alauda Data Services Streaming E1, Alauda Container Platform Ingress Controller |
+| infra | Alauda Container Platform Advanced Monitoring, Alauda Container Platform Log Storage Management, Alauda Data Services Analytical Database E1, Alauda Data Services Streaming E1, Alauda Container Platform Gateway API Controller |
 
 Workload cluster, size B:
 
 | Node pool | Plugins |
 | --- | --- |
-| ingress | Alauda Container Platform Ingress Controller |
+| gateway | Alauda Container Platform Gateway API Controller |
 | monitor | Alauda Container Platform Advanced Monitoring |
 | log | Alauda Container Platform Log Storage Management, Alauda Data Services Analytical Database E1, Alauda Data Services Streaming E1 |
 
-Configure the placement of ClickHouse and Kafka when you install them, in the same way as for a Single Cluster; see [Plugins on Infra Nodes](#single-cluster-infra-plugins). Decide the Kafka node label before you create the instance.
+Configure the placement of Envoy Gateway, ClickHouse, and Kafka when you install them, in the same way as for a Single Cluster; see [Plugins on Infra Nodes](#single-cluster-infra-plugins). Decide the Kafka node label before you create the instance.
 
 ### Installation Steps \{#multi-cluster-steps}
 
@@ -288,7 +298,7 @@ Configure the placement of ClickHouse and Kafka when you install them, in the sa
 | 11 | If no central registry exists, install Harbor on the `global` cluster or in a dedicated DevOps cluster. | [Central Registry](#multi-cluster-registry) |
 | 12 | Install the providers that the workload clusters need on the `global` cluster. | [Install the Providers on the global Cluster](../../workload_clusters/alauda_os/index.mdx#install-providers) |
 | 13 | Create the workload clusters. Choose the image registry, create the node pools for size A or size B, and declare the role labels and taints on the node pools. | [Cluster Creation Workflow](../../workload_clusters/alauda_os/index.mdx#workflow), [Choose the Image Registry](../../workload_clusters/alauda_os/prepare/index.mdx#image-registry), [Custom Role Nodes](../../configure/nodes/node_planning.mdx#custom-role-nodes) |
-| 14 | On each workload cluster, install in this order: TopoLVM, monitoring, logging, the Ingress Controller (and MetalLB if no enterprise load balancer is used), and the etcd backup plugin. | [Install TopoLVM](../../storage/storagesystem_topolvm/installation.mdx), [ACP Advanced Monitoring](../../observability/monitor/install_monitor.mdx#acp-monitoring-with-victoriametrics), <ExternalSiteLink name="logs" href="/install/fast-install.html" children="Fast Install" />, [Ingress Controller](../../networking/operators/ingress_nginx_operator.mdx), [MetalLB component placement](../../networking/operators/metallb_operator.mdx#configure-component-placement), [etcd Backup and Restore](../../configure/backup/etcd.mdx) |
+| 14 | On each workload cluster, install in this order: TopoLVM, monitoring, logging, Envoy Gateway with its VIP (the enterprise load balancer, MetalLB, or on Huawei Cloud Stack the host network and the HCS ELB), and the etcd backup plugin. | [Install TopoLVM](../../storage/storagesystem_topolvm/installation.mdx), [ACP Advanced Monitoring](../../observability/monitor/install_monitor.mdx#acp-monitoring-with-victoriametrics), <ExternalSiteLink name="logs" href="/install/fast-install.html" children="Fast Install" />, [Install Envoy Gateway via Envoy Gateway Operator](../../networking/operators/envoy_gateway_operator.mdx#install_envoy_gateway_operator), [Node selector and tolerations for `envoy-proxy`](../../networking/how_to/tasks_for_envoy_gateway.mdx#envoy_proxy_scheduling), [MetalLB component placement](../../networking/operators/metallb_operator.mdx#configure-component-placement), [`hostNetwork` in `envoy-proxy`](../../networking/how_to/tasks_for_envoy_gateway.mdx#envoy_proxy_hostnetwork), [etcd Backup and Restore](../../configure/backup/etcd.mdx) |
 | — | Fail over. | [Fail Over to the Standby global Cluster](../alauda_os/disaster_recovery_failover.mdx) |
 | — | Upgrade later. | [Upgrade Overview](../../upgrade/overview.mdx), [Upgrade global Clusters in a DR Environment](../../upgrade/global/upgrade_global_dr.mdx) |
 
@@ -300,20 +310,25 @@ When a workload cluster needs storage that follows the Pod across nodes, deploy 
 
 | Node pool | Nodes | CPU | Memory | Purpose |
 | --- | ---: | --- | --- | --- |
-| storage | 3 | 8 cores | 24 GiB | Ceph. Place the 3 nodes in 3 failure domains. Do not share them with infra or worker nodes. |
+| storage | 3 on Huawei DCS, Huawei Cloud Stack, or VMware vSphere; 4 on Bare Metal | 8 cores | 24 GiB | Ceph. Spread the nodes across failure domains. Do not share them with infra or worker nodes. |
 
-Sizes are per node, in GiB.
+Sizes are per node, in GB. For what each disk holds and why it has this size, see [Disk Configuration](../../configure/scalability/disk_configuration.mdx).
 
-| Disk | Used for | storage |
-| --- | --- | ---: |
-| System disk | Operating system | 100 |
-| `/var/lib/containerd` | Container images and container writable layers | 150 |
-| `/var/lib/kubelet` | Pod ephemeral data, such as `emptyDir` volumes | 100 |
-| `/var/cpaas` | Platform data: the log collection buffer | 100 |
-| Ceph OSD data disk (raw, SSD) | Ceph data | 500 |
-| `/var/lib/rook` (persistent) | MON and Rook data | 100 |
+| Disk | storage |
+| --- | ---: |
+| **On Huawei DCS, Huawei Cloud Stack, or VMware vSphere** |  |
+| System disk | 100 |
+| `/var/lib/containerd` | 150 |
+| `/var/lib/kubelet` | 100 |
+| `/var/cpaas` (persistent) | 50 |
+| **On Bare Metal** |  |
+| System disk, minimum / recommended | 512 / 512 |
+| **On all providers** |  |
+| Raw disk for the Ceph OSD (SSD) | 512 |
+| Persistent disk for `/var/lib/rook` | 100 |
 
 - With 3 replicas, usable capacity is about one third of the raw OSD capacity. Add OSD disks for more capacity.
+- On Bare Metal, use 4 storage nodes. A replacement for a failed physical server can take a long time to arrive. With only 3 nodes, Ceph then runs degraded on 2 nodes for that whole time, and maintenance operations and upgrades are blocked. With 4 nodes, 3 nodes remain after one failure, and Ceph can restore all 3 replicas.
 - `/var/lib/rook` must be on a persistent disk, and each OSD must be a separate raw disk; see [Prerequisites for Deploying on Alauda OS](../../storage/storagesystem_ceph/installation/immutable_infrastructure_prerequisites.mdx).
 - For the CPU and memory that Ceph reserves, see the small three-node baseline in [Aggregate Cluster Planning Budget](../../storage/storagesystem_ceph/planning.mdx#aggregate-cluster-planning-budget).
 
