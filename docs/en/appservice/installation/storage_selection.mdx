@@ -1,0 +1,193 @@
+---
+weight: 20
+queries:
+  - Which storage class should I use for MySQL-MGR PostgreSQL Redis Valkey Kafka or RabbitMQ
+  - Can Alauda Application Services run on Ceph RBD NFS or an enterprise SAN
+  - Why does the instance form list only TopoLVM storage classes
+  - Where should middleware backups be stored
+---
+
+# Storage Selection
+
+Before you create an Alauda Application Services instance, choose the storage for its data and its backups. The storage class of an existing persistent volume claim (PVC) cannot be changed in place, so moving to other storage later requires the data migration or PVC replacement procedure that the product supports.
+
+This page covers high availability (HA) and backup inside a single <Term name="product" /> (<Term name="productShort" />) cluster in one data center. It lists the storage options and their limits and rates each option for each product. To check the storage before production, see [Validate Storage](./validate_storage.mdx).
+
+## Storage Types \{#storage-types}
+
+<div className="rating-matrix">
+
+| Storage | Provisioner | After node loss | Expansion | Snapshot |
+| --- | --- | --- | --- | --- |
+| [TopoLVM](/storage/storagesystem_topolvm/index.mdx) | `topolvm.cybozu.com` | Stays on the node | Supported | Depends on configuration |
+| [Local Storage](/storage/local_storage/index.mdx) | Static, Local Disk Provisioner | Stays on the node | Not stated | Not stated |
+| [Ceph RBD](/storage/storagesystem_ceph/index.mdx) | `rook-ceph.rbd.csi.ceph.com` | Follows the Pod | Supported | Supported |
+| [CephFS](/storage/storagesystem_ceph/index.mdx) | `rook-ceph.cephfs.csi.ceph.com` | Follows the Pod | Supported | Supported |
+| [NFS](/configure/storage/functions/nfs_storageclass.mdx) | `nfs.csi.k8s.io` | Follows the Pod | Not supported | Not supported |
+| Enterprise SAN | Vendor CSI driver | Follows the Pod | Depends on the driver | Depends on the driver |
+
+</div>
+
+Local Storage stays on its node like TopoLVM, so the node and disk limits of TopoLVM also apply to it. The tables below do not rate Local Storage. They use enterprise object storage and Ceph Object Storage only for backups and for Milvus data. For background, see [Overview](/storage/overview.mdx), [Access Modes and Volume Modes](/configure/storage/concepts/selection.mdx), and [Third-Party Storage Capability Annotation Guide](/configure/storage/how_to/third_mask.mdx).
+
+### Storage Limits \{#limits}
+
+- **TopoLVM**: a volume stays on its node, cannot span nodes, and delivers only the IOPS and throughput of its underlying disk. A node failure makes the volume unavailable, and a disk failure can lose its data. After a permanent loss, the replica can start on another node only after its PVC is replaced, and it then starts empty and recovers its data from the other replicas or from a backup. Before you replace a PVC, follow the product's procedure in [Node and Disk Loss](#node-loss). In production, back the volume group with dedicated local SSDs or NVMe, not with throttled virtual disks or HDDs. Use device classes whose **Provision Type** is **Thick**. A **Thin** device class over-provisions, so a volume can run out of space before it reaches its requested size.
+- **Enterprise SAN and enterprise object storage**: the platform release test matrix does not include enterprise storage, so verify compatibility, failover, backup, and performance in your environment before production. To validate an enterprise SAN, follow [Validate Storage](./validate_storage.mdx), starting with its [requirements](./validate_storage.mdx#requirements) and [disk performance test](./validate_storage.mdx#disk). On an enterprise SAN, all replicas on one array share one failure domain. With 2 arrays, a majority of 3 replicas still sits on one array, so you need 3 arrays to survive the loss of one. After an unexpected node shutdown, a volume might not detach. See [Detach CSI Volumes After Non-Graceful Node Shutdown](/configure/storage/trouble_shooting/detach_csi_volumes_non_graceful_shutdown.mdx).
+- **Ceph RBD**: all replicas share one Ceph failure domain. The default pool keeps 3 copies of each volume, so 3 replicas take 9 copies. Ceph RBD volumes are thin-provisioned: the size of a volume is only an upper limit, because Ceph allocates space as data is written and does not reserve it. When the Ceph cluster runs short of space, other applications can use up the unused space, and writes to the volume fail before the volume reaches its size. Plan the capacity of all the applications that share the Ceph cluster.
+
+## Storage by Product \{#by-product}
+
+The tables rate each storage option for each scenario:
+
+- **Recommended**: the preferred choice. When two options in a row are both **Recommended**, they are equal choices.
+- **Secondary**: use it when the recommended storage is not available or does not fit.
+- **Last resort**: test it first, and read [Storage Limits](#limits).
+- **Testing only**: use it only where losing data is acceptable.
+- **Avoid**: do not use it.
+
+A dash means that the option does not apply or was not evaluated. Enterprise SAN and enterprise object storage are recommended when you have them, but validate them in your environment first, because enterprise storage is not in the release test matrix. For an enterprise SAN, check the [requirements](./validate_storage.mdx#requirements) and run the [disk performance test](./validate_storage.mdx#disk) before you choose it, because these checks do not need Alauda Application Services.
+
+Each product runs in one of two modes. In **HA mode**, the product keeps more than one replica of its data and can fail over to another replica when one fails. In **non-HA mode**, it cannot. The notes under each table say which setup puts a product in each mode.
+
+Back up to a different device from the primary data. Where the product supports it, register the backup target in [Backup Management](/appservice/unified-om/backup-mgt/index.mdx), also called **Backup Center**. If the primary data is in Ceph, back up outside that Ceph cluster. Keycloak has no persistent volumes of its own, so apply the ratings in [Relational Databases](#relational) to its external database.
+
+### Relational Databases \{#relational}
+
+<div className="rating-matrix">
+
+| Product and scenario | TopoLVM | Enterprise SAN | Ceph RBD | Enterprise object storage | Ceph Object Storage |
+| --- | --- | --- | --- | --- | --- |
+| **MySQL-MGR**, HA | Recommended | Recommended | Last resort | — | — |
+| **MySQL-MGR**, non-HA (testing only) | Testing only | Recommended | Secondary | — | — |
+| **MySQL-MGR**, backup | — | — | — | Recommended | Secondary |
+| **PostgreSQL**, HA | Recommended | Recommended | Last resort | — | — |
+| **PostgreSQL**, non-HA (testing only) | Testing only | Recommended | Secondary | — | — |
+| **PostgreSQL**, backup | — | — | — | Recommended | Secondary |
+| **CloudNativePG**, HA | Recommended | Recommended | Last resort | — | — |
+| **CloudNativePG**, non-HA | Testing only | Recommended | Secondary | — | — |
+| **CloudNativePG**, backup | — | — | — | Recommended | Secondary |
+
+</div>
+
+HA mode means 3 or more members for MySQL-MGR, and 3 or more instances for PostgreSQL and CloudNativePG. Non-HA mode means a single member or instance. Avoid NFS and CephFS for the instance data of all three products. The notes below add details for individual rows.
+
+- **MySQL-MGR**, HA: on storage whose volume root directory the MySQL user cannot write to, such as Ceph RBD, use MySQL-MGR v4.4.1 or later, which sets the volume ownership through `fsGroup`. MySQL-MGR is validated on TopoLVM, Ceph RBD, and local volumes, so verify it on your SAN before production. Run at most one member on each node. For `N` members you need at least `N` nodes, and `N + 1` nodes to reschedule a member while a node is down. For local volumes, see <ExternalSiteLink name="mysql-mgr" href="/how_to/40-deploy-without-topolvm.html" children="Deploy MySQL-MGR Without TopoLVM" />.
+- **MySQL-MGR**, non-HA (testing only): the MySQL-MGR documentation limits a single member to testing.
+- **MySQL-MGR**, backup: backups can be full or incremental, and they run through Backup Center. Point-in-time recovery (PITR) is not available. See <ExternalSiteLink name="mysql-mgr" href="/functions/20-backup_restore.html" children="Backup & Restore" />.
+- **PostgreSQL**, HA: replication is asynchronous by default. Use SSD or a SAN with high random IOPS, especially when the working set exceeds memory, and provide 50 GB or more. See <ExternalSiteLink name="postgresql" href="/how_to/configure_ha_cluster.html" children="Configuring a High Availability PostgreSQL Cluster" />.
+- **PostgreSQL**, non-HA (testing only): the PostgreSQL documentation limits a single instance to testing.
+- **PostgreSQL**, backup: backups support PITR. See <ExternalSiteLink name="postgresql" href="/functions/15_back_restore.html" children="Backup and Restore" />.
+- **CloudNativePG**, HA: for the storage class requirements, see <ExternalSiteLink name="cnpg" href="/configuration.html" children="Configuration" />.
+- **CloudNativePG**, backup: the Barman Cloud plugin sends backups to object storage, and PITR requires it. Volume snapshot backups are also supported on storage classes that can take snapshots, but they count as backups only when they are stored off the primary device. See <ExternalSiteLink name="cnpg" href="/how_to/ops-runbook.html" children="Operations Runbook" />.
+
+Two points apply to all the rows above:
+
+- **TopoLVM or Enterprise SAN**: when the replicas run on different nodes, TopoLVM on dedicated local SSDs or NVMe gives each replica its own failure domain without an external array, but a lost node means rebuilding that replica in full. Enterprise SAN keeps the volume when a node is lost, so a replica can usually catch up incrementally, which helps large databases. It still needs a full rebuild if the replication history that it missed is no longer available. The advantage of an enterprise SAN holds only if you verify commit latency, random IOPS, and failover on your array, and accept or mitigate the shared array failure domain.
+- **Recovery point objective (RPO) of 0**: use synchronous replication. To keep accepting writes after one replica fails, the remaining replicas must still provide the synchronous acknowledgements that a commit needs.
+  - MySQL-MGR: use 3 or 5 members. It stops writes when it loses a majority.
+  - PostgreSQL: set `spec.patroni.synchronous_mode` and `synchronous_mode_strict` to `true`.
+  - CloudNativePG: for the synchronous replication settings, see the <ExternalSiteLink name="cnpg" children="CloudNativePG documentation" />.
+  - PostgreSQL and CloudNativePG pause writes when too few synchronous standbys remain.
+
+### Middleware That Replicates Data Itself \{#replicated}
+
+<div className="rating-matrix">
+
+| Product and scenario | TopoLVM | Enterprise SAN | Ceph RBD | Enterprise object storage | Ceph Object Storage |
+| --- | --- | --- | --- | --- | --- |
+| **Redis**, HA | Recommended | Recommended | Last resort | — | — |
+| **Redis**, non-HA (testing only) | Testing only | Recommended | Secondary | — | — |
+| **Redis**, backup | Testing only | — | — | Recommended | Secondary |
+| **Valkey**, HA | Recommended | Recommended | Last resort | — | — |
+| **Valkey**, non-HA | Testing only | Recommended | Secondary | — | — |
+| **Kafka**, HA | Recommended | Recommended | Last resort | — | — |
+| **Kafka**, non-HA | Testing only | Recommended | Secondary | — | — |
+| **RabbitMQ**, HA | Recommended | Recommended | Last resort | — | — |
+| **RabbitMQ**, non-HA | Testing only | Recommended | Secondary | — | — |
+| **ClickHouse**, HA | Recommended | Recommended | Last resort | — | — |
+| **ClickHouse**, non-HA | Testing only | Recommended | Secondary | — | — |
+| **ClickHouse**, backup | — | — | — | Recommended | Secondary |
+| **OpenSearch**, HA | Recommended | Recommended | Last resort | — | — |
+| **OpenSearch**, non-HA | Testing only | Recommended | Secondary | — | — |
+| **OpenSearch**, backup | — | — | — | Recommended | Secondary |
+| **Redis or Valkey**, no persistence | — | — | — | — | — |
+
+</div>
+
+The notes below say which setup puts each product in each mode and add details for individual rows.
+
+- **Redis**, HA: this means Redis Sentinel, or Redis Cluster with replicas. Replication is asynchronous, and append-only file (AOF) persistence needs fast storage. See <ExternalSiteLink name="redis" href="/functions/30-parameter.html" children="Parameter Configuration" />.
+- **Redis**, non-HA (testing only): this means a standalone instance. You can create it only from YAML, and only for testing.
+- **Redis**, backup: PVC-based backups can also be stored on NFS or CephFS. Keep the backup storage separate from the primary data. See <ExternalSiteLink name="redis" href="/functions/70-backup-restore.html" children="Backup & Restore Instance" />.
+- **Valkey**, HA: this means `replicasOfShard` of 2 or more, so that each shard has a primary and at least one replica. Replication is asynchronous. You need at least `replicasOfShard` nodes. The PVCs remain after you delete the instance. The operator has no backup of its own, so use an external process. See <ExternalSiteLink name="valkey" href="/functions/60-scheduling.html" children="Configure scheduling" />.
+- **Valkey**, non-HA: this means `replicasOfShard: 1`, so that each shard has only a primary.
+- **Kafka**, HA: this means 3 brokers and topics with a replication factor of 3. Majority writes need the producer setting `acks=all` and `min.insync.replicas=2`, whose default is 1. KRaft controllers have their own volumes. The operator has no message backup of its own. See <ExternalSiteLink name="kafka" href="/functions/40-parameter.html" children="Parameter Configuration" />.
+- **Kafka**, non-HA: this means one broker, or topics with a replication factor of 1.
+- **RabbitMQ**, HA: this means a cluster of 3 or 5 nodes with quorum queues or streams. Use publisher confirms and manual acknowledgements. The console places at most one RabbitMQ Pod on each node. The operator has no message backup of its own, and exported definitions contain only the configuration, not the messages. See <ExternalSiteLink name="rabbitmq" href="/how_to/25-manage-definitions.html" children="Manage RabbitMQ Definitions" />.
+- **RabbitMQ**, non-HA: this means a single-node instance, or classic queues without mirroring. On RabbitMQ 4.x, all classic queues are unmirrored.
+- **ClickHouse**, HA: this means 2 or more replicas per shard, and 3 Keeper or ZooKeeper members. Replication is asynchronous unless `insert_quorum` is set in the profile or query, and the operator does not set it. With 2 replicas, `insert_quorum: 2` stops inserts while 1 replica is down, so use 3 or more replicas for quorum availability. Put Keeper or ZooKeeper on SSD or NVMe. Leave headroom inside each volume for merges, and on TopoLVM keep free volume group space (`allowVolumeExpansion: true`) for expansion. See <ExternalSiteLink name="clickhouse" href="/how_to/configure_replicated_cluster.html" children="Configure a replicated cluster" /> and <ExternalSiteLink name="clickhouse" href="/how_to/expand_storage.html" children="Expand storage" />.
+- **ClickHouse**, non-HA: this means one replica per shard, or a single Keeper or ZooKeeper member.
+- **ClickHouse**, backup: use the `BACKUP` and `RESTORE` statements or an external tool, and verify your backup and restore procedure before production. The operator has no backup of its own. See <ExternalSiteLink name="clickhouse" href="/intro.html" children="Introduction" />.
+- **OpenSearch**, HA: this means `number_of_replicas` of 1 or more, with at least 2 data nodes. `number_of_replicas` is set per index, and the default is 1. Run 3 `cluster_manager` nodes for quorum. The OpenSearch documentation shows local volumes with replicas, or Ceph RBD when a volume must survive node loss. Ceph RBD is rated last resort here when indices already keep replicas, because Ceph multiplies the writes. See <ExternalSiteLink name="opensearch" href="/functions/storage.html" children="Storage" />.
+- **OpenSearch**, non-HA: this means `number_of_replicas: 0`, or a single data node.
+- **OpenSearch**, backup: snapshots use `OpensearchSnapshotPolicy`. The images include the plugins of the upstream distribution, except Security Analytics and Skills (see <ExternalSiteLink name="opensearch" href="/limitations.html#plugins_not_included" children="Known Limitations" />). S3 snapshots also need the `repository-s3` plugin, which is not in that upstream distribution. Install it with `spec.general.pluginsList`. In an air-gapped cluster, pass a reachable URL for the plugin ZIP that matches your version, or the Pods fail to start. Then set the S3 credentials in `spec.general.keystore`.
+- **Redis or Valkey**, no persistence: these instances have no persistent volume.
+
+With asynchronous replication, a failover can lose writes that were already acknowledged, whatever the storage. In OpenSearch, the default `wait_for_active_shards: 1` lets a write start when only the primary shard is active, so while replica shards are unassigned, writes are acknowledged on the primary alone. NFS and CephFS are not evaluated for the instance data of these products, but Kafka cannot use NFS. When an NFS client deletes a file that is still open, it renames the file to a temporary `.nfsXXX` file and removes it later (silly rename). In some cases, such as the rebalance after a scale-out, these temporary files can crash a Kafka broker.
+
+### Milvus \{#milvus}
+
+<div className="rating-matrix">
+
+| Scenario | TopoLVM | Enterprise SAN | Ceph RBD | Enterprise object storage | Ceph Object Storage |
+| --- | --- | --- | --- | --- | --- |
+| **Vector data and WAL** | — | — | — | Recommended | Secondary |
+| **etcd**, HA | Recommended | Recommended | Last resort | — | — |
+| **etcd**, non-HA | Testing only | Recommended | Secondary | — | — |
+| **Silo** (testing only) | Testing only | Recommended | Secondary | — | — |
+| **Backup** | — | — | — | Recommended | Secondary |
+
+</div>
+
+The notes below add details for individual rows.
+
+- **Vector data and WAL**: the write-ahead log (WAL) is in the object storage only when Woodpecker stores it there; with an external Kafka or Pulsar, the WAL is in that system instead. The default Silo (resources named `<instance>-minio`) is a single server, and it is for testing only. See <ExternalSiteLink name="milvus" href="/installation.html" children="Installation" />.
+- **etcd**, HA: this means 3 etcd members.
+- **etcd**, non-HA: this means a single etcd member.
+- **Silo** (testing only): these ratings apply to the volumes of the default single-server Silo.
+- **Backup**: the operator has no general-purpose backup. Back up the object storage data and etcd together, using your own procedure. See the backup step in <ExternalSiteLink name="milvus" href="/upgrade.html" children="Upgrade" />.
+
+In Milvus cluster mode, set `spec.dependencies.msgStreamType: woodpecker`, because the default Pulsar images are not delivered. When Woodpecker uses object storage, the default `conditionWrite: auto` requires S3 conditional writes (`If-None-Match`), and Milvus does not start if the object storage lacks them. If your object storage does not support conditional writes, set `woodpecker.logstore.fencePolicy.conditionWrite: disable`, which selects the documented etcd distributed-lock mode, or use an external Kafka or Pulsar. Test that setup before production.
+
+## Storage Classes in the Console \{#console}
+
+The instance forms of MySQL-MGR, PostgreSQL, Redis, Kafka, and RabbitMQ offer only TopoLVM by default. To offer another storage class, an administrator adds its provisioner to the `middleware-sc-cm` ConfigMap in the `cpaas-system` namespace of the `global` cluster, under the component key `MGR`, `PostgreSQL`, `Redis`, `Kafka`, or `RabbitMQ`. Do not edit `middleware-sc-cm-base`.
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: middleware-sc-cm
+  namespace: cpaas-system
+data:
+  middleware_sc_map.yaml: |
+    Redis:
+      instance:
+        - rook-ceph.rbd.csi.ceph.com
+```
+
+The `Redis.backup` key lists the provisioners that Redis PVC backups can use. From Data Services Essentials v4.4.1, it allows NFS, CephFS, and TopoLVM by default. The ConfigMap has no keys for Valkey, CloudNativePG, ClickHouse, OpenSearch, or Milvus, so set their storage class in the custom resource. For Valkey, use `spec.storage.storageClassName`.
+
+## Node and Disk Loss \{#node-loss}
+
+On TopoLVM and Local Storage, check what the product documents before you delete the PVC of a replica on a lost node:
+
+| Product | Product documentation |
+| --- | --- |
+| MySQL-MGR | Recovery needs manual reprovisioning and data resync. See <ExternalSiteLink name="mysql-mgr" href="/how_to/40-deploy-without-topolvm.html" children="Deploy MySQL-MGR Without TopoLVM" />. |
+| CloudNativePG | In v1.30.1-acp.1, PVC replacement was tested with RPO = 0, and node shutdown was not tested. See <ExternalSiteLink name="cnpg" href="/release_notes.html" children="Release Notes" />. |
+| Valkey | Do not delete the PVC until the recovery procedure is known. See <ExternalSiteLink name="valkey" href="/trouble_shooting/10-instance-not-ready.html" children="Diagnose an instance that is not Ready" />. |
+| ClickHouse Keeper or ZooKeeper | Losing 2 of 3 members makes replicated tables read-only until a majority of the members is back. Losing the Keeper or ZooKeeper volumes loses the replication metadata: rebuild the Keeper or ZooKeeper ensemble, then restore the metadata of each replicated table with `SYSTEM RESTORE REPLICA`. See <ExternalSiteLink name="clickhouse" href="/how_to/deploy_keeper_quorum.html" children="Deploy a Keeper quorum" />. |
+| OpenSearch | Keep `number_of_replicas` at 1 or more, and check that the replica shards are assigned (cluster health `green`), so that losing one data node does not lose data. See <ExternalSiteLink name="opensearch" href="/functions/storage.html" children="Storage" />. |
+| Others | Not documented. Test the recovery first. RabbitMQ quorum queue membership might need manual repair. |
