@@ -1,0 +1,172 @@
+---
+weight: 55
+title: Update the Platform Image Registry
+queries:
+  - change the platform mirror registry endpoint
+  - update the platform registry username and password
+  - change a workload cluster Registry CR
+---
+
+# Update the Platform Image Registry
+
+Use this procedure to change the image registry address or account of a cluster whose `cpaas-system/cpaas-registry` Registry resource uses `mirror` mode. It applies to the `global` cluster and platform-created workload clusters. Imported and registered clusters are outside this procedure.
+
+Run the commands with the kubeconfig of the cluster you want to change. Each cluster has its own Registry resource. Repeat the procedure for each existing cluster that needs the change.
+
+## Before You Start
+
+- Prepare `kubectl` and `jq`, and permission to read and update the Registry resource and create Secrets in `cpaas-system`.
+- Populate the new registry with the platform, plugin, and OS images and charts required by the cluster. See [Prepare an External Platform Image Registry](../../install/prepare/external-platform-image-registry.mdx).
+- Confirm that the registry is reachable from the cluster nodes and that its HTTPS connection works with their existing configuration.
+- Keep the old registry and account available until verification is complete. Schedule the change in a maintenance window: applying node registry configuration can restart containerd.
+
+## Check and Back Up the Current Configuration
+
+Confirm the target context and registry mode:
+
+```bash
+kubectl config current-context
+kubectl -n cpaas-system get registries.platform.alauda.io cpaas-registry \
+  -o jsonpath='{.spec.mode}{"\n"}{.spec.endpoints}{"\n"}{.spec.credentialsSecretRef.name}{"\n"}'
+```
+
+Continue only when the resource exists and the mode is `mirror`.
+
+Save the current specification for rollback. Run the remaining commands in the same working directory:
+
+```bash
+umask 077
+kubectl -n cpaas-system get registries.platform.alauda.io cpaas-registry \
+  -o json > registry-before.json
+jq '{spec: {endpoints: .spec.endpoints, credentialsSecretRef: .spec.credentialsSecretRef}}' \
+  registry-before.json > registry-rollback.json
+```
+
+Keep the currently referenced Secret unchanged so you can restore its reference if needed.
+
+## Prepare the Username and Password
+
+Create `registry-auth.json` with an editor. Replace the example address, username, and password with the intended values. Writing credentials in a file keeps them out of shell history and command arguments.
+
+```json title="registry-auth.json"
+{
+  "auths": {
+    "registry.example.com:5000": {
+      "username": "<username>",
+      "password": "<password>"
+    }
+  }
+}
+```
+
+The address must match an entry in the Registry's new `spec.endpoints` list, in `host[:port]` form. For multiple endpoints, add an entry for every endpoint and use the same username and password for all of them. For an anonymous registry, use `{"auths": {}}`.
+
+Create a new Secret in the target cluster. Choose an unused name for each change, and use that same name in the next step:
+
+```bash
+chmod 600 registry-auth.json
+kubectl -n cpaas-system create secret generic platform-registry-credentials-v2 \
+  --type=kubernetes.io/dockerconfigjson \
+  --from-file=.dockerconfigjson=registry-auth.json
+```
+
+After the Secret is created successfully, remove the local credentials file:
+
+```bash
+rm -f registry-auth.json
+```
+
+## Update the Registry Resource
+
+Create the following patch file. Set `endpoints` to the complete list of intended registry addresses and `name` to the Secret created above. To change only the username or password, keep the current endpoint list.
+
+```yaml title="registry-patch.yaml"
+spec:
+  endpoints:
+    - registry.example.com:5000
+  credentialsSecretRef:
+    name: platform-registry-credentials-v2
+```
+
+Use addresses in `host[:port]` form. The list replaces all existing endpoints. The logical image source remains `cpaas-registry.cpaas-system`.
+
+Apply the address and credential reference together:
+
+```bash
+kubectl -n cpaas-system patch registries.platform.alauda.io cpaas-registry \
+  --type=merge --patch-file=registry-patch.yaml
+```
+
+For a cluster already using mirror mode, this Registry resource is the configuration to update. Changes to the RegistryCredential Secret selected when the cluster was created do not update this cluster's mirror configuration.
+
+## Verify the Change
+
+Watch the Registry status:
+
+```bash
+kubectl -n cpaas-system get registries.platform.alauda.io cpaas-registry \
+  -o yaml --watch
+```
+
+Wait until all of the following are true:
+
+- `status.observedGeneration` equals `metadata.generation`.
+- `status.phase` and `status.bootstrapPublished` are `Ready`.
+- `status.bootstrapConfigVersion` equals `status.effectiveConfigVersion`.
+
+If the phase is `Degraded`, read `status.errorSummary` and correct the address, credentials, or connectivity before continuing.
+
+Check Pods for image pull failures:
+
+```bash
+kubectl get pods -A | awk '$4 ~ /ImagePullBackOff|ErrImagePull/'
+```
+
+Verify an actual pull with a test Pod in `cpaas-system`. Confirm that the platform pull Secret has been published:
+
+```bash
+kubectl -n cpaas-system get secret global-registry-auth
+```
+
+Create `registry-pull-check.yaml`. Choose a platform image and tag present in the new registry, and replace the node name.
+
+```yaml title="registry-pull-check.yaml"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: registry-pull-check
+  namespace: cpaas-system
+spec:
+  nodeName: <node-name>
+  restartPolicy: Never
+  imagePullSecrets:
+    - name: global-registry-auth
+  containers:
+    - name: check
+      image: cpaas-registry.cpaas-system/<repository>:<tag>
+      imagePullPolicy: Always
+```
+
+```bash
+kubectl create -f registry-pull-check.yaml
+kubectl -n cpaas-system describe pod registry-pull-check
+```
+
+Confirm that Events report a successful image pull. The test checks image access; the image might exit because the Pod does not supply its normal application configuration. Delete the test Pod, and repeat on the other nodes:
+
+```bash
+kubectl delete -f registry-pull-check.yaml
+```
+
+Confirm that required platform Pods are running and required `ModuleInfo` and `AppRelease` resources are healthy. A `Ready` Registry alone does not verify that the new registry contains every required image or chart.
+
+## Roll Back
+
+If verification fails, restore the previous endpoints and credential reference:
+
+```bash
+kubectl -n cpaas-system patch registries.platform.alauda.io cpaas-registry \
+  --type=merge --patch-file=registry-rollback.json
+```
+
+Repeat the verification steps. Keep the old Secret and account available for rollback until the change has been accepted.
