@@ -8,6 +8,7 @@ queries:
   - scale baremetal workers
   - replace baremetal node
   - baremetal machinedeployment
+  - register host for global cluster
 ---
 
 # Manage Nodes on Bare Metal
@@ -22,7 +23,7 @@ This document explains how to scale worker nodes up and down, replace specific m
 - The control plane must already be running. See [Create Cluster](../../../workload_clusters/alauda_os/bare-metal/create_cluster.mdx).
 - The worker `MachineInventoryPool` must have enough free inventories (`status.available`) for the nodes that you add. With `maxSurge: 0`, a rollout needs no extra hosts. Take the new hosts from the [available hosts](../../../workload_clusters/alauda_os/bare-metal/register_hosts.mdx#available-hosts) of the cluster's OS.
 - The target `Machine.spec.version` must be a key in the `elemental-image-catalog` ConfigMap for the architecture and OS of the hosts. If the key is missing, add it as described in [Add the Image Catalog Keys](../../../workload_clusters/alauda_os/bare-metal/prepare_os.mdx#add-versions-to-image-catalog).
-- To manage the nodes of the `global` cluster itself, first install the provider on `global`; see [Manage Nodes on Alauda OS Clusters](./index.mdx). Register a host for the `global` cluster as described in [Hosts for the global Cluster](../../../workload_clusters/alauda_os/bare-metal/register_hosts.mdx#global-hosts). The host goes into a pool that the `install-config.yaml` of the `global` cluster names.
+- To manage the nodes of the `global` cluster itself, the provider must run on `global`. A `global` cluster installed with `ac` already runs it; otherwise install it as described in [Providers](../../../workload_clusters/alauda_os/bare-metal/prerequisites.mdx#providers). Register its hosts as described in [Registering Hosts for the global Cluster](#global-hosts).
 :::
 
 :::info
@@ -44,7 +45,7 @@ A worker node group consists of four resources:
 3. **`KubeadmConfigTemplate`** (`<cluster-name>-worker-config`) — the cloud-init `user-data` for `kubeadm join`. Each time the provider reinstalls a host, it sets the hostname, `provider-id`, and `criSocket` in this user-data. Do not fill in those fields yourself.
 4. **`MachineDeployment`** — sets the replica count, the version, and the rollout strategy.
 
-To add another worker node group to a workload cluster, see [Adding a Worker Node Group](#add-worker-node-group).
+The names above belong to a node group named `worker`, as in the `install-config.yaml` example. For a group with another name, replace `worker` with that name in the commands on this page. To add a worker node group, see [Adding a Worker Node Group](#add-worker-node-group).
 
 <Directive type="warning" title="Clusters created with ac">
   `ac adm alpha cluster create` and `ac adm alpha global create` only create a cluster. To change a running cluster, change its objects as described on this page. Do not change `install-config.yaml` and run `create` again. `ac adm alpha cluster destroy` deletes only the objects that `ac` rendered. When you destroy the cluster, also delete the templates that you created yourself.
@@ -54,6 +55,39 @@ To add another worker node group to a workload cluster, see [Adding a Worker Nod
 
 ## Node Management Operations
 
+### Registering Hosts for the global Cluster \{#global-hosts}
+
+**Use Case**: Add hosts to the `global` cluster, to scale it out or to replace a node. These hosts need a registration and an ISO of their own. The ISO built during the installation registers hosts with the bootstrap node, which no longer exists. The registration of workload cluster hosts does not connect a host to the `global` cluster.
+
+**Procedure**:
+
+1. **Select the `global` cluster**
+
+   Run `ac config use-cluster global`. In a disaster recovery pair, register the host on the `global` cluster that it joins. For the standby, run `export KUBECONFIG=<standby-kubeconfig>` instead, and `unset KUBECONFIG` when you finish.
+
+2. **Write the registration**
+
+   Generate the **Registration file** for the OS and architecture of the hosts as described in [Prepare Alauda OS for Hosts](../../../workload_clusters/alauda_os/bare-metal/prepare_os.mdx#generate). Then change two things:
+
+   - Rename it to a name that starts with `global-`, for example `global-alaudaos-m55-amd64`. Replace the name in `metadata.name`, `machineName`, the `SeedImage` name, and its `registrationRef`. A registration with any other name gives no registration URL.
+   - Add these annotations to the `MachineRegistration`. `<control-plane-vip>` is the control plane VIP of the `global` cluster that the host joins:
+
+     ```yaml
+     metadata:
+       annotations:
+         baremetal.cluster.io/system-agent-auth-scope: global
+         baremetal.cluster.io/system-agent-server-url: https://<control-plane-vip>:6443
+         baremetal.cluster.io/system-agent-endpoint-mode: direct-apiserver
+     ```
+
+3. **Build the ISO**
+
+   Run **Create the registration and build the ISO** with the new name, as described in [Create the Registration and the ISO](../../../workload_clusters/alauda_os/bare-metal/prepare_os.mdx#create-registration). If a `global-` registration for this OS and architecture already exists, skip steps 2 and 3 and use its ISO.
+
+4. **Register the hosts**
+
+   Prepare, boot, and confirm the hosts as described in [Register Hosts](../../../workload_clusters/alauda_os/bare-metal/register_hosts.mdx). They register as `global-*`. Then add them to a pool as described in the sections below.
+
 ### Scaling Worker Nodes
 
 #### Adding Worker Nodes
@@ -62,6 +96,7 @@ To add another worker node group to a workload cluster, see [Adding a Worker Nod
 
 **Prerequisites**:
 
+- The cluster has a worker node group. A cluster created without `computes` in `install-config.yaml` has none, and the commands below report `NotFound`. In that case, add the workers as described in [Adding a Worker Node Group](#add-worker-node-group).
 - The worker pool has enough free inventories (`status.available`). If it does not, append more [available hosts](../../../workload_clusters/alauda_os/bare-metal/register_hosts.mdx#available-hosts) to `MachineInventoryPool.spec.machineInventories[]`. When there are no more available hosts, first register additional hosts as described in [Register Hosts](../../../workload_clusters/alauda_os/bare-metal/register_hosts.mdx).
 
 **Procedure**:
@@ -120,7 +155,7 @@ Two strategies are supported. Both work the same way as in upstream Cluster API:
 :::info
 **Inventory recycling**
 
-A `clean` plan stops kubelet, clears the CRI workload, and stops containerd. It does **not** wipe the Kubernetes persistent directories or reset the OS. The OS is cleaned later: when the same or a different inventory is picked for a new `BaremetalMachine`, it runs the `reprovision` plan. In the meantime, the inventory returns to `Available` and can be allocated again.
+A `clean` plan stops kubelet, clears the CRI workload, and stops containerd. It does **not** wipe the Kubernetes persistent directories or reset the OS. The OS is reinstalled later: when the same or a different inventory is picked for a new `BaremetalMachine`, it runs the `reprovision` plan, which writes the OS image to the system disk again and does not wipe the disks of the host. In the meantime, the inventory returns to `Available` and can be allocated again.
 :::
 
 ##### Random Removal
@@ -175,7 +210,7 @@ CAPI selects the machines to delete in its standard order. For each selected mac
 
 ### Adding a Worker Node Group \{#add-worker-node-group}
 
-**Use Case**: Add workers that draw from their own pool. The `global` cluster does not support adding a worker node group.
+**Use Case**: Add workers that draw from their own pool. For the `global` cluster, `<cluster-name>` is `global`, and its hosts are registered as described in [Registering Hosts for the global Cluster](#global-hosts).
 
 In the following steps, `<group>` is an existing worker node group, and `<new-group>` is the name of the new one. The new name must be a DNS-1123 label that no other group uses. The name `control-plane` is reserved.
 
@@ -195,6 +230,15 @@ In the following steps, `<group>` is an existing worker node group, and `<new-gr
    ```
 
    The first command prints `<kubernetes-version>` and `<bootstrap-template-name>`.
+
+   If the cluster has no worker node group yet, read the values from the control plane instead:
+
+   ```bash
+   ac config use-cluster global
+   ac -n cpaas-system get kubeadmcontrolplane <cluster-name>-control-plane -o yaml
+   ```
+
+   Use `spec.version` as `<kubernetes-version>`, and the keys in `spec.kubeadmConfigSpec.users[].sshAuthorizedKeys` as `<ssh-public-key>`. If `spec.kubeadmConfigSpec.files` contains `/etc/chrony.d/ntp-servers.conf`, the cluster uses `cluster.ntpServers`. Copy that file into `files` of the new `KubeadmConfigTemplate`, and add `preKubeadmCommands` with `systemctl restart chronyd.service`.
 
 3. **Write the worker objects**
 
@@ -292,7 +336,7 @@ In the following steps, `<group>` is an existing worker node group, and `<new-gr
            namespace: cpaas-system
    ```
 
-   - `version` must be the version of the existing group. It must also be a key in the `elemental-image-catalog` ConfigMap.
+   - `version` must be the version of the existing group.
    - Keep `maxSurge: 0`. Each old node is then removed before its replacement is created, so a rollout needs no spare host. The platform upgrade does not start while a node group has another `maxSurge`. An unset value counts as `1`.
    - If a field in `<bootstrap-template-name>` differs from `spec.template.spec` above, use the value from that template instead. For example, on Kubernetes 1.35 and later, the kubelet configuration patch needs `"imagePullCredentialsVerificationPolicy": "NeverVerify"`. Earlier versions do not accept this field.
    - Leave out the fields that the provider sets itself: the hostname, `kubeletExtraArgs.provider-id`, and `nodeRegistration.criSocket`.
@@ -339,7 +383,7 @@ If a `BaremetalMachine` ends up in `Failed`, the safest recovery is to delete th
    ac -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io -w
    ```
 
-   For a node of the `global` cluster, the replacement host must be registered for the `global` cluster; see [Hosts for the global Cluster](../../../workload_clusters/alauda_os/bare-metal/register_hosts.mdx#global-hosts).
+   For a node of the `global` cluster, the replacement host must be registered for the `global` cluster; see [Registering Hosts for the global Cluster](#global-hosts).
 
 ### Moving Workers to a Different Pool \{#moving-workers-to-a-different-pool}
 
@@ -357,7 +401,7 @@ If a `BaremetalMachine` ends up in `Failed`, the safest recovery is to delete th
   ac -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io <target-pool-name>
   ```
 
-- The new hosts meet the same prerequisites as the current hosts: they are [available](../../../workload_clusters/alauda_os/bare-metal/register_hosts.mdx#available-hosts) (registered and ready), the image catalog has the target Kubernetes version and CPU architecture, and the CNI network device is present. See [Pool Capacity](../../../workload_clusters/alauda_os/bare-metal/create_cluster.mdx#worker-pool-capacity).
+- The new hosts meet the same prerequisites as the current hosts: they are [available](../../../workload_clusters/alauda_os/bare-metal/register_hosts.mdx#available-hosts) (registered and ready), and the CNI network device is present. See [Pool Capacity](../../../workload_clusters/alauda_os/bare-metal/create_cluster.mdx#worker-pool-capacity).
 - Keep the old template and the old pool until the move is finished.
 
 **Procedure**:
