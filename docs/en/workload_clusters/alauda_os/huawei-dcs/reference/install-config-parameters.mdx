@@ -1,0 +1,156 @@
+---
+weight: 10
+title: Parameters
+author: dev@alauda.io
+category: reference
+queries:
+  - dcs self-built vip control plane endpoint
+  - dcs additional nics raw disks topolvm
+  - dcs rendered manifests dcsiphostnamepool
+---
+
+# install-config.yaml Parameters for Huawei DCS
+
+This page describes how the fields of a Huawei DCS workload cluster's `install-config.yaml` act on DCS: the control plane endpoint, node addresses and placement, disks, and the optional topology. It also lists the objects that `ac` renders from them. For the fields themselves, see [Write `install-config.yaml`](../create_cluster.mdx#write-install-config).
+
+## Control Plane Endpoint and HA \{#configure-dcscluster}
+
+- **`external`**: your load balancer forwards `TCP/6443` to the control plane nodes.
+- **`internal`** (Self-built VIP): the provider runs the VIP on the control plane nodes; see [Self-built VIP](#self-built-vip).
+- **`controlPlaneHA: true`**: the provider keeps a DRS mutual-exclusion rule for the control plane VMs, and the DCS scheduler keeps them on different hosts. It works with either endpoint mode. The provider does not run DRS itself. For the DCS-side requirements, see [DCS Objects, Capacity, and Addresses](../prerequisites.mdx#dcs-objects).
+
+A cluster with a single control plane node still needs one of the endpoint modes.
+
+## Node Addresses and Placement \{#node-addresses}
+
+Each node group lists its nodes in `hosts`, with at least `replicas` entries. Entries beyond `replicas` become spare slots in the group's `DCSIpHostnamePool`. Only when the group has no spare slot is a replacement VM guaranteed to take over the address slot of the node it replaces, and with it the persistent disks; see [What Happens on Alauda OS Nodes](../../../../upgrade/overview.mdx#alauda-os-nodes). Hostnames and addresses must be unique across all node groups and must differ from the control plane endpoint. Every node of a group shares the group's `network`.
+
+The DCS scheduler picks the host of each VM. With `controlPlaneHA: true`, the provider also maintains a DRS rule that places the control plane VMs on different hosts; see [Control Plane Endpoint and HA](#configure-dcscluster). `machineFolder` groups the VMs on DCS and does not affect placement. A node group can set its own `machineFolder` under `<group>.dcs`.
+
+## Disks \{#disks}
+
+Every node group must declare the whole standard disk set. `ac` rejects any other name, and rejects a group that leaves a standard disk out.
+
+| Name | Kind | Mount path | Node groups |
+|---|---|---|---|
+| `var-lib-containerd` | `ephemeral` | `/var/lib/containerd` | All |
+| `var-lib-kubelet` | `ephemeral` | `/var/lib/kubelet` | All |
+| `var-lib-etcd` | `ephemeral` | `/var/lib/etcd` | Control plane only |
+| `var-cpaas` | `persistent` | `/var/cpaas` | All |
+
+- **Ephemeral disks** go to the `DCSMachineTemplate`, next to the system disk, and are recreated with the VM.
+- **Persistent disks** and **raw disks** go to the address slot of each node in the `DCSIpHostnamePool`. When a VM is replaced, they are detached and reattached to the replacement, which mounts the existing filesystem instead of formatting it. See [Change Persistent Disks](#persistent-disks) and [Raw Disks for TopoLVM](#raw-disks).
+- Every mounted disk is formatted `xfs`.
+- `disks.datastore` applies to the system disk as well. `DatastoreCluster` lets DCS pick a member datastore with free space. Prefer it when the platform has one.
+
+Every node group is replaced one node at a time (`maxSurge: 0`), and so is a control plane of `3` or more replicas.
+
+### Change Persistent Disks \{#persistent-disks}
+
+Persistent and raw disks are entries in `DCSIpHostnamePool.spec.pool[].persistentDisk`, as in [Worker Objects](#worker-objects). `slot` sets the attach order and the device name in the guest. Each entry names exactly one of `datastoreName` and `datastoreClusterName`. When you change the entries of an existing pool:
+
+- An appended entry is attached to the running VM on DCS, but it is formatted and mounted only when the VM is replaced.
+- Removing an entry is rejected. `format`, `options`, and `pciType` cannot change.
+- The webhook rejects a change to the size (`quantityGB`) or to the datastore of an existing disk. `isThin` affects only volumes created later.
+- `path` and `mountOptions` take effect on replacement VMs.
+
+## Optional Topology \{#optional-topology}
+
+Set these in `install-config.yaml` before the cluster is created.
+
+### Self-built VIP \{#self-built-vip}
+
+Set `cluster.network.loadBalancer.type: internal` with the fields described in [Write `install-config.yaml`](../create_cluster.mdx#write-install-config), and meet the [Self-built VIP requirements](../../../../install/alauda_os/prerequisites.mdx#self-built-vip). `controlPlaneHA` is not required. `type`, `address`, `port`, `vrid`, and `interface` cannot change after the control plane is initialized.
+
+To check it, see [Verify the Self-built VIP](../create_cluster.mdx#verify-self-built-vip).
+
+### Additional NICs \{#additional-nics}
+
+A node group can attach NICs on secondary networks, such as storage, management, or isolation networks, through `<group>.network.additions` and `hosts[].additionalIps`; see [Write `install-config.yaml`](../create_cluster.mdx#write-install-config). A host may list fewer addresses than there are NICs. Addresses match NICs in order, so the host gets only the first NICs, one for each address. Its VM has no other additional NICs.
+
+- Without `dcs`, an additional NIC attaches to `provider.dcs.network`, the same network as the primary NIC.
+- An additional NIC gets no gateway and uses the node's first DNS server. Static routes and route metrics need MachineConfig or guest OS configuration.
+- The primary `hosts[].ip` stays the Kubernetes Node IP.
+- The NICs are added when the provider clones a VM. Changing them later does not hot-add NICs to running VMs.
+
+### Raw Disks for TopoLVM \{#raw-disks}
+
+`<group>.disks.rawDisks` attaches unformatted block devices for TopoLVM. Raw disks are rendered as persistent disks without a mount path or filesystem. They come after the standard persistent disks in the slot order of the `DCSIpHostnamePool`, on the same datastore with the same `isThin` and `pciType`. Like `/var/cpaas`, they are kept when a VM is replaced, and they are deleted with the cluster. Do not remove or reorder entries after the cluster is created, because the slot of a disk follows its position, and removing a persistent disk is rejected.
+
+## Rendered Manifests \{#render-manifests}
+
+`ac` writes the objects it applies to `<install-dir>/manifests/`, one file per object, all in `cpaas-system`. For their API fields, see the [Huawei DCS API reference](../../../../apis/kubernetes_apis/infrastructure_providers/huawei-dcs/index.mdx).
+
+| Object | Name | Notes |
+|---|---|---|
+| `Secret` | `<cluster-name>-encryption-provider-config` | The encryption configuration, referenced by `DCSCluster`. |
+| `Cluster` | `<cluster-name>` | Labelled `cluster-type: DCS`. |
+| `DCSCluster` | `<cluster-name>` | The site from the credential Secret, the control plane endpoint, `controlPlaneHA`, and the credential and encryption Secret references. |
+| `KubeadmControlPlane`, `DCSMachineTemplate`, `DCSIpHostnamePool` | `<cluster-name>-control-plane` | |
+| `MachineDeployment`, `DCSMachineTemplate`, `DCSIpHostnamePool` | `<cluster-name>-<group>` | |
+| `KubeadmConfigTemplate` | `<cluster-name>-<group>-config` | |
+
+The credential Secret is yours to manage; `ac` does not render or delete it.
+
+### Worker Objects \{#worker-objects}
+
+`hosts`, `network`, and the persistent and raw disks go to the `DCSIpHostnamePool`. The VM size, the location, and the ephemeral disks go to the `DCSMachineTemplate`. For one worker host with the defaults:
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: DCSIpHostnamePool
+metadata:
+  name: <cluster-name>-worker
+  namespace: cpaas-system
+spec:
+  pool:
+  - hostname: <worker-0-hostname>
+    ip: <worker-0-ip>
+    mask: "24"
+    gateway: <worker-gateway>
+    dns: <dns-ip>
+    persistentDisk:              # Kept when the VM is replaced
+    - path: /var/cpaas
+      quantityGB: 100
+      slot: 0
+      datastoreName: <datastore-name>
+      format: xfs
+      isThin: false
+      pciType: VIRTIO
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: DCSMachineTemplate
+metadata:
+  name: <cluster-name>-worker
+  namespace: cpaas-system
+spec:
+  template:
+    spec:
+      vmTemplateName: <vm-template-name>
+      ipHostPoolRef:
+        name: <cluster-name>-worker
+      location:
+        type: folder
+        name: <folder-name>
+      vmConfig:
+        dcsMachineCpuSpec:
+          quantity: 8
+        dcsMachineMemorySpec:
+          quantity: 16384        # MiB
+        dvSwitchName: <dv-switch-name>
+        portGroupName: <port-group-name>
+        dcsMachineDiskSpec:      # Recreated with the VM
+        - systemVolume: true
+          quantity: 0            # 0 keeps the template's system disk size
+          datastoreName: <datastore-name>
+        - path: /var/lib/containerd
+          quantity: 100
+          format: xfs
+          datastoreName: <datastore-name>
+        - path: /var/lib/kubelet
+          quantity: 100
+          format: xfs
+          datastoreName: <datastore-name>
+```
+
+Additional NICs render as `additionNic` entries on each pool slot.

@@ -15,7 +15,7 @@ This document discusses a virtual machine solution based on the open-source comp
 
 - The `kubectl` command-line tool is installed and configured to access the cluster.
 
-- A StorageClass that supports `ReadWriteOnce` (RWO) access mode is available in the cluster.
+- A StorageClass that supports the `ReadWriteMany` (RWX) access mode is available in the cluster. Live migration requires every PVC attached to the virtual machine to be shared, so all DataVolumes in this document use RWX. If you do not need live migration, `ReadWriteOnce` (RWO) also works.
 
 ## Constraints and Limitations
 
@@ -31,17 +31,13 @@ Upload the Windows ISO and virtio-win ISO files directly to the cluster storage 
 
 **Set up the CDI Upload Proxy**
 
-1. Set up port-forwarding to the CDI upload proxy. This port-forward session will be used for uploading both ISO files.
+1. Set up port-forwarding to the CDI upload proxy. This port-forward session will be used for uploading both ISO files. The `cdi-uploadproxy` Service runs in the namespace the virtualization components are installed in, which is `kubevirt` by default.
 
    ```bash
-   kubectl port-forward -n cdi svc/cdi-uploadproxy 8443:443 &
+   kubectl port-forward -n kubevirt svc/cdi-uploadproxy 8443:443 &
    ```
 
-2. Obtain an authentication token.
-
-   ```bash
-   TOKEN=$(kubectl create token default -n default)
-   ```
+   **Note**: Each upload needs its own authentication token, obtained from CDI with an `UploadTokenRequest`. A token authorizes uploading to **one specific PVC** and is valid for **5 minutes**, so the token is requested in each upload procedure below, immediately before the transfer starts, rather than once up front.
 
 **Upload the Windows ISO**
 
@@ -60,7 +56,7 @@ Upload the Windows ISO and virtio-win ISO files directly to the cluster storage 
        upload: {}
      storage:
        accessModes:
-         - ReadWriteOnce
+         - ReadWriteMany
        resources:
          requests:
            storage: 8Gi
@@ -81,7 +77,22 @@ Upload the Windows ISO and virtio-win ISO files directly to the cluster storage 
    # The PHASE column should show UploadReady
    ```
 
-4. Upload the Windows ISO file using curl. Replace the file path with the actual path to your ISO.
+4. Request an upload token for the `win-iso-dv` PVC. The token is valid for 5 minutes, so run this immediately before the upload.
+
+   ```bash
+   TOKEN=$(kubectl create -o jsonpath='{.status.token}' -f - <<'EOF'
+   apiVersion: upload.cdi.kubevirt.io/v1beta1
+   kind: UploadTokenRequest
+   metadata:
+     name: win-iso-dv-upload
+     namespace: default
+   spec:
+     pvcName: win-iso-dv
+   EOF
+   )
+   ```
+
+5. Upload the Windows ISO file using curl. Replace the file path with the actual path to your ISO.
 
    ```bash
    curl -v --insecure \
@@ -90,7 +101,7 @@ Upload the Windows ISO and virtio-win ISO files directly to the cluster storage 
      "https://localhost:8443/v1beta1/upload"
    ```
 
-5. Verify that the DataVolume status changes to `Succeeded`.
+6. Verify that the DataVolume status changes to `Succeeded`.
 
    ```bash
    kubectl get dv win-iso-dv
@@ -114,7 +125,7 @@ Upload the Windows ISO and virtio-win ISO files directly to the cluster storage 
        upload: {}
      storage:
        accessModes:
-         - ReadWriteOnce
+         - ReadWriteMany
        resources:
          requests:
            storage: 1Gi
@@ -135,7 +146,22 @@ Upload the Windows ISO and virtio-win ISO files directly to the cluster storage 
    # The PHASE column should show UploadReady
    ```
 
-4. Upload the virtio-win ISO file using curl.
+4. Request an upload token for the `virtio-iso-dv` PVC. This is a separate token from the one used for the Windows ISO, because a token authorizes uploading to a single PVC.
+
+   ```bash
+   TOKEN=$(kubectl create -o jsonpath='{.status.token}' -f - <<'EOF'
+   apiVersion: upload.cdi.kubevirt.io/v1beta1
+   kind: UploadTokenRequest
+   metadata:
+     name: virtio-iso-dv-upload
+     namespace: default
+   spec:
+     pvcName: virtio-iso-dv
+   EOF
+   )
+   ```
+
+5. Upload the virtio-win ISO file using curl.
 
    ```bash
    curl -v --insecure \
@@ -144,7 +170,7 @@ Upload the Windows ISO and virtio-win ISO files directly to the cluster storage 
      "https://localhost:8443/v1beta1/upload"
    ```
 
-5. Verify that the DataVolume status changes to `Succeeded`.
+6. Verify that the DataVolume status changes to `Succeeded`.
 
    ```bash
    kubectl get dv virtio-iso-dv
@@ -217,10 +243,21 @@ Upload the Windows ISO and virtio-win ISO files directly to the cluster storage 
              name: rootfs
    ```
 
-8. Check the YAML file. The complete YAML after finishing the configuration is as follows.
+8. Add the following annotation under `spec.template.metadata.annotations`. The primary interface of this virtual machine uses `bridge` binding on the pod network, which KubeVirt refuses to live-migrate by default; this annotation declares that the underlying CNI can follow the migration and lifts that restriction. Kube-OVN, the default CNI of the platform, preserves the virtual machine IP address across a migration. Without this annotation, migration is rejected with `InterfaceNotLiveMigratable`.
 
    ```yaml
-   apiVersion: kubevirt.io/v1alpha3
+     template:
+       metadata:
+         annotations:
+           kubevirt.io/allow-pod-bridge-network-live-migration: "true"
+   ```
+
+   **Note**: KubeVirt only reports the first condition that blocks live migration, and the interface check runs before the disk check. If any PVC still uses `ReadWriteOnce`, the virtual machine remains non-migratable after adding this annotation, and the reason reported changes to `DisksNotLiveMigratable`. Both the annotation and RWX access modes are required.
+
+9. Check the YAML file. The complete YAML after finishing the configuration is as follows.
+
+   ```yaml
+   apiVersion: kubevirt.io/v1
    kind: VirtualMachine
    metadata:
      annotations:
@@ -249,7 +286,7 @@ Upload the Windows ISO and virtio-win ISO files directly to the cluster storage 
          spec:
            pvc:
              accessModes:
-               - ReadWriteOnce
+               - ReadWriteMany
              resources:
                requests:
                  storage: 100Gi
@@ -266,6 +303,7 @@ Upload the Windows ISO and virtio-win ISO files directly to the cluster storage 
            cpaas.io/updated-at: 2024-09-01T14:55:44Z
            kubevirt.io/latest-observed-api-version: v1
            kubevirt.io/storage-observed-api-version: v1
+           kubevirt.io/allow-pod-bridge-network-live-migration: "true"
          creationTimestamp: null
          labels:
            virtualization.cpaas.io/image-name: debian-2120-x86
@@ -339,11 +377,11 @@ Upload the Windows ISO and virtio-win ISO files directly to the cluster storage 
              name: rootfs
    ```
 
-9. Click **Create**.
+10. Click **Create**.
 
-10. Click **Actions** > **VNC Login**.
+11. Click **Actions** > **VNC Login**.
 
-11. When the prompt **press any key boot from CD or DVD** appears, press any key to enter the Windows installation program; if you do not see the prompt, click on **Send Remote Command** in the top left of the page, then select **Ctrl-Alt-Delete** from the dropdown menu to restart the server.
+12. When the prompt **press any key boot from CD or DVD** appears, press any key to enter the Windows installation program; if you do not see the prompt, click on **Send Remote Command** in the top left of the page, then select **Ctrl-Alt-Delete** from the dropdown menu to restart the server.
 
     **Note**: If a message appears at the top of the virtual machine details page stating **The current virtual machine has configuration changes that require a restart to take effect, please restart**, this message can be ignored; no restart is necessary.
 

@@ -1,0 +1,283 @@
+---
+weight: 30
+title: DR Environment
+---
+
+# Upgrade `global` Clusters in a DR Environment
+
+Use this page when the platform has a primary and a standby `global` cluster connected by Alauda Container Platform Global Cluster Disaster Recovery, for every minor upgrade, and for a patch upgrade in which both `global` clusters are upgraded before the workload clusters. For a patch upgrade within the same minor version, from ACP 4.5.0 or later, when the standby is upgraded after the workload clusters, use [Upgrade the Standby `global` Cluster After the Workload Clusters](./upgrade_global_dr_deferred_standby.mdx) instead. Upgrade the standby, then the primary, and reinstall the plugin without delay; do not change clusters on either `global` cluster until the plugin is reinstalled. Upgrade no workload cluster until both `global` clusters run the target ACP version (Distribution Version). Synchronization stops from the plugin uninstall until the reinstall, so there is no DR protection in between; see [Uninstall the Global Cluster Disaster Recovery Plugin from the Standby](#uninstall-dr-plugin). In the plugin settings, the `active_*` parameters refer to the primary.
+
+## Before You Begin \{#before-you-begin}
+
+- [Prepare for the Upgrade](../pre-upgrade.mdx) is complete on both `global` clusters. These items are not synchronized between them, so each side has its own: published packages, including the Global Cluster Disaster Recovery package on the standby; Alauda OS image ConfigMaps or catalog entries; the administrator acknowledgement; `ResourcePatch` exemptions; and a preflight result that lets you continue. On the standby, every check passes except `DRSplitUpgradeWindow`, which may fail only with `EtcdSyncNotPaused`, `TokenRotatorEnabled`, or both, and passes after you uninstall the plugin below. For another reason, see [DR Standby Checks](../troubleshooting.mdx#dr-split-upgrade-window).
+- On Bare Metal, the `global` clusters run ACP 4.5.0 or later. To upgrade a Bare Metal pair from an earlier version, contact technical support.
+- Each `global` cluster has a recent successful etcd backup, as described in [Check the etcd Backup](../pre-upgrade.mdx#etcd-backup).
+- You are on the [execution host](../pre-upgrade.mdx#execution-host), logged in with `ac login` as a platform administrator, in the `installer/` directory of the extracted target Core Package, with a kubeconfig of the standby that points to its VIP: `<standby-kubeconfig>`.
+
+On the primary, `ac` commands use the `ac login` session, and `upgrade.sh` uses `kubectl` with the kubeconfig that `ac login` saved, after `ac config use-cluster global`; `ac whoami --show-server` prints `https://<platform-address>/kubernetes/global/`. Each command block for the standby starts with `export KUBECONFIG=<standby-kubeconfig>` and ends with `unset KUBECONFIG`, and `ac whoami --show-server` prints the standby VIP. Confirm the printed address before you continue with a block.
+
+## Upgrade Procedure \{#global-dr-procedure}
+
+<Steps>
+
+### Verify Data Consistency \{#verify-dr-consistency}
+
+:::warning
+Do not uninstall the plugin until this check passes.
+:::
+
+Run the check on a control plane node of the standby `global` cluster, then return to the execution host:
+
+```bash
+export KUBECONFIG=/etc/kubernetes/admin.conf
+mirror_svc=$(kubectl get svc -n cpaas-system etcd-sync-monitor -o jsonpath='{.spec.clusterIP}')
+if [[ $mirror_svc =~ ^[0-9a-fA-F:]+$ ]]; then mirror_host="[$mirror_svc]"; else mirror_host="$mirror_svc"; fi
+curl -g "http://${mirror_host}/check"
+```
+
+| Result | Action |
+|---|---|
+| `localMissedKeys [0]` | Continue. `localSurplusKeys` is for information only. |
+| `check too frequent` | Wait one minute and run the check again; if it does not change, contact technical support. |
+| `localMissedKeys` is not `[0]` | Run the steps in [Global Cluster Disaster Recovery Does Not Synchronize](../troubleshooting.mdx#dr-sync-diagnostics), then run the check again. |
+
+### Check the Machines and Ongoing Upgrades \{#check-machines-before-uninstall}
+
+On the primary:
+
+```bash
+ac config use-cluster global
+ac whoami --show-server
+ac get machines.platform.tkestack.io
+ac get machines.cluster.x-k8s.io -A   # Alauda OS
+ac -n cpaas-system get cvsh \
+  -o custom-columns='CLUSTER:.metadata.name,REQUESTED:.spec.desiredUpdate.version,CURRENT:.status.current.version'
+```
+
+On the standby:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server   # the standby VIP
+ac get machines.platform.tkestack.io
+ac get machines.cluster.x-k8s.io -A   # Alauda OS
+unset KUBECONFIG
+```
+
+| Result | Action |
+|---|---|
+| Every machine on both `global` clusters is `Running`, and on every row of the `cvsh` list `REQUESTED` is empty or equal to `CURRENT` | Continue. |
+| The `cvsh` command reports `the server doesn't have a resource type`, and every machine on both `global` clusters is `Running` | Continue. |
+| On a row of the `cvsh` list, `REQUESTED` differs from `CURRENT` | Run the block on the primary again after that workload cluster upgrade completes. If that upgrade does not advance, see [Inspect Upgrade State](../troubleshooting.mdx#inspect-upgrade-state). |
+| A machine is not `Running` | Contact technical support. |
+
+### Uninstall the Global Cluster Disaster Recovery Plugin from the Standby \{#uninstall-dr-plugin}
+
+:::warning
+From now until you reinstall the plugin, do not change clusters on either `global` cluster: do not create, scale, or delete clusters or nodes, do not change cluster configuration, and do not request any upgrade other than the two `global` upgrades. A change made on one side can be reconciled back by the providers of the other side. Upgrade the standby, then the primary, and reinstall the plugin without delay.
+:::
+
+The plugin settings are removed with the plugin. Record them first, without the token, in a file on the execution host:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server   # the standby VIP
+ac get moduleinfo -l cpaas.io/module-name=etcd-sync,cpaas.io/cluster-name=global -o jsonpath='{range .items[*]}version: {.spec.version}
+active_cluster_vip: {.spec.config.active_cluster_vip}
+active_cluster_etcd_endpoints: {.spec.config.active_cluster_etcd_endpoints}
+dest_etcd_endpoints: {.spec.config.dest_etcd_endpoints}
+active_cluster_token_secret_ref: {.spec.config.active_cluster_token_secret_ref}
+monitor_check_interval: {.spec.config.monitor_check_interval}
+detail: {.spec.config.detail}
+{end}' | tee etcd-sync-settings.txt
+unset KUBECONFIG
+```
+
+Continue when `active_cluster_vip` shows the primary VIP; otherwise, do not uninstall the plugin, and contact technical support. Keep the file until the reinstall. Then uninstall the plugin:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server   # the standby VIP
+ac delete moduleinfo -l cpaas.io/module-name=etcd-sync,cpaas.io/cluster-name=global
+ac get moduleinfo -l cpaas.io/module-name=etcd-sync
+ac -n cpaas-system get pod -l 'app in (etcd-sync,etcd-sync-monitor)'
+unset KUBECONFIG
+```
+
+Continue when the last two commands return nothing; otherwise, run them again after one minute, and if they still list objects, contact technical support.
+
+### Upgrade the Standby `global` Cluster \{#upgrade-standby}
+
+:::warning
+An upgrade cannot be rolled back. On Huawei DCS, Huawei Cloud Stack, and VMware vSphere, the request also replaces every node with a new VM, one at a time; on Bare Metal, it reinstalls every host, one at a time. This happens on every minor upgrade, and on a patch upgrade when the target changes the Kubernetes build or the Alauda OS image.
+:::
+
+On the standby, **deploy the Cluster Version Operator (CVO)** and the target release information. `<target-version>` is the target ACP version, for example `4.5.0`:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server   # the standby VIP
+bash upgrade.sh --skip-sync-image
+ac get productmanifest v<target-version>
+unset KUBECONFIG
+```
+
+| Result | Action |
+|---|---|
+| The script completes without an error, and `READY` is `True` | Continue. |
+| The script reports that the product manifest did not become ready, or `READY` is not `True` | Follow [Recover a Missing Aligned Extension Package](../troubleshooting.mdx#recover-missing-aligned-package). |
+| The script fails with another error | Contact technical support. |
+
+Then **run the final preflight check**:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server   # the standby VIP
+bash upgrade.sh --preflight
+unset KUBECONFIG
+```
+
+Continue when `Summary` shows `Passed` or `PassedWithWarnings`. Otherwise, resolve the checks on the standby as described in [Handle Preflight Blocks](../troubleshooting.mdx#handle-preflight-blocks-when-needed) and run the check again; `AdminAckRequired` can appear for the first time here, see [Handle Administrator Acknowledgement Gates](../troubleshooting.mdx#handle-administrator-acknowledgement-gates). Then **request the upgrade** with the target version exactly as `ac adm upgrade` lists it:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server   # the standby VIP
+ac adm upgrade
+ac adm upgrade --cluster=global --to=<target-version>
+unset KUBECONFIG
+```
+
+**Monitor the upgrade:**
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server   # the standby VIP
+ac adm upgrade status --cluster=global
+ac -n cpaas-system get infraclusterversion global   # Alauda OS
+unset KUBECONFIG
+```
+
+Run the block again until `Current` shows the target version and `Ready` is `True`, and on Alauda OS `PHASE` is `Succeeded`. While control plane nodes are replaced, a command can fail to connect; run it again. If `Upgrade` shows `Blocked` or `Retrying`, see [Inspect Upgrade State](../troubleshooting.mdx#inspect-upgrade-state). On Alauda OS, if the upgrade stays `InProgress` in the `Kubernetes` stage, read the `Stalled` condition of the `InfraClusterVersion` as described there. Fix the reported cause and the upgrade continues; if it cannot be fixed, contact technical support.
+
+
+### Check the Standby Before Upgrading the Primary \{#go-no-go}
+
+On the standby:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server   # the standby VIP
+ac adm upgrade status --cluster=global
+ac get nodes
+ac get moduleinfo -l cpaas.io/module-name=etcd-sync
+unset KUBECONFIG
+```
+
+Continue with the primary when `Current` shows the target version and `Ready` is `True`, on Alauda OS every node is `Ready` and shows the target Kubernetes version in `VERSION`, and the last command returns nothing; otherwise, do not upgrade the primary, and contact technical support.
+
+### Upgrade the Primary `global` Cluster \{#upgrade-primary}
+
+:::warning
+An upgrade cannot be rolled back. On Huawei DCS, Huawei Cloud Stack, and VMware vSphere, the request also replaces every node with a new VM, one at a time; on Bare Metal, it reinstalls every host, one at a time. This happens on every minor upgrade, and on a patch upgrade when the target changes the Kubernetes build or the Alauda OS image.
+:::
+
+On the primary, **deploy CVO** and the target release information:
+
+```bash
+ac config use-cluster global
+ac whoami --show-server   # ends with /kubernetes/global/
+bash upgrade.sh --skip-sync-image
+ac get productmanifest v<target-version>
+```
+
+| Result | Action |
+|---|---|
+| The script completes without an error, and `READY` is `True` | Continue. |
+| The script reports that the product manifest did not become ready, or `READY` is not `True` | Follow [Recover a Missing Aligned Extension Package](../troubleshooting.mdx#recover-missing-aligned-package). |
+| The script fails with another error | Contact technical support. |
+
+Then **run the final preflight check**:
+
+```bash
+ac config use-cluster global
+ac whoami --show-server   # ends with /kubernetes/global/
+bash upgrade.sh --preflight
+```
+
+Continue when `Summary` shows `Passed` or `PassedWithWarnings`. Otherwise, resolve the checks on the primary as described in [Handle Preflight Blocks](../troubleshooting.mdx#handle-preflight-blocks-when-needed) and run the check again; `AdminAckRequired` can appear for the first time here, see [Handle Administrator Acknowledgement Gates](../troubleshooting.mdx#handle-administrator-acknowledgement-gates). Then **request the upgrade** with the target version exactly as `ac adm upgrade` lists it:
+
+```bash
+ac adm upgrade
+ac adm upgrade --cluster=global --to=<target-version>
+```
+
+**Monitor the upgrade:**
+
+```bash
+ac adm upgrade status --cluster=global
+ac -n cpaas-system get infraclusterversion global   # Alauda OS
+```
+
+Run the commands again until `Current` shows the target version and `Ready` is `True`, and on Alauda OS `PHASE` is `Succeeded`. While control plane nodes are replaced, a command can fail to connect; run it again. If `Upgrade` shows `Blocked` or `Retrying`, see [Inspect Upgrade State](../troubleshooting.mdx#inspect-upgrade-state). On Alauda OS, if the upgrade stays `InProgress` in the `Kubernetes` stage, read the `Stalled` condition of the `InfraClusterVersion` as described there. Fix the reported cause and the upgrade continues; if it cannot be fixed, contact technical support.
+
+
+### Reinstall the Global Cluster Disaster Recovery Plugin \{#reinstall-dr-plugin}
+
+Reinstall the plugin on the standby after both `global` clusters run the target ACP version. The standby reads the primary etcd on port `2379`, through the primary VIP or, when the VIP does not forward that port, directly from the primary control plane nodes; `etcd-sync-settings.txt` shows which one the plugin used before. Create the token Secret on the standby from the primary token without printing it. Then list the plugin versions on the standby:
+
+```bash
+ac config use-cluster global
+ac whoami --show-server   # the primary
+ACTIVE_CLUSTER_TOKEN=$(ac -n cpaas-system get secret k8sadmin -o jsonpath='{.data.token}' | base64 -d)
+export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server   # the standby VIP
+ac -n cpaas-system create secret generic etcd-sync-active-cluster-token \
+  --from-literal=token="${ACTIVE_CLUSTER_TOKEN}" --dry-run=client -o yaml | ac apply -f -
+unset ACTIVE_CLUSTER_TOKEN
+ac get moduleconfigs -l cpaas.io/module-name=etcd-sync -o custom-columns='NAME:.metadata.name,VERSION:.spec.version'
+unset KUBECONFIG
+```
+
+Install the plugin on the standby. Set `version` to the version that you pushed to the standby in [Publish to the Standby global Cluster](../pre-upgrade.mdx#publish-standby), the highest `VERSION` in the previous output. For `active_cluster_vip`, `active_cluster_etcd_endpoints`, `dest_etcd_endpoints`, `monitor_check_interval`, and `detail`, use the values recorded in `etcd-sync-settings.txt` instead of the example values:
+
+```bash
+export KUBECONFIG=<standby-kubeconfig>
+ac whoami --show-server   # the standby VIP
+ac create -f - <<'EOF'
+apiVersion: cluster.alauda.io/v1alpha1
+kind: ModuleInfo
+metadata:
+  name: global-temporary-name   # keep this name; the platform renames the object
+  labels:
+    cpaas.io/cluster-name: global
+    cpaas.io/module-name: etcd-sync
+    cpaas.io/module-type: plugin
+spec:
+  version: <etcd-sync-version>
+  config:
+    active_cluster_vip: "<primary-vip>"
+    active_cluster_etcd_endpoints: ""     # or "https://<primary-node-1-ip>:2379,https://<primary-node-2-ip>:2379,https://<primary-node-3-ip>:2379"
+    dest_etcd_endpoints: "https://etcd.kube-system:2379"
+    active_cluster_token_secret_ref: "etcd-sync-active-cluster-token"
+    active_cluster_token: ""
+    monitor_check_interval: 1
+    detail: false
+EOF
+ac get moduleinfo -l cpaas.io/module-name=etcd-sync
+ac -n cpaas-system get pod -l 'app in (etcd-sync,etcd-sync-monitor)'
+unset KUBECONFIG
+```
+
+Continue when the `ModuleInfo` shows `STATUS` `Running` and `CURRENT_VERSION` equal to the version you set, every Pod is `Running`, and the `/check` command from [Verify Data Consistency](#verify-dr-consistency), run again on a standby control plane node, shows `localMissedKeys [0]`. Otherwise, run the steps in [Global Cluster Disaster Recovery Does Not Synchronize](../troubleshooting.mdx#dr-sync-diagnostics); if they do not resolve it, contact technical support.
+
+### Upgrade the Agnostic Extensions and Validate \{#upgrade-agnostic-extensions}
+
+The upgrade requests do not upgrade Extensions (Operators and Cluster Plugins) with the `Agnostic` lifecycle. Upgrade each Agnostic Extension installed on the primary, and each one installed on the standby, by following its own documentation; the plugin does not synchronize installed Extensions. For example, see <ExternalSiteLink name="ai" href="/upgrade/upgrade-from-aml-1.2.html" children="Upgrade Alauda AI" /> and <ExternalSiteLink name="devops" href="/upgrade/index.html" children="Upgrade Alauda DevOps" />. Then complete [Upgrade Validation](../validation.mdx) on the primary and on the standby.
+
+The upgrade of the two `global` clusters is complete only when every step on this page is done, including the synchronization check after the reinstall; do not start another upgrade of either `global` cluster before that.
+
+</Steps>
+
+## Next Step
+
+Upgrade the workload clusters. See [Upgrade Workload Clusters](../workload/upgrade_workload_cluster.mdx).

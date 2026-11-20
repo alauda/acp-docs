@@ -1,0 +1,170 @@
+---
+weight: 50
+---
+
+# Upgrade Validation
+
+Validate each upgraded cluster to finish its upgrade. In a DR environment, validate the standby and the primary `global` cluster separately, before you upgrade any workload cluster; when the standby is upgraded after the workload clusters, validate the primary before the workload clusters and the standby after its upgrade. The upgrade of a cluster is finished when every check on this page passes.
+
+Run the commands on this page from the [execution host](./pre-upgrade.mdx#execution-host), on the `global` cluster, which is the primary in a DR environment, for the `global` cluster and for every workload cluster; `ac whoami --show-server` prints an address that ends with `/kubernetes/global/`:
+
+```bash
+ac config use-cluster global
+ac whoami --show-server
+```
+
+To validate the standby `global` cluster in a DR environment, run `export KUBECONFIG=<standby-kubeconfig>` instead, confirm that `ac whoami --show-server` prints the standby VIP, keep it for every block on this page, skip the `ac config use-cluster` lines, and run `unset KUBECONFIG` when you finish.
+
+## Check the ACP Version \{#check-distribution-version}
+
+Replace `<cluster-name>` with `global` or the workload cluster name:
+
+```bash
+ac adm upgrade status --cluster=<cluster-name>
+ac -n cpaas-system get cvsh <cluster-name> \
+  -o jsonpath='{range .status.history[*]}{.version}{"\t"}{.state}{"\t"}{.startedTime}{"\t"}{.completionTime}{"\n"}{end}'
+```
+
+Continue when `Upgrade` is `Completed`, `Current` shows the target ACP version (Distribution Version), the `Ready` condition is `True`, `Stalled` is not `True`, and the first history entry shows the target version with the state `Completed`; otherwise, follow [Inspect Upgrade State](./troubleshooting.mdx#inspect-upgrade-state).
+
+## Check Kubernetes, Nodes, and Extensions \{#check-kubernetes-nodes-plugins}
+
+On the `global` cluster, read the Core and the installed Extensions of the cluster:
+
+```bash
+ac get moduleinfo -l cpaas.io/cluster-name=<cluster-name> \
+  -o custom-columns='MODULE:.metadata.labels.cpaas\.io/module-name,CURRENT:.status.version,TARGET:.spec.version,PHASE:.status.phase'
+ac get clustermodule <cluster-name> -o jsonpath='{.status.base.deployStatus}{"\n"}'
+```
+
+Then read Kubernetes, the nodes, and the Pods on the upgraded cluster itself. For a workload cluster, the first line switches to it and the last line switches back to `global`; for a `global` cluster, skip both lines:
+
+```bash
+ac config use-cluster <cluster-name>   # workload cluster only
+ac version
+ac get nodes
+ac get pods --all-namespaces \
+  | awk '{if ($4 != "Running" && $4 != "Completed")print}' \
+  | awk -F'[/ ]+' '{if ($3 != $4)print}'
+ac config use-cluster global           # workload cluster only
+```
+
+| Result | Action |
+|---|---|
+| Every module is `Running` with `CURRENT` equal to `TARGET`, and `deployStatus` is not `Upgrading`, `DeployFailed`, or `UpgradeFailed`. Every node is `Ready`; for a cluster created by ACP, the server version and the `VERSION` of every node are the Kubernetes version of the target ACP release. The `ac get pods` command prints only its header line | Continue. |
+| The `ac get pods` command lists only Pods of your own applications that did not run before the upgrade either | Continue. |
+| A module is not `Running` or its `CURRENT` differs from `TARGET`, or `deployStatus` is `Upgrading`, `DeployFailed`, or `UpgradeFailed` | Follow [Diagnose a Module That Does Not Advance](./troubleshooting.mdx#module-not-advancing). |
+| `deployStatus` is empty or `<none>` | Run the command again later. If it stays empty, contact technical support. |
+| Another node or Pod result | Contact technical support. |
+
+## Additional Checks for Alauda OS Clusters \{#alauda-os-checks}
+
+**Applies to**: Alauda OS clusters. Skip it for non-Alauda OS clusters.
+
+### Check the Kube-OVN and CoreDNS Takeover \{#check-core-addons}
+
+On the `global` cluster, use the kind that matches the provider of the cluster, `dcscluster`, `baremetalcluster`, `hcscluster`, or `vspherecluster`:
+
+```bash
+ac -n cpaas-system get <provider-cluster-kind> <cluster-name> \
+  -o jsonpath='{range .status.conditions[?(@.type=="CoreAddonsHandedOff")]}{.status}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
+```
+
+| Result | Action |
+|---|---|
+| `True`, or no output on a cluster that does not use Kube-OVN | Continue. |
+| `False` with `CoreAddonsHandoffPending` or `CoreDNSSkipPhasePending` | Run the command again later; if it does not change, contact technical support. |
+| `False` with `CoreAddonsHandoffNotApplicable` | Contact technical support. |
+| `False` with `CoreAddonsHandoffBlocked` | Contact technical support with the message, which names the setting. |
+
+### Check the Provider Resources \{#check-provider-resources}
+
+On the `global` cluster, run the checks for the provider of the cluster:
+
+<Tabs>
+  <Tab label="Huawei DCS">
+
+```bash
+ac -n cpaas-system get infraclusterversion <cluster-name>
+ac -n cpaas-system get infraclusterversion <cluster-name> \
+  -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{"\t"}{.message}{"\n"}{end}'
+```
+
+| Result | Action |
+|---|---|
+| `CURRENT` equals `DESIRED`, `PHASE` is `Succeeded`, and `Ready` is `True` | Continue. |
+| The `Ready` message starts with `kube-proxy rollout pending` | Run the commands again after the `kube-proxy` DaemonSet in `kube-system` of the cluster has rolled out; if the message does not change, contact technical support. |
+| Another result | Follow [Read the Progress](./troubleshooting.mdx#infra-progress). |
+
+  </Tab>
+  <Tab label="Bare Metal">
+
+```bash
+ac -n cpaas-system get infraclusterversion <cluster-name>
+ac -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io -l cluster.x-k8s.io/cluster-name=<cluster-name> \
+  -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,INVENTORY:.status.machineInventoryRef.name,PLAN_SECRET:.status.planSecretRef.name'
+ac -n cpaas-system get machineinventories.elemental.cattle.io <inventory-name> \
+  -o jsonpath='{.status.plan.state}{"\n"}'
+ac -n cpaas-system get secret <plan-secret-name> \
+  -o jsonpath='{.metadata.annotations.baremetal\.alauda\.io/plan\.type}{"\n"}'
+```
+
+| Result | Action |
+|---|---|
+| `CURRENT` of the `InfraClusterVersion` equals `DESIRED` and `PHASE` is `Succeeded`, and every `BaremetalMachine` is `Running`. For each listed `INVENTORY` and `PLAN_SECRET`, the inventory reports `Applied` and the plan Secret reports `reprovision` | Continue. |
+| Another result | Follow [Read the Progress](./troubleshooting.mdx#infra-progress). |
+
+  </Tab>
+  <Tab label="Huawei Cloud Stack">
+
+```bash
+ac -n cpaas-system get infraclusterversion <cluster-name>
+ac -n cpaas-system get infraclusterversion <cluster-name> \
+  -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{"\t"}{.message}{"\n"}{end}'
+ac -n cpaas-system get hcsmachineconfigpool \
+  -o custom-columns='NAME:.metadata.name,DISK_PHASES:.status.persistentDiskStatus[*].phase'
+```
+
+| Result | Action |
+|---|---|
+| `CURRENT` equals `DESIRED`, `PHASE` is `Succeeded`, and `Ready` is `True`, and no pool of the cluster shows `Error` in `DISK_PHASES` | Continue. |
+| The `Ready` message starts with `kube-proxy rollout pending` | Run the commands again after the `kube-proxy` DaemonSet in `kube-system` of the cluster has rolled out; if the message does not change, contact technical support. |
+| A pool of the cluster shows `Error` in `DISK_PHASES` | Contact technical support. |
+| Another result | Follow [Read the Progress](./troubleshooting.mdx#infra-progress). |
+
+  </Tab>
+  <Tab label="VMware vSphere">
+
+```bash
+ac -n cpaas-system get infraclusterversion <cluster-name>
+ac -n cpaas-system get infraclusterversion <cluster-name> \
+  -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{"\t"}{.message}{"\n"}{end}'
+ac -n cpaas-system get vspheremachineconfigpool
+ac -n cpaas-system get vspheremachineconfigpool <pool-name> \
+  -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}{range .status.persistentDiskStatuses[*]}{.hostname}{" "}{.name}{" "}{.phase}{"\n"}{end}'
+```
+
+| Result | Action |
+|---|---|
+| `CURRENT` equals `DESIRED`, `PHASE` is `Succeeded`, and `Ready` is `True`; each pool of the cluster reports `Ready=True` and `PersistentDisksReady=True`; and every persistent disk on an allocated slot is `Attached` | Continue. |
+| The `Ready` message starts with `kube-proxy rollout pending` | Run the commands again after the `kube-proxy` DaemonSet in `kube-system` of the cluster has rolled out; if the message does not change, contact technical support. |
+| A pool or a persistent disk shows another state | See [vSphere Rollout Holds That Are Not Failures](./troubleshooting.mdx#rollout-holds); if the state does not change, contact technical support. |
+| Another result | Follow [Read the Progress](./troubleshooting.mdx#infra-progress). |
+
+  </Tab>
+</Tabs>
+
+## Check the Web UI \{#check-web-ui}
+
+Open the platform Web UI. Continue when login, cluster pages, and Marketplace pages load, and, for each Extension with the `Agnostic` lifecycle that you upgraded, its pages open; otherwise, contact technical support.
+
+## Next Step
+
+After you validate the `global` clusters, continue with [Upgrade Workload Clusters](./workload/upgrade_workload_cluster.mdx). After you validate a workload cluster, return to that page for the next cluster. After the last cluster, continue with [After All Clusters Are Upgraded](#after-all-clusters).
+
+## After All Clusters Are Upgraded \{#after-all-clusters}
+
+When `global` and every workload cluster run the target ACP version:
+
+- If the source ACP version was earlier than 4.3 and the PKCE hardening is not done yet, follow [Disabling the PKCE Plain Method](../security/platform_security_configurations/disable_pkce_plain_method.mdx).
+- Delete a VM template, cloud image, or Bare Metal OS image of an earlier version only after the last cluster that uses it is upgraded.

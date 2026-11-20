@@ -1,0 +1,243 @@
+---
+weight: 40
+title: Create a Cluster
+author: gangwang@alauda.io
+category: howto
+queries:
+  - create baremetal cluster
+  - deploy kubernetes on bare metal
+  - baremetal cluster creation guide
+  - ac adm alpha cluster create --provider baremetal
+  - bare metal workload cluster install-config.yaml fields
+---
+
+# Create a Cluster on Bare Metal
+ACP CLI (ac) renders the cluster objects from one `install-config.yaml` and applies them to the `global` cluster. The Bare Metal provider then builds the cluster from the hosts in your pools. First, collect available hosts into one `MachineInventoryPool` for each node group, because `ac` does not register hosts or create pools. All objects are in the `cpaas-system` namespace of the `global` cluster.
+
+## Prerequisites
+
+- You meet the [Bare Metal prerequisites](./prerequisites.mdx).
+- Enough [available hosts](./register_hosts.mdx#available-hosts) of the cluster's OS: one host for each node, that is, `controlPlane.replicas` plus the `replicas` of every node group in `computes`.
+- The image catalog has a key for the Kubernetes version of the `global` cluster, for the architecture and OS of these hosts; see [Add the Image Catalog Keys](./prepare_os.mdx#add-versions-to-image-catalog).
+- `ac` is logged in to the platform as a platform administrator (`ac login https://<platform-address> --name <session-name>`).
+- You have chosen the cluster name. It **must not** be `global` or start with `global-`. Use it as the prefix of the pool names.
+
+| Placeholder | Value |
+|---|---|
+| `<cluster-name>` | The workload cluster name, later `cluster.clusterName`. |
+
+## Procedure
+
+### 1. Create the Pools \{#step-2-pools}
+
+List the [available hosts](./register_hosts.mdx#available-hosts) with the command on that page, and pick the hosts of each node group from them. All hosts of a cluster run the same OS. Alauda OS M55 hosts are `amd64`. An Alauda OS KU cluster can mix `amd64` and `arm64` hosts, even within one pool.
+
+Create one pool for the control plane and one pool for each worker node group. Two node groups cannot share a pool, and a `MachineInventory` must not appear in two active pools.
+
+```yaml title="machineinventorypools.yaml"
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: MachineInventoryPool
+metadata:
+  name: <cluster-name>-control-plane-pool
+  namespace: cpaas-system
+spec:
+  clusterName: <cluster-name> # [!code callout]
+  machineInventories:
+    - name: <control-plane-inventory-1> # [!code callout]
+      hostname: <control-plane-host-1> # [!code callout]
+    - name: <control-plane-inventory-2>
+    - name: <control-plane-inventory-3>
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: MachineInventoryPool
+metadata:
+  name: <cluster-name>-worker-pool
+  namespace: cpaas-system
+spec:
+  clusterName: <cluster-name>
+  machineInventories:
+    - name: <worker-inventory-1>
+    - name: <worker-inventory-2>
+    - name: <worker-inventory-3>
+```
+
+<Callouts>
+
+1. `clusterName`: the workload cluster this pool serves.
+2. `name`: the exact `MachineInventory` name.
+3. `hostname`: optional. The host gets this name each time it is reinstalled. Defaults to the inventory name.
+
+</Callouts>
+
+```bash
+ac config use-cluster global
+ac apply -f machineinventorypools.yaml
+ac -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io \
+  -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status,TOTAL:.status.total,AVAILABLE:.status.available'
+```
+
+Continue when each pool shows `READY` `True` and its `TOTAL` equals the number of inventories that it lists. Otherwise, read the `MembersValid` condition of the pool, and see [Provider Conditions](./troubleshooting.mdx#provider-conditions).
+
+Give each pool at least as many hosts as the `replicas` of its node group, because an upgrade replaces each node with a host from the same pool.
+
+#### Pool Capacity \{#worker-pool-capacity}
+
+```bash
+ac config use-cluster global
+ac -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io <cluster-name>-worker-pool
+```
+
+`status.available` must be at least the target replica count. To add capacity, register more hosts as described in [Register Hosts](./register_hosts.mdx), and add the names of the available hosts to `spec.machineInventories`.
+
+### 2. Write `install-config.yaml` \{#write-install-config}
+
+Create an installation directory for the cluster and write `install-config.yaml` in it. `ac` writes `manifests/` and `logs/ac.log` into the same directory.
+
+Copy the following template and fill in the placeholders. The numbered lines are specific to Bare Metal, and the table below the template describes them. For the other fields, see [Common `install-config.yaml` Fields](../reference.mdx#install-config). For the objects that `ac` renders from this file, see [Rendered Manifests](./reference/install-config-parameters.mdx).
+
+```yaml title="install-config.yaml"
+cluster:
+  clusterName: <cluster-name>
+  sshKeys:
+    - <ssh-public-key>
+  # registrySecretRef:
+  #   name: <registry-secret-name>
+  #   namespace: cpaas-system
+  # encryptionProviderConfig: <encryption-key>
+  ntpServers: []
+  network:
+    podCIDR: 10.199.0.0/16
+    serviceCIDR: 10.96.0.0/12
+    kubeOVN:
+      joinCIDR: 100.64.0.0/16
+    loadBalancer: # [!code callout]
+      type: internal
+      address: <control-plane-endpoint>
+      port: 6443
+      vrid: <vrid>
+
+controlPlane:
+  replicas: 3
+  baremetal:
+    machineInventoryPool: <cluster-name>-control-plane-pool # [!code callout]
+
+computes:
+  - name: worker
+    replicas: 3
+    baremetal:
+      machineInventoryPool: <cluster-name>-worker-pool # [!code callout]
+```
+
+<table className="field-table">
+  <thead>
+    <tr><th>#</th><th>Field</th><th>Description</th></tr>
+  </thead>
+  <tbody>
+    <tr><td></td><td><code>cluster.<wbr />network</code></td><td><span className="field-meta">Required · `object`</span>The cluster network.</td></tr>
+    <tr><td><Callout>1</Callout></td><td><code>cluster.<wbr />network.<wbr />loadBalancer</code></td><td><span className="field-meta">Required · `object`</span>The control plane endpoint. `type`: the kind of endpoint. `internal`, the default, is a [Self-built VIP](../../../install/alauda_os/prerequisites.mdx#self-built-vip) that the provider runs on the control plane nodes, on the NIC that holds the node address. `external` is your [own load balancer](../../../install/alauda_os/prerequisites.mdx#external-load-balancer); it must be ready before you run `create` and must forward the ports in [Workload Cluster VIP and Nodes](../../../install/prepare/communication_matrix.mdx#workload_cluster). `address`: the VIP or the frontend address of the load balancer. It must be an IPv4 address that is not a node address and is outside the Pod, Service, and join CIDRs. For `internal`, use an unused address in the control plane Layer 2 domain; see [Network Connectivity](./prerequisites.mdx#network-connectivity). `port`: default `6443`. `vrid`: required with `internal`. A VRRP router ID from 1 to 255 that is unique in the control plane Layer 2 domain. Delete it with `external`. `interface` and `vipMode` are not supported.</td></tr>
+    <tr><td></td><td><code>controlPlane</code></td><td><span className="field-meta">Required · `object`</span>The control plane node group.</td></tr>
+    <tr><td><Callout>2</Callout></td><td><code>controlPlane.<wbr />baremetal.<wbr />machineInventoryPool</code></td><td><span className="field-meta">Required · `string`</span>The `MachineInventoryPool` that this node group takes its hosts from, which you created in [Create the Pools](#step-2-pools). Two node groups cannot share a pool.</td></tr>
+    <tr><td></td><td><code>computes[]</code></td><td><span className="field-meta">Optional · `[]object` · Default: `[]`</span>The worker node groups, one entry per group.</td></tr>
+    <tr><td><Callout>3</Callout></td><td><code>computes[].<wbr />baremetal.<wbr />machineInventoryPool</code></td><td><span className="field-meta">Required · `string`</span>The `MachineInventoryPool` of this worker group. Each node group has its own pool.</td></tr>
+  </tbody>
+</table>
+
+On Bare Metal, a node group takes only `replicas` and `baremetal.machineInventoryPool`, because the hosts determine the size, network, and disks of every node. If you set `cpuCore`, `memoryGiB`, `network`, `disks`, or `hosts` in a node group, or set `provider.baremetal` or `credentialRef`, you get an error that names the field.
+
+You do not set the Kubernetes version. The cluster gets the version of the `global` cluster.
+
+### 3. Create the Cluster \{#create-with-ac}
+
+Run the following command from a machine where `ac` is logged in to the platform:
+
+```bash
+ac config use-cluster global
+ac adm alpha cluster create --dir <install-dir> --provider baremetal
+```
+
+`ac` first checks the provider CRDs on the `global` cluster, the pools and their size, and the registry. If a check fails, nothing is changed, and the error names the failed item. Make sure that each pool has enough `Available` inventories; see [Pool Capacity](#worker-pool-capacity).
+
+`create` returns as soon as the objects are applied, and the cluster continues to build after that. To wait until all stages are ready, add `--wait`. `--timeout` (default `2h`) limits only the wait. To render the objects without applying them, run `ac adm alpha cluster manifests` with the same flags.
+
+### 4. Monitor the Creation \{#monitor-creation}
+
+```bash
+ac config use-cluster global
+ac adm alpha cluster status --cluster <cluster-name>                      # prints the four stages once
+ac adm alpha cluster wait-for install-complete --cluster <cluster-name>   # waits until all four are ready
+```
+
+Continue when all four stages are ready; otherwise see [Troubleshooting](./troubleshooting.mdx).
+
+### 5. Verify the Cluster \{#verify-the-cluster}
+
+Run the following commands from a machine where `ac` is logged in to the platform:
+
+```bash
+ac config sync
+ac config use-cluster <cluster-name>
+ac get nodes
+ac config use-cluster global
+```
+
+Continue when every node is `Ready`; otherwise see [Troubleshooting](./troubleshooting.mdx).
+
+#### Hosts and Pools \{#verify-hosts-and-pools}
+
+```bash
+ac config use-cluster global
+ac -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io
+ac -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io \
+  -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status,TOTAL:.status.total,AVAILABLE:.status.available'
+```
+
+Continue when every `BaremetalMachine` reports `Running` and each pool shows `READY` `True`; otherwise see [Provider Conditions](./troubleshooting.mdx#provider-conditions).
+
+#### Self-built VIP \{#verify-self-built-vip}
+
+**Applies to**: `type: internal`. Skip it for an external load balancer.
+
+```bash
+ac config sync
+ac config use-cluster <cluster-name>
+ac -n kube-system get pods -l app=alive -o wide
+ac config use-cluster global
+```
+
+Continue when an Alive Pod is `Running` on each control plane node; otherwise see [Provider Conditions](./troubleshooting.mdx#provider-conditions).
+
+Log in to a control plane node of the cluster as the `boot` user (`ssh boot@<control-plane-node-ip>`). Use the private key that matches an SSH public key in `cluster.sshKeys`. Run `curl` with `sudo`, because only `root` can read the cluster CA file:
+
+```bash
+sudo curl --cacert /etc/kubernetes/pki/ca.crt https://<vip>:6443/healthz
+```
+
+Continue when it prints `ok`; otherwise see [Provider Conditions](./troubleshooting.mdx#provider-conditions).
+
+#### External Load Balancer \{#verify-external-load-balancer}
+
+**Applies to**: `type: external`. Skip it for a Self-built VIP.
+
+On the load balancer, check the frontend and every backend against [the External Load Balancer requirements](../../../install/prepare/communication_matrix.mdx#external_load_balancer). Continue when every current control plane node is registered as a backend and HTTPS `/healthz` returns HTTP `200` on each backend. Otherwise, fix the load balancer configuration.
+
+## Run `create` Again \{#rerun-create}
+
+`create` only creates a cluster. Do not run it on a cluster that already exists. To change a running cluster, see [Manage Nodes](../../../configure/nodes/alauda_os/bare-metal.mdx).
+
+If `create` stops before the cluster is created, run the same command again. It skips the work that is already done. When you run `create` again on the same directory:
+
+- It recreates objects that were deleted. Secrets are the exception: `ac` creates them once and then leaves them as they are.
+- It does not overwrite a field that another tool changed. When the rendered value differs, `create` reports that the fields are owned by another manager and stops. Do not delete the object that the error names.
+- When `manifests/` already exists, `create` asks whether to reuse it. Press Enter to reuse it, or answer `n` to render again after you change `install-config.yaml`. When standard input is not a terminal, pass `--reuse-manifests=true` or `--reuse-manifests=false`. Reusing `manifests/` ignores `install-config.yaml` and skips every check.
+
+Do not edit the files in `manifests/`.
+
+:::warning
+Keep `<install-dir>/manifests/`, or set `cluster.encryptionProviderConfig`. A generated encryption key is stored only in `manifests/`. If you render again without either of them, a new key is generated, and `manifests/` no longer records the key that the cluster uses.
+:::
+
+## Next Steps
+
+- [Manage Nodes](../../../configure/nodes/alauda_os/bare-metal.mdx)
+- [Upgrade Overview](../../../upgrade/overview.mdx#upgrade-steps-by-node-os)
+- [Delete the Cluster](./deleting.mdx)

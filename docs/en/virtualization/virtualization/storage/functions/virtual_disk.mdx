@@ -7,6 +7,8 @@ sourceSHA: 00aae36df1b13f6ea25df3e8f77cbbe339bc28a55c915bb2a31eb0d1c9b9591b
 
 Data disks can be used to meet the data persistence requirements of the business.
 
+A data disk is backed by a CDI `DataVolume` (which provisions a PVC of the same name). The operations below map to: create a `DataVolume`, hot-plug it to a virtual machine (`addvolume`), expand its PVC, detach it (`removevolume`), and delete the `DataVolume`.
+
 ## Creating a Virtual Disk
 
 Create a **data disk** for the virtual machine. Only **one** virtual disk can be added at a time; if multiple disks are needed, please repeat this operation.
@@ -26,11 +28,40 @@ Create a **data disk** for the virtual machine. Only **one** virtual disk can be
    | Parameter     | Description                                                                                                        |
    | :----------  | :----------------------------------------------------------------------------------------------------------------- |
    | **Volume Mode** | - **File System**: Mount the disk in a way that mounts the file directory.<br />- **Block Device**: Mount the disk as a block device.                   |
-   | **Storage Class** | The platform maintains virtual machine disks by automatically creating and managing persistent volume claims. You need to specify the storage class required for dynamically creating persistent volume claims.<br /><br />Different storage classes support different volume modes. If there are no available storage classes for the selected volume mode, please contact the administrator for addition. |
+   | **Storage Class** | The platform maintains virtual machine disks by automatically creating and managing persistent volume claims. You need to specify the storage class required for dynamically creating persistent volume claims.<br /><br />Different storage classes support different volume modes. If there are no available storage classes for the selected volume mode, please contact the administrator for addition.<br /><br />The access mode of the disk follows the storage class's [StorageProfile](#storageprofile-and-cross-namespace-clone-scope): **ReadWriteMany** wherever it is offered with the volume mode, which live migration needs, otherwise the mode the profile offers. |
    | **Delete with VM** | If enabled, the disk data will also be deleted when the virtual machine is deleted.                                                  |
    | **Mount**      | - **Do Not Mount**: Only create the virtual disk; it can be mounted later when needed.<br />- **Mount to VM**: Select the target virtual machine to which the virtual disk needs to be mounted. |
 
 5. Click on **Create**.
+
+### Using the API
+
+Create a blank data disk as a `DataVolume`:
+
+```yaml
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: datadisk-1
+  namespace: demo
+spec:
+  source:
+    blank: {}
+  storage:
+    resources:
+      requests:
+        storage: 10Gi
+    storageClassName: rbd-1
+    volumeMode: Block
+    accessModes:
+      - ReadWriteMany
+```
+
+```bash
+kubectl apply -f datadisk.yaml
+# wait for the DataVolume to reach Succeeded and its PVC to be Bound
+kubectl get datavolume datadisk-1 -n demo -w
+```
 
 ## Mounting a Virtual Disk
 
@@ -48,6 +79,16 @@ Mount the **data disk** to a virtual machine, attaching the already created virt
 
 4. Select the target virtual machine and click **Mount**.
 
+### Using the API
+
+Hot-plug the disk into a running virtual machine. With `virtctl`, use `--persist` so the disk is added to the virtual machine spec and survives a restart:
+
+```bash
+virtctl addvolume web-01 --volume-name=datadisk-1 --persist -n demo
+```
+
+This issues the `addvolume` subresource request (`AddVolumeOptions`). The disk then appears in `VirtualMachineInstance.status.volumeStatus` and progresses from `AttachedToNode` to `Ready`. Without `--persist`, the hot-plug applies to the running instance only and does not survive a restart.
+
 ## Expanding a Virtual Disk
 
 Expand the **system disk** and **data disk** already mounted to the virtual machine.
@@ -64,6 +105,17 @@ Expand the **system disk** and **data disk** already mounted to the virtual mach
 
 5. Enter the new capacity and click **Expand**.
 
+### Using the API
+
+Patch the PVC's requested size (the StorageClass must allow volume expansion):
+
+```bash
+kubectl patch pvc datadisk-1 -n demo --type merge \
+  -p '{"spec":{"resources":{"requests":{"storage":"20Gi"}}}}'
+```
+
+`status.capacity.storage` grows to the new size; CSI drivers such as Ceph RBD expand online (no restart needed).
+
 ## Unmounting a Virtual Disk
 
 Unmount the **data disk** from the virtual machine; only virtual machines in the **stopped** state can unmount disks.
@@ -75,6 +127,16 @@ Unmount the **data disk** from the virtual machine; only virtual machines in the
 2. In the left navigation bar, click on **Virtualization** > **Virtual Disk**.
 
 3. Click ⋮ > **Unmount** next to the virtual disk to be unmounted and confirm.
+
+### Using the API
+
+Detach the hot-plugged disk:
+
+```bash
+virtctl removevolume web-01 --volume-name=datadisk-1 -n demo
+```
+
+This issues the `removevolume` subresource and the disk is detached (the entry leaves `VirtualMachineInstance.status.volumeStatus`). The KubeVirt API supports detaching from a **running** virtual machine, but make sure the disk is no longer in use inside the guest (unmounted at the OS level) before removing it, to avoid data loss.
 
 ## Deleting a Virtual Disk
 
@@ -89,3 +151,26 @@ Deletion is only supported when the virtual disk is in an unmounted state.
 2. In the left navigation bar, click on **Virtualization** > **Virtual Disk**.
 
 3. Click ⋮ > **Delete** next to the virtual disk to be deleted and confirm.
+
+### Using the API
+
+```bash
+kubectl delete datavolume datadisk-1 -n demo
+```
+
+The backing PVC is owned by the `DataVolume` and is garbage-collected with it. If CDI already garbage-collected the `DataVolume`, delete the PVC directly (`kubectl delete pvc datadisk-1 -n demo`).
+
+## StorageProfile and cross-namespace clone scope \{#storageprofile-and-cross-namespace-clone-scope}
+
+CDI publishes a `StorageProfile` for each StorageClass that describes how disks can be provisioned and cloned on that backend. Inspect it to see the supported access/volume modes and the clone method:
+
+```bash
+kubectl get storageprofile rbd-1 -o jsonpath='cloneStrategy={.status.cloneStrategy} claimPropertySets={.status.claimPropertySets}{"\n"}'
+# cloneStrategy=csi-clone claimPropertySets=[{RWX,Block},{RWO,Block},{RWO,Filesystem}]
+```
+
+`cloneStrategy` (`csi-clone`, `snapshot`, or host-assisted `copy`) determines how a bootable volume or VM clone copies a disk; whether snapshot/clone work at all depends on the StorageClass having these capabilities.
+
+**Cross-namespace clone scope**: when creating a virtual machine or a bootable volume, the console only offers boot images from the **current namespace and `kube-public`** as clone sources. This UI guardrail — not RBAC — is the supported boundary on this platform: publish shared golden images to `kube-public`, where the built-in `os-images.kubevirt.io:view` role makes them clone-able by every authenticated user.
+
+> CDI's upstream `datavolumes/source` permission (the `datavolume-cloner` ClusterRole) does **not** reliably gate CSI-path clones, so binding it is **not** a supported or sufficient way to expose images from an arbitrary non-public namespace. Use `kube-public` for shared images instead.

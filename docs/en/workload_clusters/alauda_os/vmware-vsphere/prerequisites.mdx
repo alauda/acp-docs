@@ -1,0 +1,110 @@
+---
+weight: 30
+title: Prerequisites
+author: dev@alauda.io
+category: howto
+queries:
+  - vsphere cluster prerequisites
+  - vsphere vm template requirements
+  - vsphere credential secret
+  - vsphere control plane endpoint mode
+---
+
+import VmTemplateConfigMap /* eslint-disable-line no-unused-vars */ from '../../../../shared/components/VmTemplateConfigMap'
+
+# Prerequisites for VMware vSphere Workload Clusters
+
+Meet the following before you [create the cluster](./create_cluster.mdx). `ac` does not create any of the vCenter objects that this page lists. It checks them before it applies anything.
+
+## Providers \{#providers}
+
+Make sure that the Cluster Bootstrap Provider and the Infrastructure Provider for Virtualization Platform are installed on the `global` cluster. A `global` cluster that was installed on VMware vSphere with `ac` already runs both. Otherwise, see [Install the Provider](./reference/install_provider.mdx).
+
+## vCenter Reachability \{#vcenter-reachability}
+
+Allow the flows to vCenter that [VMware vSphere](../../../install/prepare/communication_matrix.mdx#provider-vsphere) lists. The sources are the `global` cluster, the workload cluster nodes, and the machine that runs `ac`.
+
+## VM Template \{#vm-template-requirements}
+
+Make sure that the VM template, the datacenter, the port groups, the datastores, and the compute resource exist in vCenter. Create the VM template from the Alauda OS image published for the target platform release, and do not modify the image. The image carries the Kubernetes version that `ac` installs, which is the latest Kubernetes version that the platform supports. See [OS Support Matrix](../../../overview/alauda_os_support_matrix.mdx).
+
+### VM Template ConfigMap \{#vm-template-configmap}
+
+Register each VM template with a ConfigMap on the `global` cluster when you create the template. Creating a cluster does not read these ConfigMaps; the platform upgrade does. ACP cannot discover the VM templates in your vCenter, so the upgrade learns them only from these ConfigMaps. Create one ConfigMap per VM template. The ConfigMap records:
+
+- The name of the VM template.
+- The ACP version whose Alauda OS image the VM template was made from.
+- The Kubernetes version and etcd tag of that ACP version.
+
+The platform upgrade uses these ConfigMaps to find the VM template of each Kubernetes version, so every vSphere cluster needs them. Before an upgrade, deploy the VM template of every version on the upgrade path, with the same name, in every datacenter that the cluster uses. Then register each VM template, as described in [Stage the Alauda OS Images](../../../upgrade/pre-upgrade.mdx#stage-alauda-os-images).
+
+Follow these rules:
+
+- Keep the ConfigMaps of earlier ACP versions.
+- For each ACP version, register only one VM template.
+- The value of the `cpaas.io/vsphere-vm-template` label must match the VM template name in vCenter.
+
+Run `ac config use-cluster global` first, and then run the command that the generator prints.
+
+<VmTemplateConfigMap provider="vsphere">
+  Replace `<os>` with the OS of the VM template, such as `m55`, `ko`, or `ku`, and take `<acp-version>`, `<kubernetes-version>`, and `<etcd-tag>` from the matching row of [Version Mapping](../../../overview/alauda_os_support_matrix.mdx#version-mapping).
+</VmTemplateConfigMap>
+
+Check that the ConfigMap of your VM template exists. Run the following commands from a machine where `ac` is logged in to the platform:
+
+```bash
+ac config use-cluster global
+ac -n cpaas-system get cm -l cpaas.io/vsphere-vm-template -L cpaas.io/vsphere-vm-template
+```
+
+If no ConfigMap lists your VM template name, create the ConfigMap of your VM template.
+
+## Control Plane Endpoint \{#control-plane-endpoint-modes}
+
+Every cluster reaches its API server through a stable endpoint. Choose the mode before you write `install-config.yaml`. You cannot change the mode after the cluster is created. For example, an existing cluster cannot switch to a Self-built VIP.
+
+| Endpoint mode | Who provides the endpoint |
+|---|---|
+| External load balancer (default) | You provide it. Provision an external Layer 4 TCP load balancer that satisfies [the External Load Balancer requirements](../../../install/prepare/communication_matrix.mdx#external_load_balancer). |
+| Self-built VIP | The provider runs a Self-built VIP on the control plane nodes. Meet the [Self-built VIP requirements](../../../install/alauda_os/prerequisites.mdx#self-built-vip) first. |
+
+## Static IP Addresses \{#static-ip-addresses}
+
+Give every node a hostname and a static IPv4 address, plus one address for each additional NIC. Make sure that every address is allocated and not in use. Plan the addresses and disks of each host before you create the cluster. After a machine takes a slot, you cannot change them; see [Allocated slot restrictions](./reference/install-config-parameters.mdx#create-the-machine-config-pools).
+
+## ClusterResourceSet \{#cluster-resource-set}
+
+The vSphere cloud provider reaches the workload cluster through a Cluster API `ClusterResourceSet` on the `global` cluster. You do not prepare anything for it. If the nodes stay uninitialized after the cluster is created, see [Troubleshooting](./troubleshooting.mdx#common-causes).
+
+## Image Registry \{#image-registry}
+
+The cluster pulls its platform components either from the registry of the `global` cluster or from a dedicated registry. See [Choose the Image Registry for a Workload Cluster](../prepare/workload-cluster-image-registry.mdx). The registry must be reachable from the workload nodes. It must contain what the cluster needs: the Kube-OVN chart and CoreDNS repositories and the vSphere CPI tag.
+
+## vCenter Credential Secret \{#before-you-start}
+
+Create the vCenter credential Secret in the `cpaas-system` namespace of the `global` cluster. `ac` never creates it. The cluster references the Secret by name. Unlike the `global` cluster, it does not hold an inline credential. Use an editor to write the account to `vsphere-credential.env`, with one `key=value` per line and no quotes:
+
+```text title="vsphere-credential.env"
+username=<administrator@vsphere.local>
+password=<password>
+```
+
+Keep the file private (`chmod 600 vsphere-credential.env`), because it holds the password.
+
+Run the following commands from a machine where `ac` is logged in to the platform. The last command removes the file:
+
+```bash
+ac config use-cluster global
+ac -n cpaas-system create secret generic <cluster-name>-credential --from-env-file=vsphere-credential.env
+rm -f vsphere-credential.env
+```
+
+Do not create the Secret with `ac apply`, because it stores the password in an annotation of the Secret.
+
+Use one Secret per cluster. The provider deletes the Secret when it deletes the cluster. Create the Secret again before you recreate a cluster. `ac` renders the CPI credential from the same account. You do not prepare a second one.
+
+The account must be able to read the inventory. It must also be able to clone, power, reconfigure, and delete VMs and their disks. When custom attributes are in use, the account needs the privileges listed in [Install the Provider](./reference/install_provider.mdx#prerequisites).
+
+## Node Labels and Taints \{#node-labels}
+
+To dedicate node groups to a purpose such as monitoring, logging, or ingress, plan their role labels and taints before you create the cluster, as described in [Infra Nodes](../../../configure/nodes/node_planning.mdx#create-infra-nodes-alauda-os).

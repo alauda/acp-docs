@@ -1,0 +1,105 @@
+---
+weight: 40
+title: Tuning Node Kernel Parameters (sysctl)
+queries:
+  - how to set sysctl kernel parameters on immutable nodes
+  - increase ARP neighbor table gc_thresh with MachineConfig
+  - resolve neighbour table overflow on cluster nodes
+  - apply net.ipv4.neigh gc_thresh without rebooting the node
+---
+
+# Tuning Node Kernel Parameters (sysctl)
+
+Some kernel parameters are set per node rather than per workload—for example, the ARP/neighbor table garbage-collection thresholds. These are node-level (non-namespaced) settings, so they cannot be set from a Pod's `securityContext.sysctls` or a security context constraint; they must be applied on the host.
+
+You can set them by writing a `sysctl` drop-in file with a `MachineConfig` object. The setting is written as a separate file under `/etc/sysctl.d/`, so the node's other kernel settings are left unchanged. Pair the `MachineConfig` with a node disruption policy so the value is applied without rebooting the node.
+
+## When to Use This
+
+A common case is a large cluster whose nodes log a `neighbour table overflow` error: the ARP/neighbor table is too small for the number of peers, and its garbage-collection thresholds need to be raised. The example below raises those thresholds; the same procedure applies to any node-level `sysctl` key.
+
+## Setting a Kernel Parameter
+
+The following example raises the ARP/neighbor table garbage-collection thresholds on worker nodes.
+
+1. Create the `sysctl` drop-in file. Each line is a `key = value` pair:
+
+   ```ini
+   net.ipv4.neigh.default.gc_thresh1 = 32768
+   net.ipv4.neigh.default.gc_thresh2 = 65536
+   net.ipv4.neigh.default.gc_thresh3 = 262144
+   ```
+
+2. Base64-encode the contents:
+
+   ```bash
+   base64 -w0 99-neigh-thresh.conf
+   ```
+
+3. Create a `MachineConfig` object that writes the file under `/etc/sysctl.d/`:
+
+   ```yaml
+   apiVersion: machineconfiguration.alauda.io/v1alpha1
+   kind: MachineConfig
+   metadata:
+     name: 99-worker-neigh-thresh
+     labels:
+       machineconfiguration.alauda.io/role: worker
+   spec:
+     config:
+       ignition:
+         version: 3.4.0
+       storage:
+         files:
+           - path: /etc/sysctl.d/99-neigh-thresh.conf
+             mode: 0o644
+             overwrite: true
+             contents:
+               source: 'data:text/plain;base64,bmV0LmlwdjQubmVpZ2guZGVmYXVsdC5nY190aHJlc2gxID0gMzI3NjgKbmV0LmlwdjQubmVpZ2guZGVmYXVsdC5nY190aHJlc2gyID0gNjU1MzYKbmV0LmlwdjQubmVpZ2guZGVmYXVsdC5nY190aHJlc2gzID0gMjYyMTQ0Cg=='
+   ```
+
+   The `role` label selects which nodes the file is applied to. To target only a subset of nodes, create a custom `MachineConfigPool` and set the label to that pool's role.
+
+4. Configure a node disruption policy that re-applies `sysctl` settings when this file changes. Because the default action for file changes is `None`, the file would otherwise be written to disk without taking effect. Add the following to the cluster-scoped `MachineConfiguration` singleton named `cluster`, and confirm it is reflected in `status.nodeDisruptionPolicyStatus` **before** applying the `MachineConfig`:
+
+   ```yaml
+   apiVersion: machineconfiguration.alauda.io/v1alpha1
+   kind: MachineConfiguration
+   metadata:
+     name: cluster
+   spec:
+     nodeDisruptionPolicy:
+       files:
+         - path: /etc/sysctl.d/99-neigh-thresh.conf
+           actions:
+             - type: Restart
+               restart:
+                 serviceName: systemd-sysctl.service
+       sshkey:
+         actions:
+           - type: None
+   ```
+
+Restarting `systemd-sysctl.service` re-applies every file under `/etc/sysctl.d/`. The new values take effect and the node is not rebooted.
+
+:::warning
+Set the node disruption policy for the file path first and wait until it appears in `status.nodeDisruptionPolicyStatus`. If you apply the `MachineConfig` before the policy is in effect, the file is written to disk but the value is not applied. For the full list of disruption actions, see [Node Disruption Policies](./node_disruption.mdx).
+:::
+
+## Verifying the Change
+
+On a target node, read back the parameter:
+
+```bash
+sysctl net.ipv4.neigh.default.gc_thresh2
+```
+
+The output should show the value you set:
+
+```text
+net.ipv4.neigh.default.gc_thresh2 = 65536
+```
+
+## Reverting the Change
+
+Delete the `MachineConfig` object to remove the drop-in file. Values that were already applied remain in effect on the running kernel until the node is next rebooted, after which the node's default values apply.

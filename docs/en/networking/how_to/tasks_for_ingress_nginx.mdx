@@ -39,7 +39,61 @@ weight: 10
 
 ## Rate Limiting
 
-[config rate limiting](https://kubernetes.github.io/ingress-nginx/user-guide/nginx-configuration/annotations/#rate-limiting)
+Ingress NGINX supports request-rate and concurrent-connection limits through Ingress annotations. For the complete annotation reference, see [Rate Limiting](https://kubernetes.github.io/ingress-nginx/user-guide/nginx-configuration/annotations/#rate-limiting).
+
+### Limit a specific path
+
+Annotations are applied to an Ingress object. If only one path, such as a login endpoint, must be limited, put that path in a separate Ingress object so that other paths are not limited by the same annotations.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: login-rate-limit
+  namespace: demo
+  annotations:
+    nginx.ingress.kubernetes.io/limit-rps: "10"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "2"
+    nginx.ingress.kubernetes.io/limit-connections: "20"
+spec:
+  ingressClassName: demo-nginx
+  rules:
+    - host: app.example.com
+      http:
+        paths:
+          - path: /auth/login
+            pathType: Exact
+            backend:
+              service:
+                name: app
+                port:
+                  number: 80
+```
+
+- `limit-rps` limits requests per second for each client IP handled by each Controller Pod.
+- `limit-burst-multiplier` allows a burst in addition to the configured rate. The burst size is calculated from `limit-rps` and this multiplier.
+- `limit-connections` limits concurrent connections for each client IP handled by each Controller Pod.
+
+These limits are local to each Controller Pod. With multiple replicas, the effective cluster-wide threshold depends on traffic distribution and the replica count; it is not a single shared counter. Preserve the real client IP before relying on IP-based limits.
+
+### Configure the rejection status code
+
+`limit-req-status-code` and `limit-conn-status-code` are Controller-wide settings. Configure them on the `IngressNginx` resource instead of editing the generated ConfigMap:
+
+```yaml
+apiVersion: ingress-nginx.alauda.io/v1
+kind: IngressNginx
+metadata:
+  name: demo-nginx
+  namespace: ingress-nginx-operator
+spec:
+  controller:
+    config:
+      limit-req-status-code: "429"
+      limit-conn-status-code: "429"
+```
+
+Changing these values affects every Ingress handled by that Controller instance. Use a dedicated Controller when another application cannot accept the same rejection status code.
 
 ## WAF
 
@@ -178,6 +232,7 @@ When using a Kubernetes Service with `type: LoadBalancer`, the default behavior 
 - **Uneven load distribution**: Traffic can only go to nodes with local pods, potentially causing imbalanced load
 - **Pod scheduling**: Ingress-Nginx pods must be scheduled on nodes that MetalLB can route to (use nodeSelector to ensure alignment)
 - **Health check behavior**: If all local pods are unhealthy, the node is removed from load balancing entirely
+- **Tainted nodes**: If the selected nodes have a `NoSchedule` taint, configure a matching toleration for both Ingress-Nginx and MetalLB
 
 #### How to configure
 
@@ -196,10 +251,26 @@ spec:
       externalTrafficPolicy: Local          # Preserve source IP by routing traffic only to local pods
       annotations:
         metallb.universe.tf/address-pool: demo-pool  # Specify the MetalLB IP address pool to use
-    nodeSelector:                           # Schedule pods only on nodes matching these labels. This selector must match the MetalLB address pool's node selector
-      ingress-nginx: "true"  
+    nodeSelector:                           # Schedule pods only on nodes matching these labels. This selector must match the MetalLB L2Advertisement node selector
+      dedicated: ingress
+    tolerations:
+      - key: dedicated
+        operator: Equal
+        value: ingress
+        effect: NoSchedule
 ```
 
-**Important**: The `nodeSelector` must match the nodes in your MetalLB address pool configuration to ensure Ingress-Nginx pods are scheduled on nodes that can receive traffic from MetalLB.
+**Important**:
+
+- The `nodeSelector` must match the nodes selected by the MetalLB `L2Advertisement` so that Ingress-Nginx pods are scheduled on nodes that can receive traffic from MetalLB.
+- Configure the same node selection and toleration on the MetalLB custom resource: use `spec.nodeSelector` and `spec.speakerTolerations` for the speaker, and `spec.controllerNodeSelector` and `spec.controllerTolerations` for the controller. By default, MetalLB tolerates no additional taints.
 
 For more details, see [externalTrafficPolicy documentation](https://kubernetes.io/docs/tasks/access-application-cluster/create-external-load-balancer/#preserving-the-client-source-ip).
+
+## Trademark Notice
+
+NGINX® is a registered trademark of F5, Inc. in the U.S. and in other countries.
+
+MetalLB™ is a trademark of The Linux Foundation.
+
+Alauda is an independent vendor. This product is not affiliated with, endorsed by, or sponsored by The Linux Foundation or F5, Inc. All trademarks are the property of their respective owners and are used here for identification purposes only.

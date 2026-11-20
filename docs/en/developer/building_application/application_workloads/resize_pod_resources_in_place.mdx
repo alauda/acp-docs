@@ -1,0 +1,160 @@
+---
+weight: 95
+---
+
+# Adjust Pod Resource Levels Without Pod Disruption
+
+Use in-place Pod resizing when you need to adjust CPU or memory requests and limits for a running Pod without recreating the Pod. This task uses the Kubernetes Pod `resize` subresource.
+
+## Prerequisites
+
+Ensure that the target Kubernetes cluster supports the Pod `resize` subresource. Use Kubernetes v1.33 or later with the `InPlacePodVerticalScaling` feature gate enabled on the control plane and nodes. In Kubernetes v1.35, this feature is stable and enabled by default.
+
+## About In-place Pod Resizing
+
+In-place Pod resizing lets you change CPU and memory resource requests and limits for containers in a running Pod. Standard resource changes usually require the Pod to be recreated, which can interrupt applications or lose runtime state. In-place Pod resizing applies supported resource changes through the Kubernetes Pod `resize` subresource.
+
+You can control whether a container restarts during the resize by configuring `resizePolicy` in the Pod specification. For example, you can allow CPU changes without a restart and require a container restart for memory changes.
+
+## Configure In-place Pod Resizing
+
+Configure `resizePolicy` before you resize a running Pod. You cannot add or modify `resizePolicy` on an existing Pod. If the Pod is managed by an owner object, such as a Deployment or StatefulSet, add or update `resizePolicy` in the owner object's Pod template.
+
+```yaml title="deployment-resize-policy.yaml"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: resize-demo
+spec:
+  selector:
+    matchLabels:
+      app: resize-demo
+  template:
+    metadata:
+      labels:
+        app: resize-demo
+    spec:
+      containers:
+        - name: app
+          image: nginx:latest
+          resizePolicy:
+            - resourceName: cpu
+              restartPolicy: NotRequired
+            - resourceName: memory
+              restartPolicy: RestartContainer
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+```
+
+For CPU and memory resources, use one of the following `restartPolicy` values:
+
+| Value | Description |
+| --- | --- |
+| `NotRequired` | Apply supported resource changes without restarting the container. |
+| `RestartContainer` | Apply supported resource changes and restart the container. |
+
+When decreasing memory limits with `NotRequired` or no memory `resizePolicy`, the kubelet applies the change on a best-effort basis and does not guarantee that the container avoids an out-of-memory kill. If current memory usage is higher than the requested limit, the resize can be skipped and remain in progress. Use `RestartContainer` for memory changes when you need more predictable behavior.
+
+## Resize a Running Pod
+
+Use the `resize` subresource when editing Pod resources. Run the commands from a workstation that can access the target cluster.
+
+::: tip
+Use `kubectl` v1.32.0 or later, or another API client that supports the Pod `resize` subresource. Older `kubectl` clients might reject `--subresource=resize` with errors such as `invalid subresource value: "resize"` or might not provide the `--subresource` flag for some commands, even when the Kubernetes API server supports `pods/resize`.
+:::
+
+Edit the Pod resources interactively:
+
+```bash
+kubectl edit pod <pod_name> -n <namespace> --subresource=resize
+```
+
+Apply an updated Pod manifest through the `resize` subresource by using server-side apply:
+
+```bash
+kubectl apply --server-side -f <file_name>.yaml --subresource=resize
+```
+
+Patch the target container resources directly:
+
+```bash
+kubectl patch pod <pod_name> \
+  -n <namespace> \
+  --subresource=resize \
+  --patch '{"spec":{"containers":[{"name":"<container_name>","resources":{"requests":{"cpu":"800m"},"limits":{"cpu":"800m"}}}]}}'
+```
+
+Replace `<pod_name>`, `<namespace>`, and `<container_name>` with the target Pod, namespace, and container names.
+
+Because this operation requires the Pod `resize` subresource, use `kubectl` or an API client version that supports the subresource.
+
+## Verify Restart Behavior
+
+Check whether the Pod restarted after the resize:
+
+```bash
+kubectl get pods -n <namespace>
+```
+
+If `restartPolicy` is `NotRequired` for the changed resource, the Pod should remain running without a container restart.
+
+```text
+NAME         READY   STATUS    RESTARTS   AGE
+resize-pod   1/1     Running   0          5s
+```
+
+If `restartPolicy` is `RestartContainer` for the changed resource, the container restarts while the Pod remains running.
+
+```text
+NAME         READY   STATUS    RESTARTS      AGE
+resize-pod   1/1     Running   1 (5s ago)    5s
+```
+
+## Check Resize Status
+
+Check the resources currently applied to the running container:
+
+```bash
+kubectl get pod <pod_name> \
+  -n <namespace> \
+  -o jsonpath='{.status.containerStatuses[?(@.name=="<container_name>")].resources}'
+```
+
+Check resize conditions and events:
+
+```bash
+kubectl describe pod <pod_name> -n <namespace>
+```
+
+Resize conditions include:
+
+- `PodResizeInProgress`: kubelet can allocate the requested resources and is applying the change.
+- `PodResizePending`: kubelet cannot apply the change immediately.
+  - `Infeasible`: The requested resize cannot be executed on the current node.
+  - `Deferred`: The requested resize is not currently possible, but might become possible later.
+  - `Error`: kubelet reports an error during resource allocation.
+
+## Limitations
+
+- Only CPU and memory requests and limits can be resized.
+- In-place Pod resizing is not supported for non-restartable init containers or ephemeral containers.
+- The resize must not violate other Pod mutability constraints, such as changing the Pod QoS class.
+- Pods managed by static `cpuManagerPolicy` or `memoryManagerPolicy` cannot be resized in place.
+- Pods that use swap memory must use `RestartContainer` for memory requests.
+- ResourceQuota, LimitRange, and admission policies can still reject the resize request.
+
+::: note
+Because this operation requires the Pod `resize` subresource, it might not be available through web console resource editing. Use `kubectl` or an API client version that supports the `resize` subresource.
+:::
+
+## Additional Resources
+
+- [Pods](./pod.mdx)
+- [Resource Units](../concepts/unit.mdx)
+- [Configuring VerticalPodAutoscaler (VPA)](../operation_maintaining/add_vpa.mdx)
+- [Pod API Reference](../../../apis/kubernetes_apis/workload/pod.mdx)

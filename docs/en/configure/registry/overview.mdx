@@ -1,22 +1,124 @@
 ---
 weight: 10
+i18n:
+  title:
+    en: "Alauda Container Platform Registry Overview"
 ---
 
-# Overview
+# Alauda Container Platform Registry Overview
 
-<Term name="productShort" /> Registry provides a platform-managed image registry for storing and serving container images used by platform components and application workloads. Platform administrators install, upgrade, expose, and recover the registry as a cluster plugin. Developers and application teams use the registry through developer image workflows.
+Alauda Container Platform Registry stores container images for ACP clusters. It manages
+ImageStream and ImageDigest metadata, controls access by namespace, provides service account pull
+credentials, and prunes unused images.
 
-## Administration scope
+## Components and Resource Scope
 
-| Need | Continue with |
-| --- | --- |
-| Install the registry cluster plugin. | [Install](./install/index.mdx) |
-| Upgrade the registry cluster plugin. | [Upgrade](./upgrade/index.mdx) |
-| Back up or recover registry data. | [Registry backup and recovery](./backup_and_restore.mdx) |
-| Use images in workloads or developer workflows. | [Images](../../developer/images/overview.mdx) and [registry image use](../../developer/registry/index.mdx) |
+The Image Registry Operator runs in `image-registry-system`. It manages Registry operand resources
+in `cpaas-system` by default, including the `image-registry` and `image-api-server` Deployments,
+Services, the `node-ca` DaemonSet, and the `image-pruner` CronJob.
 
-## Namespace isolation and access
+The Operator records the actual operand namespace on `Config/cluster`:
 
-Registry image repositories are organized by namespace. Pull and push access depends on the platform roles and permissions granted to users or ServiceAccounts in the target namespace.
+```bash
+kubectl get configs.imageregistry.operator.alauda.io cluster \
+  -o jsonpath='{.metadata.annotations.imageregistry\.operator\.alauda\.io/operand-namespace}{"\n"}'
+```
 
-For common image usage commands and cross-namespace pull access, see [Registry image use](../../developer/registry/index.mdx).
+If the namespace was customized, replace `cpaas-system` in commands and service addresses with the
+returned value.
+
+| Resource | Scope | Purpose |
+| --- | --- | --- |
+| `Config/cluster` | Cluster | Configures the Registry runtime, storage, access endpoints, and managed pull credentials. |
+| `ImagePruner/cluster` | Cluster | Configures the scheduled pruning policy. |
+| `ImageDigest` | Cluster | Records metadata for an image digest; primarily used by administrators and integrations. |
+| `ImageSignature` | Cluster | Records image signature metadata. |
+| `ImageStream` | Image namespace | Records a repository's tag definitions and history. |
+| `ImageStreamTag`, `ImageTag`, and `ImageStreamImage` | Image namespace | Expose tag and digest views of an ImageStream. `ImageTag` combines the current spec and status view of a tag. |
+| `ImageStreamImport` and `ImageStreamMapping` | Image namespace | Process import and tag-mapping requests through the Image API. |
+| Workload ServiceAccounts and managed pull Secrets | Workload namespace | Provide credentials for eligible ServiceAccounts to pull images. |
+
+`Config` and `ImagePruner` use `imageregistry.operator.alauda.io/v1`. Use the public
+`image.alauda.io/v1` API for image metadata operations. The cluster-scoped digest resource is
+`imagedigests.image.alauda.io`; `ac get images` lists repository and tag references instead.
+Developers normally work with ImageStreams and their tag or digest views.
+
+The Image API server stores metadata in internal CRDs under `storage.image.alauda.io/v1alpha1`.
+Manage images through the public API. Creating, editing, or deleting internal CRD objects directly
+bypasses validation, authorization, and tag and signature synchronization.
+
+## Image Storage and Imports
+
+The backend in `Config/cluster.spec.storage` stores pushed image blobs and manifests. Kubernetes
+stores the Image API metadata. Recovery requires both: a backup of the Registry PVC or object
+storage does not include ImageStreams, image digests, or signature metadata. Back up the Registry
+backend and the cluster state; see
+[Backing Up etcd](../backup/etcd.mdx).
+
+The Registry supports `emptyDir`, PVC, S3-compatible storage, and node-local `hostPath` storage through a
+PV/PVC. Use persistent storage for images that must be retained; `emptyDir` is for disposable
+development data. Node-local storage requires a single Registry replica on the node that holds
+the data. See [Configure Registry storage](./setting_up_and_configuring_the_registry.mdx).
+Other storage types that appear in the API schema are outside the Registry's support scope.
+
+Importing an external image into an ImageStream records its metadata and source reference. The
+layers stay in the source registry. Push or mirror the image to store it locally. See
+[Managing images with ac](../../developer/registry/managing_images_with_ac.mdx).
+
+## Repository Names
+
+Image repositories are namespace-scoped and use the following format:
+
+```text
+<registry-host>/<namespace>/<repository>:<tag>
+```
+
+Each repository maps to one ImageStream in the image namespace. The Registry rejects additional
+repository path segments: `registry.example.com/team-a/my-app:v1` is valid;
+`registry.example.com/team-a/backend/my-app:v1` is rejected.
+
+## Access and Request Handling
+
+The Registry integrates with <Term name="productShort" /> authentication and Kubernetes authorization.
+RoleBindings in the image namespace control image access, including pulls by ServiceAccounts in
+other namespaces. The authenticated `/v2/_catalog` endpoint lists repositories permitted by the
+caller's ImageStream permissions; anonymous catalog access is not available. See
+[Grant namespace permissions](./managing_access_and_cleanup.mdx#grant-namespace-permissions).
+
+To compare recorded identity claims on an ImageDigest, see
+[Check Recorded Signature Identity](./managing_access_and_cleanup.mdx#verify-image-signatures).
+
+Workloads use the internal service address `image-registry.cpaas-system.svc:5000`. For external
+clients, configure a custom Registry hostname with DNS and a matching TLS certificate. See
+[Accessing the Registry](../../developer/registry/accessing_the_registry.mdx) and
+[Exposing the Registry](./exposing_the_registry.mdx).
+
+`Config/cluster.spec.readOnly` rejects pushes, deletes, and Image API metadata changes while
+allowing image reads. For read-only operation, request limits, and image quotas, see
+[Setting up and configuring the Registry](./setting_up_and_configuring_the_registry.mdx).
+
+## Image Cleanup
+
+In modern mode, `ac adm prune images` retains images younger than 60 minutes and three revisions per
+tag by default. Manual runs leave `--prune-registry` disabled and remove only eligible Image API
+metadata when confirmed. Set `--prune-registry=true` to also unlink eligible Registry manifests and
+run garbage collection in a verified Registry Pod.
+
+New installations enable the `image-pruner` schedule. The Operator honors
+`ImagePruner/cluster.spec.suspend` and preserves an explicit `true`, including one set by an earlier
+safety release. Online metadata pruning requires a writable Image API. Adding
+`--prune-registry=true` also requires a writable Registry and Operator-managed Pod execution
+permissions.
+
+Deletion is irreversible. Online pruning does not stop concurrent writers, and new references can
+appear after a reference check but before deletion. It also cannot discover consumers outside the
+cluster.
+
+Standalone full storage garbage collection removes unreferenced blobs, including old orphaned data
+whose inventory is unavailable. It requires read-only mode, isolated writers, and completed
+in-flight uploads. Deleting a tag alone does not immediately reclaim storage.
+
+See [Configure scheduled image pruning](./setting_up_and_configuring_the_registry.mdx#configure-scheduled-image-pruning)
+for the Operator-managed policy, or [Prune images](./managing_access_and_cleanup.mdx#prune-images)
+and [Run Registry garbage collection](./managing_access_and_cleanup.mdx#run-registry-garbage-collection)
+for administrator-run cleanup.

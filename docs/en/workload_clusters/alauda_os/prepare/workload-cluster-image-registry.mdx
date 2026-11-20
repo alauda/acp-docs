@@ -1,0 +1,193 @@
+---
+weight: 20
+title: Choose the Image Registry for a Workload Cluster
+queries:
+  - workload cluster image registry
+  - dedicated image registry for a workload cluster
+  - registry credential for a workload cluster
+  - pull platform images from a regional registry
+  - registry reference label
+---
+
+# Choose the Image Registry for a Workload Cluster
+
+Alauda Container Platform installs and manages platform components on every workload cluster, such as Kube-OVN and the platform modules that are delivered after the cluster is up. By default, the images of these components come from the registry that the `global` cluster uses. Instead, you can bind a workload cluster to a registry of its own, for example a registry that is close to a workload cluster in another region.
+
+Decide which registry credential the cluster uses before you create the cluster. You cannot replace the credential after creation, but you can update the address in it.
+
+## Options \{#options}
+
+| Option | What you configure | When to use it |
+| --- | --- | --- |
+| Registry of the `global` cluster | Nothing in `install-config.yaml`. | The workload cluster reaches the registry of the `global` cluster with acceptable throughput and availability. |
+| Dedicated registry | A RegistryCredential Secret in `cpaas-system` on the `global` cluster. You name it in `cluster.registrySecretRef` of `install-config.yaml`. | The workload cluster is in a different region or network segment and should pull from a registry close to it. |
+
+A dedicated registry requires platform v4.4.0 or later on every provider.
+
+## What the Binding Covers \{#coverage}
+
+The binding applies to:
+
+- The platform components that Alauda Container Platform installs and manages on the workload cluster, such as Kube-OVN and the platform modules delivered to it.
+- On Bare Metal, the OS image that the hosts are reinstalled with.
+
+It does **not** apply to the following:
+
+| Not covered | Where it comes from instead |
+| --- | --- |
+| Images kubeadm manages: kube-apiserver, kube-controller-manager, kube-scheduler, etcd, CoreDNS, and kube-proxy | The Alauda OS image, which preloads them. `ac` sets the kubeadm image repository to `cpaas-registry.cpaas-system/acp/k8s` on every provider, whatever the binding. Use the Alauda OS image that is published for your platform release. An image from an earlier release cannot start the control plane, even if the Kubernetes version is the same. |
+| The pause (sandbox) image | The container runtime configuration in the Alauda OS image. |
+| The Bare Metal ISO image | `SeedImage.spec.baseImage`, which the `global` cluster pulls when it builds the ISO. |
+| Application workload images | The image references and pull Secrets that each workload declares. |
+
+## Inherit the Registry of the global Cluster \{#default}
+
+This is the default. Leave `cluster.registrySecretRef` out of `install-config.yaml`. `ac` reads the registry address from the `registry` key of the `public-registry-credential` Secret in `cpaas-system` on the `global` cluster. The key must exist even when the registry needs no authentication.
+
+Check the key before you create the cluster:
+
+```bash
+ac config use-cluster global
+ac get secret public-registry-credential -n cpaas-system \
+  -o jsonpath='{.data.registry}' | base64 -d; echo
+```
+
+Continue when the command prints the registry address of the `global` cluster, such as `<host>:<port>`. Otherwise, contact technical support.
+
+See [Add External Address for Built-in Registry](../../how_to/add_external_addr_for_global_registry.mdx) only when all of the following apply:
+
+- The `global` cluster was upgraded from an earlier version and still uses the platform built-in Registry.
+- The workload cluster nodes cannot reach that registry.
+
+## Bind a Workload Cluster to Its Own Registry \{#dedicated}
+
+### Before You Start \{#before-you-start}
+
+- You can create Secrets in the `cpaas-system` namespace of the `global` cluster.
+- The dedicated registry is reachable from every workload cluster node.
+- The dedicated registry already holds Alauda Container Platform Core for the target version, plus the packages of every platform plugin that you plan to install on this cluster. See [Prepare the Registry](#prepare-the-registry).
+
+### Step 1 — Prepare the Registry \{#prepare-the-registry}
+
+The platform never copies images into a dedicated registry. Populate the registry yourself before you create the cluster:
+
+- **Alauda Container Platform Core for the target version**, matching the version and CPU architecture of the cluster.
+- **The packages of every platform plugin that you plan to install on this cluster.** The platform does not add missing packages later.
+- **On Bare Metal, the OS images of every Kubernetes version that the cluster uses.** Each time a host is reinstalled, it pulls its OS image from this registry; see [Push the OS Images](../bare-metal/prepare_os.mdx#import-os-images).
+
+Upload with the same Core Package procedure that prepares an external platform image registry, and use the dedicated registry as the target address. See [Prepare the Target-Version Payload](../../../install/prepare/external-platform-image-registry.mdx#prepare-the-target-version-payload).
+
+Then check that the registry responds. Run the following commands on a host in the network of the workload cluster nodes:
+
+```bash
+export DEDICATED_REGISTRY="<registry-host>:<port>"
+curl -sk "https://${DEDICATED_REGISTRY}/v2/" -o /dev/null -w '%{http_code}\n'
+```
+
+Continue when the output is `200` or `401`; otherwise, correct the network path or the TLS setup of the registry.
+
+:::warning
+Before you create the cluster, confirm in the administration interface or API of the registry that the uploaded repositories and tags are complete. A cluster bound to an incomplete registry still reaches `Ready`. The gap appears later, when platform Pods stay in `ImagePullBackOff`. You cannot change the binding.
+:::
+
+### Step 2 — Create the RegistryCredential Secret \{#create-the-secret}
+
+Create the credential as described in [Create a Registry Credential](/workload_clusters/how_to/create_registry_credential.mdx). The credential holds the registry address and, when the registry requires authentication, the username and password.
+
+### Step 3 — Reference the Credential When You Create the Cluster \{#reference-the-credential}
+
+Name the Secret in `cluster.registrySecretRef` of `install-config.yaml`, then create the cluster as described in your provider's cluster creation guide:
+
+```yaml
+cluster:
+  registrySecretRef:
+    name: <registry-credential-name>
+    namespace: cpaas-system
+```
+
+`ac` checks the Secret before it applies anything. If a check fails, nothing is applied, and the error names the problem; see [Troubleshooting](#troubleshooting).
+
+:::warning
+The platform reads the credential binding only when the cluster is created. Changing the `cpaas.io/registry-reference` label on an existing `Cluster` has no effect. To use a different credential, recreate the cluster. Updating the address in the selected credential is supported.
+:::
+
+### Step 4 — Verify the Binding \{#verify}
+
+#### Check the Registry Address on the global Cluster
+
+```bash
+ac config use-cluster global
+ac get cluster.platform.tkestack.io <cluster-name> \
+  -o jsonpath='{.metadata.labels.cpaas\.io/registry-reference}{" "}{.metadata.annotations.cpaas\.io/registry-address}{"\n"}'
+```
+
+Continue when the output is the Secret name followed by the registry address from the Secret; otherwise, see [Troubleshooting](#troubleshooting).
+
+#### Check the Images on the Workload Cluster
+
+```bash
+ac config sync
+ac config use-cluster <cluster-name>
+ac get pods -A \
+  -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.image}{"\n"}{end}{end}' \
+  | sort -u
+ac config use-cluster global
+```
+
+Continue when the platform component images use the dedicated registry. The images that kubeadm manages and the pause image do not use it; they come from elsewhere, as described in [What the Binding Covers](#coverage). If every platform component image still uses another registry, see [Troubleshooting](#troubleshooting).
+
+#### Check the Registry Configuration of the Nodes
+
+```bash
+ac config use-cluster <cluster-name>
+ac -n cpaas-system get registry cpaas-registry -o yaml
+ac config use-cluster global
+```
+
+Continue when the Registry status is ready and the platform component images use the dedicated registry.
+
+## Operate an Existing Binding \{#operate}
+
+| Task | Supported | How |
+| --- | --- | --- |
+| Rotate the registry password or switch to another account | Yes | Patch the Secret, as shown below. The platform propagates the change to every cluster that references it, without a cluster restart. |
+| Correct the registry address in a credential | Yes | Patch the Secret. Every cluster that references it switches to the new address. Make sure that all of those clusters can reach the new address and that the registry holds the payload for the version of each cluster. |
+| Change the registry credential selected when the cluster was created | No | Recreate the cluster with the intended credential. |
+| Share one credential across clusters | Yes | Reference the same Secret from any number of clusters. |
+| Delete a credential | Only when unreferenced | The platform rejects the deletion while a cluster still references the Secret, and the error names those clusters. |
+
+Update a credential with `ac patch`, not `ac apply`. Quote values that contain YAML special characters, because the patch file is YAML.
+
+```yaml title="registry-credential-patch.yaml"
+stringData:
+  username: <new-username>
+  password: <new-password>
+```
+
+Keep the file private with `chmod 600 registry-credential-patch.yaml`, because it holds the password.
+
+```bash
+chmod 600 registry-credential-patch.yaml
+ac config use-cluster global
+ac patch secret <registry-credential-name> --namespace cpaas-system \
+  --type=merge --patch-file=registry-credential-patch.yaml
+
+rm -f registry-credential-patch.yaml
+```
+
+## Troubleshooting \{#troubleshooting}
+
+| Result | Action |
+| --- | --- |
+| `ac` stops with `Secret cpaas-system/public-registry-credential …: the workload cluster registry cannot be derived` (no `registrySecretRef` set) | Contact technical support. |
+| `ac` stops with `Secret cpaas-system/<registry-credential-name> does not exist …` | Create the Secret as in [Create a Registry Credential](/workload_clusters/how_to/create_registry_credential.mdx), then run `create` again. |
+| `ac` stops with `… must have label capi.cpaas.io/provider="registry-credential" …` | Apply both labels as in [Create a Registry Credential](/workload_clusters/how_to/create_registry_credential.mdx), then run `create` again. |
+| `ac` stops with `… has no "registry" key …`, `… has an invalid "registry" value …`, or `… keys "username" and "password" must either both be set or both be empty` | Correct the Secret as in [Create a Registry Credential](/workload_clusters/how_to/create_registry_credential.mdx), then run `create` again. |
+| `ac` stops with `cluster.registrySecretRef.namespace must be "cpaas-system" …` | Set `namespace: cpaas-system` in `install-config.yaml` and create the Secret there. |
+| The Secret is rejected on create or update | Set `registry`, and set `username` and `password` together or leave both out. |
+| The Secret is rejected with an unsupported-format message | Set `cpaas.io/registry-credential-format` to `direct`. |
+| `cpaas.io/registry-address` on the platform cluster record is empty | Confirm the Secret name, the `cpaas-system` namespace, and both labels. If they are correct, contact technical support. |
+| The control plane is ready, but platform Pods stay in `ImagePullBackOff` | Repeat the check in [Step 1](#prepare-the-registry) from a workload cluster node, confirm the registry contents, and confirm the credential in the Secret. |
+| Deleting a credential is rejected | Read the cluster names from the error. Delete those clusters, or recreate them against a different credential, before you delete this one. |
+| A new label value on an existing `Cluster` changes nothing | Recreate the cluster with the intended reference. |
+| Value changes to the Secret never reach the clusters, or the Secret can be deleted while clusters still use it | Apply the `capi.cpaas.io/provider: registry-credential` label. See [Create a Registry Credential](/workload_clusters/how_to/create_registry_credential.mdx). |

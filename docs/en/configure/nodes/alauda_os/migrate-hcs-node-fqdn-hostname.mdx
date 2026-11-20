@@ -1,0 +1,197 @@
+---
+weight: 51
+title: Configure FQDN Hostname on Existing HCS Clusters
+queries:
+  - migrate existing hcs cluster to fqdn hostname
+  - hcs node hostname returns full fqdn
+  - hcs hostname -f fails
+  - configure fqdn for hcs cluster nodes
+  - hcs node short hostname full fqdn
+---
+
+# Configure FQDN Hostname on Existing HCS Clusters
+
+Use this guide when an existing Huawei Cloud Stack (HCS) cluster needs nodes whose POSIX `hostname` returns the short label and whose `hostname -f` returns the full FQDN, and the cluster was originally created before `cluster-api-provider-hcs` v1.0.1.
+
+Applications that depend on a working `hostname` / `hostname -f` split — TLS server certificate SAN matching, Kerberos SPN composition, monitoring labels keyed on the short name, and any code that calls `getfqdn()` — require the node to be initialized by `cluster-api-provider-hcs` v1.0.1 or later. Existing nodes do not pick up this behavior, so replace them through a rolling replacement after the controller is upgraded.
+
+:::info
+**Version**
+
+The Infrastructure Provider for Huawei Cloud Stack delivered with this release renders dotted hostnames correctly. Controller versions earlier than `cluster-api-provider-hcs` v1.0.1 render dotted `HCSMachineConfigPool.spec.configs[].hostname` values as the full FQDN string in the POSIX hostname, which breaks `hostname -f` and can also block kubeadm init.
+:::
+
+## Overview
+
+Two conditions must both be true for a node to expose the supported hostname / FQDN behavior:
+
+1. The node's `HCSMachineConfigPool.spec.configs[].hostname` entry contains a dot (FQDN form, for example `master-1.example.org`).
+2. The node was first booted by `cluster-api-provider-hcs` v1.0.1 or later.
+
+Editing manifests or re-applying user-data does not change the hostname behavior of an existing node.
+
+Manual on-node edits to `/etc/hostname` and `/etc/hosts` do not persist on an Alauda OS node. Cloud-init re-renders these files on every boot, including reboots triggered by `transactional-update`, OS patching, or `systemctl reboot`.
+
+## Prerequisites
+
+- The Infrastructure Provider for Huawei Cloud Stack on the management cluster is the version delivered with this release (`cluster-api-provider-hcs` v1.0.1 or later), and the controller Deployment in `cpaas-system` is Ready.
+- The existing workload cluster is healthy: all current `Machine` objects report `phase=Running`, all `Node` objects report `Ready`, and no rolling replacement is in flight.
+- Storage caveats reviewed (see [Storage and data caveats](#storage-and-data-caveats)).
+- The target VM image used by the existing `HCSMachineTemplate` is still present in the HCS environment. (No image change is needed; the migration only renames the template to trigger replacement.)
+- The control plane rollout strategy and `HCSMachineConfigPool` meet [step 3](#surge-slot).
+
+## Step-by-step procedure
+
+In the commands, `<kcp-name>` and `<md-name>` are the `KubeadmControlPlane` and `MachineDeployment` names; for a cluster created with `ac`, see [Rendered Manifests](../../../workload_clusters/alauda_os/huawei-cloud-stack/reference/install-config-parameters.mdx#render-manifests).
+
+### 1. Confirm the controller is upgraded
+
+```bash
+ac config use-cluster global
+ac get deployment cluster-api-provider-hcs-manager -n cpaas-system -o wide
+ac rollout status deployment cluster-api-provider-hcs-manager -n cpaas-system
+```
+
+The Deployment must show a v1.0.1-or-later image tag and report all replicas Ready. Nodes replaced before the controller is upgraded keep the old hostname behavior.
+
+### 2. Decide which pools and templates are in scope
+
+The migration is only required for pools whose entries contain a dot. List the existing `HCSMachineConfigPool` resources and check each `spec.configs[].hostname`:
+
+```bash
+ac config use-cluster global
+ac get hcsmachineconfigpool -n cpaas-system
+ac get hcsmachineconfigpool <pool-name> -n cpaas-system \
+  -o jsonpath='{range .spec.configs[*]}{.hostname}{"\n"}{end}'
+```
+
+Pools whose entries are all short labels (no dot) are not affected by the migration and do not need to be touched. Continue only for pools that contain dotted entries.
+
+### 3. Extend the control plane pool with a surge slot \{#surge-slot}
+
+**Applies to**: a control plane whose `maxSurge` is not `0`. An empty value means `1`. Skip this step when the value is `0`.
+
+```bash
+ac config use-cluster global
+ac get kubeadmcontrolplane <kcp-name> -n cpaas-system \
+  -o jsonpath='{.spec.rolloutStrategy.rollingUpdate.maxSurge}{"\n"}'
+```
+
+If the pool has `persistentDisks[]`, do not add a slot: set `maxSurge: 0` by following [Check the Rollout Settings](../../../upgrade/persistent_disk_migration.mdx#migration-rollout-settings), then return here and continue with the next step.
+
+Otherwise, if the pool has exactly as many entries as `KubeadmControlPlane.spec.replicas`, add one more entry:
+
+```bash
+ac config use-cluster global
+ac edit hcsmachineconfigpool <cp-pool-name> -n cpaas-system
+```
+
+Add an entry under `spec.configs` with a new hostname and a free IP from the same subnet, then save.
+
+### 4. Create a new `HCSMachineTemplate` for the control plane
+
+The new template can be a byte-for-byte copy of the existing one with a new `metadata.name`. The new name alone starts the replacement; you do not need to change `imageName`, `flavorName`, or any other field.
+
+```bash
+ac config use-cluster global
+ac get hcsmachinetemplate <current-cp-template> -n cpaas-system -o yaml > new-cp-template.yaml
+```
+
+Edit `new-cp-template.yaml`:
+
+- Set `metadata.name` to a new value (for example, append `-fqdn` or a date suffix).
+- Remove the server-generated fields listed in [Changing Machine Infrastructure](./huawei-cloud-stack.mdx#changing-machine-infrastructure).
+- Leave runtime identity fields unset, including `spec.template.spec.providerID` and `spec.template.spec.serverId`. The HCS provider assigns these values when it creates the new VMs.
+
+Apply the new template:
+
+```bash
+ac config use-cluster global
+ac apply -f new-cp-template.yaml -n cpaas-system
+```
+
+Keep the previous template until the rollout is healthy; rollback uses it.
+
+### 5. Patch `KubeadmControlPlane` to reference the new template
+
+```bash
+ac config use-cluster global
+ac patch kubeadmcontrolplane <kcp-name> -n cpaas-system --type='merge' \
+  -p='{"spec":{"machineTemplate":{"infrastructureRef":{"name":"<new-cp-template>"}}}}'
+```
+
+Cluster API now starts a rolling replacement of the control plane. Monitor progress:
+
+```bash
+ac config use-cluster global
+ac get kubeadmcontrolplane <kcp-name> -n cpaas-system -w
+ac get machines.cluster.x-k8s.io -n cpaas-system -l cluster.x-k8s.io/control-plane
+```
+
+Wait until every control plane `Machine` is the new one (the old `Machine` names disappear) and `KubeadmControlPlane.status.readyReplicas` equals `spec.replicas`.
+
+### 6. Repeat for each `MachineDeployment` (workers)
+
+For each `MachineDeployment` whose nodes need the new hostname behavior, repeat steps 4 and 5 with the worker template:
+
+```bash
+ac config use-cluster global
+ac get hcsmachinetemplate <current-worker-template> -n cpaas-system -o yaml > new-worker-template.yaml
+# Edit metadata.name, strip status/server fields, apply
+ac apply -f new-worker-template.yaml -n cpaas-system
+
+ac patch machinedeployment <md-name> -n cpaas-system --type='merge' \
+  -p='{"spec":{"template":{"spec":{"infrastructureRef":{"name":"<new-worker-template>"}}}}}'
+```
+
+Wait for each `MachineDeployment` to report `status.updatedReplicas` equal to `spec.replicas` and all worker `Machine` objects on the new template before moving on.
+
+### 7. Verify hostname behavior on each new node
+
+On each new node:
+
+```bash
+hostname
+hostname -f
+cat /etc/hosts
+```
+
+For a node whose pool config was `hostname: master-1.example.org`, expect:
+
+- `hostname` returns `master-1` (short label, dot and everything after it stripped).
+- `hostname -f` returns `master-1.example.org`.
+- `/etc/hosts` contains the entry `127.0.1.1 master-1.example.org master-1`.
+
+If a new node reports the FQDN-style string from `hostname`, or `hostname -f` returns `Name or service not known`, the cloud-init log on the node (`/var/log/cloud-init.log` and `/var/lib/cloud/instance/user-data.txt`) is the first thing to inspect, then confirm the controller is actually at v1.0.1 or later.
+
+## Storage and data caveats \{#storage-and-data-caveats}
+
+Rolling replacement destroys each old VM and builds a fresh replacement from the new template. On HCS:
+
+- The system disk (root volume) is rebuilt from the VM image on every replacement.
+- Data volumes declared in `HCSMachineTemplate.spec.template.spec.dataVolumes` are not detached and reattached; volumes on the old VM may be removed with it.
+- For the disks that survive replacement, see [Changing Machine Infrastructure](./huawei-cloud-stack.mdx#changing-machine-infrastructure).
+- Workload data must live on external persistent storage (HCS EVS CSI or equivalent) to survive the migration.
+
+Complete backup and migration of any node-local state before starting.
+
+## Rollback
+
+If the new rollout is unhealthy — new VMs fail to boot, nodes do not become `Ready`, or applications break in unexpected ways — patch each affected resource back to the previous template name. Cluster API treats the reversion as a new spec drift and rolls the new machines back to the previous template:
+
+```bash
+ac config use-cluster global
+ac patch kubeadmcontrolplane <kcp-name> -n cpaas-system --type='merge' \
+  -p='{"spec":{"machineTemplate":{"infrastructureRef":{"name":"<previous-cp-template>"}}}}'
+
+ac patch machinedeployment <md-name> -n cpaas-system --type='merge' \
+  -p='{"spec":{"template":{"spec":{"infrastructureRef":{"name":"<previous-worker-template>"}}}}}'
+```
+
+Do not delete the previous `HCSMachineTemplate` until the new rollout is healthy. If it has already been deleted, recreate it from version control or backup before rolling back.
+
+## Related
+
+- [Creation Stages](../../../workload_clusters/alauda_os/huawei-cloud-stack/troubleshooting.mdx#troubleshooting) — the symptom when a controller earlier than v1.0.1 boots a node with a dotted hostname.
+- [Troubleshoot a Workload Cluster Stuck in Provisioned](../../../workload_clusters/alauda_os/troubleshooting/troubleshoot-cluster-not-ready.mdx) — provider-agnostic import-controller diagnostic flow.
+- [Hostname behavior on the node](../../../workload_clusters/alauda_os/huawei-cloud-stack/reference/install-config-parameters.mdx#hostname-behavior-on-the-node) — what `hostname` / `hostname -f` / `/etc/hosts` look like for short versus dotted pool entries on a freshly created cluster.

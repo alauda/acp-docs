@@ -1,0 +1,368 @@
+---
+queries:
+  - Rollout Kubernetes API
+  - Argo Rollouts API
+  - rollout pause resume promote abort undo
+---
+
+# Rollout [argoproj.io/v1alpha1]
+
+<K8sAPI name="rollouts.argoproj.io" pathPrefix="/kubernetes/{cluster}" />
+
+## API usage
+
+The Argo Rollouts `kubectl` plugin operates on the namespaced `Rollout` custom resource. The API server path for a Rollout is:
+
+```text
+/kubernetes/{cluster}/apis/argoproj.io/v1alpha1/namespaces/{namespace}/rollouts
+```
+
+Use a bearer token in the `Authorization` header. Use `application/merge-patch+json` for the merge patches below and `application/json-patch+json` for the JSON Patch used by `undo`.
+
+### Command-to-API mapping
+
+| Plugin command  | Kubernetes API request                                                                                                                                                       |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `get rollout`   | `GET` the Rollout and list/watch its related resources.                                                                                                                      |
+| `list rollouts` | `GET` the namespaced Rollout collection.                                                                                                                                     |
+| `pause`         | `PATCH` the Rollout with `spec.paused=true`.                                                                                                                                 |
+| `resume`        | For legacy clients, clear `spec.paused` and `status.pauseConditions`; see [Resume a rollout](#resume-a-rollout). The v1.2.0 source uses `promote` as the registered command. |
+| `promote`       | `GET` the Rollout, then patch `spec.paused`, `status.pauseConditions`, `status.currentStepIndex`, or `status.promoteFull` according to the current rollout state.            |
+| `abort`         | `PATCH` the Rollout status with `status.abort=true`.                                                                                                                         |
+| `set image`     | `GET` the Rollout, then `PUT` the Rollout or its referenced workload with the changed pod-template image.                                                                    |
+| `undo`          | `GET` the Rollout and its controlled ReplicaSets, then JSON-patch the Rollout or its referenced workload with a previous pod template.                                       |
+
+Replace `{cluster}`, `{namespace}`, and `{name}` with the target cluster, namespace, and Rollout name.
+
+### Get a rollout
+
+`get rollout` builds its status tree from informers rather than issuing only one request. The initial cache population reads the following resources:
+
+```http
+GET /kubernetes/{cluster}/apis/argoproj.io/v1alpha1/namespaces/{namespace}/rollouts
+GET /kubernetes/{cluster}/apis/apps/v1/namespaces/{namespace}/replicasets
+GET /kubernetes/{cluster}/api/v1/namespaces/{namespace}/pods
+GET /kubernetes/{cluster}/apis/argoproj.io/v1alpha1/namespaces/{namespace}/experiments
+GET /kubernetes/{cluster}/apis/argoproj.io/v1alpha1/namespaces/{namespace}/analysisruns
+```
+
+When the Rollout uses `spec.workloadRef`, the plugin also reads the referenced Deployment:
+
+```http
+GET /kubernetes/{cluster}/apis/apps/v1/namespaces/{namespace}/deployments/{workloadName}
+```
+
+With `--watch`, the plugin watches these resources and refreshes the displayed tree when a related resource changes. The Rollout watch endpoint is:
+
+```http
+GET /kubernetes/{cluster}/apis/argoproj.io/v1alpha1/namespaces/{namespace}/rollouts?watch=true&resourceVersion={resourceVersion}
+```
+
+The other related resources use their corresponding collection endpoint with `watch=true` and the current `resourceVersion`.
+
+### List rollouts
+
+List all Rollouts in a namespace:
+
+```http
+GET /kubernetes/{cluster}/apis/argoproj.io/v1alpha1/namespaces/{namespace}/rollouts
+```
+
+Filter by name, as the plugin does for `list rollouts --name`:
+
+```http
+GET /kubernetes/{cluster}/apis/argoproj.io/v1alpha1/namespaces/{namespace}/rollouts?fieldSelector=metadata.name%3D{name}
+```
+
+List across all namespaces by omitting the namespace segment:
+
+```http
+GET /kubernetes/{cluster}/apis/argoproj.io/v1alpha1/rollouts
+```
+
+Watch the collection by adding `watch=true`. Start from the returned list's `metadata.resourceVersion` to avoid missing events:
+
+```http
+GET /kubernetes/{cluster}/apis/argoproj.io/v1alpha1/namespaces/{namespace}/rollouts?watch=true&resourceVersion={resourceVersion}
+```
+
+### Pause a rollout
+
+`pause` sends a merge patch to the Rollout resource:
+
+```http
+PATCH /kubernetes/{cluster}/apis/argoproj.io/v1alpha1/namespaces/{namespace}/rollouts/{name}
+Content-Type: application/merge-patch+json
+```
+
+```json
+{
+  "spec": {
+    "paused": true
+  }
+}
+```
+
+### Resume a rollout
+
+The current v1.2.0 source registers `promote`, not a separate `resume` command. A legacy `resume` implementation used this merge patch on the main Rollout resource:
+
+```http
+PATCH /kubernetes/{cluster}/apis/argoproj.io/v1alpha1/namespaces/{namespace}/rollouts/{name}
+Content-Type: application/merge-patch+json
+```
+
+```json
+{
+  "spec": {
+    "paused": false
+  },
+  "status": {
+    "pauseConditions": null
+  }
+}
+```
+
+For clusters with the Rollout `status` subresource enabled, send the two fields as separate requests instead:
+
+```http
+PATCH /kubernetes/{cluster}/apis/argoproj.io/v1alpha1/namespaces/{namespace}/rollouts/{name}
+Content-Type: application/merge-patch+json
+```
+
+```json
+{
+  "spec": {
+    "paused": false
+  }
+}
+```
+
+```http
+PATCH /kubernetes/{cluster}/apis/argoproj.io/v1alpha1/namespaces/{namespace}/rollouts/{name}/status
+Content-Type: application/merge-patch+json
+```
+
+```json
+{
+  "status": {
+    "pauseConditions": null
+  }
+}
+```
+
+Use `promote` when the Rollout is paused by a canary step, a blue-green pre-promotion, or an analysis step. `promote` also advances the canary step when necessary.
+
+### Promote a rollout
+
+`promote` first reads the Rollout:
+
+```http
+GET /kubernetes/{cluster}/apis/argoproj.io/v1alpha1/namespaces/{namespace}/rollouts/{name}
+```
+
+The follow-up patch depends on the returned `spec` and `status`:
+
+| Rollout state or option                                        | Request body                                                                                                   |
+| -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `spec.paused=true`                                             | `{"spec":{"paused":false}}` on the Rollout resource.                                                           |
+| `status.pauseConditions` is non-empty                          | `{"status":{"pauseConditions":null}}` on `/status`.                                                            |
+| A canary step must be skipped                                  | `{"status":{"currentStepIndex":{nextStepIndex}}}` on `/status`.                                                |
+| `--full` and the current pod hash is not the stable ReplicaSet | `{"status":{"promoteFull":true}}` on `/status`.                                                                |
+| An inconclusive analysis paused the rollout                    | `{"status":{"pauseConditions":null,"controllerPause":false,"currentStepIndex":{nextStepIndex}}}` on `/status`. |
+
+For example, clear an automatic pause condition:
+
+```http
+PATCH /kubernetes/{cluster}/apis/argoproj.io/v1alpha1/namespaces/{namespace}/rollouts/{name}/status
+Content-Type: application/merge-patch+json
+```
+
+```json
+{
+  "status": {
+    "pauseConditions": null
+  }
+}
+```
+
+Advance a canary rollout to the next step:
+
+```http
+PATCH /kubernetes/{cluster}/apis/argoproj.io/v1alpha1/namespaces/{namespace}/rollouts/{name}/status
+Content-Type: application/merge-patch+json
+```
+
+```json
+{
+  "status": {
+    "pauseConditions": null,
+    "currentStepIndex": 2
+  }
+}
+```
+
+Fully promote a rollout:
+
+```http
+PATCH /kubernetes/{cluster}/apis/argoproj.io/v1alpha1/namespaces/{namespace}/rollouts/{name}/status
+Content-Type: application/merge-patch+json
+```
+
+```json
+{
+  "status": {
+    "promoteFull": true
+  }
+}
+```
+
+A client must not blindly send every field above. Read the Rollout first and apply only the patch required by its current state. The plugin first attempts a status-subresource patch. For clusters without that subresource, it falls back to a merge patch on the main Rollout resource.
+
+### Abort a rollout
+
+`abort` first tries the status subresource:
+
+```http
+PATCH /kubernetes/{cluster}/apis/argoproj.io/v1alpha1/namespaces/{namespace}/rollouts/{name}/status
+Content-Type: application/merge-patch+json
+```
+
+```json
+{
+  "status": {
+    "abort": true
+  }
+}
+```
+
+If the status subresource returns `404 Not Found`, send the same patch to the main Rollout resource:
+
+```http
+PATCH /kubernetes/{cluster}/apis/argoproj.io/v1alpha1/namespaces/{namespace}/rollouts/{name}
+Content-Type: application/merge-patch+json
+```
+
+```json
+{
+  "status": {
+    "abort": true
+  }
+}
+```
+
+The Rollout controller handles the abort and reconciles the active ReplicaSet. The patch does not change `spec.template`; update the template separately if the new version must be fully reverted.
+
+### Set a rollout image
+
+`set image` first reads the Rollout:
+
+```http
+GET /kubernetes/{cluster}/apis/argoproj.io/v1alpha1/namespaces/{namespace}/rollouts/{name}
+```
+
+The plugin changes the matching container image in `spec.template.spec.initContainers`, `containers`, or `ephemeralContainers`. It then sends a full-object update, not a small patch.
+
+For a Rollout without `spec.workloadRef`:
+
+```http
+PUT /kubernetes/{cluster}/apis/argoproj.io/v1alpha1/namespaces/{namespace}/rollouts/{name}
+Content-Type: application/json
+```
+
+The request body must be the complete Rollout returned by the GET request, with the selected image changed. Preserve `metadata.resourceVersion` and all fields not being changed. A shortened example is:
+
+```json
+{
+  "apiVersion": "argoproj.io/v1alpha1",
+  "kind": "Rollout",
+  "metadata": {
+    "name": "demo-rollout",
+    "namespace": "{namespace}",
+    "resourceVersion": "{resourceVersion}"
+  },
+  "spec": {
+    "template": {
+      "spec": {
+        "containers": [
+          {
+            "name": "demo",
+            "image": "registry.example.com/demo:v2"
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+When `spec.workloadRef` is present, the v1.2.0 plugin treats `workloadRef.name` as an `apps/v1` Deployment name, then reads and updates that Deployment instead:
+
+```http
+GET /kubernetes/{cluster}/apis/apps/v1/namespaces/{namespace}/deployments/{workloadName}
+PUT /kubernetes/{cluster}/apis/apps/v1/namespaces/{namespace}/deployments/{workloadName}
+Content-Type: application/json
+```
+
+`set image` does not branch on `workloadRef.kind` in the v1.2.0 source; it always uses the Deployment endpoint shown above. On an optimistic-concurrency conflict, repeat the GET and full update. The plugin retries this sequence up to five times.
+
+### Undo a rollout
+
+`undo` restores the previous revision by copying its pod template. The plugin performs these reads first:
+
+```http
+GET /kubernetes/{cluster}/apis/argoproj.io/v1alpha1/namespaces/{namespace}/rollouts/{name}
+GET /kubernetes/{cluster}/apis/apps/v1/namespaces/{namespace}/replicasets?labelSelector={rolloutSelector}
+```
+
+It considers only ReplicaSets controlled by the Rollout and selects the previous ReplicaSet by the `rollout.argoproj.io/revision` annotation. Use `--to-revision={revision}` to select an explicit revision; without it, the plugin selects the second newest revision. If the selected pod template already matches the current template, no update is sent.
+
+The plugin removes the `rollouts-pod-template-hash` label from the selected pod template and sends this JSON Patch:
+
+```http
+PATCH /kubernetes/{cluster}/apis/argoproj.io/v1alpha1/namespaces/{namespace}/rollouts/{name}
+Content-Type: application/json-patch+json
+```
+
+```json
+[
+  {
+    "op": "replace",
+    "path": "/spec/template",
+    "value": {
+      "metadata": {
+        "labels": {
+          "app": "demo"
+        }
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "demo",
+            "image": "registry.example.com/demo:v1"
+          }
+        ]
+      }
+    }
+  }
+]
+```
+
+When `spec.workloadRef` is present, apply the same JSON Patch to the referenced object instead of the Rollout:
+
+```http
+PATCH /kubernetes/{cluster}/apis/apps/v1/namespaces/{namespace}/deployments/{workloadName}
+Content-Type: application/json-patch+json
+```
+
+For a `ReplicaSet` workload reference use `/apis/apps/v1/.../replicasets/{workloadName}`. For a `PodTemplate` workload reference use `/api/v1/.../podtemplates/{workloadName}`. The v1.2.0 implementation rejects unsupported `workloadRef.kind` values.
+
+## Permissions
+
+The caller needs permission to read Rollouts and their related resources. Mutating operations additionally require the corresponding `patch` or `update` permission:
+
+- `get rollout`: `list` and `watch` on Rollouts, ReplicaSets, Pods, Experiments, AnalysisRuns, and referenced Deployments. A direct `GET` request, outside the plugin's informer flow, requires `get`.
+- `list rollouts`: `list` on Rollouts; add `watch` when watching the collection.
+- `pause`, `resume`, `promote`, and `abort`: `patch` on Rollouts and, when used, `patch` on the Rollout `status` subresource.
+- `set image`: `get` and `update` on Rollouts, or `get` and `update` on the referenced Deployment.
+- `undo`: `get` and `list` on Rollouts and ReplicaSets, plus `patch` on the Rollout or referenced workload.
