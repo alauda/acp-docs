@@ -27,11 +27,22 @@ Before installing the monitoring components, please ensure the following conditi
 - The appropriate monitoring component has been selected by referring to the [Monitoring Component Selection Guide](./architecture/component_selection_suggestion.mdx).
 - When installing in a workload cluster, ensure that the `global` cluster can reach the workload cluster as listed in [Workload Cluster VIP and Nodes](../../install/prepare/communication_matrix.mdx#workload_cluster).
 - If you need to use storage classes or persistent volume storage for monitoring data, please create the corresponding resources in the **Storage** section in advance.
-- Decide which cluster stores the monitoring data before you install. The `global` cluster installs its own full component set and monitors only itself. On a multi-cluster platform, install the VictoriaMetrics Center that aggregates workload cluster metrics in a dedicated workload cluster rather than in the `global` cluster, and install each workload cluster in agent-only mode pointing at that cluster, so that management cluster availability and application monitoring load stay independent.
-- If the `global` cluster is deployed with disaster recovery, workload cluster monitoring must not point to either the primary or the standby `global` cluster. Disaster recovery synchronizes only the `global` cluster's etcd data and excludes namespaces such as `cpaas-system`, so monitoring data is not replicated and would be unavailable after a failover. Each `global` cluster monitors only itself. See [Global Cluster Disaster Recovery](../../install/non_alauda_os/global_dr.mdx) for the synchronization scope.
-- If the cluster nodes run Alauda OS and you plan to use `LocalVolume` storage, do not keep the default storage path. See [LocalVolume Storage Path on Alauda OS](#immutable_storage_path).
+- Decide which cluster stores the monitoring data before you install. By default, install monitoring in every cluster, so that each cluster stores and queries its own monitoring data. The `global` cluster installs its own full component set and monitors only itself. If you need to view and manage the monitoring data of several clusters in one place, or you do not want to run the full set of components in every cluster, you can send the data of several clusters to one VictoriaMetrics Center: install the VictoriaMetrics Center in one cluster and install the other clusters in agent-only mode pointing at that cluster. Do not use the `global` cluster as the Center, so that management cluster availability and application monitoring load stay independent. Only one VictoriaMetrics Center can be installed in a cluster, the clusters that send data must be able to reach the cluster that hosts the Center, and the total monitoring scale must stay within the largest scale in [Monitor Component Capacity Planning](./architecture/capacity_planning.mdx). For the differences between these options and Fleet Monitoring, see [Multi-Cluster Monitoring Options](./architecture/component_selection_suggestion.mdx#multi-cluster-monitoring-options).
+- If the `global` cluster is deployed with disaster recovery, each `global` cluster monitors only itself: do not let the primary and standby `global` clusters share one monitoring system, and do not point workload cluster monitoring to either of them. Disaster recovery synchronizes only the `global` cluster's etcd data and excludes namespaces such as `cpaas-system`, so monitoring data is not replicated and would be unavailable after a failover. See [Global Cluster Disaster Recovery](../../install/non_alauda_os/global_dr.mdx) for the synchronization scope.
+- Use `StorageClass` or `PV` storage. `LocalVolume` storage is deprecated; see [LocalVolume Storage Is Deprecated](#localvolume_deprecated). If you keep using `LocalVolume` on Alauda OS nodes, do not keep the default storage path. See [LocalVolume Storage Path on Alauda OS](#immutable_storage_path).
+
+### LocalVolume Storage Is Deprecated \{#localvolume_deprecated}
+
+:::warning
+Starting from ACP 4.5, the `LocalVolume` storage type of both monitoring plugins is deprecated. It is still available, but a future release may remove it.
+
+- For new installations, use `StorageClass` or `PV`. `LocalVolume` data lives in a host directory of a single node and is not preserved when that node is replaced. On bare-metal clusters whose nodes run Alauda OS, `LocalVolume` data cannot be persisted, so do not use it.
+- Existing installations that use `LocalVolume` keep working after you upgrade. Plan to move to `StorageClass` or `PV` before a future release removes `LocalVolume`.
+:::
 
 ### LocalVolume Storage Path on Alauda OS \{#immutable_storage_path}
+
+This section applies only to existing installations that still use the deprecated `LocalVolume` storage type.
 
 Both monitoring plugins default the `LocalVolume` storage path to `/cpaas/monitoring`, which belongs to the layout of nodes that run a non-Alauda OS. On clusters whose nodes run [Alauda OS](../../workload_clusters/alauda_os/index.mdx), nodes have a read-only root filesystem, and node-local platform data is kept under `/var/cpaas` on a persistent disk declared in the provider's machine configuration. Anything written outside those declared disks is not preserved when the platform replaces a node. Other platform components already follow this convention; for example, etcd backup uses `/var/cpaas/backup` on clusters whose nodes run Alauda OS. See [etcd Backup and Restore](../../configure/backup/etcd.mdx).
 
@@ -129,7 +140,7 @@ Installing the operators only installs the controllers and CRDs. You must create
    | Parameter       | Description                                                                                                                |
    | --------------- | -------------------------------------------------------------------------------------------------------------------------- |
    | **Scale Configuration** | Supports three configurations: **Small Scale**, **Medium Scale**, and **Large Scale**:<br />- Default values are set based on the recommended load test values of the platform<br />- You can choose or customize quotas based on the actual cluster scale<br />- Default values will be updated with platform versions; for fixed configurations, custom settings are recommended   |
-   | **Storage Type**       | - **LocalVolume**: Local storage with data stored on specified nodes<br />- **StorageClass**: Automatically generates persistent volumes using a storage class<br />- **PV**: Utilizes existing persistent volumes<br />**Note**: Storage configuration cannot be modified after installation |
+   | **Storage Type**       | - **LocalVolume** (deprecated): Local storage with data stored on specified nodes<br />- **StorageClass**: Automatically generates persistent volumes using a storage class<br />- **PV**: Utilizes existing persistent volumes<br />**Note**: Storage configuration cannot be modified after installation |
    | **Storage Path**       | Displayed when **Storage Type** is `LocalVolume`. Host directory for storing Prometheus data; an absolute path is required. Default: `/cpaas/monitoring`. On Alauda OS, set `/var/cpaas/monitoring`; see [LocalVolume Storage Path on Alauda OS](#immutable_storage_path). |
    | **Replica Count**      | Sets the number of monitoring component pods<br />**Note**: Prometheus supports only single-node installation                                            |
    | **Advanced Configuration** | Collapsible section for plugin-level scheduling parameters. |
@@ -173,14 +184,9 @@ spec:
   version: v4.1.0
   config:
     storage:
-      type: LocalVolume
+      type: StorageClass
       capacity: 40
-      nodes:
-        - xxx.xxx.xxx.xx
-      path: /cpaas/monitoring # On Alauda OS use /var/cpaas/monitoring
-      storageClass: ""
-      pvSelectorK: ""
-      pvSelectorV: ""
+      storageClass: <storage-class-name>
     replicas: 1
     components:
       nodeSelector:
@@ -235,10 +241,10 @@ YAML field reference (Prometheus):
 | `metadata.labels.cpaas.io/module-type` | Must be `plugin`. |
 | `metadata.name` | ModuleInfo name (e.g., `<cluster>-prometheus`). |
 | `spec.version` | Plugin version to install. |
-| `spec.config.storage.type` | Storage type: `LocalVolume`, `StorageClass`, or `PV`. |
+| `spec.config.storage.type` | Storage type: `StorageClass`, `PV`, or the deprecated `LocalVolume`. |
 | `spec.config.storage.capacity` | Storage size for Prometheus (Gi). Minimum 30 Gi recommended. |
-| `spec.config.storage.nodes` | Node list when `storage.type=LocalVolume`. Up to 1 node supported. |
-| `spec.config.storage.path` | Base LocalVolume path when `storage.type=LocalVolume`. Default: `/cpaas/monitoring`. On Alauda OS, set `/var/cpaas/monitoring`; see [LocalVolume Storage Path on Alauda OS](#immutable_storage_path). |
+| `spec.config.storage.nodes` | Node list when `storage.type=LocalVolume` (deprecated). Up to 1 node supported. |
+| `spec.config.storage.path` | Base LocalVolume path when `storage.type=LocalVolume` (deprecated). Default: `/cpaas/monitoring`. On Alauda OS, set `/var/cpaas/monitoring`; see [LocalVolume Storage Path on Alauda OS](#immutable_storage_path). |
 | `spec.config.storage.storageClass` | StorageClass name when `storage.type=StorageClass`. |
 | `spec.config.storage.pvSelectorK` | PV selector key when `storage.type=PV`. |
 | `spec.config.storage.pvSelectorV` | PV selector value when `storage.type=PV`. |
@@ -318,6 +324,14 @@ Once installation is complete, the components can be accessed at the following a
 
 - If you install only the VictoriaMetrics agent, ensure that the VictoriaMetrics Center has been installed in another cluster.
 
+### High Availability \{#vm-high-availability}
+
+To run the VictoriaMetrics Center in a highly available way, deploy at least three VMStorage replicas.
+
+- ACP sets the VictoriaMetrics replication factor to 2, so each sample is stored on two different VMStorage replicas. This value is not configurable in the console or in the ModuleInfo.
+- VictoriaMetrics requires at least `2 × N - 1` storage nodes for a replication factor of `N`. With a replication factor of 2, three VMStorage replicas keep two copies of newly written data while one replica is unavailable. With fewer replicas, the cluster cannot do this.
+- Set **Replica Count** (`spec.config.replicas`) to 3 or more when **Storage Type** is `StorageClass` or `PV`. The default is 1.
+
 ### Install from the Console
 
 1. Navigate to **App Store Management** > **Cluster Plugins** and select the target cluster.
@@ -333,7 +347,7 @@ Once installation is complete, the components can be accessed at the following a
    | **Scale Configuration**           | Supports three configurations: **Small Scale**, **Medium Scale**, and **Large Scale**:<br />- Default values are set based on the recommended load test values of the platform<br />- You can choose or customize quotas based on the actual cluster scale<br />- Default values will be updated with platform versions; for fixed configurations, custom settings are recommended |
    | **Install Agent Only**            | - Off: Install the complete VictoriaMetrics component suite<br />- On: Install only the VMAgent collection component, which relies on the VictoriaMetrics Center                         |
    | **VictoriaMetrics Center**       | Select the cluster where the complete VictoriaMetrics component has been installed                                               |
-   | **Storage Type**                 | - **LocalVolume**: Local storage with data stored on specified nodes<br />- **StorageClass**: Automatically generates persistent volumes using a storage class<br />- **PV**: Utilizes existing persistent volumes                |
+   | **Storage Type**                 | - **LocalVolume** (deprecated): Local storage with data stored on specified nodes<br />- **StorageClass**: Automatically generates persistent volumes using a storage class<br />- **PV**: Utilizes existing persistent volumes                |
    | **Storage Path**                 | Displayed when **Storage Type** is `LocalVolume`. Specify the base storage path for monitoring data. Default: `/cpaas/monitoring`. On Alauda OS, set `/var/cpaas/monitoring`; see [LocalVolume Storage Path on Alauda OS](#immutable_storage_path). |
    | **Replica Count**                | Displayed when **Storage Type** is `StorageClass` or `PV`. Sets the number of monitoring component pods. When **Storage Type** is `LocalVolume`, the number of selected nodes determines the number of VMStorage replicas. |
    | **Advanced Configuration**       | Collapsible section for plugin-level scheduling parameters. |
@@ -377,14 +391,9 @@ spec:
   version: v4.1.0
   config:
     storage:
-      type: LocalVolume
+      type: StorageClass
       capacity: 40
-      nodes:
-        - xxx.xxx.xxx.xx
-      path: /cpaas/monitoring # On Alauda OS use /var/cpaas/monitoring
-      storageClass: ""
-      pvSelectorK: ""
-      pvSelectorV: ""
+      storageClass: <storage-class-name>
     replicas: 1
     agentOnly: false
     agentReplicas: 1
@@ -449,10 +458,10 @@ YAML field reference (VictoriaMetrics):
 | `metadata.labels.cpaas.io/module-type` | Must be `plugin`. |
 | `metadata.name` | ModuleInfo name (e.g., `<cluster>-victoriametrics`). |
 | `spec.version` | Plugin version to install. |
-| `spec.config.storage.type` | Storage type: `LocalVolume`, `StorageClass`, or `PV`. |
+| `spec.config.storage.type` | Storage type: `StorageClass`, `PV`, or the deprecated `LocalVolume`. |
 | `spec.config.storage.capacity` | Storage size for VictoriaMetrics (Gi). Minimum 30 Gi recommended. |
-| `spec.config.storage.nodes` | Node list when `storage.type=LocalVolume`. You can select one or more nodes. |
-| `spec.config.storage.path` | Base LocalVolume path when `storage.type=LocalVolume`. Default: `/cpaas/monitoring`. On Alauda OS, set `/var/cpaas/monitoring`; see [LocalVolume Storage Path on Alauda OS](#immutable_storage_path). |
+| `spec.config.storage.nodes` | Node list when `storage.type=LocalVolume` (deprecated). You can select one or more nodes. |
+| `spec.config.storage.path` | Base LocalVolume path when `storage.type=LocalVolume` (deprecated). Default: `/cpaas/monitoring`. On Alauda OS, set `/var/cpaas/monitoring`; see [LocalVolume Storage Path on Alauda OS](#immutable_storage_path). |
 | `spec.config.storage.storageClass` | StorageClass name when `storage.type=StorageClass`. |
 | `spec.config.storage.pvSelectorK` | PV selector key when `storage.type=PV`. |
 | `spec.config.storage.pvSelectorV` | PV selector value when `storage.type=PV`. |
