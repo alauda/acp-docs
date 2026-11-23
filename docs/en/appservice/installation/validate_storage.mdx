@@ -1,0 +1,162 @@
+---
+weight: 30
+queries:
+  - How do I validate an enterprise SAN for Alauda Application Services
+  - What latency and throughput must external storage provide for middleware instances
+---
+
+# Validate Storage
+
+Enterprise storage is not in the platform release test matrix. Before you put Alauda Application Services instances on an enterprise SAN or other external block storage, check that the storage meets the requirements below and passes the disk performance test and the database stability test. The disk performance test takes about 10 minutes, and the database stability test takes 7 days. Keep the outputs of both tests, together with the versions of the CSI driver, the MySQL Operator, and the test instance, as the record of the validation.
+
+The requirements check and the disk performance test do not need Alauda Application Services, so do them while you choose the storage. Run the database stability test after you install the MySQL Operator (see [Install Plugins and Operators](./plugins_and_operators.mdx)).
+
+The last section lists the checks to run before production on every storage type that you use.
+
+## Requirements \{#requirements}
+
+If the storage does not meet both of the following requirements, you cannot use it, and you do not need to run the tests:
+
+- The storage provides a CSI driver that dynamically provisions block storage volumes through a StorageClass.
+- The StorageClass provisions `ReadWriteOnce` volumes for instance data.
+
+The following capabilities are optional. When several storage systems meet the requirements, prefer the ones that provide them:
+
+- Volume quality of service (QoS), to reduce performance interference between applications that share a storage device.
+- VMware vStorage APIs for Array Integration (VAAI) certification, for better storage performance when the nodes are VMware virtual machines.
+- S3-compatible object storage for backups, if you need backup and restore.
+
+## Pass Criteria \{#criteria}
+
+The storage passes the validation when it meets all of the following criteria. If it fails any of them, you cannot use it. Each of the two disk performance runs must meet the disk performance criteria.
+
+| Test | Metric | Criterion |
+| --- | --- | --- |
+| Disk performance | 95th percentile of the completion latency | 10 ms or less |
+| Disk performance | Maximum completion latency | 500 ms or less |
+| Disk performance | Read and write throughput combined | 10 MB/s or more |
+| Database stability | Uninterrupted operation of the instance | 7 × 24 hours |
+| Database stability | Request success rate | Above 99.95% (error rate below 0.05%) |
+
+## Test Disk Performance \{#disk}
+
+The test runs fio in a Pod against a volume from the storage class under test. It runs a 4 KiB random read and write workload (70% reads) with direct I/O and the `libaio` engine, first with 1 job and then with 8 parallel jobs. Each job works on a 3 GiB file for up to 180 seconds. The whole test takes about 8 to 10 minutes, depending on the storage.
+
+Before you start:
+
+- Prepare a Linux image for the architecture of the target nodes that contains fio 3.x with the `libaio` engine, `/bin/sh`, `rm`, and `sleep`, and push it to a registry that the cluster can pull from.
+- Run the test while the I/O that normally runs on the storage is running, and while no unusual heavy I/O is running. This way, the result reflects what the instances will see.
+
+1. Create a PVC of 30 GiB or more on the storage class under test. The run with 8 jobs needs 24 GiB for its test files.
+
+   ```yaml
+   apiVersion: v1
+   kind: PersistentVolumeClaim
+   metadata:
+     name: fio-test
+     namespace: <namespace>
+   spec:
+     accessModes:
+       - ReadWriteOnce
+     resources:
+       requests:
+         storage: 30Gi
+     storageClassName: <storage-class>
+   ```
+
+2. Create a Job that runs the two fio runs. The Job requests 10 CPU cores and 10 GiB of memory, so make sure that one node can provide them.
+
+   ```yaml
+   apiVersion: batch/v1
+   kind: Job
+   metadata:
+     name: fio-test
+     namespace: <namespace>
+   spec:
+     backoffLimit: 0
+     template:
+       spec:
+         restartPolicy: Never
+         containers:
+           - name: fio
+             image: <fio-image>
+             command:
+               - /bin/sh
+               - -c
+               - |
+                 set -eu
+                 for jobs in 1 8; do
+                   fio --name=libaio_randrw --directory=/data \
+                     --ioengine=libaio --rw=randrw --rwmixread=70 --bs=4k \
+                     --direct=1 --size=3g --runtime=180 \
+                     --numjobs=$jobs --thread --group_reporting
+                   rm -f /data/libaio_randrw.*
+                   sleep 60
+                 done
+             resources:
+               requests:
+                 cpu: "10"
+                 memory: 10Gi
+               limits:
+                 cpu: "10"
+                 memory: 10Gi
+             volumeMounts:
+               - name: data
+                 mountPath: /data
+         volumes:
+           - name: data
+             persistentVolumeClaim:
+               claimName: fio-test
+   ```
+
+3. When the Job completes, read the fio output in the Job log, for example with `kubectl logs job/fio-test -n <namespace>`.
+
+The log contains one fio report for each run. If fio fails, the Job fails. Check that each report shows `err= 0` in its job summary line, the line that starts with `libaio_randrw: (groupid=0`. Then read the following values in each report:
+
+- **95th percentile latency**: in the `clat percentiles` block of `read` and of `write`, the `95.00th` value. The unit is in the block header, for example `(usec)`.
+- **Maximum latency**: in the `clat` line of `read` and of `write`, the `max` value. The unit is in parentheses, and a `k` suffix means thousands, so `max=76543k` in a `clat (nsec)` line is about 77 ms.
+- **Throughput**: under `Run status group 0 (all jobs)`, the `bw` values of `READ` and of `WRITE`. Add them up. fio shows each value in MB/s or kB/s in parentheses, so convert kB/s to MB/s before you add them.
+
+Delete the Job and the PVC after the test.
+
+## Test Database Stability \{#stability}
+
+The test runs a sysbench online transaction processing (OLTP) workload against a MySQL 5.7 Percona XtraDB Cluster (PXC) instance on the storage under test for 7 × 24 hours.
+
+1. Make the storage class selectable for PXC in the console: add its provisioner under the `PXC` key of the `middleware-sc-cm` ConfigMap, as described in [Storage Classes in the Console](./storage_selection.mdx#console).
+2. Create a MySQL 5.7 (PXC) instance with ProxySQL. Give PXC 4 CPU cores, 8 GiB of memory, and a data volume of 50 GiB or more on the storage class under test, and give ProxySQL 1 CPU core and 1 GiB of memory. The data volume size covers the test data, the binlog, and other logs. Choose the parameter template that matches the disk type: `hdd-4c8g-mysql-5.7-pxc` for HDD or `sdd-4c8g-mysql-5.7-pxc` for SSD. If the storage supports volume QoS, set QoS on the volumes of the instance.
+3. Prepare an image that contains SysBench v1.1, push it to a registry that the cluster can pull from, and run sysbench from a Pod that can reach the instance. Use the same `--mysql-db`, `--test`, `--oltp_tables_count`, and `--oltp-table-size` values when you prepare the data and when you run the test.
+4. Prepare the test data, 4 tables of 10 million rows each:
+
+   ```bash
+   sysbench --mysql-host=<host> --mysql-port=<port> --threads=8 \
+     --mysql-user=<user> --mysql-password=<password> --mysql-db=test \
+     --mysql-table-engine=innodb --test=oltp.lua --oltp_tables_count=4 \
+     --oltp-table-size=10000000 --rand-init=on --db-driver=mysql \
+     prepare
+   ```
+
+5. Run the test for 7 days (604,800 seconds):
+
+   ```bash
+   sysbench --mysql-host=<host> --mysql-port=<port> \
+     --mysql-user=<user> --mysql-password=<password> --mysql-db=test \
+     --test=oltp.lua --oltp_tables_count=4 --oltp-table-size=10000000 \
+     --num-threads=1 --oltp-read-only=off --rand-type=special \
+     --max-time=604800 --max-requests=0 --percentile=95 \
+     --oltp-point-selects=4 --report-interval=10 \
+     run
+   ```
+
+6. Check the result against the [pass criteria](#criteria). The instance must run for the whole 7 × 24 hours without interruption. Calculate the error rate as failed events divided by total events, and the success rate as 1 minus the error rate. If the output has no `failed events` field, no request failed during the test, and the error rate is 0.
+
+## Pre-Production Checks \{#pre-production}
+
+The pass criteria above apply to an enterprise SAN or other external block storage. Before production, also check the following on the storage that you use, against your own requirements:
+
+- On an enterprise SAN, check CSI provisioning, volume expansion, snapshot backup and restore, and Pod failover after an unexpected node shutdown.
+- For databases, ClickHouse Keeper or ZooKeeper, and Milvus etcd, measure commit latency and random read/write IOPS on enterprise SAN, Ceph RBD, and TopoLVM. This matters most when a database working set exceeds memory or Redis uses append-only file (AOF) persistence.
+- On Ceph RBD, measure throughput. On TopoLVM, measure the rebuild time of the largest replica.
+- For Milvus with Woodpecker on object storage and the default `conditionWrite: auto`, check that the object storage supports S3 conditional writes (`If-None-Match`).
+- Shut down a node and check that the instance recovers. [Node and Disk Loss](./storage_selection.mdx#node-loss) lists what each product documents.
+- Restore a backup into a new instance, and repeat this regularly.
