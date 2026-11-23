@@ -66,7 +66,7 @@ CURRENT   SESSION    PLATFORM                              USER                 
 This command displays:
 - **CURRENT**: Indicates if the current context belongs to this session (marked with `*`)
 - **SESSION**: Session name (user-defined during login)
-- **PLATFORM**: Base platform URL
+- **PLATFORM**: Platform Access Address
 - **USER**: Authenticated username for the session
 - **CLUSTERS**: Number of clusters available in this session
 

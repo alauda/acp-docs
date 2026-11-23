@@ -102,7 +102,7 @@ You have access to an ACP platform endpoint and valid authentication credentials
 ACP CLI login process creates a comprehensive kubeconfig structure that includes:
 
 - **Multiple cluster entries**: One for each accessible cluster in the platform
-- **Session metadata**: Platform URL, session name, and cluster descriptions stored in extension fields  
+- **Session metadata**: Platform Access Address, session name, and cluster descriptions stored in extension fields  
 - **Unified authentication**: Single user credential entry that works across all clusters in the platform
 - **Intelligent naming**: Conflict-free naming conventions using `acp:<session>:<cluster>` format
 
