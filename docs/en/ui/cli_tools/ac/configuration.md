@@ -80,7 +80,7 @@ You have access to an ACP platform endpoint and valid authentication credentials
    - Authenticates with the ACP platform
    - Discovers all accessible clusters in the platform  
    - Creates kubeconfig entries for all clusters with ACP-specific metadata
-   - Sets up a default context pointing to the global cluster
+   - Sets up a default context pointing to the `global` cluster
 
 3. To export the configuration to a separate file, run:
    ```bash
