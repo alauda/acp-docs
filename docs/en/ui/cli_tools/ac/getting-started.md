@@ -123,6 +123,10 @@ export AC_LOGIN_PASSWORD=your-password
 ac login
 ```
 
+#### Use an API Token
+
+`ac login` signs in with a username and password or through an identity provider. It does not accept an ACP API token. If you have an API token, for example one created for an automation account, put it in a KubeConfig file and point `ac` at that file. For the steps, and for the `ac` commands that still need `ac login`, see [Access a Cluster with KubeConfig](../../../configure/clusters/how-to/access-cluster-with-kubeconfig.mdx).
+
 ### Quick Configuration Management
 
 Once logged in, ACP CLI provides convenient commands for daily operations:
