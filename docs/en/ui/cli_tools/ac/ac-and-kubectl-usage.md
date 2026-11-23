@@ -20,7 +20,7 @@ ACP CLI provides built-in support for ACP's centralized, proxy-based multi-clust
 
 ### Intelligent Resource Routing
 
-ACP CLI automatically routes platform-level resource types like `User` and `Project` to the global cluster, since these resources only exist at the platform level. This allows you to access them from any cluster context without manual switching. All other resources work normally with your current cluster context.
+ACP CLI automatically routes platform-level resource types like `User` and `Project` to the `global` cluster, since these resources only exist at the platform level. This allows you to access them from any cluster context without manual switching. All other resources work normally with your current cluster context.
 
 #### Resource Routing Example
 
