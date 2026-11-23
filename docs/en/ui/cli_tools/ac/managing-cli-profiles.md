@@ -169,7 +169,7 @@ clusters:
         platformUrl: https://acp.prod.example.com
         sessionName: prod
         clusterName: workload-a
-        description: business cluster for team alpha
+        description: workload cluster for team alpha
         note: This cluster item is managed by ac CLI, to avoid unexpected behavior, do not edit this item.
   name: acp:prod:workload-a
 contexts:
