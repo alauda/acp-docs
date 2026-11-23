@@ -276,7 +276,7 @@ When `ac adm upgrade` shows a desired target but the upgrade is not moving:
 
 When `ac adm upgrade status --cluster=<cluster>` shows `AdminAckRequired` in `Failed` state:
 
-1. Inspect the release-provided gates from the global cluster:
+1. Inspect the release-provided gates from the `global` cluster:
 
    ```bash
    kubectl -n cpaas-system get configmap admin-gates -o yaml
