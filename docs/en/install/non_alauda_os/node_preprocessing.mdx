@@ -89,7 +89,7 @@ bash init.sh
 ```
 
 <Directive type="warning" title="WARNING">
-`init.sh` cannot guarantee that all of the following checks are properly handled. You still need to continue with the steps below.
+`init.sh` does not handle every check below. In particular, it does not set `transparent_hugepage=never`, `UsePAM`, or `DefaultTasksMax`. After you run it, complete every check in [Node Checks](#node_checks).
 </Directive>
 
 ## Node Checks \{#node_checks}
@@ -104,9 +104,9 @@ Checks are divided into two categories:
 The following is the list of checks:
 
 - **OS and Kernel**
-  - ✅ The machine's grub boot configuration must have the `transparent_hugepage=never` parameter.
-  - ✅ Check whether the kernel modules `ip_vs`, `ip_vs_rr`, `ip_vs_wrr`, and `ip_vs_sh` are enabled.
-  - ⚠️ If the `global` cluster plans to use `Kube-OVN` CNI, the kernel modules `geneve` and `openvswitch` must be enabled.
+  - ✅ The kernel command line must contain the `transparent_hugepage=never` parameter. To set it, see [Set transparent_hugepage=never](#disable_thp).
+  - ✅ The kernel modules `ip_vs`, `ip_vs_rr`, `ip_vs_wrr`, and `ip_vs_sh` must be available. Check with `modinfo ip_vs ip_vs_rr ip_vs_wrr ip_vs_sh`; the command must not report `Module <name> not found`. You do not need to load these modules yourself: the platform loads them when it deploys the node.
+  - ⚠️ If the `global` cluster plans to use `Kube-OVN` CNI, the kernel modules `geneve` and `openvswitch` must also be available. Check with `modinfo geneve openvswitch`.
   - ✅ SELinux and AppArmor must be disabled. They cannot be kept enabled on a node that runs a non-Alauda OS; see [Why SELinux and AppArmor Must Be Disabled](#selinux_apparmor_disabled).
   - ✅ The host firewall must be disabled, unless your security policy requires it to stay enabled. In that case the node must be configured as described in [Hardened Node Security Configuration](#hardened_node_security) before you install the platform.
     - `init.sh` disables the host firewall. To keep it enabled, pass the matching `--skip-` argument to `init.sh` instead of turning it back on afterwards.
@@ -117,7 +117,7 @@ The following is the list of checks:
 - **Users and Permissions**
   - ✅ The node's SSH user has `root` privileges and can use `sudo` without the password.
   - ✅ The `UseDNS` parameter in `/etc/ssh/sshd_config` must be set to `no`.
-  - ✅ Set the `UsePAM` parameter in `/etc/ssh/sshd_config` to `no` before adding the node, then restart `sshd`. PAM session policies (such as a forced password change, `pam_access`, `faillock`, or `pam_limits`) can otherwise block the SSH-based node join. After the node reaches the `Ready` state, you can restore `UsePAM yes`. On SELinux-enforcing systems that use password authentication, `UsePAM no` can itself break SSH login; use key-based authentication in that case.
+  - ⚠️ If PAM session policies on the node (such as a forced password change, `pam_access`, `faillock`, or `pam_limits`) can block a non-interactive SSH login, set `UsePAM no` for `sshd` before adding the node. After the node reaches the `Ready` state, you can restore `UsePAM yes`. If you do not set it, the platform reports a warning and continues. For the configuration steps, see [Set UsePAM](#set_usepam).
   - ✅ `systemctl show --property=DefaultTasksMax` must return `infinity`; a low limit can make busy containers fail to create threads. If it is not `infinity`, set `DefaultTasksMax=infinity` in `/etc/systemd/system.conf` and run `systemctl daemon-reexec`.
 
 - **Node Network**
@@ -227,6 +227,58 @@ The communication matrix lists the ports that the nodes listen on. Pod-to-Pod an
 </Directive>
 
 The node that runs the installer also uses additional ports. Allow them on that node before you start the installation; see [Installer Node Ports](../prepare/communication_matrix.mdx#installer_node_ports).
+
+### Set transparent_hugepage=never \{#disable_thp}
+
+Add `transparent_hugepage=never` to the kernel command line, then restart the node.
+
+<Tabs>
+  <Tab label="RHEL">
+  RHEL 9 manages boot entries with the Boot Loader Specification (BLS), so editing `/etc/default/grub` alone does not change the kernel command line. Use `grubby`:
+
+  ```bash
+  grubby --update-kernel=ALL --args="transparent_hugepage=never"
+  ```
+  </Tab>
+
+  <Tab label="Ubuntu">
+  1. In `/etc/default/grub`, add `transparent_hugepage=never` to the value of `GRUB_CMDLINE_LINUX`.
+  2. Run `update-grub` to regenerate the GRUB configuration.
+  </Tab>
+</Tabs>
+
+On Kylin Linux Advanced Server, add the parameter with the boot loader tool of the operating system.
+
+After the restart, verify the result:
+
+```bash
+grep -o 'transparent_hugepage=never' /proc/cmdline
+cat /sys/kernel/mm/transparent_hugepage/enabled
+```
+
+The first command must print `transparent_hugepage=never`, and the second must show `[never]` as the selected value, for example `always madvise [never]`.
+
+### Set UsePAM \{#set_usepam}
+
+In most cases, set `UsePAM no` in `/etc/ssh/sshd_config` and restart `sshd`.
+
+On RHEL 9, a different file is required. `sshd` uses the first value that it reads for each parameter, `/etc/ssh/sshd_config` includes the files in `/etc/ssh/sshd_config.d/` near its top, and `/etc/ssh/sshd_config.d/50-redhat.conf` sets `UsePAM yes`. Setting `UsePAM no` in `/etc/ssh/sshd_config` therefore has no effect. Put it in a file that sorts before `50-redhat.conf`:
+
+```bash
+echo "UsePAM no" > /etc/ssh/sshd_config.d/00-acp-usepam.conf
+sshd -t && systemctl restart sshd
+```
+
+On any operating system, confirm the value that `sshd` actually uses:
+
+```bash
+sshd -T | grep -i usepam
+```
+
+The command must print `usepam no`.
+
+- On RHEL, `sshd` then reports `WARNING: 'UsePAM no' is not supported in RHEL and may cause several problems.` Keep the setting only for the node join. After the node reaches the `Ready` state, delete `/etc/ssh/sshd_config.d/00-acp-usepam.conf` and restart `sshd`.
+- The platform check reads only `/etc/ssh/sshd_config`, so it still reports the `UsePAM` warning when the setting is in `/etc/ssh/sshd_config.d/`. The warning does not block the node join.
 
 ### Remove Conflicting Packages \{#remove_conflicting_packages}
 
