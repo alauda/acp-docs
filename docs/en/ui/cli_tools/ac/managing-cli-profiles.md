@@ -34,7 +34,7 @@ The login process:
 4. Creates and activates a context:
    - If `--cluster` is specified: creates context for that specific cluster
    - If `--namespace` is specified: sets the namespace in the context
-   - If no cluster is specified: defaults to the global cluster
+   - If no cluster is specified: defaults to the `global` cluster
    - Context name follows pattern: `<session_name>/<cluster_name>`
 
 #### `ac logout` - End platform sessions and clean up configuration
@@ -66,7 +66,7 @@ CURRENT   SESSION    PLATFORM                              USER                 
 This command displays:
 - **CURRENT**: Indicates if the current context belongs to this session (marked with `*`)
 - **SESSION**: Session name (user-defined during login)
-- **PLATFORM**: Base platform URL
+- **PLATFORM**: Platform Access Address
 - **USER**: Authenticated username for the session
 - **CLUSTERS**: Number of clusters available in this session
 
@@ -169,7 +169,7 @@ clusters:
         platformUrl: https://acp.prod.example.com
         sessionName: prod
         clusterName: workload-a
-        description: business cluster for team alpha
+        description: workload cluster for team alpha
         note: This cluster item is managed by ac CLI, to avoid unexpected behavior, do not edit this item.
   name: acp:prod:workload-a
 contexts:
@@ -206,7 +206,7 @@ ACP CLI uses extension metadata to organize and identify configuration entries:
 #### Metadata-Based Identification
 - **Platform Identification**: Uses `platformUrl` to identify the parent platform
 - **Session Association**: Uses `sessionName` to group related clusters, users, and contexts
-- **Global Cluster Detection**: Uses `isGlobal` field to identify management clusters
+- **`global` Cluster Detection**: Uses `isGlobal` field to identify management clusters
 - **User Credential Location**: Matches `sessionName` and `platformUrl` in user extensions
 
 #### Naming Conventions
