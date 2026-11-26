@@ -188,10 +188,12 @@ Save this script as `check-global-dcs.sh`:
 ```bash
 #!/usr/bin/env bash
 ac whoami --show-server
+KCP=$(ac -n cpaas-system get clusters.cluster.x-k8s.io global -o jsonpath='{.spec.controlPlaneRef.name}')
 
-echo "== MachineDeployments"
+echo "== Rollout settings"
+ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='replicas={.spec.replicas} maxSurge={.spec.rolloutStrategy.rollingUpdate.maxSurge}{"\n"}'
 ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=global \
-  -o custom-columns='NAME:.metadata.name,UNAVAILABLE:.spec.strategy.rollingUpdate.maxUnavailable'
+  -o custom-columns='NAME:.metadata.name,SURGE:.spec.strategy.rollingUpdate.maxSurge,UNAVAILABLE:.spec.strategy.rollingUpdate.maxUnavailable'
 
 echo "== Machines, IP pools, and the type and address of the control-plane load balancer"
 ac -n cpaas-system get dcsmachine -l cluster.x-k8s.io/cluster-name=global \
@@ -217,12 +219,15 @@ bash check-global-dcs.sh
 # on the standby: unset KUBECONFIG
 ```
 
+When no MachineDeployment is listed, `global` has no worker node pool: only `replicas` and `maxSurge` apply.
+
 A free entry is an IP address of a pool in `POOL` whose `DISKS` lists slot numbers, that no machine uses, and that is not the load balancer address when the type is `internal`.
 
 | Result | Action |
 | --- | --- |
-| Every MachineDeployment shows `UNAVAILABLE` `1` | Continue. |
-| A MachineDeployment shows `UNAVAILABLE` empty, `<none>`, or not `1` | Run the `machinedeployment` patch in [Set the Rollout Settings](#rollout-settings) for it. |
+| `replicas` is 3 or more and `maxSurge` is `0`, and every MachineDeployment shows `SURGE` `0` and `UNAVAILABLE` `1` | Continue. |
+| `replicas` is less than 3 | The cluster cannot be upgraded. |
+| `replicas` is 3 or more and `maxSurge` is empty or not `0`, or a MachineDeployment shows `SURGE` empty, `<none>`, or not `0`, or `UNAVAILABLE` empty, `<none>`, or not `1` | Run the commands in [Set the Rollout Settings](#rollout-settings). |
 | The pools in `POOL` whose `DISKS` lists slot numbers have no free entry | Continue. |
 | A free entry is not in `KEPT_DISKS` | Remove it from `spec.pool` with `ac -n cpaas-system edit dcsiphostnamepool <pool-name>`. Keep the entry of the internal load balancer address. |
 | A free entry is in `KEPT_DISKS` | Contact technical support. Do not remove the entry. |
@@ -242,11 +247,6 @@ Save this script as `check-global-dcs-no-preflight.sh`:
 #!/usr/bin/env bash
 ac whoami --show-server
 KCP=$(ac -n cpaas-system get clusters.cluster.x-k8s.io global -o jsonpath='{.spec.controlPlaneRef.name}')
-
-echo "== Rollout settings"
-ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='replicas={.spec.replicas} maxSurge={.spec.rolloutStrategy.rollingUpdate.maxSurge}{"\n"}'
-ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=global \
-  -o custom-columns='NAME:.metadata.name,SURGE:.spec.strategy.rollingUpdate.maxSurge'
 
 echo "== Machine templates in use"
 ac -n cpaas-system get dcsmachinetemplate \
@@ -285,9 +285,6 @@ bash check-global-dcs-no-preflight.sh
 
 | Result | Action |
 | --- | --- |
-| `replicas` is 3 or more and `maxSurge` is `0`, and every MachineDeployment shows `SURGE` `0` | Continue. |
-| `replicas` is less than 3 | The cluster cannot be upgraded. |
-| `replicas` is 3 or more and `maxSurge` is empty or not `0`, or a MachineDeployment shows `SURGE` empty, `<none>`, or not `0` | Run the commands in [Set the Rollout Settings](#rollout-settings). |
 | No machine template lists `/var/cpaas` in `TEMPLATE_DISKS` | Continue. |
 | A machine template lists `/var/cpaas` | [Migrate to pool-managed persistent disks](./persistent_disk_migration.mdx) before the upgrade. The migration replaces nodes. |
 | Every machine shows `READY` `true` | Continue. |
@@ -311,10 +308,10 @@ Save this script as `check-global-baremetal.sh`:
 ac whoami --show-server
 KCP=$(ac -n cpaas-system get clusters.cluster.x-k8s.io global -o jsonpath='{.spec.controlPlaneRef.name}')
 
-echo "== Control plane and MachineDeployments"
-ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='replicas={.spec.replicas}{"\n"}'
+echo "== Rollout settings"
+ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='replicas={.spec.replicas} maxSurge={.spec.rolloutStrategy.rollingUpdate.maxSurge}{"\n"}'
 ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=global \
-  -o custom-columns='NAME:.metadata.name,UNAVAILABLE:.spec.strategy.rollingUpdate.maxUnavailable'
+  -o custom-columns='NAME:.metadata.name,SURGE:.spec.strategy.rollingUpdate.maxSurge,UNAVAILABLE:.spec.strategy.rollingUpdate.maxUnavailable'
 
 echo "== Host pools and hosts"
 ac -n cpaas-system get machineinventorypools.infrastructure.cluster.x-k8s.io \
@@ -346,15 +343,17 @@ snapper --no-dbus --csvout list --columns number,default,active,userdata
 
 For Alauda OS KU hosts, the free space of `/persist` must be larger than the ROOT partition (20 GiB) plus 2 GiB. Every host must also reach the registry of its cluster.
 
+When no MachineDeployment is listed, `global` has no worker node pool: only `replicas` and `maxSurge` apply.
+
 :::warning
 A node pool with a single host has no worker while that host is reinstalled. Make sure its workloads can run on other nodes, or accept the interruption.
 :::
 
 | Result | Action |
 | --- | --- |
-| Every MachineDeployment shows `UNAVAILABLE` `1` | Continue. |
-| A MachineDeployment shows `UNAVAILABLE` empty, `<none>`, or not `1` | Run the `machinedeployment` patch in [Set the Rollout Settings](#rollout-settings) for it. |
+| `replicas` is 3 or more and `maxSurge` is `0`, and every MachineDeployment shows `SURGE` `0` and `UNAVAILABLE` `1` | Continue. |
 | `replicas` is less than 3 | The cluster cannot be upgraded. |
+| `replicas` is 3 or more and `maxSurge` is empty or not `0`, or a MachineDeployment shows `SURGE` empty, `<none>`, or not `0`, or `UNAVAILABLE` empty, `<none>`, or not `1` | Run the commands in [Set the Rollout Settings](#rollout-settings). |
 | Nothing is listed under `== Local, hostPath, and TopoLVM PersistentVolumes with a claim` | Continue. |
 | A PersistentVolume is listed under `== Local, hostPath, and TopoLVM PersistentVolumes with a claim` | Move its data to CSI storage before the upgrade. If you have confirmed that the data is safe or can be lost, [exempt the volume](./troubleshooting.mdx#exempt-hostpath-volume). |
 | `COS_STATE` is larger than 8 GiB, `Free (estimated)` is at least 4 GiB, and no snapshot shows `no` in `default` and `active` and `update-in-progress=yes` in `userdata` | Continue. |
@@ -372,11 +371,6 @@ Save this script as `check-global-baremetal-no-preflight.sh`:
 #!/usr/bin/env bash
 ac whoami --show-server
 KCP=$(ac -n cpaas-system get clusters.cluster.x-k8s.io global -o jsonpath='{.spec.controlPlaneRef.name}')
-
-echo "== Rollout settings"
-ac -n cpaas-system get kubeadmcontrolplane "${KCP}" -o jsonpath='replicas={.spec.replicas} maxSurge={.spec.rolloutStrategy.rollingUpdate.maxSurge}{"\n"}'
-ac -n cpaas-system get machinedeployment -l cluster.x-k8s.io/cluster-name=global \
-  -o custom-columns='NAME:.metadata.name,SURGE:.spec.strategy.rollingUpdate.maxSurge'
 
 echo "== Machines"
 ac -n cpaas-system get baremetalmachines.infrastructure.cluster.x-k8s.io -l cluster.x-k8s.io/cluster-name=global \
@@ -409,9 +403,6 @@ bash check-global-baremetal-no-preflight.sh
 
 | Result | Action |
 | --- | --- |
-| `replicas` is 3 or more and `maxSurge` is `0`, and every MachineDeployment shows `SURGE` `0` | Continue. |
-| `replicas` is less than 3 | The cluster cannot be upgraded. |
-| `replicas` is 3 or more and `maxSurge` is empty or not `0`, or a MachineDeployment shows `SURGE` empty, `<none>`, or not `0` | Run the commands in [Set the Rollout Settings](#rollout-settings). |
 | Every machine shows `PHASE` `Running` | Continue. |
 | A machine shows `PHASE` empty, `<none>`, or not `Running` | Run the script again later. If the machine still does not show `Running`, contact technical support. |
 | Each kubelet patch file shows `encoding=[]`, then its content, or a Secret name and a key for which the command in [Kubelet Patch File](#kubernetes-1-35-kubelet-patch) prints the content | Continue. |
