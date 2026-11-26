@@ -118,7 +118,7 @@ Manage RBAC policy with project or namespace
 ac adm policy add-project-role-to-user project-admin-system alice --project my-project
 
 # Assign a user to the namespace role in a cluster namespace in project
-ac adm policy add-namespace-role-to-user namespace-developer-system alice --namespace my-namespace --project my-project --cluster business-1
+ac adm policy add-namespace-role-to-user namespace-developer-system alice --namespace my-namespace --project my-project --cluster workload-1
 
 # add kubernetes cluster role  view  to user alice
 ac adm policy add-cluster-role-to-user view alice
@@ -147,7 +147,7 @@ Assign a platform role to a user in a special cluster namespace in project
 
 ```bash
 # Assign the namespace-developer-system role to user alice in project my-project
-ac adm policy add-namespace-role-to-user namespace-developer-system alice --namespace my-namespace --project my-project --cluster business-1
+ac adm policy add-namespace-role-to-user namespace-developer-system alice --namespace my-namespace --project my-project --cluster workload-1
 ```
 
 ## ac adm policy add-project-role-to-user
