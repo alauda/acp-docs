@@ -46,7 +46,7 @@ spec:
 
 ### 1.2 Enforcing Uniform RestartPolicy for Pods
 
-This policy enforces that the default `restartPolicy` for all newly created Pods is `Always`. This is critical to ensure that business containers are automatically restarted if they exit unexpectedly.
+This policy enforces that the default `restartPolicy` for all newly created Pods is `Always`. This is critical to ensure that application containers are automatically restarted if they exit unexpectedly.
 
 ```yaml
 apiVersion: kyverno.io/v1
