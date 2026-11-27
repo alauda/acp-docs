@@ -1,0 +1,157 @@
+---
+weight: 64
+title: Recover a RAID Device Class from a Disk Failure
+---
+
+# Recover a RAID Device Class from a Disk Failure
+
+This document describes how to recover a [RAID device class](./raid.mdx) on a node after one of its disks fails. The operator only reports the failure; you repair the RAID volumes on the node with LVM commands and then update the disk list of the device class.
+
+Workloads keep running and their data stays available during the whole procedure, as long as the number of failed disks does not exceed what the RAID level tolerates.
+
+<Directive type="warning" title="Risk Warning">
+- Do not follow [Remove Disks, Device-Class Volume Groups, or Nodes from LVM Storage](./remove-disk.mdx) for a RAID device class. That procedure deletes the affected PVCs, which is not necessary for RAID volumes.
+- Do not delete the `TopolvmCluster` or the device class while recovering. Cleanup wipes the disks.
+- A degraded `raid1`, `raid4`, or `raid5` device class tolerates no further disk failure, and a degraded `raid6` device class tolerates one more. Recover it as soon as possible.
+</Directive>
+
+## Choosing the Correct Scenario
+
+| Situation                                                                 | Scenario                                                                                   |
+| :------------------------------------------------------------------------ | :----------------------------------------------------------------------------------------- |
+| The disk was temporarily disconnected and is back, with its data intact.   | [Scenario A: The original disk is back](#scenario-a-the-original-disk-is-back)              |
+| The disk is broken and a new disk is available on the node.               | [Scenario B: Replace the disk](#scenario-b-replace-the-disk)                                |
+| The disk is broken and no new disk is available.                          | [Scenario C: Remove the disk without a replacement](#scenario-c-remove-the-disk-without-a-replacement) |
+
+## Identify the Failure
+
+When a disk fails, the device class on the node stays `Ready`, and:
+
+- `raidStatus.status` of the class on the node in the `TopolvmCluster` (`status.nodeStorageState[].successClasses[]`) becomes `Degraded`, and the `topolvm.raid.degraded` alert fires after 5 minutes.
+- The device class message on the node starts with `waiting for raid repair:`, for example `waiting for raid repair: 1 member pv(s) missing, repair the RAID volumes following the runbook`.
+
+Run the following commands on the node. `<vg-name>` is the volume group of the device class; it is the `volume-group` of the device class in the `lvmdconfig-<node-name>` ConfigMap in the `nativestor-system` namespace.
+
+```bash
+lvmconfig --type full activation/raid_fault_policy
+pvs -o pv_name,vg_name,pv_uuid,pv_missing
+lvs -a -o lv_name,lv_attr,lv_health_status,sync_percent,devices <vg-name>
+```
+
+Run the `lvs` command again after each step below to check the result. In the example output, one of four `raid5` disks is missing:
+
+```text
+  [unknown]  r5-3e31e38c-c024-4cb8-8531-c367d16f23f1 C9aZei-VtAH-UABf-kERn-SVDG-Vffu-RuM1al    missing
+  LV                                              Attr       Health          Cpy%Sync Devices
+  cd6c22dc-1761-49d7-ad56-29cf30ca326f            rwi-aor-p- partial         100.00   ...
+  [cd6c22dc-1761-49d7-ad56-29cf30ca326f_rimage_0] Iwi-aor-p- partial                  [unknown](1)
+  [cd6c22dc-1761-49d7-ad56-29cf30ca326f_rimage_1] iwi-aor---                          /dev/vdc(1)
+```
+
+To find the PVC of an affected logical volume, run the following command on the control-plane node. The logical volume name is the `volumeHandle` of the PV.
+
+```bash
+kubectl get pv -o jsonpath='{range .items[?(@.spec.csi.volumeHandle=="<lv-name>")]}{.spec.claimRef.namespace}/{.spec.claimRef.name}{"\n"}{end}'
+```
+
+## Scenario A: The Original Disk Is Back \{#scenario-a-the-original-disk-is-back}
+
+<Steps>
+
+### Check the disk name
+
+Run `lsblk` and `pvs -o pv_name,pv_uuid`. The disk may come back under a different name, for example `/dev/vdd` comes back as `/dev/vde`; LVM recognizes it by its PV UUID.
+
+### Refresh the RAID volumes
+
+If the `Health` column shows `refresh needed`, refresh the volumes:
+
+```bash
+for lv in $(lvs --noheadings -o lv_name,segtype <vg-name> | awk '$2 ~ /^raid/ {print $1}'); do
+  lvchange --refresh <vg-name>/$lv
+done
+```
+
+The volumes synchronize only the data written while the disk was missing. Wait until `Cpy%Sync` of all volumes is `100.00` and `Health` is empty.
+
+### Update the disk list if the name changed
+
+If the disk name changed, the device class message shows `waiting for raid repair: can not resolve device /dev/<old-name>, update the device list of the class`. Replace the old name with the new name in `devices` of the class on the node in the `TopolvmCluster` (`kubectl -n nativestor-system edit topolvmclusters.topolvm.cybozu.com topolvm`).
+
+</Steps>
+
+## Scenario B: Replace the Disk \{#scenario-b-replace-the-disk}
+
+<Steps>
+
+### Add the new disk to the volume group
+
+The new disk must be a whole disk without partitions or signatures (check with `wipefs <new-disk>`), at least as large as the failed one.
+
+```bash
+vgextend <vg-name> <new-disk>
+```
+
+### Repair the RAID volumes
+
+Repair every RAID volume of the volume group:
+
+```bash
+for lv in $(lvs --noheadings -o lv_name,segtype <vg-name> | awk '$2 ~ /^raid/ {print $1}'); do
+  lvconvert --repair -y <vg-name>/$lv
+done
+```
+
+Each volume reports `Faulty devices in <vg-name>/<lv-name> successfully replaced.` and then resynchronizes onto the new disk. Wait until `Cpy%Sync` of all volumes is `100.00`. The time depends on the amount of data; the device class still tolerates only the remaining redundancy until the synchronization finishes.
+
+### Remove the missing disk from the volume group
+
+```bash
+vgreduce --removemissing <vg-name>
+```
+
+### Update the disk list
+
+In `devices` of the class on the node in the `TopolvmCluster`, replace the failed disk with the new disk. The class message changes back to `create successful` and `raidStatus.status` to `Healthy`.
+
+</Steps>
+
+### If the old disk is reconnected later
+
+A replaced disk still carries the old volume group metadata. If it is connected to the node again, LVM commands report `outdated PV <disk> ... See vgck --updatemetadata to clear outdated metadata`. Clear it before reusing the disk:
+
+```bash
+vgck --updatemetadata <vg-name>
+lvmdevices --deldev <old-disk>   # only if the LVM devices file is used (/etc/lvm/devices/system.devices exists)
+wipefs -a <old-disk>
+```
+
+## Scenario C: Remove the Disk Without a Replacement \{#scenario-c-remove-the-disk-without-a-replacement}
+
+Use this scenario only when no replacement disk is available and the remaining disks still satisfy the minimum of the RAID level. The RAID volumes keep their data but **lose the redundancy of the missing disk** until a disk is added again.
+
+<Steps>
+
+### Remove the missing disk from the volume group
+
+```bash
+vgreduce --removemissing --force <vg-name>
+```
+
+Without `--force` the command refuses with `There are still partial LVs`. With `--force`, LVM keeps the RAID volumes and replaces the missing parts with empty placeholders, shown with the attribute `v`; the volumes stay readable and writable.
+
+After this step the operator recomputes the stripe count and capacity of new volumes from the remaining disks, and the TopoLVM node Pod restarts once. Mounted volumes are not affected. `raidStatus.status` stays `Degraded` and the `topolvm.raid.degraded` alert keeps firing, because the existing volumes have no redundancy.
+
+### Update the disk list
+
+Remove the failed disk from `devices` of the class on the node in the `TopolvmCluster`. The class message changes back to `create successful`.
+
+### Restore redundancy later
+
+When a disk is available, follow [Scenario B](#scenario-b-replace-the-disk) from the first step, and then add the disk to `devices` of the class on the node. `raidStatus.status` changes back to `Healthy`.
+
+</Steps>
+
+## More Than One Failed Disk
+
+If more disks fail than the RAID level tolerates, the affected volumes can no longer be read, and their data is lost unless the failed disks come back. `raidStatus.status` is `Degraded` or `Failed` depending on the state LVM reports, so check the number of missing disks with `pvs` rather than relying on the status. Reconnect the disks if possible and follow Scenario A; otherwise restore the data from a backup.

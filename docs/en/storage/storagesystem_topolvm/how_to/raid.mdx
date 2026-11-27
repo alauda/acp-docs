@@ -1,0 +1,182 @@
+---
+weight: 63
+title: Configure Software RAID for a Device Class
+---
+
+# Configure Software RAID for a Device Class
+
+LVM Storage can protect the volumes of a device class with LVM RAID (the Linux `dm-raid` target). When a device class has a `raidConfig`, every logical volume that TopoLVM provisions in that device class is created as an LVM RAID logical volume across the disks of the device-class volume group on that node. A failed disk does not interrupt the workload, and the platform reports the degraded state through the device class status, metrics, and alerts.
+
+RAID is configured per device class in the `TopolvmCluster` resource. Repairing a failed disk is a manual procedure; see [Recover a RAID Device Class from a Disk Failure](./raid_recovery.mdx).
+
+## Supported RAID Levels
+
+`n` is the number of disks of the device class on a node.
+
+| Level    | Minimum disks per node                                                   | Disk failures tolerated     | Usable capacity                   |
+| :------- | :----------------------------------------------------------------------- | :-------------------------- | :-------------------------------- |
+| `raid1`  | `mirrors + 1` (2 by default)                                             | `mirrors`                   | `raw / (mirrors + 1)`             |
+| `raid4`  | `stripes + 1` (3 when `stripes` is not set)                              | 1                           | `raw × stripes / (stripes + 1)`   |
+| `raid5`  | `stripes + 1` (3 when `stripes` is not set)                              | 1                           | `raw × stripes / (stripes + 1)`   |
+| `raid6`  | `stripes + 2` (5 when `stripes` is not set)                              | 2                           | `raw × stripes / (stripes + 2)`   |
+| `raid10` | `(mirrors + 1) × stripes`, a multiple of `mirrors + 1` (4 by default)    | 1 in each mirror set        | `raw / (mirrors + 1)`             |
+
+When `stripes` is not set, the operator derives it from the number of disks on each node: `n - 1` for `raid4` and `raid5`, `n - 2` for `raid6`, and `n / (mirrors + 1)` for `raid10`. For example, a `raid5` device class with four 20 GiB disks on a node uses 3 stripes and provides about 60 GiB of usable capacity on that node.
+
+`raid0`, RAID on thin pools, and hot spare disks are not supported.
+
+## Prerequisites
+
+- The device class is configured per node in `spec.storage.deviceClasses` of the `TopolvmCluster` (not with `useAllNodes`).
+- On every node of the device class:
+  - `lvm2` 2.03.11 or later (`lvm version`).
+  - The `dm-raid` kernel module is available (`modinfo dm-raid`). It is loaded automatically when the first RAID volume is created.
+- Each node has at least the minimum number of disks for the RAID level. Use whole disks of the same size; the smallest disk limits the usable capacity.
+- Check `raid_fault_policy` in `/etc/lvm/lvm.conf` (`lvmconfig --type full activation/raid_fault_policy`). The default `warn` only reports failures, which is the behavior this document assumes. With `allocate`, LVM repairs RAID volumes automatically using free disks in the volume group.
+
+## Procedure
+
+<Steps>
+
+### Add a RAID device class
+
+Run the following command on the control-plane node:
+
+```bash
+kubectl -n nativestor-system edit topolvmclusters.topolvm.cybozu.com topolvm
+```
+
+Add a class with `raidConfig` to every node that provides the device class. The following example adds a `raid5` device class named `parity` on two nodes:
+
+```yaml
+spec:
+  storage:
+    deviceClasses:
+      - nodeName: <node-1>
+        classes:
+          - className: parity
+            raidConfig:
+              type: raid5
+              stripeSize: 64Ki   # optional
+            devices:
+              - name: /dev/vdb
+                type: disk
+              - name: /dev/vdc
+                type: disk
+              - name: /dev/vdd
+                type: disk
+      - nodeName: <node-2>
+        classes:
+          - className: parity
+            raidConfig:
+              type: raid5
+              stripeSize: 64Ki
+            devices:
+              - name: /dev/vdb
+                type: disk
+              - name: /dev/vdc
+                type: disk
+              - name: /dev/vdd
+                type: disk
+              - name: /dev/vde
+                type: disk
+```
+
+`raidConfig` fields:
+
+| Field        | Description                                                                                                    |
+| :----------- | :------------------------------------------------------------------------------------------------------------- |
+| `type`       | Required. One of `raid1`, `raid4`, `raid5`, `raid6`, `raid10`.                                                  |
+| `mirrors`    | Number of additional copies. Only for `raid1` and `raid10`. Defaults to 1.                                      |
+| `stripes`    | Number of data stripes, at least 2. Only for `raid4`, `raid5`, `raid6`, `raid10`. Derived from the disk count when not set. |
+| `stripeSize` | Size of each stripe chunk, a power of 2 between `4Ki` and `1Gi`. Only for `raid4`, `raid5`, `raid6`, `raid10`.   |
+
+A class with the same `className` must have the same `raidConfig` on every node. Invalid configurations are reported as follows, and nothing is changed on the node:
+
+- Invalid field combinations, such as `mirrors` for `raid5` or `raidConfig` together with `thinPoolConfig`, are rejected when you save the `TopolvmCluster`.
+- A different `raidConfig` on different nodes, or an invalid `stripeSize`, is reported in `status.message` of the `TopolvmCluster`.
+- Too few disks on a node for the RAID level is reported in the class message of that node, which starts with `invalid raid config:`.
+
+### Verify the device class
+
+Check the class state and RAID status on each node:
+
+```bash
+kubectl -n nativestor-system get topolvmclusters.topolvm.cybozu.com topolvm \
+  -o jsonpath='{range .status.nodeStorageState[*]}{.node}{"\n"}{range .successClasses[*]}{"  "}{.className}{" "}{.state}{" "}{.message}{" "}{.raidStatus}{"\n"}{end}{end}'
+```
+
+Example output:
+
+```text
+192.168.133.50
+  parity Ready create successful {"degradedLVCount":0,"degradedMemberCount":0,"failedLVCount":0,"memberCount":3,"status":"Healthy"}
+```
+
+### Create a StorageClass
+
+Create a TopoLVM StorageClass for the device class (**Storage Management** > **Storage Classes** > **Create Storage Class** > **Block Storage** > **TopoLVM**, and select the device class). The StorageClass uses the parameter `topolvm.cybozu.com/device-class: <class-name>`. Do not set `topolvm.cybozu.com/lvcreate-option-class`; see [Limitations](#limitations).
+
+### Create a volume
+
+Create a PVC with the StorageClass. Its logical volume is created as an LVM RAID volume on the node where the Pod is scheduled.
+
+</Steps>
+
+## Capacity
+
+The capacity that LVM Storage reports for a RAID device class is the usable capacity, that is, the free space of the volume group divided by the RAID overhead. This applies to scheduling, the node capacity annotation, and the `topolvm_volumegroup_size_bytes` and `topolvm_volumegroup_available_bytes` metrics, so they are smaller than the sizes reported by `vgs` (about half for `raid1`). After disks are added, the stripe count of new volumes changes, so the usage ratio has a small error until the old volumes are removed.
+
+## Adding and Removing Disks
+
+- **Add disks**: add them to `devices` of the class on the node. Existing volumes keep their layout; new volumes use the new stripe count.
+- **Remove disks**: remove them from `devices` of the class on the node. If the remaining disks are fewer than the minimum of the RAID level, the disks are not removed and the class message starts with `invalid raid config:`. A disk that still holds RAID volume data cannot be removed this way; recover or migrate the volumes first.
+- **Replace a failed disk**: see [Recover a RAID Device Class from a Disk Failure](./raid_recovery.mdx).
+
+## Limitations \{#limitations}
+
+- `raidConfig` cannot be added to, changed in, or removed from an existing device class. To use a different level, create a new device class.
+- `raidConfig` cannot be combined with `thinPoolConfig`, or with `stripe` and `stripeSize` of the class. RAID volumes do not support snapshots or clones.
+- A StorageClass of a RAID device class must not use `topolvm.cybozu.com/lvcreate-option-class`. A PVC that does stays `Pending` with the error `lvcreate-option-class is not allowed`.
+- When nodes have different numbers of disks and `stripes` is not set, the stripe count, and therefore the usable capacity, differs between nodes.
+- The operator does not repair failed disks automatically.
+- `raids` and `raid` of a class are deprecated and ignored. Use `raidConfig`.
+
+## Monitoring
+
+Status fields, in `status.nodeStorageState[].successClasses[].raidStatus` of the `TopolvmCluster`:
+
+- `status`: `Healthy`, `Degraded`, or `Failed`.
+- `memberCount`, `degradedMemberCount`, `degradedLVCount`, `failedLVCount`, and `minSyncPercent` during a resync.
+
+The class `state` remains `Ready` while it is degraded. A degraded state is reported only by `raidStatus`.
+
+Metrics, with the labels `node` and `device_class`:
+
+| Metric                          | Description                                          |
+| :------------------------------ | :--------------------------------------------------- |
+| `topolvm_raid_health_status`    | 0 healthy, 1 degraded, 2 failed.                     |
+| `topolvm_raid_member_count`     | Number of disks of the device class on the node.     |
+| `topolvm_raid_degraded_count`   | Number of missing disks.                             |
+| `topolvm_raid_sync_in_progress` | 1 while a volume is synchronizing.                   |
+| `topolvm_raid_sync_percent`     | Lowest synchronization progress of the volumes.      |
+
+Alerts:
+
+| Alert                    | Condition                                    | Severity |
+| :----------------------- | :------------------------------------------- | :------- |
+| `topolvm.raid.degraded`  | Degraded for 5 minutes                       | Critical |
+| `topolvm.raid.failed`    | Failed for 1 minute                          | Critical |
+| `topolvm.raid.sync.slow` | Synchronization in progress for 30 minutes   | Warning  |
+
+A degraded `raid1` or `raid5` device class tolerates no further disk failure. Recover it as soon as possible.
+
+## Troubleshooting
+
+| Symptom                                                                   | Cause and action                                                                                                       |
+| :------------------------------------------------------------------------ | :--------------------------------------------------------------------------------------------------------------------- |
+| `status.message` of the `TopolvmCluster` reports a different `raidConfig` | The same class has different `raidConfig` on different nodes. Make them identical.                                    |
+| Class message starts with `invalid raid config:`                          | The disks on the node do not satisfy the RAID level. Fix `raidConfig` or the disk list.                                |
+| PVC `Pending` with `raid1 target support missing from kernel?` or similar | The `dm-raid` module is not available on the node. Check with `modinfo dm-raid`.                                       |
+| PVC `Pending` with `lvcreate-option-class is not allowed`                 | Remove `topolvm.cybozu.com/lvcreate-option-class` from the StorageClass.                                                |
+| Class message starts with `waiting for raid repair:`                      | A disk is missing or was renamed. Follow [Recover a RAID Device Class from a Disk Failure](./raid_recovery.mdx).        |
