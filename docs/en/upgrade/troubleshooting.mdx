@@ -51,7 +51,7 @@ ac annotate resourcepatches <rp-name> config.cpaas.io/exempt-for-ver=<target-ver
 ac config use-cluster global
 ```
 
-The value is the target version, for example `4.5.0`, and covers every patch version of that minor version. An exemption keeps the customization in place; it does not confirm that the customization still works on the target version. Confirm that with the technical support contact who supplied it.
+If a `ResourcePatch` of `cluster-api-provider-alauda-manager` holds a `replace` operation on an `image` path or a `remove` operation on an `env` path that you did not make, do not exempt it; see [The Token Rotator Setting Does Not Take Effect](#token-rotator-patch-misapplied). The value is the target version, for example `4.5.0`, and covers every patch version of that minor version. An exemption keeps the customization in place; it does not confirm that the customization still works on the target version. Confirm that with the technical support contact who supplied it.
 
 ### Resolve Other Preflight Blocks \{#resolve-other-preflight-blocks}
 
@@ -601,6 +601,58 @@ Repeat for every node whose log matches. While any `machine-config-daemon` Pod i
 ac config use-cluster global
 ac adm upgrade status --cluster=<cluster-name> --verbose
 ```
+
+## The Token Rotator Setting Does Not Take Effect \{#token-rotator-patch-misapplied}
+
+Use this section when, in [Prepare Both `global` Clusters](./global/upgrade_global_dr_deferred_standby.mdx#prepare-both), the last command prints an empty line instead of `false`, or the `ResourcePatch` created by `set env` holds changes that you did not make. The release record of `cluster-api-provider-alauda` can still hold an earlier registry address. The `ResourcePatch` is computed against that record, so it can carry the registry change as a customization and remove another `env` entry of the Deployment, for example `GLOBAL_REGISTRY_ADDRESS`. Do not exempt such a `ResourcePatch` and continue: the upgrade applies it to the new version of the Deployment, which sets the images back to the versions in the patch and removes the `env` entry again.
+
+The blocks below run on the standby `global` cluster. On the primary, replace `export KUBECONFIG=<standby-kubeconfig>` with `ac config use-cluster global` and omit `unset KUBECONFIG`.
+
+1. Compare the images in the release record with the images of the Deployment, and read the `ResourcePatch`:
+
+   ```bash
+   export KUBECONFIG=<standby-kubeconfig>
+   ac whoami --show-server   # the standby VIP
+   ac -n cpaas-system get rel -l name=cluster-api-provider-alauda,status=deployed \
+     -o jsonpath='{.items[0].spec.data.release}' | base64 -d | gunzip | grep -o 'image: [^\\"]*' | sort -u
+   ac -n cpaas-system get deploy cluster-api-provider-alauda-manager \
+     -o jsonpath='{range .spec.template.spec.containers[*]}{.image}{"\n"}{end}'
+   RP=$(ac get resourcepatches \
+     -o jsonpath='{range .items[?(@.spec.target.name=="cluster-api-provider-alauda-manager")]}{.metadata.name}{"\n"}{end}')
+   ac get resourcepatches "${RP}" -o jsonpath='{.spec.jsonPatch}{"\n"}'
+   unset KUBECONFIG
+   ```
+
+   The release record is out of date when its images start with a different registry address than the images of the Deployment, for example `<ip>:11440` instead of `cpaas-registry.cpaas-system`. The `ResourcePatch` then holds `replace` operations on `image` paths or a `remove` operation on an `env` path. If the images start with the same address, this section does not apply: contact technical support.
+
+2. Make the platform write a new release record from the current configuration. Add a temporary value to the `cluster-manager` AppRelease, which installs `cluster-api-provider-alauda`; no chart reads this value. The platform removes the value again within a few minutes and can write one more record; both are expected:
+
+   ```bash
+   export KUBECONFIG=<standby-kubeconfig>
+   ac -n cpaas-system patch apprelease cluster-manager --type merge \
+     -p '{"spec":{"values":{"relRefresh":"<yyyymmdd>"}}}'
+   ac -n cpaas-system get rel -l name=cluster-api-provider-alauda
+   ac -n cpaas-system get rel -l name=cluster-api-provider-alauda,status=deployed \
+     -o jsonpath='{.items[0].spec.data.release}' | base64 -d | gunzip | grep -o 'image: [^\\"]*' | sort -u
+   unset KUBECONFIG
+   ```
+
+   Continue when a record newer than the one in step 1 is `deployed` and its images start with the same registry address as the images of the Deployment. Until then, run the last two commands again.
+
+3. Delete the `ResourcePatch`. The platform restores the Deployment from the new record: the removed `env` entry returns, and `CLUSTER_TOKEN_ROTATOR_ENABLED` is no longer set:
+
+   ```bash
+   export KUBECONFIG=<standby-kubeconfig>
+   RP=$(ac get resourcepatches \
+     -o jsonpath='{range .items[?(@.spec.target.name=="cluster-api-provider-alauda-manager")]}{.metadata.name}{"\n"}{end}')
+   ac delete resourcepatches "${RP}"
+   ac -n cpaas-system rollout status deploy/cluster-api-provider-alauda-manager
+   ac -n cpaas-system get deploy cluster-api-provider-alauda-manager \
+     -o jsonpath='{.spec.template.spec.containers[?(@.name=="cluster-api-provider-alauda")].env}{"\n"}'
+   unset KUBECONFIG
+   ```
+
+4. On this cluster, run the token rotator block of [Prepare Both `global` Clusters](./global/upgrade_global_dr_deferred_standby.mdx#prepare-both) again. Before you exempt the new `ResourcePatch`, read it with the last command of step 1: it holds an `add` operation for `CLUSTER_TOKEN_ROTATOR_ENABLED`, and no `replace` operation on an `image` path and no `remove` operation on an `env` path. If it still holds such an operation, do not exempt it, and contact technical support.
 
 ## Global Cluster Disaster Recovery Does Not Synchronize \{#dr-sync-diagnostics}
 
